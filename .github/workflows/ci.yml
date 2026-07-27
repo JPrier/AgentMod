@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Workspace tests
+        run: cargo test --workspace --all-targets --all-features --locked
+      - name: Documentation tests
+        run: cargo test --workspace --doc --all-features --locked
+
+  architecture:
+    name: Architecture and negative fixtures
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate workspace dependency graph
+        run: cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml
+      - name: Prove intentional violations are detected
+        run: cargo test --locked -p xtask --test architecture
+
+  feature-matrix:
+    name: Feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-hack
+      - uses: Swatinem/rust-cache@v2
+      - name: Check each declared feature
+        run: cargo hack check --workspace --each-feature --all-targets
+      - name: Check all features together
+        run: cargo check --workspace --all-targets --all-features --locked
+
+  msrv:
+    name: Declared MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace on declared minimum Rust
+        run: cargo check --workspace --all-targets --all-features --locked
+
+  supply-chain:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@cargo-audit
+      - name: License, ban, advisory, and source policy
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      - name: RustSec advisory audit
+        run: cargo audit
+
+  packaging-smoke:
+    name: Packaging smoke
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --locked --release -p agentmod-runtime -p agentmod-harness -p agentmod-cli
+      - name: Runtime health smoke
+        run: cargo run --locked --release -p agentmod-runtime
+      - name: Harness health smoke
+        run: cargo run --locked --release -p agentmod-harness
+      - name: CLI doctor smoke
+        run: cargo run --locked --release -p agentmod-cli -- doctor --json --strict

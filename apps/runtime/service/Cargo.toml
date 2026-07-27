@@ -1,0 +1,29 @@
+[package]
+name = "agentmod-runtime-service"
+description = "Endpoint-facing service layer for the AgentMod runtime daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-protocol-support = { path = "../../../core/protocol-support" }
+agentmod-runtime-logic = { path = "../logic" }
+agentmod-runtime-protocol = { path = "../../../protocols/runtime-protocol" }
+async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "runtime"
+layer = "service"

@@ -1,0 +1,34 @@
+[package]
+name = "agentmod-process-host"
+description = "AgentMod supervised process capability host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-process-host-data = { path = "../data" }
+agentmod-process-host-dependency = { path = "../dependency" }
+agentmod-process-host-logic = { path = "../logic" }
+agentmod-process-host-service = { path = "../service" }
+agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+
+[dev-dependencies]
+agentmod-primitives = { path = "../../../../core/primitives" }
+agentmod-protocol-support = { path = "../../../../core/protocol-support" }
+serde_json.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agentmod-process-host"
+path = "src/main.rs"
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "process"

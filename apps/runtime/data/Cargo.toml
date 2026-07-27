@@ -1,0 +1,31 @@
+[package]
+name = "agentmod-runtime-data"
+description = "Business-facing dataset construction for the AgentMod runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-event-model = { path = "../../../core/event-model" }
+agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-runtime-dependency = { path = "../dependency" }
+async-trait.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "runtime"
+layer = "data"

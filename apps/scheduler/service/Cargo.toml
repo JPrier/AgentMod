@@ -1,0 +1,21 @@
+[package]
+name = "agentmod-scheduler-service"
+description = "Versioned scheduler protocol endpoints for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-scheduler-logic = { path = "../logic" }
+agentmod-scheduler-protocol = { path = "../../../protocols/scheduler-protocol" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "scheduler"
+layer = "service"

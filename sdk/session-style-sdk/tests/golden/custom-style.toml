@@ -1,0 +1,93 @@
+schema_version = 1
+kind = "custom"
+required_capabilities = ["events"]
+allowed_tool_groups = []
+allowed_providers = []
+allowed_plugins = []
+
+[identity]
+id = "golden-style"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[graph]
+kind = "inline"
+source = '''
+format_version = 1
+entry = "emit"
+
+[budget]
+max_steps = 10
+max_tokens = 1000
+max_cost_micros = 1000
+max_duration_ms = 10000
+
+[declarations]
+capabilities = ["events"]
+
+[[nodes]]
+id = "emit"
+kind = "emit_event"
+
+[[nodes]]
+id = "done"
+kind = "complete_session"
+
+[[edges]]
+from = "emit"
+to = "done"
+'''
+
+[[interceptors]]
+id = "audit"
+owner = "runtime"
+event = "action.proposed"
+stage = 10
+priority = 100
+before = []
+after = []
+supported_decisions = ["continue", "reject"]
+required_capabilities = ["events"]
+
+[memory]
+provider = "none"
+scopes = []
+max_items = 0
+max_injected_bytes = 0
+
+[compaction]
+strategy = "none"
+preserve_unresolved_tasks = true
+preserve_active_processes = true
+
+[approvals]
+default = "ask"
+groups = {}
+
+[budgets]
+max_iterations = 10
+max_steps = 100
+max_tokens = 10000
+max_cost_micros = 100000
+max_duration_ms = 60000
+
+[child_agents]
+max_children = 0
+max_concurrent = 0
+max_depth = 0
+per_child_token_budget = 0
+
+[retry]
+max_attempts = 1
+initial_backoff_ms = 0
+max_backoff_ms = 0
+retryable_failures = []
+
+[termination]
+allowed_outcomes = ["complete_session", "fail"]
+on_hard_limit = "fail"
+require_explicit_terminal_node = true
+
+[selection]
+requires_explicit_selection = true
+model_may_select = false

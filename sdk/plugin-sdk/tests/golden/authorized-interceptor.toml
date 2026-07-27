@@ -1,0 +1,46 @@
+schema_version = 1
+category = "interceptor"
+scope = "session"
+classification = "blocking"
+trust = "first_party"
+isolation = "trusted_in_process"
+required_capabilities = ["runtime.events"]
+provided_capabilities = ["plugin.audit"]
+subscribed_events = ["tool.call.proposed"]
+timeout_ms = 5000
+state_migration_version = 1
+
+[identity]
+id = "agentmod.audit"
+version = "1.2.3"
+runtime_api = "^1.2"
+
+[entrypoint]
+kind = "rust_builtin"
+symbol = "audit_interceptor"
+
+[authorities]
+read = ["session_state"]
+proposed_write = ["canonical_state"]
+
+[permissions]
+tools = ["filesystem.read"]
+network = []
+
+[ordering]
+stage = 20
+priority = 100
+before = []
+after = []
+
+[configuration]
+schema_id = "agentmod.audit.config"
+schema_version = 1
+required = false
+
+[configuration.source]
+kind = "inline_json"
+document = '{"type":"object","additionalProperties":false}'
+
+[failure_policy]
+kind = "reject"

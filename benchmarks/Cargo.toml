@@ -1,0 +1,25 @@
+[package]
+name = "agentmod-benchmarks"
+description = "Reproducible release-mode microbenchmark runner for AgentMod kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+agentmod-event-model = { path = "../core/event-model" }
+agentmod-expression-engine = { path = "../core/expression-engine" }
+agentmod-graph-engine = { path = "../core/graph-engine" }
+agentmod-primitives = { path = "../core/primitives" }
+agentmod-protocol-support = { path = "../core/protocol-support" }
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "benchmarks"

@@ -1,0 +1,29 @@
+[package]
+name = "agentmod-browser-host-service"
+description = "Tool-protocol endpoints for the isolated AgentMod browser host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-browser-host-logic = { path = "../logic" }
+agentmod-primitives = { path = "../../../../core/primitives" }
+agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "browser"
+layer = "service"

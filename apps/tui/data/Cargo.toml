@@ -1,0 +1,22 @@
+[package]
+name = "agentmod-tui-data"
+description = "Business-facing runtime datasets for the AgentMod TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-tui-dependency = { path = "../dependency" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "tui"
+layer = "data"

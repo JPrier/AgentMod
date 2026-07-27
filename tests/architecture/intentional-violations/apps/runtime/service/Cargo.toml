@@ -1,0 +1,13 @@
+[package]
+name = "fixture-runtime-service"
+version = "0.0.0"
+edition = "2021"
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "runtime"
+layer = "service"
+
+[dependencies]
+fixture-runtime-data = { path = "../data" }
+fixture-harness-logic = { path = "../../harness/logic" }

@@ -1,0 +1,8 @@
+[package]
+name = "fixture-bad-metadata"
+version = "0.0.0"
+edition = "2021"
+
+[package.metadata.agentmod]
+kind = "process-layer"
+layer = "logic"

@@ -1,0 +1,1991 @@
+//! Authenticated operating-system process supervision and durable bounded logs.
+
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsString,
+    path::{Path, PathBuf},
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use agentmod_primitives::{ContentHash, TimestampMillis};
+use agentmod_protocol_support::authorization::{
+    AuthorizationKey, ExpectedAuthorization, verify_authorization,
+};
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use thiserror::Error;
+use tokio::{
+    fs::{self, File, OpenOptions},
+    io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
+    process::{Child, ChildStdin, Command},
+    sync::{Mutex, RwLock, mpsc, oneshot},
+    task::JoinHandle,
+    time::{Instant, sleep, sleep_until, timeout},
+};
+use uuid::Uuid;
+
+/// Dependency-owned caller identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyIdentity {
+    /// Local owner identity.
+    pub owner_id: String,
+    /// Session identity.
+    pub session_id: String,
+}
+
+/// Dependency-owned authorization proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyAuthorization {
+    /// Bound identity.
+    pub identity: DependencyIdentity,
+    /// Runtime call ID.
+    pub call_id: String,
+    /// Exact tool name.
+    pub tool: String,
+    /// Caller-provided normalized digest.
+    pub normalized_digest: String,
+    /// Keyed short-lived grant.
+    pub grant: String,
+    /// Opaque cancellation ID.
+    pub cancellation_id: String,
+    /// Deterministic canonical operation bytes.
+    pub canonical_operation: Vec<u8>,
+}
+
+/// Stable process identifier.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct DependencyProcessId(String);
+
+impl DependencyProcessId {
+    /// Returns portable identifier text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Parses a UUID process identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed UUID text.
+    pub fn parse(value: String) -> Result<Self, ProcessDependencyError> {
+        Uuid::parse_str(&value)
+            .map(|_| Self(value))
+            .map_err(|_| ProcessDependencyError::InvalidProcessId)
+    }
+}
+
+/// Durable-log cleanup policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyCleanupPolicy {
+    /// Retain logs.
+    Retain,
+    /// Remove after success.
+    RemoveLogsOnSuccess,
+    /// Remove after every exit.
+    RemoveLogsAlways,
+}
+
+impl DependencyCleanupPolicy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retain => "retain",
+            Self::RemoveLogsOnSuccess => "remove_logs_on_success",
+            Self::RemoveLogsAlways => "remove_logs_always",
+        }
+    }
+}
+
+/// Executable policy decision enforced at the OS boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyExecutablePolicy {
+    /// Execute without another approval.
+    Allow,
+    /// Require approval unavailable at this dependency endpoint.
+    Ask,
+    /// Deny execution.
+    Deny,
+}
+
+/// Authenticated process start request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyStartProcessRequest {
+    /// Authorization proof.
+    pub authorization: DependencyAuthorization,
+    /// Approved workspace root.
+    pub workspace_root: PathBuf,
+    /// Approved working directory.
+    pub working_directory: PathBuf,
+    /// Provider-visible working-directory selection before workspace resolution.
+    pub requested_working_directory: Option<PathBuf>,
+    /// Executable passed directly to the OS.
+    pub executable: String,
+    /// Exact argument vector.
+    pub arguments: Vec<String>,
+    /// Filtered environment overrides.
+    pub environment: BTreeMap<String, String>,
+    /// Optional hard runtime limit.
+    pub timeout: Option<Duration>,
+    /// Per-stream retained-byte limit.
+    pub output_limit_bytes: u64,
+    /// Cleanup policy.
+    pub cleanup: DependencyCleanupPolicy,
+    /// Whether start waits and projects output before cleanup.
+    pub foreground: bool,
+}
+
+/// Process lifecycle state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyProcessState {
+    /// Running.
+    Running,
+    /// Exited and drained.
+    Exited,
+}
+
+/// Exit status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyExitStatus {
+    /// OS exit code.
+    pub code: Option<i32>,
+    /// Success classification.
+    pub success: bool,
+    /// Timeout initiated termination.
+    pub timed_out: bool,
+}
+
+/// Process record scoped to its owner and session.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent protocol flags are intentionally explicit"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyProcessRecord {
+    /// Stable process ID.
+    pub process_id: DependencyProcessId,
+    /// Owner.
+    pub owner_id: String,
+    /// Session.
+    pub session_id: String,
+    /// Redacted executable label.
+    pub executable: String,
+    /// Canonical cwd.
+    pub working_directory: PathBuf,
+    /// State.
+    pub state: DependencyProcessState,
+    /// Exit.
+    pub exit: Option<DependencyExitStatus>,
+    /// Detached marker.
+    pub detached: bool,
+    /// Captured stdout projection available before cleanup.
+    pub stdout_projection: Vec<u8>,
+    /// Captured stderr projection available before cleanup.
+    pub stderr_projection: Vec<u8>,
+    /// Stdout truncated.
+    pub stdout_truncated: bool,
+    /// Stderr truncated.
+    pub stderr_truncated: bool,
+    /// Logs removed.
+    pub logs_removed: bool,
+    /// Cleanup failed after an otherwise completed operation.
+    pub cleanup_failed: bool,
+}
+
+/// Authenticated process control.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyProcessRequest {
+    /// Authorization proof.
+    pub authorization: DependencyAuthorization,
+    /// Process ID.
+    pub process_id: String,
+}
+
+/// Authenticated input request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyProcessInputRequest {
+    /// Authorization proof.
+    pub authorization: DependencyAuthorization,
+    /// Process ID.
+    pub process_id: String,
+    /// Exact bytes.
+    pub bytes: Vec<u8>,
+    /// Close stdin.
+    pub close: bool,
+}
+
+/// Output stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyOutputStream {
+    /// stdout.
+    Stdout,
+    /// stderr.
+    Stderr,
+}
+
+/// Authenticated bounded output read.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyReadOutputRequest {
+    /// Authorization proof.
+    pub authorization: DependencyAuthorization,
+    /// Process ID.
+    pub process_id: String,
+    /// Stream.
+    pub stream: DependencyOutputStream,
+    /// Offset.
+    pub offset: u64,
+    /// Length.
+    pub length: u64,
+}
+
+/// Output range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyReadOutputResponse {
+    /// Bytes.
+    pub bytes: Vec<u8>,
+    /// Next offset.
+    pub next_offset: u64,
+    /// Retained size.
+    pub retained_bytes: u64,
+    /// Truncation marker.
+    pub truncated: bool,
+}
+
+/// Authenticated list request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyListRequest {
+    /// Authorization proof.
+    pub authorization: DependencyAuthorization,
+}
+
+/// Identity-scoped cancellation request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyCancelRequest {
+    /// Configured identity.
+    pub identity: DependencyIdentity,
+    /// Opaque cancellation ID.
+    pub cancellation_id: String,
+}
+
+/// Hard dependency bounds and security configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessDependencyConfig {
+    /// Trusted storage root.
+    pub storage_root: PathBuf,
+    /// Log root under storage root.
+    pub log_root: PathBuf,
+    /// Secret reference value loaded as 64 hexadecimal characters.
+    pub authorization_key_hex: String,
+    /// Bootstrap owner identity; request-supplied identity must match.
+    pub owner_id: String,
+    /// Bootstrap session identity; request-supplied identity must match.
+    pub session_id: String,
+    /// Explicit inherited environment allowlist.
+    pub inherited_environment_allowlist: BTreeSet<String>,
+    /// Max input bytes.
+    pub max_input_bytes: usize,
+    /// Max range bytes.
+    pub max_range_bytes: u64,
+    /// Max arguments.
+    pub max_arguments: usize,
+    /// Max combined argv bytes.
+    pub max_argument_bytes: usize,
+    /// Max environment entries.
+    pub max_environment_entries: usize,
+    /// Max combined environment bytes.
+    pub max_environment_bytes: usize,
+    /// Max concurrently running processes.
+    pub max_active_processes: usize,
+    /// Max retained bytes across registered logs.
+    pub max_total_retained_bytes: u64,
+    /// Output-drain deadline.
+    pub drain_timeout: Duration,
+    /// Maximum time spent sending one stdin frame.
+    pub input_write_timeout: Duration,
+    /// Maximum retained authorization nonces after expiry pruning.
+    pub max_replay_entries: usize,
+    /// Maximum completed entries retained in memory.
+    pub max_completed_entries: usize,
+    /// Maximum simultaneous waiters for one process.
+    pub max_waiters_per_process: usize,
+    /// Exact executable-name policy, normalized per platform.
+    pub executable_policy: BTreeMap<String, DependencyExecutablePolicy>,
+    /// Fallback executable decision.
+    pub default_executable_policy: DependencyExecutablePolicy,
+}
+
+/// Dependency interface.
+#[async_trait]
+pub trait ProcessDependencyPort: Send + Sync {
+    /// Starts a child after grant verification.
+    async fn start(
+        &self,
+        request: DependencyStartProcessRequest,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError>;
+    /// Writes input.
+    async fn input(
+        &self,
+        request: DependencyProcessInputRequest,
+    ) -> Result<(), ProcessDependencyError>;
+    /// Reads output.
+    async fn read_output(
+        &self,
+        request: DependencyReadOutputRequest,
+    ) -> Result<DependencyReadOutputResponse, ProcessDependencyError>;
+    /// Waits and captures output before cleanup.
+    async fn wait(
+        &self,
+        request: DependencyProcessRequest,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError>;
+    /// Requests graceful/tree termination where supported.
+    async fn interrupt(
+        &self,
+        request: DependencyProcessRequest,
+    ) -> Result<(), ProcessDependencyError>;
+    /// Forces tree termination where supported.
+    async fn kill(&self, request: DependencyProcessRequest) -> Result<(), ProcessDependencyError>;
+    /// Detaches.
+    async fn detach(
+        &self,
+        request: DependencyProcessRequest,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError>;
+    /// Reattaches.
+    async fn reattach(
+        &self,
+        request: DependencyProcessRequest,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError>;
+    /// Lists only identity-owned records.
+    async fn list(
+        &self,
+        request: DependencyListRequest,
+    ) -> Result<Vec<DependencyProcessRecord>, ProcessDependencyError>;
+    /// Cancels by opaque token and identity.
+    async fn cancel(
+        &self,
+        request: DependencyCancelRequest,
+    ) -> Result<String, ProcessDependencyError>;
+}
+
+#[derive(Clone)]
+struct RegistryEntry {
+    process_id: DependencyProcessId,
+    identity: DependencyIdentity,
+    cancellation_id: String,
+    executable: String,
+    working_directory: PathBuf,
+    log_directory: PathBuf,
+    output_limit_bytes: u64,
+    cleanup: DependencyCleanupPolicy,
+    snapshot: Arc<RwLock<ProcessSnapshot>>,
+    control: mpsc::Sender<Control>,
+    stdout_truncated: Arc<AtomicBool>,
+    stderr_truncated: Arc<AtomicBool>,
+    logs_removed: Arc<AtomicBool>,
+    cleanup_failed: Arc<AtomicBool>,
+    completion: Arc<Mutex<()>>,
+}
+
+#[derive(Clone, Debug)]
+struct ProcessSnapshot {
+    state: DependencyProcessState,
+    exit: Option<DependencyExitStatus>,
+    detached: bool,
+    capture_error: Option<String>,
+}
+
+enum Control {
+    Input {
+        bytes: Vec<u8>,
+        close: bool,
+        response: oneshot::Sender<Result<(), String>>,
+    },
+    Interrupt(oneshot::Sender<Result<(), String>>),
+    Kill(oneshot::Sender<Result<(), String>>),
+    Wait(oneshot::Sender<DependencyExitStatus>),
+}
+
+/// Tokio process dependency.
+#[derive(Clone)]
+pub struct TokioProcessDependency {
+    config: ProcessDependencyConfig,
+    authorization_key: Arc<AuthorizationKey>,
+    registry: Arc<Mutex<BTreeMap<String, RegistryEntry>>>,
+    replay: Arc<Mutex<ReplayState>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ReplaySnapshot {
+    generation: u64,
+    nonces: BTreeMap<String, i64>,
+}
+
+#[derive(Debug)]
+struct ReplayState {
+    directory: PathBuf,
+    snapshot: ReplaySnapshot,
+}
+
+impl TokioProcessDependency {
+    /// Constructs a secure dependency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when security configuration or resource bounds are invalid.
+    pub fn new(mut config: ProcessDependencyConfig) -> Result<Self, ProcessDependencyError> {
+        if config.storage_root.as_os_str().is_empty()
+            || config.log_root.as_os_str().is_empty()
+            || config.authorization_key_hex.is_empty()
+            || config.owner_id.is_empty()
+            || config.session_id.is_empty()
+            || config.max_input_bytes == 0
+            || config.max_range_bytes == 0
+            || config.max_arguments == 0
+            || config.max_argument_bytes == 0
+            || config.max_environment_entries == 0
+            || config.max_environment_bytes == 0
+            || config.max_active_processes == 0
+            || config.max_total_retained_bytes == 0
+            || config.drain_timeout.is_zero()
+            || config.input_write_timeout.is_zero()
+            || config.max_replay_entries == 0
+            || config.max_completed_entries == 0
+            || config.max_waiters_per_process == 0
+        {
+            return Err(ProcessDependencyError::InvalidConfiguration);
+        }
+        let authorization_key = AuthorizationKey::from_hex(&config.authorization_key_hex)
+            .map_err(|_| ProcessDependencyError::InvalidConfiguration)?;
+        config.authorization_key_hex.clear();
+        let mut executable_policy = BTreeMap::new();
+        for (name, decision) in std::mem::take(&mut config.executable_policy) {
+            let normalized = normalize_executable_policy_key(name.trim());
+            if normalized.is_empty()
+                || executable_policy
+                    .insert(normalized, decision)
+                    .is_some_and(|previous| previous != decision)
+            {
+                return Err(ProcessDependencyError::InvalidConfiguration);
+            }
+        }
+        config.executable_policy = executable_policy;
+        let replay = load_replay_state(&config.storage_root)?;
+        Ok(Self {
+            config,
+            authorization_key: Arc::new(authorization_key),
+            registry: Arc::new(Mutex::new(BTreeMap::new())),
+            replay: Arc::new(Mutex::new(replay)),
+        })
+    }
+
+    async fn authorize(
+        &self,
+        authorization: &DependencyAuthorization,
+        expected_tool: &str,
+        canonical_operation: &[u8],
+    ) -> Result<(), ProcessDependencyError> {
+        validate_authorization_shape(authorization)?;
+        if authorization.identity.owner_id != self.config.owner_id
+            || authorization.identity.session_id != self.config.session_id
+            || authorization.tool != expected_tool
+        {
+            return Err(ProcessDependencyError::AuthorizationDenied);
+        }
+        let digest = ContentHash::digest(canonical_operation);
+        if !constant_time_eq(
+            digest.to_hex().as_bytes(),
+            authorization.normalized_digest.as_bytes(),
+        ) {
+            return Err(ProcessDependencyError::AuthorizationDenied);
+        }
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ProcessDependencyError::AuthorizationDenied)?
+            .as_millis();
+        let now_millis =
+            i64::try_from(now_millis).map_err(|_| ProcessDependencyError::AuthorizationDenied)?;
+        let claims = verify_authorization(
+            &authorization.grant,
+            &self.authorization_key,
+            ExpectedAuthorization {
+                owner: &authorization.identity.owner_id,
+                session: &authorization.identity.session_id,
+                call_id: &authorization.call_id,
+                action: &authorization.tool,
+                normalized_digest: digest,
+            },
+            TimestampMillis::new(now_millis),
+        )
+        .map_err(|_| ProcessDependencyError::AuthorizationDenied)?;
+        let nonce_key = format!("{}:{}:{}", claims.owner, claims.session, claims.nonce);
+        let mut replay = self.replay.lock().await;
+        let mut next = replay.snapshot.clone();
+        next.nonces.retain(|_, expiry| *expiry >= now_millis);
+        if next.nonces.contains_key(&nonce_key) {
+            return Err(ProcessDependencyError::AuthorizationReplay);
+        }
+        if next.nonces.len() >= self.config.max_replay_entries {
+            return Err(ProcessDependencyError::ResourceLimit);
+        }
+        next.generation = next
+            .generation
+            .checked_add(1)
+            .ok_or(ProcessDependencyError::ResourceLimit)?;
+        next.nonces.insert(nonce_key, claims.expires_at.get());
+        persist_replay_snapshot(&replay.directory, &next)?;
+        replay.snapshot = next;
+        Ok(())
+    }
+
+    async fn entry(
+        &self,
+        raw_id: String,
+        identity: &DependencyIdentity,
+    ) -> Result<RegistryEntry, ProcessDependencyError> {
+        let process_id = DependencyProcessId::parse(raw_id)?;
+        let entry = self
+            .registry
+            .lock()
+            .await
+            .get(process_id.as_str())
+            .cloned()
+            .ok_or(ProcessDependencyError::ProcessNotFound)?;
+        ensure_owner(&entry, identity)?;
+        Ok(entry)
+    }
+
+    async fn authorized_entry(
+        &self,
+        request: &DependencyProcessRequest,
+        expected_tool: &str,
+    ) -> Result<RegistryEntry, ProcessDependencyError> {
+        let canonical = canonical_control_operation(
+            expected_tool,
+            &request.authorization.cancellation_id,
+            &request.process_id,
+        )?;
+        self.authorize(&request.authorization, expected_tool, &canonical)
+            .await?;
+        self.entry(request.process_id.clone(), &request.authorization.identity)
+            .await
+    }
+
+    async fn complete_record(
+        &self,
+        entry: &RegistryEntry,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError> {
+        let _completion = entry.completion.lock().await;
+        wait_entry(entry).await?;
+        let capture_error = entry.snapshot.read().await.capture_error.clone();
+        if capture_error.is_some() {
+            return Err(ProcessDependencyError::CaptureFailed);
+        }
+        let stdout_projection = read_entire_bounded(
+            &entry.log_directory.join("stdout.log"),
+            entry.output_limit_bytes,
+        )
+        .await?;
+        let stderr_projection = read_entire_bounded(
+            &entry.log_directory.join("stderr.log"),
+            entry.output_limit_bytes,
+        )
+        .await?;
+        let mut record = record_from_entry(entry).await;
+        record.stdout_projection = stdout_projection;
+        record.stderr_projection = stderr_projection;
+        let exit_success = record.exit.as_ref().is_some_and(|exit| exit.success);
+        let remove = matches!(entry.cleanup, DependencyCleanupPolicy::RemoveLogsAlways)
+            || (matches!(entry.cleanup, DependencyCleanupPolicy::RemoveLogsOnSuccess)
+                && exit_success);
+        if remove && !entry.logs_removed.load(Ordering::Acquire) {
+            if fs::remove_dir_all(&entry.log_directory).await.is_ok() {
+                entry.logs_removed.store(true, Ordering::Release);
+                record.logs_removed = true;
+            } else {
+                entry.cleanup_failed.store(true, Ordering::Release);
+                record.cleanup_failed = true;
+            }
+        }
+        self.prune_completed_registry().await;
+        Ok(record)
+    }
+
+    async fn prune_completed_registry(&self) {
+        let mut registry = self.registry.lock().await;
+        let completed: Vec<_> = registry
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .snapshot
+                    .try_read()
+                    .ok()
+                    .and_then(|snapshot| snapshot.exit.is_some().then(|| id.clone()))
+            })
+            .collect();
+        let excess = completed
+            .len()
+            .saturating_sub(self.config.max_completed_entries);
+        for id in completed.into_iter().take(excess) {
+            registry.remove(&id);
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "the trait implementation keeps each dependency endpoint mapping explicit"
+)]
+#[async_trait]
+impl ProcessDependencyPort for TokioProcessDependency {
+    async fn start(
+        &self,
+        request: DependencyStartProcessRequest,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError> {
+        validate_start_request(&request, &self.config)?;
+        let expected_tool = if request.foreground {
+            "process.run"
+        } else {
+            "process.start"
+        };
+        let canonical = canonical_start_operation(&request)?;
+        self.authorize(&request.authorization, expected_tool, &canonical)
+            .await?;
+        let (workspace_root, working_directory, log_root) =
+            secure_roots(&request, &self.config).await?;
+        if !working_directory.starts_with(&workspace_root) {
+            return Err(ProcessDependencyError::WorkingDirectoryEscape);
+        }
+        let executable = resolve_executable(
+            &request.executable,
+            &self.config.inherited_environment_allowlist,
+        )
+        .await?;
+        enforce_executable_policy(&request.executable, &executable, &self.config)?;
+        let environment = resolve_environment(&request.environment)?;
+        self.prune_completed_registry().await;
+        enforce_capacity(&self.registry, request.output_limit_bytes, &self.config).await?;
+
+        let process_id = DependencyProcessId(Uuid::now_v7().to_string());
+        let log_directory = log_root.join(process_id.as_str());
+        fs::create_dir(&log_directory).await.map_err(redacted_io)?;
+        let stdout_file = match File::create(log_directory.join("stdout.log")).await {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&log_directory).await;
+                return Err(redacted_io(error));
+            }
+        };
+        let stderr_file = match File::create(log_directory.join("stderr.log")).await {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&log_directory).await;
+                return Err(redacted_io(error));
+            }
+        };
+        let mut command = Command::new(executable);
+        command
+            .args(&request.arguments)
+            .current_dir(&working_directory)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        inherit_safe_environment(&mut command, &self.config.inherited_environment_allowlist);
+        for (key, value) in &environment {
+            command.env(key, value);
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&log_directory).await;
+                return Err(redacted_io(error));
+            }
+        };
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(ProcessDependencyError::PipeUnavailable)?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or(ProcessDependencyError::PipeUnavailable)?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(ProcessDependencyError::PipeUnavailable)?;
+        let stdout_truncated = Arc::new(AtomicBool::new(false));
+        let stderr_truncated = Arc::new(AtomicBool::new(false));
+        let stdout_task = tokio::spawn(capture_stream(
+            stdout,
+            stdout_file,
+            request.output_limit_bytes,
+            Arc::clone(&stdout_truncated),
+        ));
+        let stderr_task = tokio::spawn(capture_stream(
+            stderr,
+            stderr_file,
+            request.output_limit_bytes,
+            Arc::clone(&stderr_truncated),
+        ));
+        let snapshot = Arc::new(RwLock::new(ProcessSnapshot {
+            state: DependencyProcessState::Running,
+            exit: None,
+            detached: false,
+            capture_error: None,
+        }));
+        let logs_removed = Arc::new(AtomicBool::new(false));
+        let cleanup_failed = Arc::new(AtomicBool::new(false));
+        let (control, receiver) = mpsc::channel(32);
+        tokio::spawn(supervise(
+            child,
+            Some(stdin),
+            receiver,
+            Arc::clone(&snapshot),
+            request.timeout,
+            stdout_task,
+            stderr_task,
+            self.config.drain_timeout,
+            self.config.input_write_timeout,
+            self.config.max_waiters_per_process,
+        ));
+        let entry = RegistryEntry {
+            process_id: process_id.clone(),
+            identity: request.authorization.identity,
+            cancellation_id: request.authorization.cancellation_id,
+            executable: request.executable,
+            working_directory,
+            log_directory,
+            output_limit_bytes: request.output_limit_bytes,
+            cleanup: request.cleanup,
+            snapshot,
+            control,
+            stdout_truncated,
+            stderr_truncated,
+            logs_removed,
+            cleanup_failed,
+            completion: Arc::new(Mutex::new(())),
+        };
+        self.registry
+            .lock()
+            .await
+            .insert(process_id.0.clone(), entry.clone());
+        if request.foreground {
+            self.complete_record(&entry).await
+        } else {
+            Ok(record_from_entry(&entry).await)
+        }
+    }
+
+    async fn input(
+        &self,
+        request: DependencyProcessInputRequest,
+    ) -> Result<(), ProcessDependencyError> {
+        if request.bytes.len() > self.config.max_input_bytes {
+            return Err(ProcessDependencyError::InputTooLarge);
+        }
+        let canonical = canonical_input_operation(&request)?;
+        self.authorize(&request.authorization, "process.input", &canonical)
+            .await?;
+        let entry = self
+            .entry(request.process_id, &request.authorization.identity)
+            .await?;
+        send_control(&entry, |response| Control::Input {
+            bytes: request.bytes,
+            close: request.close,
+            response,
+        })
+        .await
+    }
+
+    async fn read_output(
+        &self,
+        request: DependencyReadOutputRequest,
+    ) -> Result<DependencyReadOutputResponse, ProcessDependencyError> {
+        if request.length == 0 || request.length > self.config.max_range_bytes {
+            return Err(ProcessDependencyError::InvalidOutputRange);
+        }
+        let canonical = canonical_read_operation(&request)?;
+        self.authorize(&request.authorization, "process.read", &canonical)
+            .await?;
+        let entry = self
+            .entry(request.process_id, &request.authorization.identity)
+            .await?;
+        read_output(&entry, request.stream, request.offset, request.length).await
+    }
+
+    async fn wait(
+        &self,
+        request: DependencyProcessRequest,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError> {
+        let entry = self.authorized_entry(&request, "process.wait").await?;
+        self.complete_record(&entry).await
+    }
+
+    async fn interrupt(
+        &self,
+        request: DependencyProcessRequest,
+    ) -> Result<(), ProcessDependencyError> {
+        let entry = self.authorized_entry(&request, "process.interrupt").await?;
+        send_control(&entry, Control::Interrupt).await
+    }
+
+    async fn kill(&self, request: DependencyProcessRequest) -> Result<(), ProcessDependencyError> {
+        let entry = self.authorized_entry(&request, "process.kill").await?;
+        send_control(&entry, Control::Kill).await
+    }
+
+    async fn detach(
+        &self,
+        request: DependencyProcessRequest,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError> {
+        let entry = self.authorized_entry(&request, "process.detach").await?;
+        entry.snapshot.write().await.detached = true;
+        Ok(record_from_entry(&entry).await)
+    }
+
+    async fn reattach(
+        &self,
+        request: DependencyProcessRequest,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError> {
+        let entry = self.authorized_entry(&request, "process.reattach").await?;
+        entry.snapshot.write().await.detached = false;
+        Ok(record_from_entry(&entry).await)
+    }
+
+    async fn list(
+        &self,
+        request: DependencyListRequest,
+    ) -> Result<Vec<DependencyProcessRecord>, ProcessDependencyError> {
+        let canonical = canonical_list_operation(&request.authorization.cancellation_id)?;
+        self.authorize(&request.authorization, "process.list", &canonical)
+            .await?;
+        let entries: Vec<_> = self
+            .registry
+            .lock()
+            .await
+            .values()
+            .filter(|entry| entry.identity == request.authorization.identity)
+            .cloned()
+            .collect();
+        let mut records = Vec::with_capacity(entries.len());
+        for entry in entries {
+            records.push(record_from_entry(&entry).await);
+        }
+        Ok(records)
+    }
+
+    async fn cancel(
+        &self,
+        request: DependencyCancelRequest,
+    ) -> Result<String, ProcessDependencyError> {
+        let entries: Vec<_> = self.registry.lock().await.values().cloned().collect();
+        let entry = entries
+            .into_iter()
+            .find(|entry| {
+                entry.identity == request.identity
+                    && entry.cancellation_id == request.cancellation_id
+            })
+            .ok_or(ProcessDependencyError::ProcessNotFound)?;
+        send_control(&entry, Control::Kill).await?;
+        Ok(entry.process_id.as_str().to_owned())
+    }
+}
+
+/// Reconstructs the canonical start operation from dependency-owned fields.
+///
+/// # Errors
+///
+/// Returns an authorization error when the request cannot be represented safely.
+pub fn canonical_start_operation(
+    request: &DependencyStartProcessRequest,
+) -> Result<Vec<u8>, ProcessDependencyError> {
+    let tool = if request.foreground {
+        "process.run"
+    } else {
+        "process.start"
+    };
+    let timeout_ms = request
+        .timeout
+        .map(|value| u64::try_from(value.as_millis()))
+        .transpose()
+        .map_err(|_| ProcessDependencyError::AuthorizationDenied)?;
+    canonical_bytes(
+        tool,
+        &request.authorization.cancellation_id,
+        &json!({
+            "executable": request.executable,
+            "arguments": request.arguments,
+            "working_directory": request.requested_working_directory,
+            "environment": request.environment,
+            "timeout_ms": timeout_ms,
+            "output_limit_bytes": request.output_limit_bytes,
+            "cleanup": request.cleanup.as_str(),
+        }),
+    )
+}
+
+/// Reconstructs a canonical stdin operation.
+///
+/// # Errors
+///
+/// Returns an authorization error for non-UTF-8 input or serialization failure.
+pub fn canonical_input_operation(
+    request: &DependencyProcessInputRequest,
+) -> Result<Vec<u8>, ProcessDependencyError> {
+    let content = std::str::from_utf8(&request.bytes)
+        .map_err(|_| ProcessDependencyError::AuthorizationDenied)?;
+    canonical_bytes(
+        "process.input",
+        &request.authorization.cancellation_id,
+        &json!({
+            "process_id": request.process_id,
+            "content": content,
+            "close": request.close,
+        }),
+    )
+}
+
+/// Reconstructs a canonical output-read operation.
+///
+/// # Errors
+///
+/// Returns an authorization error when serialization fails.
+pub fn canonical_read_operation(
+    request: &DependencyReadOutputRequest,
+) -> Result<Vec<u8>, ProcessDependencyError> {
+    canonical_bytes(
+        "process.read",
+        &request.authorization.cancellation_id,
+        &json!({
+            "process_id": request.process_id,
+            "stream": match request.stream {
+                DependencyOutputStream::Stdout => "stdout",
+                DependencyOutputStream::Stderr => "stderr",
+            },
+            "offset": request.offset,
+            "length": request.length,
+        }),
+    )
+}
+
+/// Reconstructs a canonical process-control operation.
+///
+/// # Errors
+///
+/// Returns an authorization error when serialization fails.
+pub fn canonical_control_operation(
+    tool: &str,
+    cancellation_id: &str,
+    process_id: &str,
+) -> Result<Vec<u8>, ProcessDependencyError> {
+    canonical_bytes(tool, cancellation_id, &json!({ "process_id": process_id }))
+}
+
+/// Reconstructs a canonical process-list operation.
+///
+/// # Errors
+///
+/// Returns an authorization error when serialization fails.
+pub fn canonical_list_operation(cancellation_id: &str) -> Result<Vec<u8>, ProcessDependencyError> {
+    canonical_bytes("process.list", cancellation_id, &json!({}))
+}
+
+fn canonical_bytes(
+    tool: &str,
+    cancellation_id: &str,
+    arguments: &Value,
+) -> Result<Vec<u8>, ProcessDependencyError> {
+    serde_json::to_vec(&(tool, cancellation_id, normalize_json(arguments)))
+        .map_err(|_| ProcessDependencyError::AuthorizationDenied)
+}
+
+fn normalize_json(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted: BTreeMap<_, _> = map
+                .iter()
+                .map(|(key, value)| (key.clone(), normalize_json(value)))
+                .collect();
+            serde_json::to_value(sorted).unwrap_or(Value::Null)
+        }
+        Value::Array(values) => Value::Array(values.iter().map(normalize_json).collect()),
+        _ => value.clone(),
+    }
+}
+
+fn load_replay_state(storage_root: &Path) -> Result<ReplayState, ProcessDependencyError> {
+    let directory = storage_root.join("authorization-replay");
+    std::fs::create_dir_all(&directory).map_err(redacted_io)?;
+    let mut snapshots = Vec::new();
+    for entry in std::fs::read_dir(&directory).map_err(redacted_io)? {
+        let path = entry.map_err(redacted_io)?.path();
+        if path.extension().is_some_and(|value| value == "json") {
+            let bytes = std::fs::read(&path).map_err(redacted_io)?;
+            if let Ok(snapshot) = serde_json::from_slice::<ReplaySnapshot>(&bytes) {
+                snapshots.push((path, snapshot));
+            }
+        }
+    }
+    snapshots.sort_by_key(|(_, snapshot)| snapshot.generation);
+    let snapshot = snapshots
+        .last()
+        .map_or_else(ReplaySnapshot::default, |(_, value)| value.clone());
+    for (path, candidate) in snapshots {
+        if candidate.generation != snapshot.generation {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    Ok(ReplayState {
+        directory,
+        snapshot,
+    })
+}
+
+fn persist_replay_snapshot(
+    directory: &Path,
+    snapshot: &ReplaySnapshot,
+) -> Result<(), ProcessDependencyError> {
+    let path = directory.join(format!("replay-{:020}.json", snapshot.generation));
+    let bytes =
+        serde_json::to_vec(snapshot).map_err(|_| ProcessDependencyError::AuthorizationDenied)?;
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .map_err(redacted_io)?;
+    std::io::Write::write_all(&mut file, &bytes).map_err(redacted_io)?;
+    file.sync_all().map_err(redacted_io)?;
+    for entry in std::fs::read_dir(directory).map_err(redacted_io)? {
+        let old = entry.map_err(redacted_io)?.path();
+        if old != path && old.extension().is_some_and(|value| value == "json") {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_environment(
+    environment: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, ProcessDependencyError> {
+    environment
+        .iter()
+        .map(|(key, value)| {
+            if let Some(reference) = value.strip_prefix("secret://") {
+                if reference.is_empty()
+                    || !reference
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+                {
+                    return Err(ProcessDependencyError::InvalidSecretReference);
+                }
+                let secret = std::env::var(reference)
+                    .map_err(|_| ProcessDependencyError::SecretUnavailable)?;
+                Ok((key.clone(), secret))
+            } else if is_sensitive_environment_key(key) {
+                Err(ProcessDependencyError::RawSecretDenied)
+            } else {
+                Ok((key.clone(), value.clone()))
+            }
+        })
+        .collect()
+}
+
+fn enforce_executable_policy(
+    requested: &str,
+    resolved: &Path,
+    config: &ProcessDependencyConfig,
+) -> Result<(), ProcessDependencyError> {
+    let requested = normalize_executable_policy_key(requested);
+    let resolved = normalize_executable_policy_key(&resolved.to_string_lossy());
+    let decision = config
+        .executable_policy
+        .get(&resolved)
+        .or_else(|| config.executable_policy.get(&requested))
+        .copied()
+        .unwrap_or(config.default_executable_policy);
+    match decision {
+        DependencyExecutablePolicy::Allow => Ok(()),
+        DependencyExecutablePolicy::Ask => Err(ProcessDependencyError::ExecutableApprovalRequired),
+        DependencyExecutablePolicy::Deny => Err(ProcessDependencyError::ExecutableDenied),
+    }
+}
+
+fn normalize_executable_policy_key(value: &str) -> String {
+    if cfg!(windows) {
+        value.to_ascii_lowercase()
+    } else {
+        value.to_owned()
+    }
+}
+
+async fn secure_roots(
+    request: &DependencyStartProcessRequest,
+    config: &ProcessDependencyConfig,
+) -> Result<(PathBuf, PathBuf, PathBuf), ProcessDependencyError> {
+    fs::create_dir_all(&config.storage_root)
+        .await
+        .map_err(redacted_io)?;
+    let storage = fs::canonicalize(&config.storage_root)
+        .await
+        .map_err(redacted_io)?;
+    fs::create_dir_all(&config.log_root)
+        .await
+        .map_err(redacted_io)?;
+    let log_root = fs::canonicalize(&config.log_root)
+        .await
+        .map_err(redacted_io)?;
+    if !log_root.starts_with(&storage) {
+        return Err(ProcessDependencyError::StorageEscape);
+    }
+    let workspace = fs::canonicalize(&request.workspace_root)
+        .await
+        .map_err(redacted_io)?;
+    let cwd = fs::canonicalize(&request.working_directory)
+        .await
+        .map_err(redacted_io)?;
+    Ok((workspace, cwd, log_root))
+}
+
+async fn enforce_capacity(
+    registry: &Mutex<BTreeMap<String, RegistryEntry>>,
+    requested: u64,
+    config: &ProcessDependencyConfig,
+) -> Result<(), ProcessDependencyError> {
+    let entries: Vec<_> = registry.lock().await.values().cloned().collect();
+    let mut active = 0_usize;
+    let mut retained = requested
+        .checked_mul(2)
+        .ok_or(ProcessDependencyError::ResourceLimit)?;
+    for entry in entries {
+        if entry.snapshot.read().await.state == DependencyProcessState::Running {
+            active += 1;
+        }
+        if !entry.logs_removed.load(Ordering::Acquire) {
+            retained = retained
+                .checked_add(entry.output_limit_bytes.saturating_mul(2))
+                .ok_or(ProcessDependencyError::ResourceLimit)?;
+        }
+    }
+    if active >= config.max_active_processes || retained > config.max_total_retained_bytes {
+        Err(ProcessDependencyError::ResourceLimit)
+    } else {
+        Ok(())
+    }
+}
+
+async fn resolve_executable(
+    executable: &str,
+    inherited: &BTreeSet<String>,
+) -> Result<PathBuf, ProcessDependencyError> {
+    let candidate = Path::new(executable);
+    if candidate.is_absolute() || candidate.components().count() > 1 {
+        let resolved = fs::canonicalize(candidate)
+            .await
+            .map_err(|_| ProcessDependencyError::ExecutableNotFound)?;
+        if fs::metadata(&resolved)
+            .await
+            .map_err(redacted_io)?
+            .is_file()
+        {
+            return Ok(resolved);
+        }
+        return Err(ProcessDependencyError::ExecutableNotFound);
+    }
+    if !inherited.iter().any(|key| normalize_env_key(key) == "PATH") {
+        return Err(ProcessDependencyError::ExecutableNotFound);
+    }
+    let path = std::env::var_os("PATH").ok_or(ProcessDependencyError::ExecutableNotFound)?;
+    for directory in std::env::split_paths(&path) {
+        for name in executable_names(executable) {
+            let candidate = directory.join(name);
+            if let Ok(resolved) = fs::canonicalize(&candidate).await
+                && fs::metadata(&resolved)
+                    .await
+                    .is_ok_and(|metadata| metadata.is_file())
+            {
+                return Ok(resolved);
+            }
+        }
+    }
+    Err(ProcessDependencyError::ExecutableNotFound)
+}
+
+fn executable_names(executable: &str) -> Vec<OsString> {
+    #[cfg(windows)]
+    {
+        if Path::new(executable).extension().is_some() {
+            vec![OsString::from(executable)]
+        } else {
+            vec![
+                OsString::from(format!("{executable}.exe")),
+                OsString::from(format!("{executable}.cmd")),
+                OsString::from(format!("{executable}.bat")),
+            ]
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        vec![OsString::from(executable)]
+    }
+}
+
+fn inherit_safe_environment(command: &mut Command, allowlist: &BTreeSet<String>) {
+    for configured in allowlist {
+        let normalized = normalize_env_key(configured);
+        for (key, value) in std::env::vars_os() {
+            if normalize_env_key(&key.to_string_lossy()) == normalized
+                && !is_sensitive_environment_key(&normalized)
+            {
+                command.env(key, value);
+                break;
+            }
+        }
+    }
+}
+
+fn normalize_env_key(key: &str) -> String {
+    if cfg!(windows) {
+        key.to_ascii_uppercase()
+    } else {
+        key.to_owned()
+    }
+}
+
+fn is_sensitive_environment_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.contains("KEY")
+        || upper.contains("TOKEN")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("CREDENTIAL")
+}
+
+fn ensure_owner(
+    entry: &RegistryEntry,
+    identity: &DependencyIdentity,
+) -> Result<(), ProcessDependencyError> {
+    if &entry.identity == identity {
+        Ok(())
+    } else {
+        Err(ProcessDependencyError::OwnershipDenied)
+    }
+}
+
+async fn wait_entry(entry: &RegistryEntry) -> Result<(), ProcessDependencyError> {
+    if entry.snapshot.read().await.exit.is_none() {
+        let (sender, receiver) = oneshot::channel();
+        if entry.control.send(Control::Wait(sender)).await.is_ok()
+            && receiver.await.is_err()
+            && entry.snapshot.read().await.exit.is_none()
+        {
+            return Err(ProcessDependencyError::SupervisorStopped);
+        }
+        if entry.snapshot.read().await.exit.is_none() {
+            return Err(ProcessDependencyError::SupervisorStopped);
+        }
+    }
+    Ok(())
+}
+
+async fn send_control<F>(entry: &RegistryEntry, control: F) -> Result<(), ProcessDependencyError>
+where
+    F: FnOnce(oneshot::Sender<Result<(), String>>) -> Control,
+{
+    let (sender, receiver) = oneshot::channel();
+    entry
+        .control
+        .send(control(sender))
+        .await
+        .map_err(|_| ProcessDependencyError::ProcessExited)?;
+    receiver
+        .await
+        .map_err(|_| ProcessDependencyError::SupervisorStopped)?
+        .map_err(|_| ProcessDependencyError::ProcessControl)
+}
+
+async fn record_from_entry(entry: &RegistryEntry) -> DependencyProcessRecord {
+    let snapshot = entry.snapshot.read().await.clone();
+    DependencyProcessRecord {
+        process_id: entry.process_id.clone(),
+        owner_id: entry.identity.owner_id.clone(),
+        session_id: entry.identity.session_id.clone(),
+        executable: entry.executable.clone(),
+        working_directory: entry.working_directory.clone(),
+        state: snapshot.state,
+        exit: snapshot.exit,
+        detached: snapshot.detached,
+        stdout_projection: Vec::new(),
+        stderr_projection: Vec::new(),
+        stdout_truncated: entry.stdout_truncated.load(Ordering::Acquire),
+        stderr_truncated: entry.stderr_truncated.load(Ordering::Acquire),
+        logs_removed: entry.logs_removed.load(Ordering::Acquire),
+        cleanup_failed: entry.cleanup_failed.load(Ordering::Acquire),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supervise(
+    mut child: Child,
+    mut stdin: Option<ChildStdin>,
+    mut receiver: mpsc::Receiver<Control>,
+    snapshot: Arc<RwLock<ProcessSnapshot>>,
+    process_timeout: Option<Duration>,
+    stdout_task: JoinHandle<Result<(), ProcessDependencyError>>,
+    stderr_task: JoinHandle<Result<(), ProcessDependencyError>>,
+    drain_timeout: Duration,
+    input_write_timeout: Duration,
+    max_waiters: usize,
+) {
+    let deadline = process_timeout.map(|duration| Instant::now() + duration);
+    let mut timeout_sleep =
+        Box::pin(sleep_until(deadline.unwrap_or_else(|| {
+            Instant::now() + Duration::from_secs(31_536_000)
+        })));
+    let mut timeout_active = deadline.is_some();
+    let mut timed_out = false;
+    let mut waiters = Vec::new();
+    let exit = loop {
+        tokio::select! {
+            status = child.wait() => {
+                break status.map_or(
+                    DependencyExitStatus { code: None, success: false, timed_out },
+                    |status| DependencyExitStatus {
+                        code: status.code(),
+                        success: status.success(),
+                        timed_out,
+                    },
+                );
+            }
+            control = receiver.recv() => {
+                match control {
+                    Some(Control::Input { bytes, close, response }) => {
+                        let result = timeout(input_write_timeout, async {
+                            let input = stdin.as_mut().ok_or_else(|| "stdin closed".to_owned())?;
+                            input.write_all(&bytes).await.map_err(|_| "input failed".to_owned())?;
+                            input.flush().await.map_err(|_| "input failed".to_owned())?;
+                            if close { stdin.take(); }
+                            Ok(())
+                        }).await.map_err(|_| "input timed out".to_owned()).and_then(|value| value);
+                        let _ = response.send(result);
+                    }
+                    Some(Control::Interrupt(response)) => {
+                        let result = interrupt_child(&mut child).await;
+                        let _ = response.send(result);
+                    }
+                    Some(Control::Kill(response)) => {
+                        let result = kill_child_tree(&mut child).await;
+                        let _ = response.send(result);
+                    }
+                    Some(Control::Wait(response)) if waiters.len() < max_waiters => {
+                        waiters.push(response);
+                    }
+                    Some(Control::Wait(_)) | None => {}
+                }
+            }
+            () = &mut timeout_sleep, if timeout_active => {
+                timeout_active = false;
+                timed_out = true;
+                let _ = kill_child_tree(&mut child).await;
+            }
+        }
+    };
+    let stdout_result = timeout(drain_timeout, stdout_task).await;
+    let stderr_result = timeout(drain_timeout, stderr_task).await;
+    let capture_error = if capture_ok(&stdout_result) && capture_ok(&stderr_result) {
+        None
+    } else {
+        Some("capture failed or exceeded drain deadline".to_owned())
+    };
+    {
+        let mut state = snapshot.write().await;
+        state.state = DependencyProcessState::Exited;
+        state.exit = Some(exit.clone());
+        state.capture_error = capture_error;
+    }
+    for waiter in waiters {
+        let _ = waiter.send(exit.clone());
+    }
+}
+
+fn capture_ok(
+    result: &Result<
+        Result<Result<(), ProcessDependencyError>, tokio::task::JoinError>,
+        tokio::time::error::Elapsed,
+    >,
+) -> bool {
+    matches!(result, Ok(Ok(Ok(()))))
+}
+
+async fn interrupt_child(child: &mut Child) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let pid = child
+            .id()
+            .ok_or_else(|| "process ID unavailable".to_owned())?;
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map_err(|_| "interrupt failed".to_owned())?;
+        if status.success() {
+            sleep(Duration::from_millis(500)).await;
+            if child
+                .try_wait()
+                .map_err(|_| "wait failed".to_owned())?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+        kill_child_tree(child).await
+    }
+    #[cfg(not(windows))]
+    {
+        signal_child_group(child, "-TERM").await.or_else(|_| {
+            child
+                .start_kill()
+                .map_err(|_| "interrupt failed".to_owned())
+        })
+    }
+}
+
+async fn kill_child_tree(child: &mut Child) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let pid = child
+            .id()
+            .ok_or_else(|| "process ID unavailable".to_owned())?;
+        let status = Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map_err(|_| "kill failed".to_owned())?;
+        if status.success() {
+            Ok(())
+        } else {
+            child.start_kill().map_err(|_| "kill failed".to_owned())
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        signal_child_group(child, "-KILL")
+            .await
+            .or_else(|_| child.start_kill().map_err(|_| "kill failed".to_owned()))
+    }
+}
+
+#[cfg(not(windows))]
+async fn signal_child_group(child: &Child, signal: &str) -> Result<(), String> {
+    let pid = child
+        .id()
+        .ok_or_else(|| "process ID unavailable".to_owned())?;
+    let status = Command::new("kill")
+        .args([signal, "--", &format!("-{pid}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|_| "process-group signal failed".to_owned())?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| "process-group signal failed".to_owned())
+}
+
+async fn capture_stream<R>(
+    mut reader: R,
+    mut log: File,
+    limit: u64,
+    truncated: Arc<AtomicBool>,
+) -> Result<(), ProcessDependencyError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut retained = 0_u64;
+    let mut buffer = vec![0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer).await.map_err(redacted_io)?;
+        if count == 0 {
+            break;
+        }
+        let available = limit.saturating_sub(retained);
+        let write_count = usize::try_from(
+            available
+                .min(u64::try_from(count).map_err(|_| ProcessDependencyError::LengthOverflow)?),
+        )
+        .map_err(|_| ProcessDependencyError::LengthOverflow)?;
+        if write_count > 0 {
+            log.write_all(&buffer[..write_count])
+                .await
+                .map_err(redacted_io)?;
+            retained = retained
+                .checked_add(
+                    u64::try_from(write_count)
+                        .map_err(|_| ProcessDependencyError::LengthOverflow)?,
+                )
+                .ok_or(ProcessDependencyError::LengthOverflow)?;
+        }
+        if write_count < count {
+            truncated.store(true, Ordering::Release);
+        }
+    }
+    log.flush().await.map_err(redacted_io)?;
+    log.sync_data().await.map_err(redacted_io)
+}
+
+async fn read_output(
+    entry: &RegistryEntry,
+    stream: DependencyOutputStream,
+    offset: u64,
+    length: u64,
+) -> Result<DependencyReadOutputResponse, ProcessDependencyError> {
+    if entry.logs_removed.load(Ordering::Acquire) {
+        return Err(ProcessDependencyError::OutputUnavailable);
+    }
+    let path = match stream {
+        DependencyOutputStream::Stdout => entry.log_directory.join("stdout.log"),
+        DependencyOutputStream::Stderr => entry.log_directory.join("stderr.log"),
+    };
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .await
+        .map_err(redacted_io)?;
+    let retained_bytes = file.metadata().await.map_err(redacted_io)?.len();
+    if offset > retained_bytes {
+        return Err(ProcessDependencyError::InvalidOutputRange);
+    }
+    file.seek(SeekFrom::Start(offset))
+        .await
+        .map_err(redacted_io)?;
+    let count = usize::try_from(retained_bytes.saturating_sub(offset).min(length))
+        .map_err(|_| ProcessDependencyError::LengthOverflow)?;
+    let mut bytes = vec![0; count];
+    file.read_exact(&mut bytes).await.map_err(redacted_io)?;
+    Ok(DependencyReadOutputResponse {
+        next_offset: offset
+            .checked_add(u64::try_from(count).map_err(|_| ProcessDependencyError::LengthOverflow)?)
+            .ok_or(ProcessDependencyError::LengthOverflow)?,
+        bytes,
+        retained_bytes,
+        truncated: match stream {
+            DependencyOutputStream::Stdout => entry.stdout_truncated.load(Ordering::Acquire),
+            DependencyOutputStream::Stderr => entry.stderr_truncated.load(Ordering::Acquire),
+        },
+    })
+}
+
+async fn read_entire_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, ProcessDependencyError> {
+    let length = fs::metadata(path).await.map_err(redacted_io)?.len();
+    if length > limit {
+        return Err(ProcessDependencyError::ResourceLimit);
+    }
+    fs::read(path).await.map_err(redacted_io)
+}
+
+fn validate_start_request(
+    request: &DependencyStartProcessRequest,
+    config: &ProcessDependencyConfig,
+) -> Result<(), ProcessDependencyError> {
+    if request.executable.trim().is_empty()
+        || request.executable.contains('\0')
+        || request.arguments.iter().any(|value| value.contains('\0'))
+        || request.arguments.len() > config.max_arguments
+        || request.arguments.iter().map(String::len).sum::<usize>() > config.max_argument_bytes
+    {
+        return Err(ProcessDependencyError::InvalidExecutable);
+    }
+    if request.workspace_root.as_os_str().is_empty()
+        || request.working_directory.as_os_str().is_empty()
+    {
+        return Err(ProcessDependencyError::InvalidWorkingDirectory);
+    }
+    if request.output_limit_bytes == 0
+        || request.output_limit_bytes > config.max_total_retained_bytes / 2
+    {
+        return Err(ProcessDependencyError::InvalidOutputLimit);
+    }
+    if request.environment.len() > config.max_environment_entries
+        || request
+            .environment
+            .iter()
+            .map(|(key, value)| key.len().saturating_add(value.len()))
+            .sum::<usize>()
+            > config.max_environment_bytes
+        || request.environment.iter().any(|(key, value)| {
+            key.is_empty()
+                || key.contains(['=', '\0'])
+                || value.contains('\0')
+                || normalize_env_key(key) == "PATH"
+        })
+    {
+        return Err(ProcessDependencyError::InvalidEnvironment);
+    }
+    Ok(())
+}
+
+fn validate_authorization_shape(
+    authorization: &DependencyAuthorization,
+) -> Result<(), ProcessDependencyError> {
+    if authorization.identity.owner_id.is_empty()
+        || authorization.identity.session_id.is_empty()
+        || authorization.call_id.is_empty()
+        || authorization.tool.is_empty()
+        || authorization.normalized_digest.len() != 64
+        || authorization.grant.len() > 4096
+        || authorization.cancellation_id.is_empty()
+        || authorization.canonical_operation.len() > 1024 * 1024
+    {
+        Err(ProcessDependencyError::AuthorizationDenied)
+    } else {
+        Ok(())
+    }
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+        == 0
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "map_err supplies owned external errors which are deliberately redacted"
+)]
+fn redacted_io(_error: std::io::Error) -> ProcessDependencyError {
+    ProcessDependencyError::Io
+}
+
+/// Redacted dependency errors.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ProcessDependencyError {
+    /// Invalid configuration.
+    #[error("invalid process dependency configuration")]
+    InvalidConfiguration,
+    /// Authorization failed.
+    #[error("process authorization denied")]
+    AuthorizationDenied,
+    /// Grant nonce was replayed.
+    #[error("process authorization replay denied")]
+    AuthorizationReplay,
+    /// Owner/session mismatch.
+    #[error("process ownership denied")]
+    OwnershipDenied,
+    /// Storage escaped trusted root.
+    #[error("process storage root escape")]
+    StorageEscape,
+    /// Invalid executable/arguments.
+    #[error("invalid executable or arguments")]
+    InvalidExecutable,
+    /// Executable cannot be resolved.
+    #[error("executable cannot be resolved")]
+    ExecutableNotFound,
+    /// Executable policy requires an approval not present at this boundary.
+    #[error("executable requires approval")]
+    ExecutableApprovalRequired,
+    /// Executable policy denied execution.
+    #[error("executable denied")]
+    ExecutableDenied,
+    /// Invalid cwd.
+    #[error("invalid working directory")]
+    InvalidWorkingDirectory,
+    /// Cwd escape.
+    #[error("working directory escape")]
+    WorkingDirectoryEscape,
+    /// Invalid environment.
+    #[error("invalid environment")]
+    InvalidEnvironment,
+    /// Raw sensitive environment value was denied.
+    #[error("raw secret environment value denied")]
+    RawSecretDenied,
+    /// Secret reference syntax was invalid.
+    #[error("invalid secret reference")]
+    InvalidSecretReference,
+    /// Secret reference could not be resolved.
+    #[error("secret reference unavailable")]
+    SecretUnavailable,
+    /// Invalid output limit.
+    #[error("invalid output limit")]
+    InvalidOutputLimit,
+    /// Invalid process ID.
+    #[error("invalid process ID")]
+    InvalidProcessId,
+    /// Missing process.
+    #[error("process not found")]
+    ProcessNotFound,
+    /// Exited.
+    #[error("process exited")]
+    ProcessExited,
+    /// Pipe unavailable.
+    #[error("process pipe unavailable")]
+    PipeUnavailable,
+    /// Input bound.
+    #[error("process input exceeds bound")]
+    InputTooLarge,
+    /// Range invalid.
+    #[error("invalid output range")]
+    InvalidOutputRange,
+    /// Output removed.
+    #[error("process output unavailable")]
+    OutputUnavailable,
+    /// Length overflow.
+    #[error("process length overflow")]
+    LengthOverflow,
+    /// Supervisor stopped.
+    #[error("process supervisor stopped")]
+    SupervisorStopped,
+    /// Control failed.
+    #[error("process control failed")]
+    ProcessControl,
+    /// Capture failed.
+    #[error("process output capture failed")]
+    CaptureFailed,
+    /// Global resource limit.
+    #[error("process resource limit exceeded")]
+    ResourceLimit,
+    /// Redacted external I/O.
+    #[error("process dependency I/O failed")]
+    Io,
+}
+
+#[cfg(test)]
+mod tests {
+    use agentmod_protocol_support::authorization::{AuthorizationClaims, seal_authorization};
+
+    use super::*;
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "test grant claims are intentionally explicit"
+    )]
+    fn sign(
+        key: &[u8; 32],
+        owner: &str,
+        session: &str,
+        call: &str,
+        tool: &str,
+        operation: &[u8],
+        expiry: i64,
+        nonce: &str,
+        cancellation: &str,
+    ) -> DependencyAuthorization {
+        let content_hash = ContentHash::digest(operation);
+        let digest = content_hash.to_hex();
+        let claims = AuthorizationClaims {
+            owner: owner.to_owned(),
+            session: session.to_owned(),
+            call_id: call.to_owned(),
+            action: tool.to_owned(),
+            normalized_digest: content_hash,
+            issued_at: TimestampMillis::new(expiry - 30_000),
+            expires_at: TimestampMillis::new(expiry),
+            nonce: nonce.to_owned(),
+        };
+        let grant = seal_authorization(&claims, &AuthorizationKey::from_bytes(*key)).expect("seal");
+        DependencyAuthorization {
+            identity: DependencyIdentity {
+                owner_id: owner.to_owned(),
+                session_id: session.to_owned(),
+            },
+            call_id: call.to_owned(),
+            tool: tool.to_owned(),
+            normalized_digest: digest,
+            grant,
+            cancellation_id: cancellation.to_owned(),
+            canonical_operation: operation.to_vec(),
+        }
+    }
+
+    fn config(root: &Path) -> ProcessDependencyConfig {
+        ProcessDependencyConfig {
+            storage_root: root.join("storage"),
+            log_root: root.join("storage/logs"),
+            authorization_key_hex: "07".repeat(32),
+            owner_id: "owner".to_owned(),
+            session_id: "session".to_owned(),
+            inherited_environment_allowlist: BTreeSet::from([
+                "PATH".to_owned(),
+                "SYSTEMROOT".to_owned(),
+                "WINDIR".to_owned(),
+            ]),
+            max_input_bytes: 1024,
+            max_range_bytes: 4096,
+            max_arguments: 16,
+            max_argument_bytes: 4096,
+            max_environment_entries: 8,
+            max_environment_bytes: 4096,
+            max_active_processes: 4,
+            max_total_retained_bytes: 64 * 1024,
+            drain_timeout: Duration::from_secs(2),
+            input_write_timeout: Duration::from_millis(250),
+            max_replay_entries: 128,
+            max_completed_entries: 8,
+            max_waiters_per_process: 4,
+            executable_policy: BTreeMap::new(),
+            default_executable_policy: DependencyExecutablePolicy::Deny,
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_forged_expired_replayed_and_wrong_claims() {
+        let root = tempfile::tempdir().expect("root");
+        let dependency = TokioProcessDependency::new(config(root.path())).expect("config");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis();
+        let now = i64::try_from(now).expect("time");
+        let valid = sign(
+            &[7; 32],
+            "owner",
+            "session",
+            "call",
+            "process.start",
+            b"operation",
+            now + 30_000,
+            "nonce",
+            "cancel",
+        );
+        dependency
+            .authorize(&valid, "process.start", b"operation")
+            .await
+            .expect("valid");
+        assert_eq!(
+            dependency
+                .authorize(&valid, "process.start", b"operation")
+                .await,
+            Err(ProcessDependencyError::AuthorizationReplay)
+        );
+        let mut forged = sign(
+            &[8; 32],
+            "owner",
+            "session",
+            "call2",
+            "process.start",
+            b"operation",
+            now + 30_000,
+            "forged",
+            "cancel2",
+        );
+        assert_eq!(
+            dependency
+                .authorize(&forged, "process.start", b"operation")
+                .await,
+            Err(ProcessDependencyError::AuthorizationDenied)
+        );
+        forged = sign(
+            &[7; 32],
+            "owner",
+            "session",
+            "call3",
+            "process.start",
+            b"operation",
+            now - 1,
+            "expired",
+            "cancel3",
+        );
+        assert_eq!(
+            dependency
+                .authorize(&forged, "process.start", b"operation")
+                .await,
+            Err(ProcessDependencyError::AuthorizationDenied)
+        );
+        let mut wrong = sign(
+            &[7; 32],
+            "owner",
+            "session",
+            "call4",
+            "process.start",
+            b"operation",
+            now + 30_000,
+            "wrong",
+            "cancel4",
+        );
+        wrong.identity.owner_id = "other".to_owned();
+        assert_eq!(
+            dependency
+                .authorize(&wrong, "process.start", b"operation")
+                .await,
+            Err(ProcessDependencyError::AuthorizationDenied)
+        );
+        let tampered = sign(
+            &[7; 32],
+            "owner",
+            "session",
+            "call5",
+            "process.start",
+            b"operation",
+            now + 30_000,
+            "tampered",
+            "cancel5",
+        );
+        assert_eq!(
+            dependency
+                .authorize(&tampered, "process.start", b"different")
+                .await,
+            Err(ProcessDependencyError::AuthorizationDenied)
+        );
+    }
+
+    #[tokio::test]
+    async fn forged_start_creates_no_logs_and_spawns_nothing() {
+        let root = tempfile::tempdir().expect("root");
+        let dependency = TokioProcessDependency::new(config(root.path())).expect("config");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis();
+        let now = i64::try_from(now).expect("time");
+        let authorization = sign(
+            &[8; 32],
+            "owner",
+            "session",
+            "forged-start",
+            "process.start",
+            b"operation",
+            now + 30_000,
+            "forged-start-nonce",
+            "cancel",
+        );
+        assert_eq!(
+            dependency
+                .start(DependencyStartProcessRequest {
+                    authorization,
+                    workspace_root: root.path().to_path_buf(),
+                    requested_working_directory: Some(root.path().to_path_buf()),
+                    working_directory: root.path().to_path_buf(),
+                    executable: std::env::current_exe()
+                        .expect("current executable")
+                        .to_string_lossy()
+                        .into_owned(),
+                    arguments: Vec::new(),
+                    environment: BTreeMap::new(),
+                    timeout: None,
+                    output_limit_bytes: 1024,
+                    cleanup: DependencyCleanupPolicy::Retain,
+                    foreground: false,
+                })
+                .await,
+            Err(ProcessDependencyError::AuthorizationDenied)
+        );
+        assert!(!root.path().join("storage/logs").exists());
+    }
+}

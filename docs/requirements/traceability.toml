@@ -1,0 +1,211 @@
+schema_version = 1
+
+[[requirement]]
+id = "E2E-01"
+capability = "coding-task"
+owner = "runtime/filesystem-host/process-host/harness"
+tests = ["runtime_tool_loop", "runtime_process_loop", "runtime_multi_tool_loop", "coding_task"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/runtime/logic/src/turn.rs", "apps/runtime/dependency/src/tool.rs", "apps/runtime/dependency/src/process_tool.rs", "tests/e2e/runtime_tool_loop.ps1", "tests/e2e/runtime_tool_loop.sh", "tests/e2e/runtime_process_loop.ps1", "tests/e2e/runtime_process_loop.sh", "tests/e2e/runtime_multi_tool_loop.ps1", "tests/e2e/runtime_multi_tool_loop.sh", "tests/e2e/coding_task.ps1", "tests/e2e/coding_task.sh"]
+status = "partial"
+limitation = "The real CLI/runtime/harness/filesystem/process path performs a model-driven read, intentionally incomplete edit, failing cargo test, corrective edit, passing test, and independent final verification; symbol search and multi-file edits remain to complete the specified scenario."
+
+[[requirement]]
+id = "E2E-02"
+capability = "pre-tool-modification"
+owner = "runtime-logic"
+tests = ["tests::pre_tool_modification_executes_only_modified_filesystem_action"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["tests/integration/src/lib.rs"]
+status = "partial"
+limitation = "Runtime now commits original and final tool proposal lifecycle records before isolated execution, while in-process interception proves only modified arguments execute; a real subprocess scenario with a modifying interceptor and replay comparison remains incomplete."
+
+[[requirement]]
+id = "E2E-03"
+capability = "tool-denial"
+owner = "runtime-logic"
+tests = ["interception::tests::mandatory_policy_evaluates_final_proposal_and_cannot_be_bypassed", "durable_tool_approval"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/runtime/logic/src/interception.rs", "apps/runtime/logic/src/turn.rs", "tests/e2e/durable_tool_approval.ps1"]
+status = "partial"
+limitation = "The Windows daemon E2E proves a denied write never starts, records a permission-denied event and structured tool result, and continues the model session. Unix/macOS execution evidence is still pending."
+
+[[requirement]]
+id = "E2E-04"
+capability = "durable-approval"
+owner = "runtime"
+tests = ["tests::durable_approval_survives_restart_and_resumes_once", "session::tests::tool_dispatch_outbox_replays_to_a_terminal_state", "turn::tests::approval_recovery_uses_receipts_for_a_dispatched_action", "receipt::tests::terminal_receipt_round_trips_and_binds_exact_request", "receipt::tests::startup_listing_reconstructs_only_verified_exact_commands", "receipt::tests::checksum_tampering_is_rejected", "durable_tool_approval", "runtime_tool_receipt_recovery", "runtime_startup_tool_recovery"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/runtime/dependency/src/continuation.rs", "apps/runtime/dependency/src/receipt.rs", "apps/runtime/dependency/src/supervised.rs", "apps/runtime/data/src/tool.rs", "apps/runtime/logic/src/turn.rs", "apps/runtime/logic/src/session.rs", "apps/runtime/service/src/turn.rs", "apps/cli/service/src/lib.rs", "tests/integration/src/lib.rs", "tests/e2e/durable_tool_approval.ps1", "tests/e2e/runtime_tool_receipt_recovery.ps1", "tests/e2e/runtime_tool_receipt_recovery.sh", "tests/e2e/runtime_startup_tool_recovery.ps1", "tests/e2e/runtime_startup_tool_recovery.sh"]
+status = "partial"
+limitation = "Windows daemon E2Es prove no pre-approval execution, restart while pending, one approved dispatch, canonical continuation, duplicate request idempotency, receipt-only recovery after a kill following a real write, and startup-wide reconciliation of an unrelated nonterminal dispatch before RPC readiness. Recovery succeeds with the host unavailable, skips committed event prefixes, and refuses missing/corrupt/conflicting receipts without redispatch. Approved-continuation receipts remain owned by the resume-once endpoint. Unix/macOS execution and provider/process effect receipts remain pending."
+
+[[requirement]]
+id = "E2E-05"
+capability = "context-replacement"
+owner = "runtime/harness"
+tests = ["conversation::tests::replacement_preserves_original_history_without_fake_message", "tests::tool_proposal_waits_for_explicit_runtime_continuation_once"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/runtime/logic/src/conversation.rs", "apps/harness/bin/src/lib.rs", "tests/e2e/runtime_cli.ps1", "tests/e2e/runtime_harness.ps1"]
+status = "partial"
+limitation = "Structured replacement, provenance, immutable history, harness replacement continuation, and live keyed runtime-to-harness transport are tested; a durable daemon restart while awaiting a context-replacement continuation remains incomplete."
+
+[[requirement]]
+id = "E2E-06"
+capability = "streaming-cancellation"
+owner = "runtime/harness"
+tests = ["execution::tests::usage_retry_tool_calls_and_cancellation_are_normalized", "local_rpc::tests::credit_window_blocks_second_item_until_valid_acknowledgement", "runtime_stream_cancel", "runtime_cli_stream", "runtime_session_reconnect"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/harness/dependency/src/execution.rs", "apps/harness/bin/src/main.rs", "apps/runtime/dependency/src/harness.rs", "apps/runtime/data/src/harness.rs", "apps/runtime/logic/src/turn.rs", "apps/runtime/logic/src/history.rs", "apps/runtime/service/src/local_rpc.rs", "apps/cli/dependency/src/lib.rs", "apps/cli/data/src/lib.rs", "apps/cli/logic/src/lib.rs", "apps/cli/service/src/lib.rs", "apps/cli/bin/src/main.rs", "tests/e2e/runtime_stream_cancel.ps1", "tests/e2e/runtime_stream_cancel.sh", "tests/e2e/runtime_cli_stream.ps1", "tests/e2e/runtime_cli_stream.sh", "tests/e2e/runtime_session_reconnect.ps1", "tests/e2e/runtime_session_reconnect.sh"]
+status = "partial"
+limitation = "Windows process E2Es prove incremental harness frames, per-event canonical commits, active cancellation, partial-output persistence without completion, harness replacement, a subsequent request, flushed headless NDJSON before provider completion, explicit request-bound credit windows, and gap-free bounded reconnect pages from canonical sequence cursors. Unix scripts are present but not executed in this report; TUI rendering and continuous live subscription after catch-up remain incomplete."
+
+[[requirement]]
+id = "E2E-07"
+capability = "large-output"
+owner = "runtime/tool-hosts"
+tests = ["artifact::tests::chunked_finalize_hashes_and_reads_ranges", "enforces_timeout_and_output_retention_bounds"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/runtime/dependency/src/artifact.rs", "apps/tools/process/dependency/tests/lifecycle.rs"]
+status = "partial"
+limitation = "Artifact ranges and bounded process retention are tested; runtime tool-result projection and later artifact reads are not yet one end-to-end session."
+
+[[requirement]]
+id = "E2E-08"
+capability = "background-process"
+owner = "runtime/process-host"
+tests = ["foreground_captures_output_before_remove_always_cleanup", "cancellation_token_kills_running_process_and_owner_is_enforced", "foreground_request_can_be_cancelled_concurrently", "runtime_process_loop", "coding_task"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/tools/process/dependency/tests/lifecycle.rs", "apps/tools/process/bin/tests/cancellation.rs", "apps/runtime/dependency/src/process_tool.rs", "tests/e2e/runtime_process_loop.ps1", "tests/e2e/runtime_process_loop.sh", "tests/e2e/coding_task.ps1", "tests/e2e/coding_task.sh"]
+status = "partial"
+limitation = "The authenticated process host proves bounded foreground/background lifecycle, owner isolation, real concurrent cancellation, durable output, cleanup ordering, and runtime-daemon model-driven foreground execution; TUI disconnect, PTY, Unix descendant-tree containment, and crash reattachment remain incomplete."
+
+[[requirement]]
+id = "E2E-09"
+capability = "mcp"
+owner = "mcp-host/runtime"
+tests = ["acceptance::mcp", "tests::streamable_http_resumes_with_exact_session_and_event_cursor", "tests::multi_event_sse_preserves_progress_cursor_and_terminal_result", "runtime_mcp_loop", "runtime_mcp_invoke"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/tools/mcp/dependency/src/lib.rs", "apps/tools/mcp/ARCHITECTURE.md", "apps/runtime/dependency/src/tool.rs", "tests/fixtures/mcp_stdio_server.rs", "tests/e2e/runtime_mcp_loop.ps1", "tests/e2e/runtime_mcp_loop.sh", "tests/e2e/runtime_mcp_invoke.ps1", "tests/e2e/runtime_mcp_invoke.sh"]
+status = "partial"
+limitation = "The separate MCP host covers discovery, namespacing, stdio and Streamable HTTP, progress, cancellation, and a real multi-event SSE resumption fixture which verifies exact MCP session and Last-Event-ID headers. Live runtime server-list and configured external stdio invocation paths are process-tested on Windows with Unix scripts present; the invocation test proves canonical progress, result projection, provider continuation, keyed authorization, and durable replay state. Restart-persistent HTTP cursors and OAuth remain incomplete."
+
+[[requirement]]
+id = "E2E-10"
+capability = "web"
+owner = "web-host/runtime"
+tests = ["authorized_http_is_bounded_and_spills_an_artifact", "redirect_to_denied_domain_is_blocked", "fetch_extracts_metadata_text_and_absolute_links", "runtime_web_loop"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/tools/web/dependency/src/lib.rs", "apps/tools/web/ARCHITECTURE.md", "apps/runtime/dependency/src/tool.rs", "tests/e2e/runtime_web_loop.ps1", "tests/e2e/runtime_web_loop.sh"]
+status = "partial"
+limitation = "The separate authenticated Web host covers HTTP, fetch extraction, deterministic search, security policy, cancellation, and artifact overflow offline; deterministic search now traverses the live Windows runtime and Unix automation is present. The complete search→fetch→JSON API→coding sequence and citation validation remain incomplete."
+
+[[requirement]]
+id = "BROWSER-01"
+capability = "managed-browser"
+owner = "browser-host/runtime"
+tests = ["real_webdriver_fixture_covers_rendering_interaction_artifacts_and_shutdown", "data_maps_owned_records_across_the_dependency_boundary", "logic_validates_and_maps_without_external_dependencies", "service_expands_defaults_before_mapping_to_logic", "runtime_browser_loop"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/tools/browser/ARCHITECTURE.md", "apps/tools/browser/dependency/src/lib.rs", "apps/tools/browser/data/src/lib.rs", "apps/tools/browser/logic/src/lib.rs", "apps/tools/browser/service/src/lib.rs", "apps/runtime/dependency/src/tool.rs", "tests/fixtures/webdriver_server.rs", "tests/e2e/runtime_browser_loop.ps1", "tests/e2e/runtime_browser_loop.sh"]
+status = "partial"
+limitation = "The isolated host and configured external WebDriver path cover lifecycle, rendered navigation/inspection, screenshots, CSS interaction, form submission, credential-preserving downloads, artifacts, URL policy, cancellation contracts, durable single-use authorization, shutdown, and provider continuation. A compatible browser driver must be installed explicitly; visible authentication handoff, real-browser cross-platform execution, and sandbox conformance evidence remain pending."
+
+[[requirement]]
+id = "E2E-11"
+capability = "lsp"
+owner = "lsp-host/runtime"
+tests = ["fixture_supports_all_required_operations_and_lifecycle", "authorization_is_deny_by_default_and_single_use", "cancellation_and_one_restart_are_bounded", "runtime_lsp_loop"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/tools/lsp/dependency/tests/native.rs", "apps/tools/lsp/ARCHITECTURE.md", "apps/runtime/dependency/src/tool.rs", "tests/e2e/runtime_lsp_loop.ps1", "tests/e2e/runtime_lsp_loop.sh"]
+status = "partial"
+limitation = "The separate authenticated LSP host covers all required operations, lifecycle, cancellation and restart against a deterministic server; project-root detection now traverses the live Windows runtime and Unix automation is present. Runtime diagnostic streaming and a configured external language-server acceptance session remain incomplete."
+
+[[requirement]]
+id = "E2E-12"
+capability = "replay-and-branch"
+owner = "runtime"
+tests = ["session::tests::replay_to_returns_exact_prefix_state", "registry::tests::branch_artifact_is_hash_validated_and_committed_with_atomic_tree", "runtime_replay_branch", "runtime_large_branch_artifact"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/runtime/logic/src/session.rs", "apps/runtime/logic/src/history.rs", "apps/runtime/data/src/registry.rs", "apps/runtime/dependency/src/registry.rs", "tests/e2e/runtime_replay_branch.ps1", "tests/e2e/runtime_replay_branch.sh", "tests/e2e/runtime_large_branch_artifact.ps1", "tests/e2e/runtime_large_branch_artifact.sh"]
+status = "partial"
+limitation = "Windows daemon E2Es prove pure replay to an earlier sequence, exact small-history branch creation with ancestry/style replacement, and artifact-backed large-history creation with a bounded child journal/live projection, full hash-bound private context artifact, independent continuation, and unchanged parent. Unix scripts are present but have not been executed in this report; snapshot-accelerated source replay and runtime artifact-read RPC remain incomplete."
+
+[[requirement]]
+id = "E2E-13"
+capability = "ephemeral-turn"
+owner = "runtime/harness"
+tests = ["acceptance::ephemeral_turn"]
+platforms = ["windows", "linux", "macos"]
+evidence = []
+status = "planned"
+limitation = "No implementation exists yet."
+
+[[requirement]]
+id = "E2E-14"
+capability = "planner-worker-reviewer"
+owner = "runtime"
+tests = ["acceptance::planner_worker_reviewer"]
+platforms = ["windows", "linux", "macos"]
+evidence = []
+status = "planned"
+limitation = "No implementation exists yet."
+
+[[requirement]]
+id = "E2E-15"
+capability = "plugin-authority"
+owner = "runtime/plugin-host"
+tests = ["authorized_blocking_interceptor_is_accepted", "observer_requesting_canonical_write_is_rejected_at_stable_path", "ordering_cycle_is_rejected_by_event_pipeline_compiler", "missing_capability_prevents_activation"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["sdk/plugin-sdk/tests/manifest.rs"]
+status = "partial"
+limitation = "Manifest authority, capabilities, and ordering are executable SDK tests; runtime activation and plugin-host isolation are not implemented."
+
+[[requirement]]
+id = "E2E-16"
+capability = "crash-recovery"
+owner = "runtime/all-hosts"
+tests = ["journal::tests::partial_final_record_is_quarantined_and_truncated", "journal::tests::interior_corruption_is_never_truncated"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/runtime/dependency/src/journal.rs"]
+status = "partial"
+limitation = "Journal crash-tail recovery and corruption quarantine are tested. Windows kill injection covers pending approvals, a real filesystem effect with post-dispatch receipt recovery, and startup-wide reconciliation before RPC readiness; provider-stream and process-host crash matrices remain incomplete."
+
+[[requirement]]
+id = "E2E-17"
+capability = "frontend-parity"
+owner = "tui/cli/acp/runtime"
+tests = ["dashboard_renders_core_interactive_surfaces", "bootstrap_reconstructs_visible_state_from_canonical_events", "runtime_tui_smoke", "runtime_acp"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/tui/ARCHITECTURE.md", "apps/tui/service/src/lib.rs", "apps/tui/logic/src/lib.rs", "apps/tui/data/src/lib.rs", "apps/tui/dependency/src/lib.rs", "apps/acp/ARCHITECTURE.md", "apps/acp/service/src/lib.rs", "apps/acp/logic/src/lib.rs", "apps/acp/data/src/lib.rs", "apps/acp/dependency/src/lib.rs", "tests/e2e/runtime_tui_smoke.ps1", "tests/e2e/runtime_tui_smoke.sh", "tests/e2e/runtime_acp.ps1", "tests/e2e/runtime_acp.sh"]
+status = "partial"
+limitation = "The independent four-layer Ratatui frontend performs authenticated bootstrap, session listing, canonical history paging, committed live turn rendering, approval, cancellation, multiline editing, history, and context/event views. The independent official-SDK ACP v1 adapter creates runtime sessions and emits an equivalent canonical provider result through session/update/end_turn; real Windows process E2Es pass and Unix automation is present. Complete cross-frontend tool/permission/cancellation parity, low-latency ACP update forwarding, management panels, and rich content remain incomplete."
+
+[[requirement]]
+id = "E2E-18"
+capability = "n-tier-replacement"
+owner = "all-processes"
+tests = ["acceptance::n_tier_replacement"]
+platforms = ["windows", "linux", "macos"]
+evidence = []
+status = "planned"
+limitation = "No implementation exists yet."
+
+[[requirement]]
+id = "E2E-19"
+capability = "process-isolation"
+owner = "runtime/supervision"
+tests = ["acceptance::process_isolation"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/runtime/dependency/src/harness.rs", "apps/runtime/dependency/src/tool.rs", "apps/runtime/dependency/src/process_tool.rs", "apps/harness/bin/src/main.rs", "apps/tools/browser/bin/src/main.rs", "apps/tools/filesystem/bin/src/main.rs", "apps/tools/process/bin/src/main.rs", "tests/e2e/runtime_harness.ps1", "tests/e2e/runtime_tool_loop.ps1", "tests/e2e/runtime_process_loop.ps1", "tests/e2e/runtime_git_loop.ps1", "tests/e2e/runtime_web_loop.ps1", "tests/e2e/runtime_browser_loop.ps1", "tests/e2e/runtime_lsp_loop.ps1", "tests/e2e/runtime_mcp_loop.ps1"]
+status = "partial"
+limitation = "The runtime supervises the harness plus per-session browser/filesystem/process/Git/Web/LSP/MCP children and drops desynchronized children without ambiguous retry; kill-injection and automatic recovery assertions for every required process type remain incomplete."
+
+[[requirement]]
+id = "SCHED-01"
+capability = "durable-scheduling"
+owner = "scheduler/runtime"
+tests = ["one_time_claim_is_durable_idempotent_and_completes_once", "existing_schedule_can_be_replaced_and_interrupted_backup_recovers", "event_and_process_triggers_use_source_ids_for_deduplication", "recurring_backlog_is_bounded_and_corruption_is_rejected", "service_requires_compatible_negotiation_before_logic", "scheduler_worker", "runtime_scheduler"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["protocols/scheduler-protocol/src/lib.rs", "protocols/runtime-protocol/src/lib.rs", "apps/scheduler/ARCHITECTURE.md", "apps/scheduler/dependency/src/lib.rs", "apps/scheduler/data/src/lib.rs", "apps/scheduler/logic/src/lib.rs", "apps/scheduler/service/src/lib.rs", "apps/runtime/dependency/src/scheduler.rs", "apps/runtime/data/src/scheduler.rs", "apps/runtime/logic/src/scheduler.rs", "apps/runtime/service/src/turn.rs", "apps/cli/service/src/lib.rs", "tests/e2e/scheduler_worker.ps1", "tests/e2e/scheduler_worker.sh", "tests/e2e/runtime_scheduler.ps1", "tests/e2e/runtime_scheduler.sh"]
+status = "partial"
+limitation = "The isolated worker plus runtime/CLI prove authenticated supervision, complete policy-bearing schedules, automatic bounded polling, one-time and bounded recurring claims, runtime-event/process-output trigger deduplication, restart safety, corruption rejection, scheduler.fired provenance, normal intercepted prompt execution, and idempotent terminal completion. Committed-event/output delivery, continuation wakeups, and TUI management remain incomplete."

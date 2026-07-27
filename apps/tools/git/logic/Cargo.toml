@@ -1,0 +1,24 @@
+[package]
+name = "agentmod-git-host-logic"
+description = "Business rules and use cases for the AgentMod Git host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-git-host-data = { path = "../data" }
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "git"
+layer = "logic"

@@ -1,0 +1,20 @@
+[package]
+name = "agentmod-expression-engine"
+description = "Bounded deterministic expression language for AgentMod graphs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "core"
+domain = "expression-engine"

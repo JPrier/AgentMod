@@ -1,0 +1,27 @@
+[package]
+name = "agentmod-acp"
+description = "Agent Client Protocol frontend for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agentmod-acp"
+path = "src/main.rs"
+
+[dependencies]
+agentmod-acp-data = { path = "../data" }
+agentmod-acp-dependency = { path = "../dependency" }
+agentmod-acp-logic = { path = "../logic" }
+agentmod-acp-service = { path = "../service" }
+agentmod-protocol-support = { path = "../../../core/protocol-support" }
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "acp"

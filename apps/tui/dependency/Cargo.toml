@@ -1,0 +1,27 @@
+[package]
+name = "agentmod-tui-dependency"
+description = "Authenticated runtime transport adapters for the AgentMod TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-protocol-support = { path = "../../../core/protocol-support" }
+agentmod-runtime-protocol = { path = "../../../protocols/runtime-protocol" }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "tui"
+layer = "dependency"

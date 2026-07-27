@@ -1,0 +1,9 @@
+[package]
+name = "fixture-orphan-service"
+version = "0.0.0"
+edition = "2021"
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "orphan"
+layer = "service"

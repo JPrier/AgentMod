@@ -1,0 +1,20 @@
+[package]
+name = "agentmod-tool-protocol"
+description = "Versioned normalized wire contracts for AgentMod capability hosts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-primitives = { path = "../../core/primitives" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "protocol"
+family = "tool"

@@ -1,0 +1,23 @@
+[package]
+name = "agentmod-filesystem-host-service"
+description = "Tool-protocol endpoint mappings for the AgentMod filesystem host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-filesystem-host-logic = { path = "../logic" }
+agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "filesystem"
+layer = "service"

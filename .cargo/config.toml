@@ -1,0 +1,9 @@
+[alias]
+architecture = "run -p xtask -- architecture"
+verify = "test --workspace --all-features"
+
+[build]
+incremental = true
+
+[term]
+color = "auto"

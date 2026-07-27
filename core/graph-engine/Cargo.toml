@@ -1,0 +1,23 @@
+[package]
+name = "agentmod-graph-engine"
+description = "Deterministic bounded compiler for AgentMod declarative session graphs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-expression-engine = { path = "../expression-engine" }
+agentmod-primitives = { path = "../primitives" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "core"
+domain = "graph-engine"

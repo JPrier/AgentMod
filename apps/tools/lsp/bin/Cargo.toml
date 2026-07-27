@@ -1,0 +1,27 @@
+[package]
+name = "agentmod-lsp-host"
+description = "Isolated Language Server Protocol capability host for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agentmod-lsp-host"
+path = "src/main.rs"
+
+[dependencies]
+agentmod-lsp-host-data = { path = "../data" }
+agentmod-lsp-host-dependency = { path = "../dependency" }
+agentmod-lsp-host-logic = { path = "../logic" }
+agentmod-lsp-host-service = { path = "../service" }
+agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "lsp"

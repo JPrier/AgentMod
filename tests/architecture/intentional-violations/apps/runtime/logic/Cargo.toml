@@ -1,0 +1,12 @@
+[package]
+name = "fixture-runtime-logic"
+version = "0.0.0"
+edition = "2021"
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "runtime"
+layer = "logic"
+
+[dependencies]
+fixture-runtime-protocol = { path = "../../../protocols/runtime-protocol" }

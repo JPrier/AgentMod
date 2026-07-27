@@ -1,0 +1,24 @@
+[package]
+name = "agentmod-harness"
+description = "Native model-provider harness process for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-harness-data = { path = "../data" }
+agentmod-harness-dependency = { path = "../dependency" }
+agentmod-harness-logic = { path = "../logic" }
+agentmod-harness-protocol = { path = "../../../protocols/harness-protocol" }
+agentmod-harness-service = { path = "../service" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "harness"

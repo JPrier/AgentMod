@@ -1,0 +1,9 @@
+{
+  "active": true,
+  "iteration": 2,
+  "max_iterations": 0,
+  "current_phase": "event-kernel",
+  "started_at": "2026-07-27T00:21:09.3711258-04:00",
+  "completed_at": null,
+  "note": "Ralph skill package was not installed; lifecycle is tracked with the documented OMX state schema."
+}

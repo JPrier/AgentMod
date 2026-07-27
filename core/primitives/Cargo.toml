@@ -1,0 +1,24 @@
+[package]
+name = "agentmod-primitives"
+description = "Stable behavior-free identifiers and portable scalar primitives for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+blake3.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "core"
+core_scope = "stable-primitives"

@@ -1,0 +1,27 @@
+[package]
+name = "agentmod-scheduler"
+description = "Isolated durable scheduler worker for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agentmod-scheduler"
+path = "src/main.rs"
+
+[dependencies]
+agentmod-scheduler-data = { path = "../data" }
+agentmod-scheduler-dependency = { path = "../dependency" }
+agentmod-scheduler-logic = { path = "../logic" }
+agentmod-scheduler-protocol = { path = "../../../protocols/scheduler-protocol" }
+agentmod-scheduler-service = { path = "../service" }
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "scheduler"

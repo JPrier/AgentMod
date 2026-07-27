@@ -1,0 +1,20 @@
+[package]
+name = "agentmod-filesystem-host-logic"
+description = "Filesystem operation policy and use cases for the AgentMod filesystem host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-filesystem-host-data = { path = "../data" }
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "filesystem"
+layer = "logic"

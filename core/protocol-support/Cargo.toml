@@ -1,0 +1,27 @@
+[package]
+name = "agentmod-protocol-support"
+description = "Versioned, bounded wire-envelope support for AgentMod protocols"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-primitives = { path = "../primitives" }
+blake3.workspace = true
+ciborium.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "core"
+core_scope = "protocol-mechanics"

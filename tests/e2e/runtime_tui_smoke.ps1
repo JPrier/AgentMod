@@ -1,0 +1,87 @@
+$ErrorActionPreference = "Stop"
+
+$repository = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+$runRoot = $null
+$daemon = $null
+Push-Location $repository
+try {
+    cargo build -p agentmod-runtime -p agentmod-harness `
+        -p agentmod-cli -p agentmod-tui
+    if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+    $runtime = (Resolve-Path "target\debug\agentmod-runtime.exe").Path
+    $harness = (Resolve-Path "target\debug\agentmod-harness.exe").Path
+    $cli = (Resolve-Path "target\debug\agentmod.exe").Path
+    $tui = (Resolve-Path "target\debug\agentmod-tui.exe").Path
+    $runRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+        "agentmod-tui-e2e-" + [guid]::NewGuid().ToString("N")
+    )
+    New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+
+    $env:AGENTMOD_RUNTIME_ENDPOINT = (
+        "\\.\pipe\agentmod-tui-e2e-" + [guid]::NewGuid().ToString("N")
+    )
+    $env:AGENTMOD_RUNTIME_AUTH_TOKEN = (
+        "0123456789abcdef0123456789abcdef0123456789abcdef"
+    )
+    $env:AGENTMOD_HARNESS_PROGRAM = $harness
+    $env:AGENTMOD_SCHEDULER_POLL_MS = "0"
+    $daemon = Start-Process -FilePath $runtime -ArgumentList "serve" `
+        -WorkingDirectory $runRoot -WindowStyle Hidden -PassThru
+
+    for ($attempt = 0; $attempt -lt 50; $attempt++) {
+        try {
+            & $cli doctor --json 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { break }
+        } catch {}
+        Start-Sleep -Milliseconds 100
+    }
+    if ($LASTEXITCODE -ne 0) { throw "runtime did not become ready" }
+
+    $created = & $cli session create --workspace $runRoot `
+        --style persistent-chat --json | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0) { throw "session creation failed" }
+    $smoke = & $tui --smoke
+    if ($LASTEXITCODE -ne 0) { throw "TUI smoke bootstrap failed" }
+    if ($smoke -notmatch "ready=true" -or $smoke -notmatch "sessions=1") {
+        throw "TUI did not map runtime health and sessions: $smoke"
+    }
+    $turn = & $tui --smoke-turn "verify committed TUI streaming"
+    if ($LASTEXITCODE -ne 0) { throw "TUI streamed turn failed" }
+    if ($turn -notmatch "deterministic response" -or
+        $turn -notmatch "turn committed") {
+        throw "TUI did not map the committed runtime stream: $turn"
+    }
+    $journalPath = Join-Path $runRoot (
+        "sessions\" + $created.session_id + "\events.jsonl"
+    )
+    $events = @(Get-Content -LiteralPath $journalPath | ForEach-Object {
+        ($_ | ConvertFrom-Json).event
+    })
+    if (@($events | Where-Object {
+        $_.metadata.event_type -eq "model.response_completed"
+    }).Count -ne 1) {
+        throw "TUI turn did not commit one provider completion"
+    }
+    if (@($events | Where-Object {
+        $_.metadata.event_type -eq "conversation.entry_committed"
+    }).Count -lt 2) {
+        throw "TUI turn did not commit canonical conversation entries"
+    }
+    Write-Output "runtime TUI smoke E2E passed"
+}
+finally {
+    if ($null -ne $daemon -and -not $daemon.HasExited) {
+        Stop-Process -Id $daemon.Id -Force
+        $daemon.WaitForExit()
+    }
+    Pop-Location
+    if ($null -ne $runRoot -and (Test-Path -LiteralPath $runRoot)) {
+        $resolved = [System.IO.Path]::GetFullPath($runRoot)
+        $temp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+        if (-not $resolved.StartsWith($temp)) {
+            throw "refusing to remove non-temporary path"
+        }
+        Remove-Item -LiteralPath $resolved -Recurse -Force
+    }
+}

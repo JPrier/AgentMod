@@ -1,0 +1,25 @@
+[package]
+name = "agentmod-cli-logic"
+description = "Doctor and headless command business behavior for the AgentMod CLI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-cli-data = { path = "../data" }
+agentmod-primitives = { path = "../../../core/primitives" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "cli"
+layer = "logic"

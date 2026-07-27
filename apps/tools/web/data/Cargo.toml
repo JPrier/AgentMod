@@ -1,0 +1,25 @@
+[package]
+name = "agentmod-web-host-data"
+description = "Business-facing Web datasets for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-web-host-dependency = { path = "../dependency" }
+async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "web"
+layer = "data"

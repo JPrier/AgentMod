@@ -1,0 +1,32 @@
+[package]
+name = "agentmod-filesystem-host"
+description = "Isolated native filesystem capability host for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agentmod-filesystem-host"
+path = "src/main.rs"
+
+[dependencies]
+agentmod-filesystem-host-data = { path = "../data" }
+agentmod-filesystem-host-dependency = { path = "../dependency" }
+agentmod-filesystem-host-logic = { path = "../logic" }
+agentmod-filesystem-host-service = { path = "../service" }
+agentmod-protocol-support = { path = "../../../../core/protocol-support" }
+agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+serde_json.workspace = true
+
+[dev-dependencies]
+agentmod-primitives = { path = "../../../../core/primitives" }
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "filesystem"

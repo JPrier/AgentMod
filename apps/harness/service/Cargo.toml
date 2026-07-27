@@ -1,0 +1,23 @@
+[package]
+name = "agentmod-harness-service"
+description = "Endpoint-facing service layer for the AgentMod native harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-harness-logic = { path = "../logic" }
+agentmod-harness-protocol = { path = "../../../protocols/harness-protocol" }
+agentmod-primitives = { path = "../../../core/primitives" }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "harness"
+layer = "service"

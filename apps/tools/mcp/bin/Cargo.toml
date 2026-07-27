@@ -1,0 +1,25 @@
+[package]
+name = "agentmod-mcp-host"
+description = "First-party MCP capability host for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+agentmod-mcp-host-data = { path = "../data" }
+agentmod-mcp-host-dependency = { path = "../dependency" }
+agentmod-mcp-host-logic = { path = "../logic" }
+agentmod-mcp-host-service = { path = "../service" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "mcp"

@@ -1,0 +1,28 @@
+[package]
+name = "agentmod-browser-host"
+description = "Isolated managed-browser capability host for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "agentmod-browser-host"
+path = "src/main.rs"
+
+[dependencies]
+agentmod-browser-host-data = { path = "../data" }
+agentmod-browser-host-dependency = { path = "../dependency" }
+agentmod-browser-host-logic = { path = "../logic" }
+agentmod-browser-host-service = { path = "../service" }
+agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "browser"

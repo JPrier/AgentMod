@@ -1,0 +1,13 @@
+/target/
+/.idea/
+/.vscode/
+*.swp
+*.tmp
+*.log
+.env
+sessions/
+artifacts/
+coverage/
+fuzz/artifacts/
+fuzz/corpus/
+

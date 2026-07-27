@@ -1,0 +1,13 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cargo_metadata = "0.18"
+regex = "1.11"
+walkdir = "2.5"
+
+[dev-dependencies]
+tempfile = "3.15"

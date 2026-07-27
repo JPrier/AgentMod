@@ -1,0 +1,25 @@
+[package]
+name = "agentmod-plugin-sdk"
+description = "Versioned plugin manifest types, parsing, and deterministic validation for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-event-pipeline = { path = "../../core/event-pipeline" }
+semver = "1.0"
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "sdk"
+sdk_scope = "plugin-manifest"

@@ -1,0 +1,18 @@
+[package]
+name = "agentmod-frontend-protocol"
+description = "Frontend capability and presentation-neutral wire contracts for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "protocol"
+family = "frontend"

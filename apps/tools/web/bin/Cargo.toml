@@ -1,0 +1,30 @@
+[package]
+name = "agentmod-web-host"
+description = "Secure first-party Web capability host for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+agentmod-web-host-data = { path = "../data" }
+agentmod-web-host-dependency = { path = "../dependency" }
+agentmod-web-host-logic = { path = "../logic" }
+agentmod-web-host-service = { path = "../service" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+
+[dev-dependencies]
+agentmod-primitives = { path = "../../../../core/primitives" }
+agentmod-protocol-support = { path = "../../../../core/protocol-support" }
+tempfile.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "web"

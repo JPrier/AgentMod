@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = [
+  "protocols/runtime-protocol",
+  "apps/runtime/service",
+  "apps/runtime/logic",
+  "apps/runtime/data",
+  "apps/runtime/dependency",
+  "apps/harness/logic",
+  "apps/missing/logic",
+  "apps/bad/data",
+  "apps/orphan/service",
+]

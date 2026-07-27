@@ -1,0 +1,25 @@
+[package]
+name = "agentmod-mcp-host-data"
+description = "Business-facing MCP server and capability datasets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-mcp-host-dependency = { path = "../dependency" }
+async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "mcp"
+layer = "data"

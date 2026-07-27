@@ -1,0 +1,87 @@
+name: Scheduled assurance
+
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      run_stress:
+        description: Run implemented stress targets
+        type: boolean
+        default: false
+      run_fuzz:
+        description: Run implemented fuzz targets for a bounded interval
+        type: boolean
+        default: false
+      run_benchmarks:
+        description: Run implemented benchmark targets
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  stress:
+    name: Stress targets
+    if: github.event_name == 'schedule' || inputs.run_stress
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Execute stress suite when present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find . -path '*/tests/stress.rs' -o -path '*/tests/stress/*.rs' | grep -q .; then
+            cargo test --workspace --release --test stress -- --nocapture
+          else
+            echo "::notice::No executable stress target exists at this revision."
+          fi
+
+  fuzz:
+    name: Bounded fuzz targets
+    if: github.event_name == 'schedule' || inputs.run_fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@cargo-fuzz
+      - name: Execute each fuzz target for 60 seconds
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f fuzz/Cargo.toml; then
+            mapfile -t targets < <(cargo fuzz list)
+            if test "${#targets[@]}" -eq 0; then
+              echo "::notice::The fuzz workspace contains no targets."
+              exit 0
+            fi
+            for target in "${targets[@]}"; do
+              cargo fuzz run "$target" -- -max_total_time=60
+            done
+          else
+            echo "::notice::No executable fuzz workspace exists at this revision."
+          fi
+
+  benchmarks:
+    name: Benchmarks
+    if: github.event_name == 'schedule' || inputs.run_benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Execute benchmark targets when present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if find . -path '*/benches/*.rs' | grep -q . || grep -Rqs '^\[\[bench\]\]' --include Cargo.toml .; then
+            cargo bench --workspace
+          else
+            echo "::notice::No executable benchmark target exists at this revision."
+          fi

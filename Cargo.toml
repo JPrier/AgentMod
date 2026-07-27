@@ -1,0 +1,86 @@
+[workspace]
+resolver = "3"
+members = [
+    "core/*",
+    "protocols/*",
+    "apps/runtime/*",
+    "apps/harness/*",
+    "apps/cli/*",
+    "apps/acp/*",
+    "apps/plugin-host/*",
+    "apps/scheduler/*",
+    "apps/tui/*",
+    "apps/tools/filesystem/*",
+    "apps/tools/browser/*",
+    "apps/tools/git/*",
+    "apps/tools/lsp/*",
+    "apps/tools/mcp/bin",
+    "apps/tools/mcp/service",
+    "apps/tools/mcp/logic",
+    "apps/tools/mcp/data",
+    "apps/tools/mcp/dependency",
+    "apps/tools/process/*",
+    "apps/tools/web/*",
+    "benchmarks",
+    "sdk/plugin-sdk",
+    "sdk/session-style-sdk",
+    "tests/integration",
+    "xtask",
+]
+exclude = ["tests/architecture/fixtures/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/JPrier/AgentMod"
+authors = ["AgentMod contributors"]
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+agent-client-protocol = "2.0.0"
+blake3 = "1.8.2"
+bytes = "1.10.1"
+base64 = "0.22.1"
+ciborium = "0.2.2"
+clap = { version = "4.5.48", features = ["derive"] }
+diffy = "0.5.1"
+encoding_rs = "0.8.35"
+futures = "=0.3.31"
+fs2 = "0.4.3"
+globset = "0.4.19"
+ignore = "0.4.31"
+proptest = "1.7.0"
+regex = "1.13.1"
+ratatui = "0.30.2"
+reqwest = { version = "=0.12.24", default-features = false, features = ["brotli", "charset", "deflate", "gzip", "json", "rustls-tls"] }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+scraper = "0.24.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.47.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.16", features = ["codec", "rt"] }
+toml = "0.9.7"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+url = "2.5.7"
+uuid = { version = "1.18.1", features = ["serde", "v7"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+debug = true

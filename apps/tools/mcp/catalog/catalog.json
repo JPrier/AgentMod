@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "id": "playwright-browser",
+      "category": "browser",
+      "version": "manual",
+      "homepage": "https://github.com/microsoft/playwright-mcp",
+      "transport": "stdio",
+      "installation": "Install the upstream package yourself, then configure its exact executable path.",
+      "enabled_by_default": false
+    },
+    {
+      "id": "github",
+      "category": "git-hosting",
+      "version": "manual",
+      "homepage": "https://github.com/github/github-mcp-server",
+      "transport": "stdio",
+      "installation": "Install the official GitHub MCP server yourself and configure secret references.",
+      "enabled_by_default": false
+    },
+    {
+      "id": "documentation",
+      "category": "documentation",
+      "version": "manual",
+      "homepage": "https://modelcontextprotocol.io/",
+      "transport": "streamable_http",
+      "installation": "Configure an approved documentation MCP endpoint.",
+      "enabled_by_default": false
+    },
+    {
+      "id": "postgres",
+      "category": "database",
+      "version": "manual",
+      "homepage": "https://github.com/modelcontextprotocol/servers",
+      "transport": "stdio",
+      "installation": "Install an approved database server and configure a connection secret reference.",
+      "enabled_by_default": false
+    },
+    {
+      "id": "containers",
+      "category": "containers",
+      "version": "manual",
+      "homepage": "https://github.com/modelcontextprotocol/servers",
+      "transport": "stdio",
+      "installation": "Install an approved container server and grant its executable explicitly.",
+      "enabled_by_default": false
+    },
+    {
+      "id": "cloud",
+      "category": "cloud",
+      "version": "manual",
+      "homepage": "https://github.com/modelcontextprotocol/servers",
+      "transport": "stdio",
+      "installation": "Install a provider-specific server and use secret references for credentials.",
+      "enabled_by_default": false
+    },
+    {
+      "id": "issue-tracker",
+      "category": "issue-tracker",
+      "version": "manual",
+      "homepage": "https://github.com/modelcontextprotocol/servers",
+      "transport": "streamable_http",
+      "installation": "Configure an approved issue-tracker endpoint and OAuth adapter.",
+      "enabled_by_default": false
+    }
+  ]
+}

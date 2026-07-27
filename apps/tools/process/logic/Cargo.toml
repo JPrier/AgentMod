@@ -1,0 +1,24 @@
+[package]
+name = "agentmod-process-host-logic"
+description = "Business policy and use cases for the AgentMod process host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-process-host-data = { path = "../data" }
+async-trait.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "process"
+layer = "logic"

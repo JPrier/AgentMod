@@ -1,0 +1,28 @@
+[package]
+name = "agentmod-session-style-sdk"
+description = "Versioned session-style manifests, validation, and deterministic compilation for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-event-pipeline = { path = "../../core/event-pipeline" }
+agentmod-graph-engine = { path = "../../core/graph-engine" }
+agentmod-primitives = { path = "../../core/primitives" }
+blake3.workspace = true
+semver = "1.0"
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "sdk"
+sdk_scope = "session-style"

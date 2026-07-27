@@ -1,0 +1,23 @@
+[package]
+name = "agentmod-tui-logic"
+description = "Interaction and state-management logic for the AgentMod TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-tui-data = { path = "../data" }
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "tui"
+layer = "logic"

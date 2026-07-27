@@ -1,0 +1,28 @@
+[package]
+name = "agentmod-git-host"
+description = "AgentMod isolated Git capability host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-git-host-data = { path = "../data" }
+agentmod-git-host-dependency = { path = "../dependency" }
+agentmod-git-host-logic = { path = "../logic" }
+agentmod-git-host-service = { path = "../service" }
+agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "agentmod-git-host"
+path = "src/main.rs"
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "git"

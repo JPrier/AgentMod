@@ -19,6 +19,7 @@ checksum-protected, atomically replaced record binds:
 
 - server ID and a hash of its transport configuration;
 - runtime owner and session;
+- negotiated MCP protocol version;
 - MCP session and last event IDs;
 - pending JSON-RPC request ID; and
 - normalized operation digest.
@@ -27,6 +28,7 @@ On reconstruction, the dependency validates every binding and resumes a
 pending stream with GET only when the caller presents the same operation.
 Changed server identity, owner/session, corruption, or a different operation
 fails closed. HTTP calls for one server are serialized around its cursor.
+Post-negotiation POST and GET requests carry `MCP-Protocol-Version`.
 Repeated delivery of the persisted cursor is suppressed. A terminal result
 advances the cursor and clears the pending request durably.
 

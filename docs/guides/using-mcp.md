@@ -34,6 +34,8 @@ written to canonical events or ordinary logs. HTTPS is mandatory except for
 loopback development endpoints. Redirects are disabled. JSON and bounded
 multi-event SSE responses are supported, including progress and up to three
 session/cursor-bound resumptions using `MCP-Session-Id` and `Last-Event-ID`.
+After initialization, POST and resumed GET requests also carry the negotiated
+`MCP-Protocol-Version`.
 The runtime assigns each session a private MCP HTTP state directory. Pending
 streams survive host reconstruction and resume only when server identity,
 runtime owner/session, and normalized operation all match. A different

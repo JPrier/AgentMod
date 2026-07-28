@@ -272,6 +272,8 @@ struct DurableHttpState {
     server_identity: String,
     owner: String,
     authorization_session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    protocol_version: Option<String>,
     session_id: Option<String>,
     last_event_id: Option<String>,
     pending_request: Option<PendingHttpRequest>,
@@ -286,6 +288,7 @@ struct StoredHttpState {
 #[derive(Default)]
 struct RuntimeState {
     initialized: bool,
+    protocol_version: Option<String>,
     session_id: Option<String>,
     last_event_id: Option<String>,
     pending_request: Option<PendingHttpRequest>,
@@ -364,6 +367,10 @@ fn load_http_state(
         || state.server_identity != identity
         || state.owner != owner
         || state.authorization_session != authorization_session
+        || state
+            .protocol_version
+            .as_deref()
+            .is_some_and(|value| value != MCP_VERSION)
         || state
             .session_id
             .as_deref()
@@ -523,6 +530,9 @@ impl McpDependency {
                     identity,
                     http_request_lock: Mutex::new(()),
                     state: Mutex::new(RuntimeState {
+                        protocol_version: durable
+                            .as_ref()
+                            .and_then(|state| state.protocol_version.clone()),
                         session_id: durable.as_ref().and_then(|state| state.session_id.clone()),
                         last_event_id: durable
                             .as_ref()
@@ -701,7 +711,10 @@ impl McpDependency {
             .await?;
             state.initialized = true;
         } else {
-            server.state.lock().await.initialized = true;
+            let mut state = server.state.lock().await;
+            state.initialized = true;
+            state.protocol_version = Some(version.clone());
+            self.persist_http_runtime_state(server, &state)?;
         }
         Ok(version)
     }
@@ -763,6 +776,7 @@ impl McpDependency {
                 server_identity: server.identity.clone(),
                 owner: self.config.authorization_owner.clone(),
                 authorization_session: self.config.authorization_session.clone(),
+                protocol_version: state.protocol_version.clone(),
                 session_id: state.session_id.clone(),
                 last_event_id: state.last_event_id.clone(),
                 pending_request: state.pending_request.clone(),
@@ -868,8 +882,15 @@ impl McpDependency {
             .post(url)
             .header("accept", "application/json, text/event-stream")
             .json(&request);
-        if let Some(session_id) = server.state.lock().await.session_id.clone() {
+        let (session_id, protocol_version) = {
+            let state = server.state.lock().await;
+            (state.session_id.clone(), state.protocol_version.clone())
+        };
+        if let Some(session_id) = session_id {
             builder = builder.header("mcp-session-id", session_id);
+        }
+        if let Some(protocol_version) = protocol_version {
+            builder = builder.header("mcp-protocol-version", protocol_version);
         }
         if let Some(variable) = bearer_token_environment {
             let token =
@@ -952,6 +973,9 @@ impl McpDependency {
                 .header("accept", "text/event-stream")
                 .header("last-event-id", &last_event_id)
                 .header("mcp-session-id", &session_id);
+            if let Some(protocol_version) = server.state.lock().await.protocol_version.clone() {
+                resume = resume.header("mcp-protocol-version", protocol_version);
+            }
             if let Some(variable) = bearer_token_environment {
                 let token =
                     std::env::var(variable).map_err(|_| McpDependencyError::SecretUnavailable)?;
@@ -1782,6 +1806,7 @@ mod tests {
                 server_identity: server.identity.clone(),
                 owner: "owner".into(),
                 authorization_session: "session".into(),
+                protocol_version: Some(MCP_VERSION.into()),
                 session_id: Some("mcp-session".into()),
                 last_event_id: Some("event-1".into()),
                 pending_request: Some(PendingHttpRequest {
@@ -1859,6 +1884,7 @@ mod tests {
             assert!(second_request.starts_with("GET /mcp "));
             assert!(lower.contains("\r\nlast-event-id: event-1\r\n"));
             assert!(lower.contains("\r\nmcp-session-id: s-1\r\n"));
+            assert!(lower.contains("\r\nmcp-protocol-version: 2025-06-18\r\n"));
             let second_body = format!(
                 "id: event-2\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"value\":\"resumed\"}}}}\n\n"
             );
@@ -1896,6 +1922,7 @@ mod tests {
         })
         .expect("dependency");
         let server = dependency.server("http-fixture").expect("server");
+        server.state.lock().await.protocol_version = Some(MCP_VERSION.into());
         let (result, progress) = dependency
             .request(&server, "fixture/resume", json!({}), None)
             .await
@@ -1936,6 +1963,7 @@ mod tests {
                         lower.contains(&format!("\r\nlast-event-id: restart-{}\r\n", index - 1))
                     );
                     assert!(lower.contains("\r\nmcp-session-id: restart-session\r\n"));
+                    assert!(lower.contains("\r\nmcp-protocol-version: 2025-06-18\r\n"));
                 }
                 let body = format!(
                     "id: restart-{index}\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progress\":{index}}}}}\n\n"
@@ -1957,6 +1985,7 @@ mod tests {
             assert!(recovered_request.starts_with("GET /mcp "));
             assert!(lower.contains("\r\nlast-event-id: restart-4\r\n"));
             assert!(lower.contains("\r\nmcp-session-id: restart-session\r\n"));
+            assert!(lower.contains("\r\nmcp-protocol-version: 2025-06-18\r\n"));
             let body = format!(
                 "id: restart-5\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"value\":\"recovered\"}}}}\n\n"
             );
@@ -1997,6 +2026,7 @@ mod tests {
         };
         let dependency = make_dependency();
         let server = dependency.server("restart-fixture").expect("server");
+        server.state.lock().await.protocol_version = Some(MCP_VERSION.into());
         assert_eq!(
             dependency
                 .request(&server, "fixture/restart", json!({"value":1}), None)

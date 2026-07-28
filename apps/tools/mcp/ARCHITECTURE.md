@@ -26,7 +26,9 @@ JSON-RPC request's terminal result is accepted.
 Streamable HTTP recovery state is stored as an atomically replaced,
 checksum-protected dependency record. It binds the configured server identity,
 runtime owner/session, MCP session ID, last event ID, pending JSON-RPC request
-ID, and normalized operation digest. A new host instance resumes only an exact
+ID, negotiated protocol version, and normalized operation digest. Every
+post-negotiation POST and resumed GET sends `MCP-Protocol-Version`. A new host
+instance resumes only an exact
 pending operation with GET; a different operation or changed server identity
 fails closed. The previous cursor is suppressed if a server replays it, and a
 terminal result clears the pending request before the next operation.

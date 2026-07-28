@@ -23,6 +23,11 @@ pub struct ExecuteToolDataRequest {
     pub cancellation_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CancelToolDataRequest {
+    pub cancellation_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecoverableToolDataRecord {
     pub execution_id: String,
@@ -80,6 +85,10 @@ pub trait ToolDataPort: Send + Sync {
         request: ExecuteToolDataRequest,
     ) -> Result<Vec<ToolDataEvent>, ToolDataError>;
 
+    async fn cancel_tool(&self, _request: CancelToolDataRequest) -> Result<bool, ToolDataError> {
+        Ok(false)
+    }
+
     /// Returns dependency-normalized terminal receipts for startup recovery.
     ///
     /// # Errors
@@ -120,6 +129,15 @@ impl<D: dependency::ToolHostDependencyPort> ToolDataPort for super::RuntimeData<
             .map(map_event)
             .collect();
         Ok(events)
+    }
+
+    async fn cancel_tool(&self, request: CancelToolDataRequest) -> Result<bool, ToolDataError> {
+        self.dependency
+            .cancel(dependency::DependencyCancelToolRequest {
+                cancellation_id: request.cancellation_id,
+            })
+            .await
+            .map_err(|_| ToolDataError::Unavailable)
     }
 
     fn list_tool_receipts(&self) -> Result<Vec<RecoverableToolDataRecord>, ToolDataError> {

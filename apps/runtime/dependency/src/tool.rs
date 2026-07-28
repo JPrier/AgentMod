@@ -41,6 +41,11 @@ pub struct DependencyToolCommand {
     pub cancellation_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyCancelToolRequest {
+    pub cancellation_id: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DependencyToolReceipt {
     pub command: DependencyToolCommand,
@@ -125,6 +130,12 @@ pub trait ToolHostDependencyPort: Send + Sync {
         &self,
         command: DependencyToolCommand,
     ) -> Result<Vec<DependencyToolEvent>, ToolHostDependencyError>;
+    async fn cancel(
+        &self,
+        _request: DependencyCancelToolRequest,
+    ) -> Result<bool, ToolHostDependencyError> {
+        Ok(false)
+    }
     /// Lists verified durable terminal receipts exposed by this dependency.
     ///
     /// # Errors

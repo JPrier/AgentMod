@@ -17,6 +17,15 @@ enter the same runtime interception, event, permission, provider, and tool paths
 as CLI and TUI requests. ACP SDK types remain confined to the service crate.
 Runtime protocol types remain confined to the dependency crate.
 
+Permission resolution uses the continuation identifier committed by the
+runtime stream, rather than trusting a provider-supplied tool identifier.
+Approval resumes the action once. Denial and client cancellation durably
+resolve the continuation without starting a replacement provider request.
+Active cancellation is registered before endpoint response work is spawned, so
+an immediate `session/cancel` is latched before provider dispatch. A confirmed
+process-host cancellation is normalized to one `Started → Cancelled` tool
+terminal sequence and never to successful completion.
+
 Current limitations:
 
 - Only text and resource-link prompt blocks are accepted; image, audio, and
@@ -32,4 +41,6 @@ item enters the bounded dependency stream; the service emits each ordered ACP
 notification immediately. Dropped frontend streams cancel the matching runtime
 turn. The Windows process E2E uses paced harness frames and proves the first ACP
 update is observable before provider completion; the Unix equivalent is
-automated for CI.
+automated for CI. Additional real-process tests cover approval, denial,
+approval-wait cancellation, pre-start and mid-stream provider cancellation, and
+cancellation during a foreground process tool.

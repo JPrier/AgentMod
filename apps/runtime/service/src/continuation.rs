@@ -67,6 +67,7 @@ where
             session_id,
             continuation_id,
             approved,
+            ..
         } = request
         else {
             return Err(ContinuationServiceError::UnsupportedEndpoint);
@@ -195,6 +196,7 @@ mod tests {
                         .expect("session"),
                     continuation_id: id.into(),
                     approved: true,
+                    resume_after_resolution: true,
                 })
                 .expect("approval"),
             RuntimeResponse::ApprovalResolved {

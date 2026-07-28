@@ -122,6 +122,7 @@ pub trait AcpRuntimeDependencyPort: Send + Sync {
         session_id: SessionId,
         continuation_id: String,
         approved: bool,
+        resume_after_resolution: bool,
     ) -> Result<Vec<DependencyTurnEvent>, AcpDependencyError>;
     async fn cancel(
         &self,
@@ -135,6 +136,9 @@ pub struct LocalRuntimeDependency {
     endpoint: String,
     authorization_token: Arc<str>,
     maximum_frame_bytes: usize,
+    provider: Arc<str>,
+    model: Arc<str>,
+    provider_options: Value,
 }
 
 impl LocalRuntimeDependency {
@@ -154,7 +158,25 @@ impl LocalRuntimeDependency {
             endpoint,
             authorization_token: authorization_token.into(),
             maximum_frame_bytes,
+            provider: String::from("deterministic-mock").into(),
+            model: String::from("mock-model").into(),
+            provider_options: Value::Object(Map::default()),
         })
+    }
+
+    pub fn with_provider_request(
+        mut self,
+        provider: String,
+        model: String,
+        options: Value,
+    ) -> Result<Self, AcpDependencyError> {
+        if provider.trim().is_empty() || model.trim().is_empty() || !options.is_object() {
+            return Err(AcpDependencyError::InvalidConfiguration);
+        }
+        self.provider = provider.into();
+        self.model = model.into();
+        self.provider_options = options;
+        Ok(self)
     }
 
     #[cfg(unix)]
@@ -376,9 +398,9 @@ impl AcpRuntimeDependencyPort for LocalRuntimeDependency {
         let request = RuntimeRequest::RunTurn {
             session_id,
             prompt,
-            provider: String::from("deterministic-mock"),
-            model: String::from("mock-model"),
-            options: Value::Object(Map::default()),
+            provider: self.provider.to_string(),
+            model: self.model.to_string(),
+            options: self.provider_options.clone(),
             cancellation_id,
         };
         let dependency = self.clone();
@@ -396,12 +418,14 @@ impl AcpRuntimeDependencyPort for LocalRuntimeDependency {
         session_id: SessionId,
         continuation_id: String,
         approved: bool,
+        resume_after_resolution: bool,
     ) -> Result<Vec<DependencyTurnEvent>, AcpDependencyError> {
         let RuntimeResponse::ApprovalResolved { events, .. } = self
             .send(RuntimeRequest::ResolveApproval {
                 session_id,
                 continuation_id,
                 approved,
+                resume_after_resolution,
             })
             .await?
         else {

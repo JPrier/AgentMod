@@ -67,6 +67,7 @@ dependencies = [
  "agentmod-acp-logic",
  "agentmod-acp-service",
  "agentmod-protocol-support",
+ "serde_json",
  "tokio",
 ]
 

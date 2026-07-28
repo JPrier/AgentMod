@@ -189,6 +189,7 @@ pub struct ResolveTurnApprovalCommand {
     pub session_id: String,
     pub continuation_id: String,
     pub approved: bool,
+    pub resume_after_resolution: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -243,10 +244,16 @@ enum ToolLoopOutcome {
 
 enum ToolCallOutcome {
     Complete(JournalPosition),
+    Cancelled(JournalPosition),
     Awaiting {
         position: JournalPosition,
         continuation_id: ContinuationId,
     },
+}
+
+struct ToolExecutionResult {
+    position: JournalPosition,
+    cancelled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -471,11 +478,19 @@ where
 #[async_trait]
 impl<D> CancelTurnLogicPort for TurnLogic<D>
 where
-    D: Clone + Send + Sync + HarnessDataPort,
+    D: Clone + Send + Sync + HarnessDataPort + agentmod_runtime_data::tool::ToolDataPort,
 {
     async fn cancel_turn(&self, command: CancelTurnCommand) -> Result<(), RunTurnError> {
         if command.cancellation_id.trim().is_empty() || command.reason.trim().is_empty() {
             return Err(RunTurnError::Invalid);
+        }
+        if self
+            .tools
+            .cancel(command.cancellation_id.clone())
+            .await
+            .map_err(RunTurnError::Tool)?
+        {
+            return Ok(());
         }
         let events = self
             .provider
@@ -516,6 +531,9 @@ where
             SessionId::from_str(&command.session_id).map_err(|_| RunTurnError::InvalidSession)?;
         let continuation_id = ContinuationId::from_str(&command.continuation_id)
             .map_err(|_| RunTurnError::InvalidContinuation)?;
+        if command.approved && !command.resume_after_resolution {
+            return Err(RunTurnError::Invalid);
+        }
         let gate = self.session_gate(&command.session_id).await;
         let _session_guard = gate.lock().await;
         let session_directory = command.sessions_root.join(session_id.to_string());
@@ -665,7 +683,7 @@ where
                     style: prepared.original.style.clone(),
                 })
                 .map_err(RunTurnError::Tool)?;
-            position = self
+            let tool_result = self
                 .execute_authorized_tool(
                     &persistence,
                     session_id,
@@ -676,6 +694,25 @@ where
                     dispatch_mode,
                 )
                 .await?;
+            position = tool_result.position;
+            if tool_result.cancelled {
+                let events = vec![ProviderEvent::Cancelled];
+                let (last_committed_sequence, _) = self.commit_provider_events(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    position.sequence,
+                    position.event_id,
+                    &resumed_turn.cancellation_id,
+                    &events,
+                )?;
+                return Ok(ResolveTurnApprovalResult {
+                    transitioned: true,
+                    events,
+                    last_committed_sequence,
+                    awaiting_continuation: None,
+                });
+            }
         } else {
             (position.sequence, position.event_id) = self.commit_tool_failure(
                 &persistence,
@@ -699,6 +736,24 @@ where
                 false,
             )?;
         }
+        if !command.resume_after_resolution {
+            let events = vec![ProviderEvent::Cancelled];
+            let (last_committed_sequence, _) = self.commit_provider_events(
+                &persistence,
+                session_id,
+                &session_directory,
+                position.sequence,
+                position.event_id,
+                &resumed_turn.cancellation_id,
+                &events,
+            )?;
+            return Ok(ResolveTurnApprovalResult {
+                transitioned: true,
+                events,
+                last_committed_sequence,
+                awaiting_continuation: None,
+            });
+        }
         for (index, pending) in remaining_tool_calls.iter().cloned().enumerate() {
             let tail = remaining_tool_calls[index + 1..].to_vec();
             match self
@@ -717,6 +772,24 @@ where
                 .await?
             {
                 ToolCallOutcome::Complete(next) => position = next,
+                ToolCallOutcome::Cancelled(next) => {
+                    let events = vec![ProviderEvent::Cancelled];
+                    let (last_committed_sequence, _) = self.commit_provider_events(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        next.sequence,
+                        next.event_id,
+                        &resumed_turn.cancellation_id,
+                        &events,
+                    )?;
+                    return Ok(ResolveTurnApprovalResult {
+                        transitioned: true,
+                        events,
+                        last_committed_sequence,
+                        awaiting_continuation: None,
+                    });
+                }
                 ToolCallOutcome::Awaiting {
                     position,
                     continuation_id,
@@ -1081,6 +1154,7 @@ where
 
     #[allow(
         clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "tool-loop coordination keeps each durable authority and stream sink explicit"
     )]
     async fn resolve_tool_calls(
@@ -1149,6 +1223,19 @@ where
                     .await?
                 {
                     ToolCallOutcome::Complete(next) => position = next,
+                    ToolCallOutcome::Cancelled(next) => {
+                        return self
+                            .complete_cancelled_tool(
+                                persistence,
+                                session_id,
+                                session_directory,
+                                &command.cancellation_id,
+                                next,
+                                sink,
+                                all_events,
+                            )
+                            .await;
+                    }
                     ToolCallOutcome::Awaiting {
                         position,
                         continuation_id,
@@ -1191,6 +1278,45 @@ where
             all_events.extend(current_events.clone());
         }
         Err(RunTurnError::ToolStepLimit)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "canonical cancellation keeps journal identity and optional stream delivery explicit"
+    )]
+    async fn complete_cancelled_tool(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        cancellation_id: &str,
+        position: JournalPosition,
+        sink: Option<&mpsc::Sender<Result<RunTurnStreamItem, RunTurnError>>>,
+        mut events: Vec<ProviderEvent>,
+    ) -> Result<ToolLoopOutcome, RunTurnError> {
+        let event = ProviderEvent::Cancelled;
+        let (sequence, event_id) = self.commit_provider_events(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            cancellation_id,
+            std::slice::from_ref(&event),
+        )?;
+        if let Some(sink) = sink {
+            let _ = sink
+                .send(Ok(RunTurnStreamItem::Event {
+                    event: event.clone(),
+                    committed_sequence: sequence,
+                }))
+                .await;
+        }
+        events.push(event);
+        Ok(ToolLoopOutcome::Complete {
+            events,
+            position: JournalPosition { sequence, event_id },
+        })
     }
 
     #[allow(
@@ -1377,17 +1503,22 @@ where
                 return Ok(ToolCallOutcome::Complete(position));
             }
         };
-        self.execute_authorized_tool(
-            persistence,
-            session_id,
-            session_directory,
-            position,
-            call_id,
-            authorized,
-            ToolDispatchMode::Fresh,
-        )
-        .await
-        .map(ToolCallOutcome::Complete)
+        let result = self
+            .execute_authorized_tool(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                call_id,
+                authorized,
+                ToolDispatchMode::Fresh,
+            )
+            .await?;
+        Ok(if result.cancelled {
+            ToolCallOutcome::Cancelled(result.position)
+        } else {
+            ToolCallOutcome::Complete(result.position)
+        })
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -1400,7 +1531,7 @@ where
         call_id: &str,
         authorized: AuthorizedToolRequest,
         dispatch_mode: ToolDispatchMode,
-    ) -> Result<JournalPosition, RunTurnError> {
+    ) -> Result<ToolExecutionResult, RunTurnError> {
         let ConsequentialAction::ToolCall(executable) = &authorized.executable.action else {
             return Err(RunTurnError::Tool(ToolExecutionError::InvalidReplacement));
         };
@@ -1516,22 +1647,28 @@ where
                     &error.to_string(),
                     true,
                 )?;
-                return self.commit_tool_conversation(
-                    persistence,
-                    session_id,
-                    session_directory,
-                    position,
-                    call_id,
-                    &executable,
-                    &json!({"error":{"code":"host_unavailable","message":error.to_string()}}),
-                    None,
-                    false,
-                );
+                return self
+                    .commit_tool_conversation(
+                        persistence,
+                        session_id,
+                        session_directory,
+                        position,
+                        call_id,
+                        &executable,
+                        &json!({"error":{"code":"host_unavailable","message":error.to_string()}}),
+                        None,
+                        false,
+                    )
+                    .map(|position| ToolExecutionResult {
+                        position,
+                        cancelled: false,
+                    });
             }
         };
         let mut final_result = json!({"error":{"code":"missing_terminal_event"}});
         let mut artifact = None;
         let mut truncated = false;
+        let mut cancelled = false;
         let observed_event_count = match dispatch_mode {
             ToolDispatchMode::Fresh => 0,
             ToolDispatchMode::Reconcile {
@@ -1635,6 +1772,7 @@ where
                     })
                 }
                 ToolEvent::Cancelled { call_id } => {
+                    cancelled = true;
                     final_result = json!({"error":{"code":"cancelled"}});
                     RuntimeCommittedEvent::ToolExecutionFailed(ToolExecutionFailedEvent {
                         call_id,
@@ -1664,6 +1802,10 @@ where
             artifact.as_deref(),
             truncated,
         )
+        .map(|position| ToolExecutionResult {
+            position,
+            cancelled,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -109,6 +109,12 @@ pub enum RuntimeRequest {
         continuation_id: String,
         /// Approval choice.
         approved: bool,
+        /// Continue the provider loop after recording the decision.
+        ///
+        /// ACP cancellation resolves the durable continuation without starting
+        /// a replacement provider request.
+        #[serde(default = "default_true")]
+        resume_after_resolution: bool,
     },
     /// Cancel an active request/session operation.
     Cancel {
@@ -127,6 +133,10 @@ pub enum RuntimeRequest {
         /// Highest contiguous stream sequence already accepted.
         last_received_sequence: u64,
     },
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// Runtime response payload.
@@ -490,4 +500,47 @@ pub enum RuntimeStreamItem {
         /// Redacted action description.
         description: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_approval_request_defaults_to_resuming() {
+        let request: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "operation": "resolve_approval",
+            "arguments": {
+                "session_id": "00000000-0000-0000-0000-000000000001",
+                "continuation_id": "continuation",
+                "approved": false
+            }
+        }))
+        .expect("legacy approval request");
+        assert!(matches!(
+            request,
+            RuntimeRequest::ResolveApproval {
+                approved: false,
+                resume_after_resolution: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn approval_cancellation_round_trips_without_resuming() {
+        let request = RuntimeRequest::ResolveApproval {
+            session_id: "00000000-0000-0000-0000-000000000001"
+                .parse()
+                .expect("session"),
+            continuation_id: String::from("continuation"),
+            approved: false,
+            resume_after_resolution: false,
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode");
+        assert_eq!(
+            serde_json::from_slice::<RuntimeRequest>(&encoded).expect("decode"),
+            request
+        );
+    }
 }

@@ -557,6 +557,7 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
                 session_id,
                 continuation_id,
                 approved,
+                resume_after_resolution: true,
             })?
         else {
             return Err(TuiDependencyError::UnexpectedResponse);

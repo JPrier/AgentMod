@@ -1167,6 +1167,7 @@ impl CliDependencyPort for LocalRuntimeClient {
             session_id: request.session_id,
             continuation_id: request.continuation_id,
             approved: request.approved,
+            resume_after_resolution: true,
         })?
         else {
             return Err(DependencyError::UnexpectedRuntimeResponse);

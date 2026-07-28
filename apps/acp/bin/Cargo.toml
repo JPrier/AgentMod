@@ -17,6 +17,7 @@ agentmod-acp-dependency = { path = "../dependency" }
 agentmod-acp-logic = { path = "../logic" }
 agentmod-acp-service = { path = "../service" }
 agentmod-protocol-support = { path = "../../../core/protocol-support" }
+serde_json.workspace = true
 tokio.workspace = true
 
 [lints]

@@ -259,6 +259,7 @@ impl<L: ApprovalTurnLogicPort> TurnService<L> {
         session_id: String,
         continuation_id: String,
         approved: bool,
+        resume_after_resolution: bool,
     ) -> Result<
         (
             bool,
@@ -275,6 +276,7 @@ impl<L: ApprovalTurnLogicPort> TurnService<L> {
                 session_id,
                 continuation_id,
                 approved,
+                resume_after_resolution,
             })
             .await
             .map_err(TurnServiceError::Logic)?;
@@ -372,11 +374,17 @@ where
             session_id,
             continuation_id,
             approved,
+            resume_after_resolution,
         } = request
         {
             let (transitioned, events, last_sequence, awaiting_continuation) = self
                 .turns
-                .resolve_approval(session_id.to_string(), continuation_id.clone(), *approved)
+                .resolve_approval(
+                    session_id.to_string(),
+                    continuation_id.clone(),
+                    *approved,
+                    *resume_after_resolution,
+                )
                 .await
                 .map_err(|error| error.to_string())?;
             return Ok(RuntimeResponse::ApprovalResolved {

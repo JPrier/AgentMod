@@ -99,6 +99,7 @@ pub trait AcpLogicPort: Send + Sync {
         session_id: String,
         approval: ApprovalRequired,
         approved: bool,
+        resume_after_resolution: bool,
     ) -> Result<Vec<PromptUpdate>, AcpLogicError>;
     async fn cancel_session(&self, session_id: String) -> Result<(), AcpLogicError>;
 }
@@ -196,10 +197,16 @@ impl<D: AcpDataPort + Clone + 'static> AcpLogicPort for AcpLogic<D> {
         session_id: String,
         approval: ApprovalRequired,
         approved: bool,
+        resume_after_resolution: bool,
     ) -> Result<Vec<PromptUpdate>, AcpLogicError> {
         let session_id = parse_session(&session_id)?;
         self.data
-            .resolve_approval(session_id, approval.continuation_id, approved)
+            .resolve_approval(
+                session_id,
+                approval.continuation_id,
+                approved,
+                resume_after_resolution,
+            )
             .await
             .map(|events| {
                 events
@@ -312,7 +319,8 @@ async fn forward_prompt_stream<D: AcpDataPort>(
             } => {
                 let terminal = match awaiting_continuation {
                     Some(continuation_id) => match pending_approval {
-                        Some(approval) if approval.continuation_id == continuation_id => {
+                        Some(mut approval) => {
+                            approval.continuation_id = continuation_id;
                             Ok(PromptStreamItem::Approval(approval))
                         }
                         _ => Err(AcpLogicError::InvalidRuntimeResult),
@@ -449,6 +457,7 @@ mod tests {
             _session_id: SessionId,
             _continuation_id: String,
             _approved: bool,
+            _resume_after_resolution: bool,
         ) -> Result<Vec<TurnDataEvent>, AcpDataError> {
             Ok(Vec::new())
         }

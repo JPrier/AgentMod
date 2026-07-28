@@ -7,7 +7,7 @@ use agentmod_harness_protocol as wire;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     process::Stdio,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -148,8 +148,16 @@ struct Connection {
 pub struct ProcessHarnessDependency {
     config: Arc<HarnessDependencyConfig>,
     connection: Arc<Mutex<Option<Connection>>>,
-    active: Arc<Mutex<BTreeMap<String, CancellationToken>>>,
+    cancellations: Arc<Mutex<CancellationRegistry>>,
 }
+
+#[derive(Default)]
+struct CancellationRegistry {
+    active: BTreeMap<String, CancellationToken>,
+    pending: BTreeSet<String>,
+}
+
+const MAX_PENDING_CANCELLATIONS: usize = 1_024;
 #[async_trait]
 pub trait HarnessDependencyPort: Send + Sync {
     async fn exchange(
@@ -193,7 +201,7 @@ impl ProcessHarnessDependency {
         Ok(Self {
             config: Arc::new(config),
             connection: Arc::new(Mutex::new(None)),
-            active: Arc::new(Mutex::new(BTreeMap::new())),
+            cancellations: Arc::new(Mutex::new(CancellationRegistry::default())),
         })
     }
     fn connect(&self) -> Result<Connection, HarnessDependencyError> {
@@ -386,14 +394,17 @@ impl HarnessDependencyPort for ProcessHarnessDependency {
             if cancellation_id.trim().is_empty() {
                 return Err(HarnessDependencyError::InvalidRequest);
             }
-            let cancellation = self
-                .active
-                .lock()
-                .await
-                .get(cancellation_id)
-                .cloned()
-                .ok_or(HarnessDependencyError::UnknownCancellation)?;
-            cancellation.cancel();
+            let mut cancellations = self.cancellations.lock().await;
+            if let Some(cancellation) = cancellations.active.get(cancellation_id) {
+                cancellation.cancel();
+            } else {
+                if cancellations.pending.len() >= MAX_PENDING_CANCELLATIONS
+                    && !cancellations.pending.contains(cancellation_id)
+                {
+                    return Err(HarnessDependencyError::TooManyPendingCancellations);
+                }
+                cancellations.pending.insert(cancellation_id.clone());
+            }
             return Ok(DependencyReply::Events(vec![DependencyEvent::Cancelled]));
         }
         let active_id = match &command {
@@ -403,11 +414,13 @@ impl HarnessDependencyPort for ProcessHarnessDependency {
             _ => None,
         };
         let cancellation = if let Some(id) = &active_id {
+            let mut cancellations = self.cancellations.lock().await;
+            if cancellations.pending.remove(id) {
+                return Ok(DependencyReply::Events(vec![DependencyEvent::Cancelled]));
+            }
             let cancellation = CancellationToken::new();
-            if self
+            if cancellations
                 .active
-                .lock()
-                .await
                 .insert(id.clone(), cancellation.clone())
                 .is_some()
             {
@@ -419,7 +432,7 @@ impl HarnessDependencyPort for ProcessHarnessDependency {
         };
         let result = self.once(&command, cancellation).await;
         if let Some(id) = active_id {
-            self.active.lock().await.remove(&id);
+            self.cancellations.lock().await.active.remove(&id);
         }
         let was_cancelled = matches!(
             &result,
@@ -456,11 +469,17 @@ impl HarnessDependencyPort for ProcessHarnessDependency {
             DependencyCommand::Cancel { .. } | DependencyCommand::Health => unreachable!(),
         };
         let cancellation = if let Some(id) = &active_id {
+            let mut cancellations = self.cancellations.lock().await;
+            if cancellations.pending.remove(id) {
+                let (sender, receiver) = mpsc::channel(1);
+                sender
+                    .try_send(Ok(DependencyEvent::Cancelled))
+                    .map_err(|_| HarnessDependencyError::Transport)?;
+                return Ok(DependencyEventStream { receiver });
+            }
             let cancellation = CancellationToken::new();
-            if self
+            if cancellations
                 .active
-                .lock()
-                .await
                 .insert(id.clone(), cancellation.clone())
                 .is_some()
             {
@@ -478,7 +497,7 @@ impl HarnessDependencyPort for ProcessHarnessDependency {
                 .await;
             let was_cancelled = cancellation.is_some_and(|token| token.is_cancelled());
             if let Some(id) = active_id {
-                adapter.active.lock().await.remove(&id);
+                adapter.cancellations.lock().await.active.remove(&id);
             }
             if let Err(error) = result {
                 let _ = sender.send(Err(error)).await;
@@ -716,4 +735,55 @@ pub enum HarnessDependencyError {
     InvalidRequest,
     #[error("harness cancellation identifier is not active")]
     UnknownCancellation,
+    #[error("harness pending cancellation capacity is exhausted")]
+    TooManyPendingCancellations,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dependency() -> ProcessHarnessDependency {
+        ProcessHarnessDependency::new(HarnessDependencyConfig {
+            program: String::from("must-not-start-for-pre-cancel"),
+            arguments: Vec::new(),
+            maximum_frame_bytes: 1024,
+            request_timeout: Duration::from_secs(1),
+            frame_pacing: Duration::ZERO,
+            authorization_key: [7_u8; 32],
+        })
+        .expect("dependency")
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_execute_is_latched_without_spawning() {
+        let dependency = dependency();
+        assert_eq!(
+            dependency
+                .exchange(DependencyCommand::Cancel {
+                    cancellation_id: String::from("cancel-before-start"),
+                })
+                .await
+                .expect("pre-cancel"),
+            DependencyReply::Events(vec![DependencyEvent::Cancelled])
+        );
+        let mut stream = dependency
+            .exchange_events(DependencyCommand::Execute {
+                session_id: String::from("session"),
+                provider: String::from("provider"),
+                model: String::from("model"),
+                entries: Vec::new(),
+                options: Value::Object(serde_json::Map::default()),
+                grant: String::from("unused"),
+                cancellation_id: String::from("cancel-before-start"),
+            })
+            .await
+            .expect("cancelled execution stream");
+        assert_eq!(
+            stream.next().await.expect("event").expect("valid event"),
+            DependencyEvent::Cancelled
+        );
+        assert!(stream.next().await.is_none());
+        assert!(dependency.connection.lock().await.is_none());
+    }
 }

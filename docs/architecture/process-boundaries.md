@@ -31,10 +31,12 @@ canonical event order in the journal.
 
 ## Remaining boundary work
 
-The runtime does not yet supervise every native tool host, plugin host, MCP
-server, or LSP server from the canonical agent loop. Harness output is returned
-as a bounded command reply rather than independent streaming frames, so active
-mid-stream cancellation and transport backpressure remain incomplete.
+The runtime supervises the native harness and first-party capability hosts.
+Harness events traverse independent bounded frames with explicit credit
+windows. Active cancellation covers provider startup, provider streaming,
+approval waits, and foreground process-tool execution; exact process
+cancellation is routed through an independent authenticated host connection.
+Crash-injection coverage must still expand across every host category.
 
 The ACP adapter is an independent five-crate process using the official stable
 v1 Rust SDK over stdio; it maps session create/load, prompts, updates,
@@ -46,8 +48,7 @@ managed WebDriver capability host. A durable scheduler worker owns schedule
 storage and occurrence claims; the runtime supervises it, polls with a bounded
 missed-tick policy, and executes claimed prompt work through the canonical
 intercepted turn path. Event/output trigger delivery remains open.
-Crash-injection coverage must expand
-to harness/tool/plugin/frontend termination and recovery.
+ACP rich-content projection and per-session MCP activation remain open.
 
 Tool hosts return structured results only. The runtime alone decides which
 canonical events are committed. The harness owns provider execution but not

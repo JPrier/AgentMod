@@ -180,7 +180,7 @@ async fn complete_prompt<L: AcpLogicPort + 'static>(
                     _ => (false, true),
                 };
                 let updates = logic
-                    .resolve_approval(stream.session_id.clone(), approval, approved)
+                    .resolve_approval(stream.session_id.clone(), approval, approved, !cancelled)
                     .await
                     .map_err(map_logic)?;
                 if cancelled {

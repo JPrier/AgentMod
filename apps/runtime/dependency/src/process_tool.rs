@@ -34,8 +34,8 @@ use tokio::{
 };
 
 use crate::tool::{
-    DependencyOutputStream, DependencyToolCommand, DependencyToolEvent, ToolHostDependencyError,
-    ToolHostDependencyPort,
+    DependencyCancelToolRequest, DependencyOutputStream, DependencyToolCommand,
+    DependencyToolEvent, ToolHostDependencyError, ToolHostDependencyPort,
 };
 
 #[derive(Clone, Debug)]
@@ -137,6 +137,60 @@ impl ProcessCapabilityDependency {
             }
         }
         Err(ToolHostDependencyError::Unavailable)
+    }
+
+    async fn connect_existing(
+        &self,
+        session: &str,
+        workspace: &Path,
+    ) -> Result<Connection, ToolHostDependencyError> {
+        let endpoint = self.endpoint(session, workspace);
+        let mut stream = open_endpoint(&endpoint)
+            .await
+            .map_err(|_| ToolHostDependencyError::Unavailable)?;
+        self.handshake(&mut stream).await?;
+        Ok(Connection { stream })
+    }
+
+    /// Cancels an exact active process-host request through an independent
+    /// authenticated connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a dependency-owned error for invalid identifiers, unavailable
+    /// endpoints, failed authentication, or malformed terminal responses.
+    pub async fn cancel_active(
+        &self,
+        session: &str,
+        workspace: &Path,
+        cancellation_id: &str,
+    ) -> Result<bool, ToolHostDependencyError> {
+        let cancellation_id = CancellationId::from_str(cancellation_id)
+            .map_err(|_| ToolHostDependencyError::InvalidRequest)?;
+        let mut connection = None;
+        for _ in 0..20 {
+            match self.connect_existing(session, workspace).await {
+                Ok(value) => {
+                    connection = Some(value);
+                    break;
+                }
+                Err(ToolHostDependencyError::Unavailable) => {
+                    sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let mut connection = connection.ok_or(ToolHostDependencyError::Unavailable)?;
+        let events = self
+            .send_command(
+                &mut connection,
+                ToolHostCommand::Cancel { cancellation_id },
+                cancellation_id,
+            )
+            .await?;
+        Ok(events
+            .iter()
+            .any(|event| matches!(event, DependencyToolEvent::Cancelled { .. })))
     }
 
     fn spawn_host(
@@ -393,6 +447,13 @@ impl ToolHostDependencyPort for ProcessCapabilityDependency {
             self.connections.lock().await.remove(&key);
         }
         result
+    }
+
+    async fn cancel(
+        &self,
+        _request: DependencyCancelToolRequest,
+    ) -> Result<bool, ToolHostDependencyError> {
+        Ok(false)
     }
 
     async fn shutdown(&self) {

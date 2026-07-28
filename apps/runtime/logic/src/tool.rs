@@ -316,6 +316,22 @@ impl<D> ToolExecutionLogic<D> {
 }
 
 impl<D: data::ToolDataPort> ToolExecutionLogic<D> {
+    /// Cancels one exact active tool operation when its selected dependency
+    /// supports concurrent cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a logic-owned error for empty identifiers or data failures.
+    pub async fn cancel(&self, cancellation_id: String) -> Result<bool, ToolExecutionError> {
+        if cancellation_id.trim().is_empty() {
+            return Err(ToolExecutionError::Invalid);
+        }
+        self.data
+            .cancel_tool(data::CancelToolDataRequest { cancellation_id })
+            .await
+            .map_err(|_| ToolExecutionError::Unavailable)
+    }
+
     /// Dispatches exactly one already-authorized request through runtime data.
     ///
     /// # Errors

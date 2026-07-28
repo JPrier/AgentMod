@@ -113,6 +113,7 @@ pub trait AcpDataPort: Send + Sync {
         session_id: SessionId,
         continuation_id: String,
         approved: bool,
+        resume_after_resolution: bool,
     ) -> Result<Vec<TurnDataEvent>, AcpDataError>;
     async fn cancel(
         &self,
@@ -190,9 +191,15 @@ impl<D: AcpRuntimeDependencyPort> AcpDataPort for AcpData<D> {
         session_id: SessionId,
         continuation_id: String,
         approved: bool,
+        resume_after_resolution: bool,
     ) -> Result<Vec<TurnDataEvent>, AcpDataError> {
         self.dependency
-            .resolve_approval(session_id, continuation_id, approved)
+            .resolve_approval(
+                session_id,
+                continuation_id,
+                approved,
+                resume_after_resolution,
+            )
             .await
             .map(|events| events.into_iter().map(map_event).collect())
             .map_err(map_error)

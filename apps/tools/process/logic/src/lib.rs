@@ -10,8 +10,8 @@ use agentmod_process_host_data::{
     ProcessCancelDataRequest, ProcessControlDataRequest, ProcessDataAuthorization,
     ProcessDataCleanup, ProcessDataError, ProcessDataExit, ProcessDataId, ProcessDataIdentity,
     ProcessDataPort, ProcessDataRecord, ProcessDataState, ProcessDataStream,
-    ProcessInputDataRequest, ProcessOutputDataRecord, ReadProcessOutputDataRequest,
-    StartProcessDataRequest,
+    ProcessDataTerminalSize, ProcessInputDataRequest, ProcessOutputDataRecord,
+    ReadProcessOutputDataRequest, ResizeProcessTerminalDataRequest, StartProcessDataRequest,
 };
 use async_trait::async_trait;
 use thiserror::Error;
@@ -89,6 +89,19 @@ pub enum CleanupPolicy {
     RemoveLogsAlways,
 }
 
+/// Logic-owned terminal dimensions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalSize {
+    /// Columns.
+    pub columns: u16,
+    /// Rows.
+    pub rows: u16,
+    /// Cell width in pixels.
+    pub pixel_width: u16,
+    /// Cell height in pixels.
+    pub pixel_height: u16,
+}
+
 /// Start command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartProcessCommand {
@@ -110,6 +123,8 @@ pub struct StartProcessCommand {
     pub cleanup: CleanupPolicy,
     /// Mode.
     pub mode: ExecutionMode,
+    /// PTY dimensions.
+    pub terminal_size: Option<TerminalSize>,
 }
 
 /// State.
@@ -167,6 +182,12 @@ pub struct ProcessResult {
     pub logs_removed: bool,
     /// Cleanup failure.
     pub cleanup_failed: bool,
+    /// PTY marker.
+    pub terminal: bool,
+    /// Current terminal dimensions.
+    pub terminal_size: Option<TerminalSize>,
+    /// OS process ID.
+    pub os_process_id: Option<u32>,
 }
 
 /// Stream.
@@ -176,6 +197,8 @@ pub enum OutputStream {
     Stdout,
     /// stderr.
     Stderr,
+    /// Combined PTY stream.
+    Terminal,
 }
 
 /// Control command.
@@ -226,6 +249,17 @@ pub struct InputProcessCommand {
     pub bytes: Vec<u8>,
     /// Close.
     pub close: bool,
+}
+
+/// Resize terminal command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResizeTerminalCommand {
+    /// Authorization.
+    pub authorization: ProcessAuthorization,
+    /// ID.
+    pub process_id: ProcessId,
+    /// Dimensions.
+    pub size: TerminalSize,
 }
 
 /// Cancel command.
@@ -305,6 +339,11 @@ pub trait ProcessLogicPort: Send + Sync {
     async fn read_output(&self, query: ReadOutputQuery) -> Result<OutputRange, ProcessLogicError>;
     /// Input.
     async fn input(&self, command: InputProcessCommand) -> Result<(), ProcessLogicError>;
+    /// Resize PTY.
+    async fn resize(
+        &self,
+        command: ResizeTerminalCommand,
+    ) -> Result<ProcessResult, ProcessLogicError>;
     /// Wait.
     async fn wait(
         &self,
@@ -382,6 +421,7 @@ impl<D: ProcessDataPort> ProcessLogicPort for ProcessLogic<D> {
                         CleanupPolicy::RemoveLogsAlways => ProcessDataCleanup::RemoveLogsAlways,
                     },
                     foreground: command.mode == ExecutionMode::Foreground,
+                    terminal_size: command.terminal_size.map(map_terminal_size),
                 })
                 .await
                 .map_err(map_error)?,
@@ -399,6 +439,7 @@ impl<D: ProcessDataPort> ProcessLogicPort for ProcessLogic<D> {
                 stream: match query.stream {
                     OutputStream::Stdout => ProcessDataStream::Stdout,
                     OutputStream::Stderr => ProcessDataStream::Stderr,
+                    OutputStream::Terminal => ProcessDataStream::Terminal,
                 },
                 offset: query.offset,
                 length: query.length,
@@ -418,6 +459,23 @@ impl<D: ProcessDataPort> ProcessLogicPort for ProcessLogic<D> {
             })
             .await
             .map_err(map_error)
+    }
+
+    async fn resize(
+        &self,
+        command: ResizeTerminalCommand,
+    ) -> Result<ProcessResult, ProcessLogicError> {
+        validate_terminal_size(command.size)?;
+        map_record(
+            self.data
+                .resize_process_terminal(ResizeProcessTerminalDataRequest {
+                    authorization: map_authorization(command.authorization),
+                    process_id: map_id(command.process_id)?,
+                    size: map_terminal_size(command.size),
+                })
+                .await
+                .map_err(map_error)?,
+        )
     }
 
     async fn wait(
@@ -519,7 +577,18 @@ fn validate_start(
     if command.output_limit_bytes == 0 || command.output_limit_bytes > config.max_output_bytes {
         return Err(ProcessLogicError::InvalidOutputLimit);
     }
+    if let Some(size) = command.terminal_size {
+        validate_terminal_size(size)?;
+    }
     Ok(())
+}
+
+fn validate_terminal_size(size: TerminalSize) -> Result<(), ProcessLogicError> {
+    if size.columns == 0 || size.rows == 0 {
+        Err(ProcessLogicError::InvalidArgument)
+    } else {
+        Ok(())
+    }
 }
 
 fn resolve_cwd(workspace: &Path, requested: Option<PathBuf>) -> Result<PathBuf, ProcessLogicError> {
@@ -630,7 +699,28 @@ fn map_record(value: ProcessDataRecord) -> Result<ProcessResult, ProcessLogicErr
         stderr_truncated: value.stderr_truncated,
         logs_removed: value.logs_removed,
         cleanup_failed: value.cleanup_failed,
+        terminal: value.terminal,
+        terminal_size: value.terminal_size.map(map_data_terminal_size),
+        os_process_id: value.os_process_id,
     })
+}
+
+fn map_terminal_size(value: TerminalSize) -> ProcessDataTerminalSize {
+    ProcessDataTerminalSize {
+        columns: value.columns,
+        rows: value.rows,
+        pixel_width: value.pixel_width,
+        pixel_height: value.pixel_height,
+    }
+}
+
+fn map_data_terminal_size(value: ProcessDataTerminalSize) -> TerminalSize {
+    TerminalSize {
+        columns: value.columns,
+        rows: value.rows,
+        pixel_width: value.pixel_width,
+        pixel_height: value.pixel_height,
+    }
 }
 
 fn map_exit(value: &ProcessDataExit) -> ExitStatus {

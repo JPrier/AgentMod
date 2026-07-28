@@ -43,7 +43,7 @@ and cross-platform CI evidence remain outstanding.
 | Deterministic harness mock provider | Integration tested | Full harness N-tier mappings; text, streaming, tool-call, malformed, timeout, rate-limit, partial-failure, cancellation, usage and disconnect scenarios |
 | Runtime action interception | Implemented and unit tested | Style-before-plugin ordering, exact replacement audit, final-proposal permission evaluation and mandatory-deny enforcement |
 | Deterministic compaction strategies | Implemented and unit tested | No-op, sliding window, typed summary, artifact handoff and artifact-safe tool-output eviction with source provenance |
-| Native process host (non-PTY) | Integration tested | Authenticated foreground/background execution, durable bounded logs, input/read/wait/detach/reattach/interrupt/kill/cancel, restart-persistent replay denial, strict owner/session scope, secret references, executable policy, bounded concurrency/waiters, Windows tree kill and Unix process groups pass dependency and real-binary tests; PTY and crash reattachment remain pending |
+| Native process host | Integration tested | Authenticated foreground/background execution plus native PTY start/run, interactive input, resize, detach/reattach, merged durable terminal output, restart-persistent replay denial, strict owner/session scope, secret references, executable policy, bounded concurrency/waiters, Windows tree kill, and Unix process groups pass dependency tests; Windows ConPTY lifecycle is exercised with a real compiled console fixture; crash reconciliation remains pending |
 | Native filesystem host | Integration tested | Separate N-tier host with bounded read/list/glob/grep, atomic write/edit, prevalidated multi-file patch, encoding/binary handling, lazy schemas and path/symlink/device/sensitive-file controls; 13 tests |
 | Plugin manifest SDK | Implemented and unit tested | Strict TOML/JSON model, PLUG001–PLUG024 validation, authority/trust/capability/version checks and cross-plugin ordering diagnostics; 12 tests |
 | Harness continuation gate | Integration tested | Tool-call generation stops at a proposal; explicit runtime continuation issues a fresh provider request exactly once, with replacement structured context |
@@ -72,7 +72,7 @@ and cross-platform CI evidence remain outstanding.
 
 ## In progress
 
-- PTY support and restart reconciliation for supervised processes.
+- Restart reconciliation and restart-safe reattachment classification for supervised processes.
 - TUI management panels for schedules, plugins, MCP, processes, artifacts,
   child agents, and LSP; core interactive streaming is implemented.
 - MCP OAuth authorization-code flow and restart-persistent HTTP cursors.

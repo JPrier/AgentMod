@@ -12,6 +12,7 @@ agentmod-primitives = { path = "../../../../core/primitives" }
 agentmod-protocol-support = { path = "../../../../core/protocol-support" }
 async-trait.workspace = true
 blake3.workspace = true
+portable-pty.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

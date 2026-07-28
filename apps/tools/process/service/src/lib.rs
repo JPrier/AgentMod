@@ -6,7 +6,7 @@ use agentmod_process_host_logic::{
     CancelProcessCommand, CleanupPolicy, ExecutionMode, InputProcessCommand, OutputRange,
     OutputStream as LogicOutputStream, ProcessAuthorization, ProcessControlCommand, ProcessId,
     ProcessIdentity, ProcessLogicError, ProcessLogicPort, ProcessResult, ProcessStatus,
-    ReadOutputQuery, StartProcessCommand,
+    ReadOutputQuery, ResizeTerminalCommand, StartProcessCommand, TerminalSize,
 };
 use agentmod_tool_protocol::{OutputStream, ToolDescriptor, ToolHostCommand, ToolHostEvent};
 use serde::{Deserialize, Serialize};
@@ -60,6 +60,19 @@ struct StartRequest {
     output_limit_bytes: u64,
     #[serde(default)]
     cleanup: ServiceCleanup,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal: Option<ServiceTerminalSize>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ServiceTerminalSize {
+    columns: u16,
+    rows: u16,
+    #[serde(default)]
+    pixel_width: u16,
+    #[serde(default)]
+    pixel_height: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
@@ -91,6 +104,7 @@ struct ReadRequest {
 enum ServiceStream {
     Stdout,
     Stderr,
+    Terminal,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -100,6 +114,18 @@ struct InputRequest {
     content: String,
     #[serde(default)]
     close: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ResizeRequest {
+    process_id: String,
+    columns: u16,
+    rows: u16,
+    #[serde(default)]
+    pixel_width: u16,
+    #[serde(default)]
+    pixel_height: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -217,14 +243,18 @@ impl<L: ProcessLogicPort> ProcessHostService<L> {
     ) -> Result<Vec<ToolHostEvent>, ProcessServiceError> {
         let mut events = Vec::new();
         match tool.as_str() {
-            "process.run" | "process.start" => {
+            "process.run" | "process.start" | "process.run_pty" | "process.start_pty" => {
                 let request: StartRequest = parse(arguments)?;
+                let is_terminal = matches!(tool.as_str(), "process.run_pty" | "process.start_pty");
+                if is_terminal != request.terminal.is_some() {
+                    return Err(ProcessServiceError::InvalidArguments);
+                }
                 let result = self
                     .logic
                     .start(map_start(
                         request,
                         authorization,
-                        if tool == "process.run" {
+                        if matches!(tool.as_str(), "process.run" | "process.run_pty") {
                             ExecutionMode::Foreground
                         } else {
                             ExecutionMode::LongRunning
@@ -242,6 +272,7 @@ impl<L: ProcessLogicPort> ProcessHostService<L> {
                 let stream = match request.stream {
                     ServiceStream::Stdout => LogicOutputStream::Stdout,
                     ServiceStream::Stderr => LogicOutputStream::Stderr,
+                    ServiceStream::Terminal => LogicOutputStream::Terminal,
                 };
                 let result = self
                     .logic
@@ -271,6 +302,27 @@ impl<L: ProcessLogicPort> ProcessHostService<L> {
                     .await
                     .map_err(map_logic_error)?;
                 events.extend(simple_success(&call_id));
+            }
+            "process.resize" => {
+                let request: ResizeRequest = parse(arguments)?;
+                let result = self
+                    .logic
+                    .resize(ResizeTerminalCommand {
+                        authorization,
+                        process_id: parse_id(request.process_id)?,
+                        size: TerminalSize {
+                            columns: request.columns,
+                            rows: request.rows,
+                            pixel_width: request.pixel_width,
+                            pixel_height: request.pixel_height,
+                        },
+                    })
+                    .await
+                    .map_err(map_logic_error)?;
+                events.push(ToolHostEvent::Started {
+                    call_id: call_id.clone(),
+                });
+                append_process_result(&mut events, &call_id, &result);
             }
             "process.wait" | "process.interrupt" | "process.kill" | "process.detach"
             | "process.reattach" => {
@@ -346,11 +398,12 @@ fn canonical_operation(
     cancellation_id: &str,
 ) -> Result<Vec<u8>, ProcessServiceError> {
     let normalized = match tool {
-        "process.run" | "process.start" => {
+        "process.run" | "process.start" | "process.run_pty" | "process.start_pty" => {
             serde_json::to_value(parse::<StartRequest>(arguments.clone())?)
         }
         "process.read" => serde_json::to_value(parse::<ReadRequest>(arguments.clone())?),
         "process.input" => serde_json::to_value(parse::<InputRequest>(arguments.clone())?),
+        "process.resize" => serde_json::to_value(parse::<ResizeRequest>(arguments.clone())?),
         "process.wait" | "process.interrupt" | "process.kill" | "process.detach"
         | "process.reattach" => serde_json::to_value(parse::<ProcessRequest>(arguments.clone())?),
         "process.list" => serde_json::to_value(parse::<EmptyRequest>(arguments.clone())?),
@@ -395,6 +448,12 @@ fn map_start(
             ServiceCleanup::RemoveLogsAlways => CleanupPolicy::RemoveLogsAlways,
         },
         mode,
+        terminal_size: request.terminal.map(|size| TerminalSize {
+            columns: size.columns,
+            rows: size.rows,
+            pixel_width: size.pixel_width,
+            pixel_height: size.pixel_height,
+        }),
     }
 }
 
@@ -430,7 +489,7 @@ fn append_output(
         events.push(ToolHostEvent::Output {
             call_id: call_id.to_owned(),
             stream: match stream {
-                LogicOutputStream::Stdout => OutputStream::Standard,
+                LogicOutputStream::Stdout | LogicOutputStream::Terminal => OutputStream::Standard,
                 LogicOutputStream::Stderr => OutputStream::Error,
             },
             content: String::from_utf8_lossy(&result.bytes).into_owned(),
@@ -457,6 +516,14 @@ fn process_json(result: &ProcessResult) -> Value {
         "stderr_truncated":result.stderr_truncated,
         "logs_removed":result.logs_removed,
         "cleanup_failed":result.cleanup_failed,
+        "terminal":result.terminal,
+        "terminal_size":result.terminal_size.map(|size| json!({
+            "columns":size.columns,
+            "rows":size.rows,
+            "pixel_width":size.pixel_width,
+            "pixel_height":size.pixel_height,
+        })),
+        "os_process_id":result.os_process_id,
     })
 }
 
@@ -512,8 +579,11 @@ fn tool_descriptors() -> Vec<ToolDescriptor> {
     [
         "process.run",
         "process.start",
+        "process.run_pty",
+        "process.start_pty",
         "process.read",
         "process.input",
+        "process.resize",
         "process.wait",
         "process.interrupt",
         "process.kill",
@@ -558,6 +628,12 @@ mod tests {
             unreachable!()
         }
         async fn input(&self, _command: InputProcessCommand) -> Result<(), ProcessLogicError> {
+            unreachable!()
+        }
+        async fn resize(
+            &self,
+            _command: ResizeTerminalCommand,
+        ) -> Result<ProcessResult, ProcessLogicError> {
             unreachable!()
         }
         async fn wait(

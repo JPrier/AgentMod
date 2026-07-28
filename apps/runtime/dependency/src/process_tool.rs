@@ -314,6 +314,16 @@ fn canonical_operation(
             "output_limit_bytes":u64_value(object, "output_limit_bytes")?,
             "cleanup":object.get("cleanup").and_then(Value::as_str).unwrap_or("retain"),
         }),
+        "process.run_pty" | "process.start_pty" => json!({
+            "executable":string(object, "executable")?,
+            "arguments":string_array(object, "arguments")?,
+            "working_directory":object.get("working_directory").cloned().unwrap_or(Value::Null),
+            "environment":string_map(object, "environment")?,
+            "timeout_ms":object.get("timeout_ms").cloned().unwrap_or(Value::Null),
+            "output_limit_bytes":u64_value(object, "output_limit_bytes")?,
+            "cleanup":object.get("cleanup").and_then(Value::as_str).unwrap_or("retain"),
+            "terminal":terminal_size(object)?,
+        }),
         "process.read" => json!({
             "process_id":string(object, "process_id")?,
             "stream":string(object, "stream")?,
@@ -324,6 +334,13 @@ fn canonical_operation(
             "process_id":string(object, "process_id")?,
             "content":string(object, "content")?,
             "close":object.get("close").and_then(Value::as_bool).unwrap_or(false),
+        }),
+        "process.resize" => json!({
+            "process_id":string(object, "process_id")?,
+            "columns":u16_value(object, "columns")?,
+            "rows":u16_value(object, "rows")?,
+            "pixel_width":optional_u16_value(object, "pixel_width")?,
+            "pixel_height":optional_u16_value(object, "pixel_height")?,
         }),
         "process.wait" | "process.interrupt" | "process.kill" | "process.detach"
         | "process.reattach" => json!({"process_id":string(object, "process_id")?}),
@@ -364,6 +381,37 @@ fn u64_value(object: &Map<String, Value>, key: &str) -> Result<u64, ToolHostDepe
         .get(key)
         .and_then(Value::as_u64)
         .ok_or(ToolHostDependencyError::InvalidRequest)
+}
+
+fn u16_value(object: &Map<String, Value>, key: &str) -> Result<u16, ToolHostDependencyError> {
+    u16::try_from(u64_value(object, key)?).map_err(|_| ToolHostDependencyError::InvalidRequest)
+}
+
+fn optional_u16_value(
+    object: &Map<String, Value>,
+    key: &str,
+) -> Result<u16, ToolHostDependencyError> {
+    object.get(key).map_or(Ok(0), |value| {
+        value
+            .as_u64()
+            .ok_or(ToolHostDependencyError::InvalidRequest)
+            .and_then(|value| {
+                u16::try_from(value).map_err(|_| ToolHostDependencyError::InvalidRequest)
+            })
+    })
+}
+
+fn terminal_size(object: &Map<String, Value>) -> Result<Value, ToolHostDependencyError> {
+    let terminal = object
+        .get("terminal")
+        .and_then(Value::as_object)
+        .ok_or(ToolHostDependencyError::InvalidRequest)?;
+    Ok(json!({
+        "columns":u16_value(terminal, "columns")?,
+        "rows":u16_value(terminal, "rows")?,
+        "pixel_width":optional_u16_value(terminal, "pixel_width")?,
+        "pixel_height":optional_u16_value(terminal, "pixel_height")?,
+    }))
 }
 
 fn string_array(

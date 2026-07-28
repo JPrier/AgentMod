@@ -12,10 +12,11 @@ use agentmod_process_host_dependency::{
     DependencyAuthorization, DependencyCancelRequest, DependencyCleanupPolicy,
     DependencyExecutablePolicy, DependencyIdentity, DependencyListRequest, DependencyOutputStream,
     DependencyProcessInputRequest, DependencyProcessRequest, DependencyProcessState,
-    DependencyReadOutputRequest, DependencyStartProcessRequest, ProcessDependencyConfig,
-    ProcessDependencyError, ProcessDependencyPort, TokioProcessDependency,
-    canonical_control_operation, canonical_input_operation, canonical_list_operation,
-    canonical_read_operation, canonical_start_operation,
+    DependencyReadOutputRequest, DependencyResizeTerminalRequest, DependencyStartProcessRequest,
+    DependencyTerminalSize, ProcessDependencyConfig, ProcessDependencyError, ProcessDependencyPort,
+    TokioProcessDependency, canonical_control_operation, canonical_input_operation,
+    canonical_list_operation, canonical_read_operation, canonical_resize_operation,
+    canonical_start_operation,
 };
 use agentmod_protocol_support::authorization::{
     AuthorizationClaims, AuthorizationKey, seal_authorization,
@@ -148,6 +149,7 @@ fn start_request(
         output_limit_bytes: 4096,
         cleanup,
         foreground,
+        terminal_size: None,
     };
     let canonical = canonical_start_operation(&request).expect("canonical start");
     request.authorization = authorization(
@@ -174,6 +176,35 @@ fn control(
         authorization: authorization(owner, "session", call, tool, call, nonce, canonical),
         process_id: process_id.to_owned(),
     }
+}
+
+fn terminal_start_request(root: &TempDir, executable: &Path) -> DependencyStartProcessRequest {
+    let mut request = start_request(
+        root,
+        executable,
+        "pty-start",
+        "pty-cancel",
+        "pty-start-nonce",
+        false,
+        DependencyCleanupPolicy::Retain,
+    );
+    request.terminal_size = Some(DependencyTerminalSize {
+        columns: 80,
+        rows: 24,
+        pixel_width: 0,
+        pixel_height: 0,
+    });
+    let canonical = canonical_start_operation(&request).expect("canonical PTY start");
+    request.authorization = authorization(
+        "owner",
+        "session",
+        "pty-start",
+        "process.start_pty",
+        "pty-cancel",
+        "pty-start-nonce",
+        canonical,
+    );
+    request
 }
 
 #[tokio::test]
@@ -360,4 +391,155 @@ async fn output_read_is_owner_scoped() {
         })
         .await
         .expect("cleanup");
+}
+
+#[tokio::test]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the process-level PTY acceptance test keeps one exact grant per lifecycle action visible"
+)]
+async fn terminal_supports_input_resize_detach_reattach_and_durable_output() {
+    let root = TempDir::new().expect("root");
+    let executable = compile_fixture(&root);
+    let dependency = dependency(&root);
+    let started = dependency
+        .start(terminal_start_request(&root, &executable))
+        .await
+        .expect("start PTY");
+    assert!(started.terminal);
+    assert!(started.os_process_id.is_some());
+    assert_eq!(
+        started.terminal_size,
+        Some(DependencyTerminalSize {
+            columns: 80,
+            rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let process_id = started.process_id.as_str().to_owned();
+
+    let resized_size = DependencyTerminalSize {
+        columns: 100,
+        rows: 40,
+        pixel_width: 8,
+        pixel_height: 16,
+    };
+    let mut resize = DependencyResizeTerminalRequest {
+        authorization: authorization(
+            "owner",
+            "session",
+            "pty-resize",
+            "process.resize",
+            "pty-resize-cancel",
+            "pty-resize-nonce",
+            Vec::new(),
+        ),
+        process_id: process_id.clone(),
+        size: resized_size,
+    };
+    resize.authorization = authorization(
+        "owner",
+        "session",
+        "pty-resize",
+        "process.resize",
+        "pty-resize-cancel",
+        "pty-resize-nonce",
+        canonical_resize_operation(&resize).expect("canonical resize"),
+    );
+    let resized = dependency.resize(resize).await.expect("resize");
+    assert_eq!(resized.terminal_size, Some(resized_size));
+
+    let detached = dependency
+        .detach(control(
+            &process_id,
+            "owner",
+            "pty-detach",
+            "process.detach",
+            "pty-detach-nonce",
+        ))
+        .await
+        .expect("detach");
+    assert!(detached.detached);
+    let reattached = dependency
+        .reattach(control(
+            &process_id,
+            "owner",
+            "pty-reattach",
+            "process.reattach",
+            "pty-reattach-nonce",
+        ))
+        .await
+        .expect("reattach");
+    assert!(!reattached.detached);
+
+    let mut input = DependencyProcessInputRequest {
+        authorization: authorization(
+            "owner",
+            "session",
+            "pty-input",
+            "process.input",
+            "pty-input-cancel",
+            "pty-input-nonce",
+            Vec::new(),
+        ),
+        process_id: process_id.clone(),
+        bytes: b"terminal-input\r\n".to_vec(),
+        close: false,
+    };
+    input.authorization = authorization(
+        "owner",
+        "session",
+        "pty-input",
+        "process.input",
+        "pty-input-cancel",
+        "pty-input-nonce",
+        canonical_input_operation(&input).expect("canonical input"),
+    );
+    dependency.input(input).await.expect("input");
+    let completed = dependency
+        .wait(control(
+            &process_id,
+            "owner",
+            "pty-wait",
+            "process.wait",
+            "pty-wait-nonce",
+        ))
+        .await
+        .expect("wait");
+    assert_eq!(completed.state, DependencyProcessState::Exited);
+    assert!(
+        completed.exit.as_ref().is_some_and(|exit| exit.success),
+        "PTY process did not exit successfully: {completed:?}"
+    );
+
+    let mut read = DependencyReadOutputRequest {
+        authorization: authorization(
+            "owner",
+            "session",
+            "pty-read",
+            "process.read",
+            "pty-read-cancel",
+            "pty-read-nonce",
+            Vec::new(),
+        ),
+        process_id,
+        stream: DependencyOutputStream::Terminal,
+        offset: 0,
+        length: 4096,
+    };
+    read.authorization = authorization(
+        "owner",
+        "session",
+        "pty-read",
+        "process.read",
+        "pty-read-cancel",
+        "pty-read-nonce",
+        canonical_read_operation(&read).expect("canonical read"),
+    );
+    let output = dependency.read_output(read).await.expect("read terminal");
+    let output = String::from_utf8_lossy(&output.bytes);
+    assert!(output.contains("fixture-stderr"));
+    assert!(output.contains("fixture-stdout:terminal-input"));
 }

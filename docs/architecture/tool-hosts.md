@@ -65,9 +65,11 @@ Executables are denied unless explicitly allowed. The host clears the ambient
 environment and selectively inherits a documented set of non-secret
 platform/toolchain discovery variables; secret-shaped names remain blocked.
 
-The process host supports foreground and background execution, bounded durable
-stdout/stderr logs, input, historical reads, wait, detach/reattach, interrupt,
-kill, listing, cancellation, timeouts, and cleanup policies.
+The process host supports foreground, background, and native PTY execution,
+bounded durable stdout/stderr or combined terminal logs, interactive input,
+PTY resize, historical reads, wait, detach/reattach, interrupt, kill, listing,
+cancellation, timeouts, and cleanup policies. PTY SDK types remain in
+dependency; every upper layer owns and explicitly maps terminal dimensions.
 `tests/e2e/runtime_process_loop.ps1` and `.sh` prove the live runtime route.
 `tests/e2e/coding_task.ps1` and `.sh` prove a model-driven
 read/edit/failing-test/fix/passing-test loop through both isolated hosts.
@@ -83,7 +85,7 @@ The Windows process E2Es are `runtime_git_loop.ps1`,
 present. The invocation fixture emits a real MCP progress notification and
 terminal tool result, both of which are committed before provider continuation.
 
-PTY, interactive browser authentication handoff, runtime-wide tool discovery, active cross-host
+Process restart reconciliation, interactive browser authentication handoff, runtime-wide tool discovery, active cross-host
 cancellation, MCP OAuth and restart-persistent HTTP cursors, and broader
 reconnect/recovery acceptance tests remain open. In-process MCP HTTP reconnect
 is covered by a real loopback server test which verifies exact session and event

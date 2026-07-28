@@ -3,10 +3,11 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsString,
+    io::{Read, Write},
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -17,6 +18,7 @@ use agentmod_protocol_support::authorization::{
     AuthorizationKey, ExpectedAuthorization, verify_authorization,
 };
 use async_trait::async_trait;
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -113,6 +115,30 @@ pub enum DependencyExecutablePolicy {
     Deny,
 }
 
+/// Dependency-owned terminal dimensions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DependencyTerminalSize {
+    /// Text columns.
+    pub columns: u16,
+    /// Text rows.
+    pub rows: u16,
+    /// Cell width in pixels, or zero when unknown.
+    pub pixel_width: u16,
+    /// Cell height in pixels, or zero when unknown.
+    pub pixel_height: u16,
+}
+
+impl DependencyTerminalSize {
+    const fn portable(self) -> PtySize {
+        PtySize {
+            rows: self.rows,
+            cols: self.columns,
+            pixel_width: self.pixel_width,
+            pixel_height: self.pixel_height,
+        }
+    }
+}
+
 /// Authenticated process start request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyStartProcessRequest {
@@ -138,6 +164,8 @@ pub struct DependencyStartProcessRequest {
     pub cleanup: DependencyCleanupPolicy,
     /// Whether start waits and projects output before cleanup.
     pub foreground: bool,
+    /// Allocates a terminal when dimensions are present.
+    pub terminal_size: Option<DependencyTerminalSize>,
 }
 
 /// Process lifecycle state.
@@ -195,6 +223,12 @@ pub struct DependencyProcessRecord {
     pub logs_removed: bool,
     /// Cleanup failed after an otherwise completed operation.
     pub cleanup_failed: bool,
+    /// Whether the child owns a pseudo-terminal.
+    pub terminal: bool,
+    /// Current terminal dimensions.
+    pub terminal_size: Option<DependencyTerminalSize>,
+    /// Operating-system process identifier when available.
+    pub os_process_id: Option<u32>,
 }
 
 /// Authenticated process control.
@@ -226,6 +260,19 @@ pub enum DependencyOutputStream {
     Stdout,
     /// stderr.
     Stderr,
+    /// Combined pseudo-terminal output.
+    Terminal,
+}
+
+/// Authenticated terminal resize.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyResizeTerminalRequest {
+    /// Authorization proof.
+    pub authorization: DependencyAuthorization,
+    /// Process ID.
+    pub process_id: String,
+    /// New dimensions.
+    pub size: DependencyTerminalSize,
 }
 
 /// Authenticated bounded output read.
@@ -332,6 +379,11 @@ pub trait ProcessDependencyPort: Send + Sync {
         &self,
         request: DependencyProcessInputRequest,
     ) -> Result<(), ProcessDependencyError>;
+    /// Resizes a pseudo-terminal.
+    async fn resize(
+        &self,
+        request: DependencyResizeTerminalRequest,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError>;
     /// Reads output.
     async fn read_output(
         &self,
@@ -388,6 +440,8 @@ struct RegistryEntry {
     logs_removed: Arc<AtomicBool>,
     cleanup_failed: Arc<AtomicBool>,
     completion: Arc<Mutex<()>>,
+    terminal: bool,
+    os_process_id: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -396,12 +450,17 @@ struct ProcessSnapshot {
     exit: Option<DependencyExitStatus>,
     detached: bool,
     capture_error: Option<String>,
+    terminal_size: Option<DependencyTerminalSize>,
 }
 
 enum Control {
     Input {
         bytes: Vec<u8>,
         close: bool,
+        response: oneshot::Sender<Result<(), String>>,
+    },
+    Resize {
+        size: DependencyTerminalSize,
         response: oneshot::Sender<Result<(), String>>,
     },
     Interrupt(oneshot::Sender<Result<(), String>>),
@@ -646,10 +705,11 @@ impl ProcessDependencyPort for TokioProcessDependency {
         request: DependencyStartProcessRequest,
     ) -> Result<DependencyProcessRecord, ProcessDependencyError> {
         validate_start_request(&request, &self.config)?;
-        let expected_tool = if request.foreground {
-            "process.run"
-        } else {
-            "process.start"
+        let expected_tool = match (request.foreground, request.terminal_size.is_some()) {
+            (true, false) => "process.run",
+            (false, false) => "process.start",
+            (true, true) => "process.run_pty",
+            (false, true) => "process.start_pty",
         };
         let canonical = canonical_start_operation(&request)?;
         self.authorize(&request.authorization, expected_tool, &canonical)
@@ -686,75 +746,106 @@ impl ProcessDependencyPort for TokioProcessDependency {
                 return Err(redacted_io(error));
             }
         };
-        let mut command = Command::new(executable);
-        command
-            .args(&request.arguments)
-            .current_dir(&working_directory)
-            .env_clear()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-        inherit_safe_environment(&mut command, &self.config.inherited_environment_allowlist);
-        for (key, value) in &environment {
-            command.env(key, value);
-        }
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&log_directory).await;
-                return Err(redacted_io(error));
-            }
-        };
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(ProcessDependencyError::PipeUnavailable)?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or(ProcessDependencyError::PipeUnavailable)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or(ProcessDependencyError::PipeUnavailable)?;
         let stdout_truncated = Arc::new(AtomicBool::new(false));
         let stderr_truncated = Arc::new(AtomicBool::new(false));
-        let stdout_task = tokio::spawn(capture_stream(
-            stdout,
-            stdout_file,
-            request.output_limit_bytes,
-            Arc::clone(&stdout_truncated),
-        ));
-        let stderr_task = tokio::spawn(capture_stream(
-            stderr,
-            stderr_file,
-            request.output_limit_bytes,
-            Arc::clone(&stderr_truncated),
-        ));
         let snapshot = Arc::new(RwLock::new(ProcessSnapshot {
             state: DependencyProcessState::Running,
             exit: None,
             detached: false,
             capture_error: None,
+            terminal_size: request.terminal_size,
         }));
         let logs_removed = Arc::new(AtomicBool::new(false));
         let cleanup_failed = Arc::new(AtomicBool::new(false));
         let (control, receiver) = mpsc::channel(32);
-        tokio::spawn(supervise(
-            child,
-            Some(stdin),
-            receiver,
-            Arc::clone(&snapshot),
-            request.timeout,
-            stdout_task,
-            stderr_task,
-            self.config.drain_timeout,
-            self.config.input_write_timeout,
-            self.config.max_waiters_per_process,
-        ));
+        let os_process_id = if let Some(terminal_size) = request.terminal_size {
+            let stdout_file = stdout_file.into_std().await;
+            drop(stderr_file);
+            match spawn_terminal_process(
+                &executable,
+                &request.arguments,
+                &working_directory,
+                &environment,
+                &self.config.inherited_environment_allowlist,
+                terminal_size,
+                stdout_file,
+                request.output_limit_bytes,
+                Arc::clone(&stdout_truncated),
+                receiver,
+                Arc::clone(&snapshot),
+                request.timeout,
+                self.config.drain_timeout,
+                self.config.input_write_timeout,
+                self.config.max_waiters_per_process,
+            ) {
+                Ok(process_id) => process_id,
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&log_directory).await;
+                    return Err(error);
+                }
+            }
+        } else {
+            let mut command = Command::new(executable);
+            command
+                .args(&request.arguments)
+                .current_dir(&working_directory)
+                .env_clear()
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            command.process_group(0);
+            inherit_safe_environment(&mut command, &self.config.inherited_environment_allowlist);
+            for (key, value) in &environment {
+                command.env(key, value);
+            }
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    let _ = fs::remove_dir_all(&log_directory).await;
+                    return Err(redacted_io(error));
+                }
+            };
+            let os_process_id = child.id();
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or(ProcessDependencyError::PipeUnavailable)?;
+            let stderr = child
+                .stderr
+                .take()
+                .ok_or(ProcessDependencyError::PipeUnavailable)?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or(ProcessDependencyError::PipeUnavailable)?;
+            let stdout_task = tokio::spawn(capture_stream(
+                stdout,
+                stdout_file,
+                request.output_limit_bytes,
+                Arc::clone(&stdout_truncated),
+            ));
+            let stderr_task = tokio::spawn(capture_stream(
+                stderr,
+                stderr_file,
+                request.output_limit_bytes,
+                Arc::clone(&stderr_truncated),
+            ));
+            tokio::spawn(supervise(
+                child,
+                Some(stdin),
+                receiver,
+                Arc::clone(&snapshot),
+                request.timeout,
+                stdout_task,
+                stderr_task,
+                self.config.drain_timeout,
+                self.config.input_write_timeout,
+                self.config.max_waiters_per_process,
+            ));
+            os_process_id
+        };
         let entry = RegistryEntry {
             process_id: process_id.clone(),
             identity: request.authorization.identity,
@@ -771,6 +862,8 @@ impl ProcessDependencyPort for TokioProcessDependency {
             logs_removed,
             cleanup_failed,
             completion: Arc::new(Mutex::new(())),
+            terminal: request.terminal_size.is_some(),
+            os_process_id,
         };
         self.registry
             .lock()
@@ -802,6 +895,28 @@ impl ProcessDependencyPort for TokioProcessDependency {
             response,
         })
         .await
+    }
+
+    async fn resize(
+        &self,
+        request: DependencyResizeTerminalRequest,
+    ) -> Result<DependencyProcessRecord, ProcessDependencyError> {
+        validate_terminal_size(request.size)?;
+        let canonical = canonical_resize_operation(&request)?;
+        self.authorize(&request.authorization, "process.resize", &canonical)
+            .await?;
+        let entry = self
+            .entry(request.process_id, &request.authorization.identity)
+            .await?;
+        if !entry.terminal {
+            return Err(ProcessDependencyError::TerminalRequired);
+        }
+        send_control(&entry, |response| Control::Resize {
+            size: request.size,
+            response,
+        })
+        .await?;
+        Ok(record_from_entry(&entry).await)
     }
 
     async fn read_output(
@@ -906,29 +1021,48 @@ impl ProcessDependencyPort for TokioProcessDependency {
 pub fn canonical_start_operation(
     request: &DependencyStartProcessRequest,
 ) -> Result<Vec<u8>, ProcessDependencyError> {
-    let tool = if request.foreground {
-        "process.run"
-    } else {
-        "process.start"
+    let tool = match (request.foreground, request.terminal_size.is_some()) {
+        (true, false) => "process.run",
+        (false, false) => "process.start",
+        (true, true) => "process.run_pty",
+        (false, true) => "process.start_pty",
     };
     let timeout_ms = request
         .timeout
         .map(|value| u64::try_from(value.as_millis()))
         .transpose()
         .map_err(|_| ProcessDependencyError::AuthorizationDenied)?;
-    canonical_bytes(
-        tool,
-        &request.authorization.cancellation_id,
-        &json!({
-            "executable": request.executable,
-            "arguments": request.arguments,
-            "working_directory": request.requested_working_directory,
-            "environment": request.environment,
-            "timeout_ms": timeout_ms,
-            "output_limit_bytes": request.output_limit_bytes,
-            "cleanup": request.cleanup.as_str(),
-        }),
-    )
+    let arguments = request.terminal_size.map_or_else(
+        || {
+            json!({
+                "executable": request.executable,
+                "arguments": request.arguments,
+                "working_directory": request.requested_working_directory,
+                "environment": request.environment,
+                "timeout_ms": timeout_ms,
+                "output_limit_bytes": request.output_limit_bytes,
+                "cleanup": request.cleanup.as_str(),
+            })
+        },
+        |size| {
+            json!({
+                "executable": request.executable,
+                "arguments": request.arguments,
+                "working_directory": request.requested_working_directory,
+                "environment": request.environment,
+                "timeout_ms": timeout_ms,
+                "output_limit_bytes": request.output_limit_bytes,
+                "cleanup": request.cleanup.as_str(),
+                "terminal": {
+                    "columns": size.columns,
+                    "rows": size.rows,
+                    "pixel_width": size.pixel_width,
+                    "pixel_height": size.pixel_height,
+                },
+            })
+        },
+    );
+    canonical_bytes(tool, &request.authorization.cancellation_id, &arguments)
 }
 
 /// Reconstructs a canonical stdin operation.
@@ -952,6 +1086,27 @@ pub fn canonical_input_operation(
     )
 }
 
+/// Reconstructs a canonical terminal-resize operation.
+///
+/// # Errors
+///
+/// Returns an authorization error when serialization fails.
+pub fn canonical_resize_operation(
+    request: &DependencyResizeTerminalRequest,
+) -> Result<Vec<u8>, ProcessDependencyError> {
+    canonical_bytes(
+        "process.resize",
+        &request.authorization.cancellation_id,
+        &json!({
+            "process_id": request.process_id,
+            "columns": request.size.columns,
+            "rows": request.size.rows,
+            "pixel_width": request.size.pixel_width,
+            "pixel_height": request.size.pixel_height,
+        }),
+    )
+}
+
 /// Reconstructs a canonical output-read operation.
 ///
 /// # Errors
@@ -968,6 +1123,7 @@ pub fn canonical_read_operation(
             "stream": match request.stream {
                 DependencyOutputStream::Stdout => "stdout",
                 DependencyOutputStream::Stderr => "stderr",
+                DependencyOutputStream::Terminal => "terminal",
             },
             "offset": request.offset,
             "length": request.length,
@@ -1250,6 +1406,20 @@ fn inherit_safe_environment(command: &mut Command, allowlist: &BTreeSet<String>)
     }
 }
 
+fn inherit_safe_terminal_environment(command: &mut CommandBuilder, allowlist: &BTreeSet<String>) {
+    for configured in allowlist {
+        let normalized = normalize_env_key(configured);
+        for (key, value) in std::env::vars_os() {
+            if normalize_env_key(&key.to_string_lossy()) == normalized
+                && !is_sensitive_environment_key(&normalized)
+            {
+                command.env(key, value);
+                break;
+            }
+        }
+    }
+}
+
 fn normalize_env_key(key: &str) -> String {
     if cfg!(windows) {
         key.to_ascii_uppercase()
@@ -1327,7 +1497,279 @@ async fn record_from_entry(entry: &RegistryEntry) -> DependencyProcessRecord {
         stderr_truncated: entry.stderr_truncated.load(Ordering::Acquire),
         logs_removed: entry.logs_removed.load(Ordering::Acquire),
         cleanup_failed: entry.cleanup_failed.load(Ordering::Acquire),
+        terminal: entry.terminal,
+        terminal_size: snapshot.terminal_size,
+        os_process_id: entry.os_process_id,
     }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the dependency boundary keeps all PTY security and resource parameters explicit"
+)]
+fn spawn_terminal_process(
+    executable: &Path,
+    arguments: &[String],
+    working_directory: &Path,
+    environment: &BTreeMap<String, String>,
+    inherited_environment_allowlist: &BTreeSet<String>,
+    size: DependencyTerminalSize,
+    stdout_file: std::fs::File,
+    output_limit_bytes: u64,
+    stdout_truncated: Arc<AtomicBool>,
+    receiver: mpsc::Receiver<Control>,
+    snapshot: Arc<RwLock<ProcessSnapshot>>,
+    process_timeout: Option<Duration>,
+    drain_timeout: Duration,
+    input_write_timeout: Duration,
+    max_waiters: usize,
+) -> Result<Option<u32>, ProcessDependencyError> {
+    let pair = native_pty_system()
+        .openpty(size.portable())
+        .map_err(|_| ProcessDependencyError::Terminal)?;
+    let mut command = CommandBuilder::new(executable);
+    command.args(arguments);
+    command.cwd(working_directory);
+    command.env_clear();
+    inherit_safe_terminal_environment(&mut command, inherited_environment_allowlist);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|_| ProcessDependencyError::Terminal)?;
+    let process_id = child.process_id();
+    let reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|_| ProcessDependencyError::Terminal)?;
+    let writer = Arc::new(StdMutex::new(
+        pair.master
+            .take_writer()
+            .map_err(|_| ProcessDependencyError::Terminal)?,
+    ));
+    drop(pair.slave);
+    std::thread::Builder::new()
+        .name("agentmod-pty-supervisor".to_owned())
+        .spawn(move || {
+            supervise_terminal(
+                child,
+                pair.master,
+                reader,
+                writer,
+                stdout_file,
+                output_limit_bytes,
+                stdout_truncated,
+                receiver,
+                snapshot,
+                process_timeout,
+                drain_timeout,
+                input_write_timeout,
+                max_waiters,
+            );
+        })
+        .map_err(redacted_io)?;
+    Ok(process_id)
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the PTY supervisor owns one isolated child lifecycle and its bounded control loop"
+)]
+fn supervise_terminal(
+    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    master: Box<dyn MasterPty + Send>,
+    reader: Box<dyn Read + Send>,
+    writer: Arc<StdMutex<Box<dyn Write + Send>>>,
+    stdout_file: std::fs::File,
+    output_limit_bytes: u64,
+    stdout_truncated: Arc<AtomicBool>,
+    mut receiver: mpsc::Receiver<Control>,
+    snapshot: Arc<RwLock<ProcessSnapshot>>,
+    process_timeout: Option<Duration>,
+    drain_timeout: Duration,
+    input_write_timeout: Duration,
+    max_waiters: usize,
+) {
+    let (capture_sender, capture_receiver) = std::sync::mpsc::sync_channel(1);
+    let capture_truncated = Arc::clone(&stdout_truncated);
+    let capture_writer = Arc::clone(&writer);
+    let capture_started = std::thread::Builder::new()
+        .name("agentmod-pty-capture".to_owned())
+        .spawn(move || {
+            let result = capture_terminal_stream(
+                reader,
+                stdout_file,
+                output_limit_bytes,
+                capture_truncated,
+                capture_writer,
+            );
+            let _ = capture_sender.send(result);
+        })
+        .is_ok();
+    let deadline = process_timeout.map(|duration| std::time::Instant::now() + duration);
+    let mut timed_out = false;
+    let mut waiters = Vec::new();
+    let exit = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                break DependencyExitStatus {
+                    code: i32::try_from(status.exit_code()).ok(),
+                    success: status.success(),
+                    timed_out,
+                };
+            }
+            Err(_) => {
+                break DependencyExitStatus {
+                    code: None,
+                    success: false,
+                    timed_out,
+                };
+            }
+            Ok(None) => {}
+        }
+        if deadline.is_some_and(|value| std::time::Instant::now() >= value) {
+            timed_out = true;
+            let _ = child.kill();
+        }
+        while let Ok(control) = receiver.try_recv() {
+            match control {
+                Control::Input {
+                    bytes,
+                    close,
+                    response,
+                } => {
+                    let started = std::time::Instant::now();
+                    let result = writer
+                        .lock()
+                        .map_err(|_| "terminal writer unavailable".to_owned())
+                        .and_then(|mut writer| {
+                            writer
+                                .write_all(&bytes)
+                                .and_then(|()| writer.flush())
+                                .map_err(|_| "input failed".to_owned())
+                        })
+                        .and_then(|()| {
+                            (started.elapsed() <= input_write_timeout)
+                                .then_some(())
+                                .ok_or_else(|| "input timed out".to_owned())
+                        });
+                    if close {
+                        let _ = response
+                            .send(Err("PTY input cannot be closed independently".to_owned()));
+                        continue;
+                    }
+                    let _ = response.send(result);
+                }
+                Control::Resize { size, response } => {
+                    let result = master
+                        .resize(size.portable())
+                        .map_err(|_| "terminal resize failed".to_owned());
+                    if result.is_ok() {
+                        snapshot.blocking_write().terminal_size = Some(size);
+                    }
+                    let _ = response.send(result);
+                }
+                Control::Interrupt(response) => {
+                    let result = writer
+                        .lock()
+                        .map_err(|_| "interrupt failed".to_owned())
+                        .and_then(|mut writer| {
+                            writer
+                                .write_all(&[3])
+                                .and_then(|()| writer.flush())
+                                .map_err(|_| "interrupt failed".to_owned())
+                        });
+                    let _ = response.send(result);
+                }
+                Control::Kill(response) => {
+                    let result = child.kill().map_err(|_| "kill failed".to_owned());
+                    let _ = response.send(result);
+                }
+                Control::Wait(response) if waiters.len() < max_waiters => {
+                    waiters.push(response);
+                }
+                Control::Wait(_) => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(writer);
+    drop(master);
+    let capture_error =
+        if capture_started && matches!(capture_receiver.recv_timeout(drain_timeout), Ok(Ok(()))) {
+            None
+        } else {
+            Some("terminal capture failed or exceeded drain deadline".to_owned())
+        };
+    {
+        let mut state = snapshot.blocking_write();
+        state.state = DependencyProcessState::Exited;
+        state.exit = Some(exit.clone());
+        state.capture_error = capture_error;
+    }
+    for waiter in waiters {
+        let _ = waiter.send(exit.clone());
+    }
+}
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "owned Arc values keep the detached capture thread resources alive"
+)]
+fn capture_terminal_stream(
+    mut reader: Box<dyn Read + Send>,
+    mut log: std::fs::File,
+    limit: u64,
+    truncated: Arc<AtomicBool>,
+    writer: Arc<StdMutex<Box<dyn Write + Send>>>,
+) -> Result<(), ProcessDependencyError> {
+    let mut retained = 0_u64;
+    let mut buffer = vec![0_u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer).map_err(redacted_io)?;
+        if count == 0 {
+            break;
+        }
+        respond_to_terminal_queries(&buffer[..count], &writer)?;
+        let available = limit.saturating_sub(retained);
+        let write_count = usize::try_from(
+            available
+                .min(u64::try_from(count).map_err(|_| ProcessDependencyError::LengthOverflow)?),
+        )
+        .map_err(|_| ProcessDependencyError::LengthOverflow)?;
+        if write_count > 0 {
+            log.write_all(&buffer[..write_count]).map_err(redacted_io)?;
+            retained = retained
+                .checked_add(
+                    u64::try_from(write_count)
+                        .map_err(|_| ProcessDependencyError::LengthOverflow)?,
+                )
+                .ok_or(ProcessDependencyError::LengthOverflow)?;
+        }
+        if write_count < count {
+            truncated.store(true, Ordering::Release);
+        }
+    }
+    log.flush().map_err(redacted_io)?;
+    log.sync_data().map_err(redacted_io)
+}
+
+fn respond_to_terminal_queries(
+    bytes: &[u8],
+    writer: &StdMutex<Box<dyn Write + Send>>,
+) -> Result<(), ProcessDependencyError> {
+    if bytes.windows(4).any(|window| window == b"\x1b[6n") {
+        let mut writer = writer
+            .lock()
+            .map_err(|_| ProcessDependencyError::Terminal)?;
+        writer.write_all(b"\x1b[1;1R").map_err(redacted_io)?;
+        writer.flush().map_err(redacted_io)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1374,6 +1816,9 @@ async fn supervise(
                             Ok(())
                         }).await.map_err(|_| "input timed out".to_owned()).and_then(|value| value);
                         let _ = response.send(result);
+                    }
+                    Some(Control::Resize { response, .. }) => {
+                        let _ = response.send(Err("process has no terminal".to_owned()));
                     }
                     Some(Control::Interrupt(response)) => {
                         let result = interrupt_child(&mut child).await;
@@ -1559,6 +2004,12 @@ async fn read_output(
     let path = match stream {
         DependencyOutputStream::Stdout => entry.log_directory.join("stdout.log"),
         DependencyOutputStream::Stderr => entry.log_directory.join("stderr.log"),
+        DependencyOutputStream::Terminal => {
+            if !entry.terminal {
+                return Err(ProcessDependencyError::TerminalRequired);
+            }
+            entry.log_directory.join("stdout.log")
+        }
     };
     let mut file = OpenOptions::new()
         .read(true)
@@ -1583,7 +2034,9 @@ async fn read_output(
         bytes,
         retained_bytes,
         truncated: match stream {
-            DependencyOutputStream::Stdout => entry.stdout_truncated.load(Ordering::Acquire),
+            DependencyOutputStream::Stdout | DependencyOutputStream::Terminal => {
+                entry.stdout_truncated.load(Ordering::Acquire)
+            }
             DependencyOutputStream::Stderr => entry.stderr_truncated.load(Ordering::Acquire),
         },
     })
@@ -1619,6 +2072,9 @@ fn validate_start_request(
     {
         return Err(ProcessDependencyError::InvalidOutputLimit);
     }
+    if let Some(size) = request.terminal_size {
+        validate_terminal_size(size)?;
+    }
     if request.environment.len() > config.max_environment_entries
         || request
             .environment
@@ -1636,6 +2092,14 @@ fn validate_start_request(
         return Err(ProcessDependencyError::InvalidEnvironment);
     }
     Ok(())
+}
+
+fn validate_terminal_size(size: DependencyTerminalSize) -> Result<(), ProcessDependencyError> {
+    if size.columns == 0 || size.rows == 0 {
+        Err(ProcessDependencyError::InvalidTerminalSize)
+    } else {
+        Ok(())
+    }
 }
 
 fn validate_authorization_shape(
@@ -1737,6 +2201,15 @@ pub enum ProcessDependencyError {
     /// Pipe unavailable.
     #[error("process pipe unavailable")]
     PipeUnavailable,
+    /// Terminal dimensions are invalid.
+    #[error("invalid terminal dimensions")]
+    InvalidTerminalSize,
+    /// Operation requires a pseudo-terminal.
+    #[error("process has no pseudo-terminal")]
+    TerminalRequired,
+    /// Pseudo-terminal setup or control failed.
+    #[error("pseudo-terminal operation failed")]
+    Terminal,
     /// Input bound.
     #[error("process input exceeds bound")]
     InputTooLarge,
@@ -1982,6 +2455,7 @@ mod tests {
                     output_limit_bytes: 1024,
                     cleanup: DependencyCleanupPolicy::Retain,
                     foreground: false,
+                    terminal_size: None,
                 })
                 .await,
             Err(ProcessDependencyError::AuthorizationDenied)

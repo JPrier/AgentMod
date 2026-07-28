@@ -7,7 +7,8 @@ use agentmod_process_host_dependency::{
     DependencyExitStatus, DependencyIdentity, DependencyListRequest, DependencyOutputStream,
     DependencyProcessInputRequest, DependencyProcessRecord, DependencyProcessRequest,
     DependencyProcessState, DependencyReadOutputRequest, DependencyReadOutputResponse,
-    DependencyStartProcessRequest, ProcessDependencyError, ProcessDependencyPort,
+    DependencyResizeTerminalRequest, DependencyStartProcessRequest, DependencyTerminalSize,
+    ProcessDependencyError, ProcessDependencyPort,
 };
 use async_trait::async_trait;
 use thiserror::Error;
@@ -76,6 +77,19 @@ pub enum ProcessDataCleanup {
     RemoveLogsAlways,
 }
 
+/// Data-owned terminal dimensions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessDataTerminalSize {
+    /// Columns.
+    pub columns: u16,
+    /// Rows.
+    pub rows: u16,
+    /// Cell width in pixels.
+    pub pixel_width: u16,
+    /// Cell height in pixels.
+    pub pixel_height: u16,
+}
+
 /// Start data request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartProcessDataRequest {
@@ -101,6 +115,8 @@ pub struct StartProcessDataRequest {
     pub cleanup: ProcessDataCleanup,
     /// Foreground.
     pub foreground: bool,
+    /// Terminal dimensions when a PTY is requested.
+    pub terminal_size: Option<ProcessDataTerminalSize>,
 }
 
 /// State.
@@ -158,6 +174,12 @@ pub struct ProcessDataRecord {
     pub logs_removed: bool,
     /// cleanup failed.
     pub cleanup_failed: bool,
+    /// PTY marker.
+    pub terminal: bool,
+    /// Current terminal dimensions.
+    pub terminal_size: Option<ProcessDataTerminalSize>,
+    /// OS process ID.
+    pub os_process_id: Option<u32>,
 }
 
 /// Stream.
@@ -167,6 +189,8 @@ pub enum ProcessDataStream {
     Stdout,
     /// stderr.
     Stderr,
+    /// Combined PTY stream.
+    Terminal,
 }
 
 /// Control request.
@@ -189,6 +213,17 @@ pub struct ProcessInputDataRequest {
     pub bytes: Vec<u8>,
     /// Close.
     pub close: bool,
+}
+
+/// Terminal resize request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResizeProcessTerminalDataRequest {
+    /// Authorization.
+    pub authorization: ProcessDataAuthorization,
+    /// ID.
+    pub process_id: ProcessDataId,
+    /// Dimensions.
+    pub size: ProcessDataTerminalSize,
 }
 
 /// Output request.
@@ -262,6 +297,11 @@ pub trait ProcessDataPort: Send + Sync {
     /// Input.
     async fn input_process(&self, request: ProcessInputDataRequest)
     -> Result<(), ProcessDataError>;
+    /// Resize terminal.
+    async fn resize_process_terminal(
+        &self,
+        request: ResizeProcessTerminalDataRequest,
+    ) -> Result<ProcessDataRecord, ProcessDataError>;
     /// Output.
     async fn read_process_output(
         &self,
@@ -338,6 +378,7 @@ impl<D: ProcessDependencyPort> ProcessDataPort for ProcessData<D> {
                 output_limit_bytes: request.output_limit_bytes,
                 cleanup: map_cleanup(request.cleanup),
                 foreground: request.foreground,
+                terminal_size: request.terminal_size.map(map_terminal_size),
             })
             .await
             .map_err(map_error)?;
@@ -359,6 +400,22 @@ impl<D: ProcessDependencyPort> ProcessDataPort for ProcessData<D> {
             .map_err(map_error)
     }
 
+    async fn resize_process_terminal(
+        &self,
+        request: ResizeProcessTerminalDataRequest,
+    ) -> Result<ProcessDataRecord, ProcessDataError> {
+        map_record(
+            self.dependency
+                .resize(DependencyResizeTerminalRequest {
+                    authorization: map_authorization(request.authorization),
+                    process_id: request.process_id.0,
+                    size: map_terminal_size(request.size),
+                })
+                .await
+                .map_err(map_error)?,
+        )
+    }
+
     async fn read_process_output(
         &self,
         request: ReadProcessOutputDataRequest,
@@ -370,6 +427,7 @@ impl<D: ProcessDependencyPort> ProcessDataPort for ProcessData<D> {
                 stream: match request.stream {
                     ProcessDataStream::Stdout => DependencyOutputStream::Stdout,
                     ProcessDataStream::Stderr => DependencyOutputStream::Stderr,
+                    ProcessDataStream::Terminal => DependencyOutputStream::Terminal,
                 },
                 offset: request.offset,
                 length: request.length,
@@ -498,6 +556,24 @@ fn map_cleanup(value: ProcessDataCleanup) -> DependencyCleanupPolicy {
     }
 }
 
+fn map_terminal_size(value: ProcessDataTerminalSize) -> DependencyTerminalSize {
+    DependencyTerminalSize {
+        columns: value.columns,
+        rows: value.rows,
+        pixel_width: value.pixel_width,
+        pixel_height: value.pixel_height,
+    }
+}
+
+fn map_dependency_terminal_size(value: DependencyTerminalSize) -> ProcessDataTerminalSize {
+    ProcessDataTerminalSize {
+        columns: value.columns,
+        rows: value.rows,
+        pixel_width: value.pixel_width,
+        pixel_height: value.pixel_height,
+    }
+}
+
 fn map_record(value: DependencyProcessRecord) -> Result<ProcessDataRecord, ProcessDataError> {
     Ok(ProcessDataRecord {
         process_id: ProcessDataId::parse(value.process_id.as_str().to_owned())?,
@@ -517,6 +593,9 @@ fn map_record(value: DependencyProcessRecord) -> Result<ProcessDataRecord, Proce
         stderr_truncated: value.stderr_truncated,
         logs_removed: value.logs_removed,
         cleanup_failed: value.cleanup_failed,
+        terminal: value.terminal,
+        terminal_size: value.terminal_size.map(map_dependency_terminal_size),
+        os_process_id: value.os_process_id,
     })
 }
 
@@ -549,10 +628,12 @@ fn map_error(error: ProcessDependencyError) -> ProcessDataError {
         ProcessDependencyError::InputTooLarge
         | ProcessDependencyError::InvalidOutputRange
         | ProcessDependencyError::InvalidOutputLimit
+        | ProcessDependencyError::InvalidTerminalSize
         | ProcessDependencyError::LengthOverflow
         | ProcessDependencyError::ResourceLimit => ProcessDataError::Bounds,
         ProcessDependencyError::ProcessNotFound
         | ProcessDependencyError::ProcessExited
+        | ProcessDependencyError::TerminalRequired
         | ProcessDependencyError::SupervisorStopped => ProcessDataError::Lifecycle,
         _ => ProcessDataError::External,
     }

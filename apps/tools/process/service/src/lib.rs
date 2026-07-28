@@ -1,5 +1,7 @@
 //! Authenticated tool-protocol service for process operations.
 
+pub mod local_rpc;
+
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
 use agentmod_process_host_logic::{
@@ -154,6 +156,20 @@ impl<L> ProcessHostService<L> {
 }
 
 impl<L: ProcessLogicPort> ProcessHostService<L> {
+    /// Returns whether the reconnectable endpoint may exit without abandoning
+    /// live inherited process handles.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted service error when activity inspection fails.
+    pub async fn may_exit_idle(&self) -> Result<bool, ProcessServiceError> {
+        self.logic
+            .active_count(self.identity())
+            .await
+            .map(|count| count == 0)
+            .map_err(map_logic_error)
+    }
+
     /// Handles a request without terminating the host on failure.
     ///
     /// # Errors
@@ -675,6 +691,12 @@ mod tests {
             _authorization: ProcessAuthorization,
         ) -> Result<Vec<ProcessResult>, ProcessLogicError> {
             Ok(Vec::new())
+        }
+        async fn active_count(
+            &self,
+            _identity: ProcessIdentity,
+        ) -> Result<usize, ProcessLogicError> {
+            Ok(0)
         }
         async fn cancel(
             &self,

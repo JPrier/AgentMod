@@ -1,8 +1,11 @@
 //! Provider-independent tool-host wire contracts.
 
-use agentmod_primitives::{ArtifactId, CancellationId};
+use agentmod_primitives::{ArtifactId, CancellationId, Version};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Current tool-host wire protocol version.
+pub const PROTOCOL_VERSION: Version = Version::new(1, 0);
 
 /// Tool schema advertised lazily by a host.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]

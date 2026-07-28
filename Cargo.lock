@@ -746,6 +746,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -790,13 +791,16 @@ dependencies = [
 name = "agentmod-process-host-service"
 version = "0.1.0"
 dependencies = [
+ "agentmod-primitives",
  "agentmod-process-host-logic",
+ "agentmod-protocol-support",
  "agentmod-tool-protocol",
  "async-trait",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

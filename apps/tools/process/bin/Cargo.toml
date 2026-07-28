@@ -21,6 +21,7 @@ agentmod-primitives = { path = "../../../../core/primitives" }
 agentmod-protocol-support = { path = "../../../../core/protocol-support" }
 serde_json.workspace = true
 tempfile.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

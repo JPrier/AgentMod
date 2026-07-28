@@ -42,4 +42,10 @@ Recovered-exited and dispatch-uncertain records remain inspectable and are never
 
 Recovered-running-unattached records prove that an OS child with the original identity remains, but they do not prove access to its inherited streams or PTY. Handle-dependent control is denied. This fail-closed result is preferable to sending input or signals to a reused or unrelated process.
 
-Cross-runtime live reattachment therefore depends on a surviving, reconnectable process-host transport. The durable identity model is designed to support that next step without changing logic or service semantics.
+## Runtime reconnection
+
+The runtime connects to a deterministic endpoint bound to owner, session, and workspace. The process host runs in an independent process group and accepts the versioned tool protocol over an authenticated Unix socket or Windows named pipe. The authentication key is derived from the runtime's protected bootstrap authority, so a legitimate replacement runtime can negotiate with the existing host without persisting a plaintext key in canonical state.
+
+A runtime connection disappearing does not terminate the host. The host retains the inherited process and PTY handles, and a replacement connection can list, attach, read, input, resize, interrupt, or kill through the normal exact-action grants. The host exits only when an idle check observes zero in-flight requests and zero live child handles.
+
+If the process host itself crashes, live handle recreation remains impossible. The durable identity model then reports `recovered_running_unattached` and continues to fail closed.

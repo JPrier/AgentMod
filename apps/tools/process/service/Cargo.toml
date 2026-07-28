@@ -8,15 +8,18 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+agentmod-primitives = { path = "../../../../core/primitives" }
 agentmod-process-host-logic = { path = "../logic" }
+agentmod-protocol-support = { path = "../../../../core/protocol-support" }
 agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-tokio.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

@@ -33,6 +33,86 @@ use tokio::{
 };
 use uuid::Uuid;
 
+/// Prepares the exact reconnectable process-host endpoint before binding.
+///
+/// # Errors
+///
+/// Fails closed for relative paths, live listeners, symlinks, or non-socket
+/// entries. Windows named pipes have no persistent entry to remove.
+#[cfg(unix)]
+pub fn prepare_local_endpoint(endpoint: &str) -> Result<(), ProcessDependencyError> {
+    use std::os::unix::{fs::FileTypeExt, net::UnixStream};
+
+    let path = Path::new(endpoint);
+    if endpoint.is_empty() || !path.is_absolute() {
+        return Err(ProcessDependencyError::InvalidConfiguration);
+    }
+    let Some(parent) = path.parent() else {
+        return Err(ProcessDependencyError::InvalidConfiguration);
+    };
+    if !parent.is_dir() {
+        return Err(ProcessDependencyError::InvalidConfiguration);
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(ProcessDependencyError::Io),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(ProcessDependencyError::StorageEscape);
+    }
+    if UnixStream::connect(path).is_ok() {
+        return Err(ProcessDependencyError::ResourceLimit);
+    }
+    std::fs::remove_file(path).map_err(redacted_io)
+}
+
+/// Validates the exact Windows named-pipe endpoint before binding.
+///
+/// # Errors
+///
+/// Returns [`ProcessDependencyError::InvalidConfiguration`] for malformed
+/// local pipe names.
+#[cfg(windows)]
+pub fn prepare_local_endpoint(endpoint: &str) -> Result<(), ProcessDependencyError> {
+    if !endpoint.starts_with(r"\\.\pipe\") || endpoint.len() <= r"\\.\pipe\".len() {
+        return Err(ProcessDependencyError::InvalidConfiguration);
+    }
+    Ok(())
+}
+
+/// Removes the exact Unix socket after graceful host shutdown.
+///
+/// # Errors
+///
+/// Refuses to remove anything other than a socket at the configured path.
+#[cfg(unix)]
+pub fn cleanup_local_endpoint(endpoint: &str) -> Result<(), ProcessDependencyError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let path = Path::new(endpoint);
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(ProcessDependencyError::Io),
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(ProcessDependencyError::StorageEscape);
+    }
+    std::fs::remove_file(path).map_err(redacted_io)
+}
+
+/// Windows named pipes disappear when their final handle closes.
+///
+/// # Errors
+///
+/// This platform implementation has no fallible cleanup.
+#[cfg(windows)]
+#[allow(clippy::unnecessary_wraps)]
+pub fn cleanup_local_endpoint(_endpoint: &str) -> Result<(), ProcessDependencyError> {
+    Ok(())
+}
+
 /// Dependency-owned caller identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyIdentity {
@@ -437,6 +517,11 @@ pub trait ProcessDependencyPort: Send + Sync {
         &self,
         request: DependencyListRequest,
     ) -> Result<Vec<DependencyProcessRecord>, ProcessDependencyError>;
+    /// Counts identity-owned children whose handles remain live in this host.
+    async fn active_count(
+        &self,
+        identity: DependencyIdentity,
+    ) -> Result<usize, ProcessDependencyError>;
     /// Cancels by opaque token and identity.
     async fn cancel(
         &self,
@@ -1128,6 +1213,32 @@ impl ProcessDependencyPort for TokioProcessDependency {
             records.push(record_from_entry(&entry).await);
         }
         Ok(records)
+    }
+
+    async fn active_count(
+        &self,
+        identity: DependencyIdentity,
+    ) -> Result<usize, ProcessDependencyError> {
+        let entries: Vec<_> = self
+            .registry
+            .lock()
+            .await
+            .values()
+            .filter(|entry| entry.identity == identity)
+            .cloned()
+            .collect();
+        let mut count = 0_usize;
+        for entry in entries {
+            refresh_recovered_entry(&entry).await?;
+            if entry.snapshot.read().await.state == DependencyProcessState::Running
+                && *entry.recovery_state.read().await == DependencyRecoveryState::Live
+            {
+                count = count
+                    .checked_add(1)
+                    .ok_or(ProcessDependencyError::ResourceLimit)?;
+            }
+        }
+        Ok(count)
     }
 
     async fn cancel(

@@ -45,4 +45,4 @@ Malformed generation files are renamed with a corruption suffix and omitted. Own
 
 Recovery no longer relies on PID alone and cannot duplicate an ambiguous dispatch. The runtime can display exact recovery classification and causally decide whether a continuation is safe.
 
-True interactive reattachment across a process-host crash requires the original capability host to survive and accept a reconnectable authenticated transport. It is not simulated by reopening `/proc`, console devices, or guessed PTY paths.
+True interactive reattachment across a process-host crash remains impossible and is not simulated by reopening `/proc`, console devices, or guessed PTY paths. ADR 0017 adds a reconnectable authenticated transport so runtime-daemon replacement retains the original capability host and its handles.

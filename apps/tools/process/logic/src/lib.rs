@@ -385,6 +385,8 @@ pub trait ProcessLogicPort: Send + Sync {
         &self,
         authorization: ProcessAuthorization,
     ) -> Result<Vec<ProcessResult>, ProcessLogicError>;
+    /// Counts live children owned by the process host identity.
+    async fn active_count(&self, identity: ProcessIdentity) -> Result<usize, ProcessLogicError>;
     /// Cancel.
     async fn cancel(&self, command: CancelProcessCommand) -> Result<String, ProcessLogicError>;
 }
@@ -541,6 +543,16 @@ impl<D: ProcessDataPort> ProcessLogicPort for ProcessLogic<D> {
             .into_iter()
             .map(map_record)
             .collect()
+    }
+
+    async fn active_count(&self, identity: ProcessIdentity) -> Result<usize, ProcessLogicError> {
+        self.data
+            .active_process_count(ProcessDataIdentity {
+                owner_id: identity.owner_id,
+                session_id: identity.session_id,
+            })
+            .await
+            .map_err(map_error)
     }
 
     async fn cancel(&self, command: CancelProcessCommand) -> Result<String, ProcessLogicError> {

@@ -354,6 +354,11 @@ pub trait ProcessDataPort: Send + Sync {
         &self,
         authorization: ProcessDataAuthorization,
     ) -> Result<Vec<ProcessDataRecord>, ProcessDataError>;
+    /// Counts identity-owned children whose dependency handles remain live.
+    async fn active_process_count(
+        &self,
+        identity: ProcessDataIdentity,
+    ) -> Result<usize, ProcessDataError>;
     /// Cancel.
     async fn cancel_process(
         &self,
@@ -523,6 +528,16 @@ impl<D: ProcessDependencyPort> ProcessDataPort for ProcessData<D> {
             .into_iter()
             .map(map_record)
             .collect()
+    }
+
+    async fn active_process_count(
+        &self,
+        identity: ProcessDataIdentity,
+    ) -> Result<usize, ProcessDataError> {
+        self.dependency
+            .active_count(map_identity(identity))
+            .await
+            .map_err(map_error)
     }
 
     async fn cancel_process(

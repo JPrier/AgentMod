@@ -166,9 +166,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_owned)
                 .collect(),
+            endpoint_root: sessions_root.join(".process-hosts"),
             maximum_frame_bytes: 16 * 1024 * 1024,
             request_timeout: std::time::Duration::from_secs(24 * 60 * 60),
-            authorization_key: ProcessCapabilityDependency::generate_authorization_key(),
+            authorization_key: ProcessCapabilityDependency::derive_authorization_key(
+                authorization_token.as_bytes(),
+            ),
         })?;
         let scheduler_root = std::env::var_os("AGENTMOD_SCHEDULER_ROOT").map_or_else(
             || {

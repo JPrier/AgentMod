@@ -6,25 +6,31 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    path::Path,
+    io,
+    path::{Path, PathBuf},
     process::Stdio,
     str::FromStr,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use agentmod_primitives::{CancellationId, ContentHash, TimestampMillis};
-use agentmod_protocol_support::authorization::{
-    AuthorizationClaims, AuthorizationKey, seal_authorization,
+use agentmod_primitives::{
+    CancellationId, CausationId, ContentHash, CorrelationId, IdempotencyId, RequestId,
+    TimestampMillis,
 };
-use agentmod_tool_protocol::{OutputStream, ToolHostCommand, ToolHostEvent};
+use agentmod_protocol_support::{
+    FrameHeader, FrameKind, Handshake, Negotiated, WireFrame,
+    authorization::{AuthorizationClaims, AuthorizationKey, seal_authorization},
+    read_frame as read_protocol_frame, write_frame as write_protocol_frame,
+};
+use agentmod_tool_protocol::{OutputStream, PROTOCOL_VERSION, ToolHostCommand, ToolHostEvent};
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{Child, ChildStdin, ChildStdout, Command},
+    io::{AsyncRead, AsyncWrite},
+    process::Command,
     sync::Mutex,
-    time::timeout,
+    time::{sleep, timeout},
 };
 
 use crate::tool::{
@@ -38,15 +44,18 @@ pub struct ProcessCapabilityDependencyConfig {
     pub arguments: Vec<String>,
     pub owner: String,
     pub allowed_executables: Vec<String>,
+    pub endpoint_root: PathBuf,
     pub maximum_frame_bytes: usize,
     pub request_timeout: Duration,
     pub authorization_key: [u8; 32],
 }
 
+trait ProcessLocalStream: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> ProcessLocalStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
 struct Connection {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stream: Box<dyn ProcessLocalStream>,
 }
 
 #[derive(Clone)]
@@ -67,6 +76,16 @@ impl ProcessCapabilityDependency {
         key
     }
 
+    /// Derives a restart-stable host trust key from a protected bootstrap
+    /// secret.
+    #[must_use]
+    pub fn derive_authorization_key(seed: &[u8]) -> [u8; 32] {
+        let mut material = Vec::with_capacity(38 + seed.len());
+        material.extend_from_slice(b"agentmod.process-host.authorization.v1\0");
+        material.extend_from_slice(seed);
+        *blake3::hash(&material).as_bytes()
+    }
+
     /// Creates a lazy per-session process-host supervisor.
     ///
     /// # Errors
@@ -78,23 +97,51 @@ impl ProcessCapabilityDependency {
             || config.program.contains('\0')
             || config.arguments.iter().any(|value| value.contains('\0'))
             || config.owner.trim().is_empty()
+            || !config.endpoint_root.is_absolute()
             || config.maximum_frame_bytes == 0
             || config.request_timeout.is_zero()
             || config.authorization_key == [0; 32]
         {
             return Err(ToolHostDependencyError::InvalidConfiguration);
         }
+        prepare_endpoint_root(&config.endpoint_root)?;
         Ok(Self {
             config: Arc::new(config),
             connections: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    fn connect(
+    async fn connect(
         &self,
         session: &str,
         workspace: &Path,
     ) -> Result<Connection, ToolHostDependencyError> {
+        let endpoint = self.endpoint(session, workspace);
+        match open_endpoint(&endpoint).await {
+            Ok(mut stream) => {
+                self.handshake(&mut stream).await?;
+                return Ok(Connection { stream });
+            }
+            Err(_) => self.spawn_host(session, workspace, &endpoint)?,
+        }
+        for _ in 0..100 {
+            match open_endpoint(&endpoint).await {
+                Ok(mut stream) => {
+                    self.handshake(&mut stream).await?;
+                    return Ok(Connection { stream });
+                }
+                Err(_) => sleep(Duration::from_millis(20)).await,
+            }
+        }
+        Err(ToolHostDependencyError::Unavailable)
+    }
+
+    fn spawn_host(
+        &self,
+        session: &str,
+        workspace: &Path,
+        endpoint: &str,
+    ) -> Result<(), ToolHostDependencyError> {
         let mut command = Command::new(&self.config.program);
         command
             .args(&self.config.arguments)
@@ -110,10 +157,12 @@ impl ProcessCapabilityDependency {
                 "AGENTMOD_PROCESS_ALLOWED_EXECUTABLES",
                 self.config.allowed_executables.join(";"),
             )
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
+            .env("AGENTMOD_PROCESS_ENDPOINT", endpoint)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .kill_on_drop(true);
+            .kill_on_drop(false);
+        configure_detached_host(&mut command);
         for name in [
             "ALLUSERSPROFILE",
             "APPDATA",
@@ -150,19 +199,112 @@ impl ProcessCapabilityDependency {
         let mut child = command
             .spawn()
             .map_err(|_| ToolHostDependencyError::Unavailable)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or(ToolHostDependencyError::Unavailable)?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(ToolHostDependencyError::Unavailable)?;
-        Ok(Connection {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        })
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+        });
+        Ok(())
+    }
+
+    async fn handshake(
+        &self,
+        stream: &mut Box<dyn ProcessLocalStream>,
+    ) -> Result<(), ToolHostDependencyError> {
+        let request = new_header(FrameKind::Handshake, None);
+        write_protocol_frame(
+            stream,
+            &WireFrame {
+                header: request.clone(),
+                payload: Handshake {
+                    supported_versions: vec![PROTOCOL_VERSION],
+                    capabilities: std::collections::BTreeSet::from([
+                        String::from("bounded_backpressure"),
+                        String::from("cancellation"),
+                        String::from("idempotency"),
+                        String::from("request_response"),
+                        String::from("streaming"),
+                    ]),
+                    authorization_token: encode_hex(&self.config.authorization_key),
+                },
+            },
+            self.config.maximum_frame_bytes,
+        )
+        .await
+        .map_err(|_| ToolHostDependencyError::Transport)?;
+        let response: WireFrame<Negotiated> =
+            read_protocol_frame(stream, self.config.maximum_frame_bytes)
+                .await
+                .map_err(|_| ToolHostDependencyError::Transport)?;
+        validate_unary_header(&response.header, &request)?;
+        if !response
+            .payload
+            .version
+            .is_compatible_with(PROTOCOL_VERSION)
+            || !response.payload.capabilities.contains("request_response")
+            || !response.payload.capabilities.contains("streaming")
+        {
+            return Err(ToolHostDependencyError::Protocol);
+        }
+        Ok(())
+    }
+
+    fn endpoint(&self, session: &str, workspace: &Path) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"agentmod.process-host.endpoint.v1\0");
+        hasher.update(self.config.owner.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(session.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(workspace.as_os_str().to_string_lossy().as_bytes());
+        let digest = hasher.finalize().to_hex();
+        endpoint_name(&self.config.endpoint_root, &digest)
+    }
+
+    async fn send_command(
+        &self,
+        connection: &mut Connection,
+        wire: ToolHostCommand,
+        cancellation_id: CancellationId,
+    ) -> Result<Vec<DependencyToolEvent>, ToolHostDependencyError> {
+        let request = new_header(FrameKind::Request, Some(cancellation_id));
+        write_protocol_frame(
+            &mut connection.stream,
+            &WireFrame {
+                header: request.clone(),
+                payload: wire,
+            },
+            self.config.maximum_frame_bytes,
+        )
+        .await
+        .map_err(|_| ToolHostDependencyError::Transport)?;
+        let mut events = Vec::new();
+        let mut sequence = 1_u64;
+        loop {
+            let response: WireFrame<ToolHostEvent> =
+                read_protocol_frame(&mut connection.stream, self.config.maximum_frame_bytes)
+                    .await
+                    .map_err(|_| ToolHostDependencyError::Transport)?;
+            validate_event_header(&response.header, &request, sequence)?;
+            let terminal_event = matches!(
+                response.payload,
+                ToolHostEvent::Completed { .. }
+                    | ToolHostEvent::Failed { .. }
+                    | ToolHostEvent::Cancelled { .. }
+            );
+            let terminal_frame = matches!(
+                response.header.kind,
+                FrameKind::Response | FrameKind::StreamEnd
+            );
+            if terminal_event != terminal_frame {
+                return Err(ToolHostDependencyError::Protocol);
+            }
+            events.push(map_event(response.payload)?);
+            if terminal_frame {
+                return Ok(events);
+            }
+            sequence = sequence
+                .checked_add(1)
+                .ok_or(ToolHostDependencyError::Protocol)?;
+        }
     }
 
     async fn execute_once(
@@ -192,40 +334,14 @@ impl ProcessCapabilityDependency {
         if !connections.contains_key(&key) {
             connections.insert(
                 key.clone(),
-                self.connect(&command.session_id, &command.workspace)?,
+                self.connect(&command.session_id, &command.workspace)
+                    .await?,
             );
         }
         let connection = connections
             .get_mut(&key)
             .ok_or(ToolHostDependencyError::Unavailable)?;
-        let mut bytes = serde_json::to_vec(&wire).map_err(|_| ToolHostDependencyError::Protocol)?;
-        bytes.push(b'\n');
-        connection
-            .stdin
-            .write_all(&bytes)
-            .await
-            .map_err(|_| ToolHostDependencyError::Transport)?;
-        connection
-            .stdin
-            .flush()
-            .await
-            .map_err(|_| ToolHostDependencyError::Transport)?;
-        let mut events = Vec::new();
-        loop {
-            let frame = read_frame(&mut connection.stdout, self.config.maximum_frame_bytes).await?;
-            let event: ToolHostEvent =
-                serde_json::from_slice(&frame).map_err(|_| ToolHostDependencyError::Protocol)?;
-            let terminal = matches!(
-                event,
-                ToolHostEvent::Completed { .. }
-                    | ToolHostEvent::Failed { .. }
-                    | ToolHostEvent::Cancelled { .. }
-            );
-            events.push(map_event(event)?);
-            if terminal {
-                return Ok(events);
-            }
-        }
+        self.send_command(connection, wire, cancellation_id).await
     }
 
     fn grant(
@@ -266,22 +382,129 @@ impl ToolHostDependencyPort for ProcessCapabilityDependency {
             Ok(result) => result,
             Err(_) => Err(ToolHostDependencyError::Timeout),
         };
-        if result.is_err()
-            && let Some(mut connection) = self.connections.lock().await.remove(&key)
-        {
-            let _ = connection.child.start_kill();
-            let _ = connection.child.wait().await;
+        if result.is_err() {
+            self.connections.lock().await.remove(&key);
         }
         result
     }
 
     async fn shutdown(&self) {
-        let connections = std::mem::take(&mut *self.connections.lock().await);
-        for (_, mut connection) in connections {
-            let _ = connection.child.start_kill();
-            let _ = connection.child.wait().await;
-        }
+        self.connections.lock().await.clear();
     }
+}
+
+fn prepare_endpoint_root(root: &Path) -> Result<(), ToolHostDependencyError> {
+    std::fs::create_dir_all(root).map_err(|_| ToolHostDependencyError::Unavailable)?;
+    let metadata =
+        std::fs::symlink_metadata(root).map_err(|_| ToolHostDependencyError::Unavailable)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(ToolHostDependencyError::InvalidConfiguration);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
+            .map_err(|_| ToolHostDependencyError::Unavailable)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn endpoint_name(root: &Path, digest: &str) -> String {
+    root.join(format!("process-{}.sock", &digest[..32]))
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(windows)]
+fn endpoint_name(_root: &Path, digest: &str) -> String {
+    format!(r"\\.\pipe\agentmod-process-{}", &digest[..32])
+}
+
+#[cfg(unix)]
+async fn open_endpoint(endpoint: &str) -> io::Result<Box<dyn ProcessLocalStream>> {
+    tokio::net::UnixStream::connect(endpoint)
+        .await
+        .map(|stream| Box::new(stream) as Box<dyn ProcessLocalStream>)
+}
+
+#[cfg(windows)]
+async fn open_endpoint(endpoint: &str) -> io::Result<Box<dyn ProcessLocalStream>> {
+    tokio::task::yield_now().await;
+    tokio::net::windows::named_pipe::ClientOptions::new()
+        .open(endpoint)
+        .map(|stream| Box::new(stream) as Box<dyn ProcessLocalStream>)
+}
+
+#[cfg(unix)]
+fn configure_detached_host(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_detached_host(command: &mut Command) {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+fn new_header(kind: FrameKind, cancellation_id: Option<CancellationId>) -> FrameHeader {
+    FrameHeader {
+        family: String::from("tool"),
+        version: PROTOCOL_VERSION,
+        kind,
+        request_id: RequestId::from_uuid(uuid::Uuid::now_v7()),
+        stream_sequence: None,
+        correlation_id: CorrelationId::from_uuid(uuid::Uuid::now_v7()),
+        causation_id: CausationId::from_uuid(uuid::Uuid::now_v7()),
+        idempotency_id: IdempotencyId::from_uuid(uuid::Uuid::now_v7()),
+        cancellation_id,
+    }
+}
+
+fn validate_unary_header(
+    response: &FrameHeader,
+    request: &FrameHeader,
+) -> Result<(), ToolHostDependencyError> {
+    if response.family != "tool"
+        || response.kind != FrameKind::Response
+        || response.stream_sequence != Some(1)
+        || !response.version.is_compatible_with(PROTOCOL_VERSION)
+        || response.request_id != request.request_id
+        || response.correlation_id != request.correlation_id
+        || response.causation_id != request.causation_id
+        || response.idempotency_id != request.idempotency_id
+        || response.cancellation_id != request.cancellation_id
+    {
+        return Err(ToolHostDependencyError::Protocol);
+    }
+    Ok(())
+}
+
+fn validate_event_header(
+    response: &FrameHeader,
+    request: &FrameHeader,
+    expected_sequence: u64,
+) -> Result<(), ToolHostDependencyError> {
+    if response.family != "tool"
+        || !matches!(
+            response.kind,
+            FrameKind::Response | FrameKind::StreamItem | FrameKind::StreamEnd
+        )
+        || response.stream_sequence != Some(expected_sequence)
+        || (response.kind == FrameKind::Response && expected_sequence != 1)
+        || !response.version.is_compatible_with(PROTOCOL_VERSION)
+        || response.request_id != request.request_id
+        || response.correlation_id != request.correlation_id
+        || response.causation_id != request.causation_id
+        || response.idempotency_id != request.idempotency_id
+        || response.cancellation_id != request.cancellation_id
+    {
+        return Err(ToolHostDependencyError::Protocol);
+    }
+    Ok(())
 }
 
 fn validate(command: &DependencyToolCommand) -> Result<(), ToolHostDependencyError> {
@@ -506,26 +729,6 @@ fn map_event(event: ToolHostEvent) -> Result<DependencyToolEvent, ToolHostDepend
             return Err(ToolHostDependencyError::Protocol);
         }
     })
-}
-
-async fn read_frame(
-    reader: &mut BufReader<ChildStdout>,
-    maximum: usize,
-) -> Result<Vec<u8>, ToolHostDependencyError> {
-    let mut frame = Vec::new();
-    loop {
-        let byte = reader
-            .read_u8()
-            .await
-            .map_err(|_| ToolHostDependencyError::Transport)?;
-        if byte == b'\n' {
-            return Ok(frame);
-        }
-        if frame.len() >= maximum {
-            return Err(ToolHostDependencyError::FrameTooLarge);
-        }
-        frame.push(byte);
-    }
 }
 
 fn encode_hex(bytes: &[u8]) -> String {

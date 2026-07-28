@@ -5,10 +5,12 @@ use std::{collections::BTreeSet, error::Error, io, sync::Arc, time::Duration};
 use agentmod_process_host_data::ProcessData;
 use agentmod_process_host_dependency::{
     DependencyExecutablePolicy, ProcessDependencyConfig, TokioProcessDependency,
+    cleanup_local_endpoint, prepare_local_endpoint,
 };
 use agentmod_process_host_logic::{ProcessLogic, ProcessLogicConfig};
 use agentmod_process_host_service::{
     ProcessHostService, ProcessHostServiceConfig, ProcessServiceError,
+    local_rpc::{ProcessLocalRpcConfig, run_local},
 };
 use agentmod_tool_protocol::{ToolHostCommand, ToolHostEvent};
 use tokio::{
@@ -40,7 +42,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let dependency = TokioProcessDependency::new(ProcessDependencyConfig {
         storage_root: storage_root.clone(),
         log_root: storage_root.join("process-logs"),
-        authorization_key_hex,
+        authorization_key_hex: authorization_key_hex.clone(),
         owner_id: owner_id.clone(),
         session_id: session_id.clone(),
         inherited_environment_allowlist: BTreeSet::from([
@@ -106,13 +108,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
             max_projection_bytes: 1024 * 1024,
         },
     );
-    let service = Arc::new(ProcessHostService::new(
+    let service = ProcessHostService::new(
         logic,
         ProcessHostServiceConfig {
             owner_id,
             session_id,
         },
-    )?);
+    )?;
+    if let Ok(endpoint) = std::env::var("AGENTMOD_PROCESS_ENDPOINT") {
+        prepare_local_endpoint(&endpoint)?;
+        let result = run_local(
+            service,
+            ProcessLocalRpcConfig {
+                endpoint: endpoint.clone(),
+                authorization_token: authorization_key_hex.into(),
+                maximum_frame_bytes: MAX_FRAME_BYTES,
+                idle_check_interval: Duration::from_millis(
+                    std::env::var("AGENTMOD_PROCESS_IDLE_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|value| value.parse().ok())
+                        .unwrap_or(30_000),
+                ),
+            },
+        )
+        .await;
+        let cleanup = cleanup_local_endpoint(&endpoint);
+        result?;
+        cleanup?;
+        return Ok(());
+    }
+    let service = Arc::new(service);
     let (sender, mut receiver) = mpsc::channel::<ToolHostEvent>(RESPONSE_CHANNEL_CAPACITY);
     let request_limit = Arc::new(Semaphore::new(MAX_IN_FLIGHT_REQUESTS));
     let writer = tokio::spawn(async move {

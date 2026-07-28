@@ -17,6 +17,14 @@ It also owns the common keyed authorization primitive used by capability hosts:
 claims bind owner, session, call, action, exact operation digest, expiry, and
 nonce.
 
+Tool protocol 1.0 is used by the reconnectable process host over Unix sockets
+and Windows named pipes. A token-authenticated handshake negotiates bounded
+request/response, streaming, cancellation, idempotency, and backpressure
+capabilities before any `ToolHostCommand` is decoded. Every response repeats
+the exact request, correlation, causation, idempotency, and cancellation
+identity with a monotonic stream sequence. Service failures become terminal
+`ToolHostEvent::Failed` frames instead of tearing down the listener.
+
 The runtime service uses this framing over Unix sockets and Windows named pipes,
 with mandatory token-authenticated negotiation before endpoint dispatch.
 Runtime wire version 2.1 includes session-scoped approval resolution and resumed

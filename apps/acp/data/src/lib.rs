@@ -9,11 +9,14 @@
     reason = "the data port exposes one closed error taxonomy"
 )]
 
-use agentmod_acp_dependency::{AcpDependencyError, AcpRuntimeDependencyPort, DependencyTurnEvent};
+use agentmod_acp_dependency::{
+    AcpDependencyError, AcpRuntimeDependencyPort, DependencyTurnEvent, DependencyTurnStreamItem,
+};
 use agentmod_primitives::{CancellationId, SessionId};
 use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionDataRecord {
@@ -48,9 +51,44 @@ pub enum TurnDataEvent {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct TurnDataRecord {
-    pub events: Vec<TurnDataEvent>,
-    pub awaiting_continuation: Option<String>,
+pub enum TurnDataStreamItem {
+    Event(TurnDataEvent),
+    Complete {
+        awaiting_continuation: Option<String>,
+    },
+}
+
+pub struct TurnDataStream {
+    receiver: mpsc::Receiver<Result<TurnDataStreamItem, AcpDataError>>,
+}
+
+#[derive(Clone)]
+pub struct TurnDataStreamSender {
+    sender: mpsc::Sender<Result<TurnDataStreamItem, AcpDataError>>,
+}
+
+impl TurnDataStream {
+    #[must_use]
+    pub fn channel(capacity: usize) -> (TurnDataStreamSender, Self) {
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        (TurnDataStreamSender { sender }, Self { receiver })
+    }
+
+    pub async fn recv(&mut self) -> Option<Result<TurnDataStreamItem, AcpDataError>> {
+        self.receiver.recv().await
+    }
+}
+
+impl TurnDataStreamSender {
+    pub async fn send(
+        &self,
+        item: Result<TurnDataStreamItem, AcpDataError>,
+    ) -> Result<(), AcpDataError> {
+        self.sender
+            .send(item)
+            .await
+            .map_err(|_| AcpDataError::StreamClosed)
+    }
 }
 
 #[async_trait]
@@ -64,12 +102,12 @@ pub trait AcpDataPort: Send + Sync {
         &self,
         session_id: SessionId,
     ) -> Result<Option<SessionDataRecord>, AcpDataError>;
-    async fn run_turn(
+    async fn run_turn_stream(
         &self,
         session_id: SessionId,
         prompt: String,
         cancellation_id: CancellationId,
-    ) -> Result<TurnDataRecord, AcpDataError>;
+    ) -> Result<TurnDataStream, AcpDataError>;
     async fn resolve_approval(
         &self,
         session_id: SessionId,
@@ -124,20 +162,27 @@ impl<D: AcpRuntimeDependencyPort> AcpDataPort for AcpData<D> {
             .map_err(map_error)
     }
 
-    async fn run_turn(
+    async fn run_turn_stream(
         &self,
         session_id: SessionId,
         prompt: String,
         cancellation_id: CancellationId,
-    ) -> Result<TurnDataRecord, AcpDataError> {
-        self.dependency
-            .run_turn(session_id, prompt, cancellation_id)
+    ) -> Result<TurnDataStream, AcpDataError> {
+        let mut dependency_stream = self
+            .dependency
+            .run_turn_stream(session_id, prompt, cancellation_id)
             .await
-            .map(|turn| TurnDataRecord {
-                events: turn.events.into_iter().map(map_event).collect(),
-                awaiting_continuation: turn.awaiting_continuation,
-            })
-            .map_err(map_error)
+            .map_err(map_error)?;
+        let (sender, stream) = TurnDataStream::channel(1);
+        tokio::spawn(async move {
+            while let Some(item) = dependency_stream.recv().await {
+                let item = item.map(map_stream_item).map_err(map_error);
+                if sender.send(item).await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(stream)
     }
 
     async fn resolve_approval(
@@ -203,6 +248,17 @@ fn map_event(event: DependencyTurnEvent) -> TurnDataEvent {
     }
 }
 
+fn map_stream_item(item: DependencyTurnStreamItem) -> TurnDataStreamItem {
+    match item {
+        DependencyTurnStreamItem::Event(event) => TurnDataStreamItem::Event(map_event(event)),
+        DependencyTurnStreamItem::Complete {
+            awaiting_continuation,
+        } => TurnDataStreamItem::Complete {
+            awaiting_continuation,
+        },
+    }
+}
+
 #[allow(
     clippy::needless_pass_by_value,
     reason = "map_err consumes the lower-layer error at this explicit boundary"
@@ -215,4 +271,6 @@ fn map_error(error: AcpDependencyError) -> AcpDataError {
 pub enum AcpDataError {
     #[error("ACP runtime dependency failed: {0}")]
     Dependency(String),
+    #[error("ACP data stream consumer disconnected")]
+    StreamClosed,
 }

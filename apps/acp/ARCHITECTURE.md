@@ -7,9 +7,9 @@ runtime internals and follows `service → logic → data → dependency`.
 | Layer | Responsibility and owned types |
 |---|---|
 | service | ACP initialization/capabilities, JSON-RPC handlers, ACP content mapping, update notifications, permission requests, and stdio lifecycle |
-| logic | Session identity/workspace invariants, prompt construction, active-turn cancellation state, and approval coordination |
-| data | Session/turn datasets and explicit runtime-dependency normalization |
-| dependency | Authenticated runtime socket/named-pipe negotiation, bounded frames, credit windows, cancellation, session creation/loading, turns, and approvals |
+| logic | Session identity/workspace invariants, prompt construction, bounded prompt streams, active-turn cancellation state, disconnect cancellation, and approval coordination |
+| data | Session/turn datasets, bounded layer-owned streams, and explicit runtime-dependency normalization |
+| dependency | Authenticated runtime socket/named-pipe negotiation, bounded layer-owned streams, exact credit windows, cancellation, session creation/loading, turns, and approvals |
 | bin | Environment bootstrap and concrete assembly |
 
 ACP sessions are runtime sessions. Prompt and cancellation requests therefore
@@ -23,8 +23,13 @@ Current limitations:
   embedded-resource capabilities are not advertised.
 - Per-session MCP declarations and additional workspace directories are
   rejected until their runtime activation contracts are available.
-- Runtime provider events are currently collected behind the bounded runtime
-  credit window and then emitted as ordered ACP updates before the prompt
-  response; direct low-latency event forwarding is still required.
 - Stable session listing, deletion, resume/close, and terminal callbacks are not
   advertised.
+
+Provider events cross every ACP layer through capacity-one, layer-owned streams.
+The dependency grants the runtime one additional credit only after the current
+item enters the bounded dependency stream; the service emits each ordered ACP
+notification immediately. Dropped frontend streams cancel the matching runtime
+turn. The Windows process E2E uses paced harness frames and proves the first ACP
+update is observable before provider completion; the Unix equivalent is
+automated for CI.

@@ -9,13 +9,20 @@
     reason = "the logic port exposes one closed error taxonomy"
 )]
 
-use std::{collections::HashMap, str::FromStr, sync::Mutex};
+use std::{
+    collections::HashMap,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
-use agentmod_acp_data::{AcpDataError, AcpDataPort, TurnDataEvent};
+use agentmod_acp_data::{
+    AcpDataError, AcpDataPort, TurnDataEvent, TurnDataStream, TurnDataStreamItem,
+};
 use agentmod_primitives::{CancellationId, SessionId};
 use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,18 +71,29 @@ pub struct ApprovalRequired {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct PromptResult {
+pub enum PromptStreamItem {
+    Update(PromptUpdate),
+    Approval(ApprovalRequired),
+    Complete,
+    Cancelled,
+}
+
+pub struct PromptStream {
     pub session_id: String,
-    pub updates: Vec<PromptUpdate>,
-    pub approval: Option<ApprovalRequired>,
-    pub cancelled: bool,
+    receiver: mpsc::Receiver<Result<PromptStreamItem, AcpLogicError>>,
+}
+
+impl PromptStream {
+    pub async fn recv(&mut self) -> Option<Result<PromptStreamItem, AcpLogicError>> {
+        self.receiver.recv().await
+    }
 }
 
 #[async_trait]
 pub trait AcpLogicPort: Send + Sync {
     async fn create_session(&self, command: CreateSessionCommand) -> Result<String, AcpLogicError>;
     async fn load_session(&self, command: LoadSessionCommand) -> Result<(), AcpLogicError>;
-    async fn prompt(&self, command: PromptCommand) -> Result<PromptResult, AcpLogicError>;
+    async fn prompt_stream(&self, command: PromptCommand) -> Result<PromptStream, AcpLogicError>;
     async fn resolve_approval(
         &self,
         session_id: String,
@@ -87,7 +105,7 @@ pub trait AcpLogicPort: Send + Sync {
 
 pub struct AcpLogic<D> {
     data: D,
-    active: Mutex<HashMap<SessionId, CancellationId>>,
+    active: Arc<Mutex<HashMap<SessionId, CancellationId>>>,
 }
 
 impl<D> AcpLogic<D> {
@@ -95,13 +113,13 @@ impl<D> AcpLogic<D> {
     pub fn new(data: D) -> Self {
         Self {
             data,
-            active: Mutex::new(HashMap::new()),
+            active: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 #[async_trait]
-impl<D: AcpDataPort> AcpLogicPort for AcpLogic<D> {
+impl<D: AcpDataPort + Clone + 'static> AcpLogicPort for AcpLogic<D> {
     async fn create_session(&self, command: CreateSessionCommand) -> Result<String, AcpLogicError> {
         if command.workspace.trim().is_empty() {
             return Err(AcpLogicError::InvalidWorkspace);
@@ -127,7 +145,7 @@ impl<D: AcpDataPort> AcpLogicPort for AcpLogic<D> {
         Ok(())
     }
 
-    async fn prompt(&self, command: PromptCommand) -> Result<PromptResult, AcpLogicError> {
+    async fn prompt_stream(&self, command: PromptCommand) -> Result<PromptStream, AcpLogicError> {
         let session_id = parse_session(&command.session_id)?;
         if command.parts.is_empty() {
             return Err(AcpLogicError::EmptyPrompt);
@@ -154,54 +172,22 @@ impl<D: AcpDataPort> AcpLogicPort for AcpLogic<D> {
         }
         let turn = self
             .data
-            .run_turn(session_id, prompt, cancellation_id)
-            .await;
-        self.active
-            .lock()
-            .map_err(|_| AcpLogicError::StateUnavailable)?
-            .remove(&session_id);
-        let turn = turn.map_err(map_error)?;
-        let mut updates = Vec::new();
-        let mut approval = None;
-        let mut cancelled = false;
-        for event in turn.events {
-            match event {
-                TurnDataEvent::Text(value) => updates.push(PromptUpdate::Text(value)),
-                TurnDataEvent::ToolProposed {
-                    continuation_id,
-                    call_id,
-                    tool,
-                    arguments,
-                } => {
-                    updates.push(PromptUpdate::ToolCall {
-                        call_id: call_id.clone(),
-                        name: tool.clone(),
-                        arguments: arguments.clone(),
-                    });
-                    approval = Some(ApprovalRequired {
-                        continuation_id,
-                        call_id,
-                        tool,
-                        arguments,
-                    });
-                }
-                TurnDataEvent::Cancelled => cancelled = true,
-                TurnDataEvent::Failed { code, message, .. } => {
-                    updates.push(PromptUpdate::Failure { code, message });
-                }
-                TurnDataEvent::Started
-                | TurnDataEvent::ToolDelta { .. }
-                | TurnDataEvent::Completed { .. } => {}
-            }
-        }
-        if approval.is_none() && turn.awaiting_continuation.is_some() {
-            return Err(AcpLogicError::InvalidRuntimeResult);
-        }
-        Ok(PromptResult {
+            .run_turn_stream(session_id, prompt, cancellation_id)
+            .await
+            .map_err(|error| {
+                remove_active(&self.active, session_id, cancellation_id);
+                map_error(error)
+            })?;
+        let receiver = spawn_prompt_forwarder(
+            turn,
+            self.data.clone(),
+            Arc::clone(&self.active),
+            session_id,
+            cancellation_id,
+        );
+        Ok(PromptStream {
             session_id: session_id.to_string(),
-            updates,
-            approval,
-            cancelled,
+            receiver,
         })
     }
 
@@ -246,6 +232,138 @@ impl<D: AcpDataPort> AcpLogicPort for AcpLogic<D> {
     }
 }
 
+fn spawn_prompt_forwarder<D: AcpDataPort + Clone + 'static>(
+    mut turn: TurnDataStream,
+    data: D,
+    active: Arc<Mutex<HashMap<SessionId, CancellationId>>>,
+    session_id: SessionId,
+    cancellation_id: CancellationId,
+) -> mpsc::Receiver<Result<PromptStreamItem, AcpLogicError>> {
+    let (sender, receiver) = mpsc::channel(1);
+    tokio::spawn(async move {
+        forward_prompt_stream(
+            &mut turn,
+            &data,
+            &active,
+            session_id,
+            cancellation_id,
+            &sender,
+        )
+        .await;
+    });
+    receiver
+}
+
+async fn forward_prompt_stream<D: AcpDataPort>(
+    turn: &mut TurnDataStream,
+    data: &D,
+    active: &Mutex<HashMap<SessionId, CancellationId>>,
+    session_id: SessionId,
+    cancellation_id: CancellationId,
+    sender: &mpsc::Sender<Result<PromptStreamItem, AcpLogicError>>,
+) {
+    let mut pending_approval = None;
+    while let Some(item) = turn.recv().await {
+        let item = match item {
+            Ok(item) => item,
+            Err(error) => {
+                let _ = sender.send(Err(map_error(error))).await;
+                remove_active(active, session_id, cancellation_id);
+                return;
+            }
+        };
+        let outgoing = match item {
+            TurnDataStreamItem::Event(TurnDataEvent::Text(value)) => {
+                Some(PromptStreamItem::Update(PromptUpdate::Text(value)))
+            }
+            TurnDataStreamItem::Event(TurnDataEvent::ToolProposed {
+                continuation_id,
+                call_id,
+                tool,
+                arguments,
+            }) => {
+                pending_approval = Some(ApprovalRequired {
+                    continuation_id,
+                    call_id: call_id.clone(),
+                    tool: tool.clone(),
+                    arguments: arguments.clone(),
+                });
+                Some(PromptStreamItem::Update(PromptUpdate::ToolCall {
+                    call_id,
+                    name: tool,
+                    arguments,
+                }))
+            }
+            TurnDataStreamItem::Event(TurnDataEvent::Cancelled) => {
+                remove_active(active, session_id, cancellation_id);
+                if sender.send(Ok(PromptStreamItem::Cancelled)).await.is_err() {
+                    cancel_disconnected(data, cancellation_id).await;
+                }
+                return;
+            }
+            TurnDataStreamItem::Event(TurnDataEvent::Failed { code, message, .. }) => {
+                Some(PromptStreamItem::Update(PromptUpdate::Failure {
+                    code,
+                    message,
+                }))
+            }
+            TurnDataStreamItem::Complete {
+                awaiting_continuation,
+            } => {
+                let terminal = match awaiting_continuation {
+                    Some(continuation_id) => match pending_approval {
+                        Some(approval) if approval.continuation_id == continuation_id => {
+                            Ok(PromptStreamItem::Approval(approval))
+                        }
+                        _ => Err(AcpLogicError::InvalidRuntimeResult),
+                    },
+                    None => Ok(PromptStreamItem::Complete),
+                };
+                remove_active(active, session_id, cancellation_id);
+                if sender.send(terminal).await.is_err() {
+                    cancel_disconnected(data, cancellation_id).await;
+                }
+                return;
+            }
+            TurnDataStreamItem::Event(
+                TurnDataEvent::Started
+                | TurnDataEvent::ToolDelta { .. }
+                | TurnDataEvent::Completed { .. },
+            ) => None,
+        };
+        if let Some(outgoing) = outgoing
+            && sender.send(Ok(outgoing)).await.is_err()
+        {
+            cancel_disconnected(data, cancellation_id).await;
+            remove_active(active, session_id, cancellation_id);
+            return;
+        }
+    }
+    remove_active(active, session_id, cancellation_id);
+    let _ = sender.send(Err(AcpLogicError::StreamClosed)).await;
+}
+
+fn remove_active(
+    active: &Mutex<HashMap<SessionId, CancellationId>>,
+    session_id: SessionId,
+    cancellation_id: CancellationId,
+) {
+    if let Ok(mut active) = active.lock()
+        && active.get(&session_id) == Some(&cancellation_id)
+    {
+        active.remove(&session_id);
+    }
+}
+
+async fn cancel_disconnected<D: AcpDataPort>(data: &D, cancellation_id: CancellationId) {
+    let _ = data
+        .cancel(
+            cancellation_id,
+            String::from("ACP client disconnected during an active prompt"),
+        )
+        .await;
+}
+
 fn parse_session(value: &str) -> Result<SessionId, AcpLogicError> {
     SessionId::from_str(value).map_err(|_| AcpLogicError::InvalidSessionId)
 }
@@ -278,6 +396,154 @@ pub enum AcpLogicError {
     NoActiveTurn,
     #[error("ACP runtime returned inconsistent continuation state")]
     InvalidRuntimeResult,
+    #[error("ACP runtime stream closed without a terminal result")]
+    StreamClosed,
     #[error("ACP runtime state is unavailable")]
     StateUnavailable,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentmod_acp_data::{SessionDataRecord, TurnDataStreamSender};
+
+    #[derive(Clone, Default)]
+    struct MockData {
+        sender: Arc<Mutex<Option<TurnDataStreamSender>>>,
+        cancellations: Arc<Mutex<Vec<CancellationId>>>,
+    }
+
+    #[async_trait]
+    impl AcpDataPort for MockData {
+        async fn create_session(
+            &self,
+            _workspace: String,
+            _style: String,
+        ) -> Result<SessionId, AcpDataError> {
+            Ok(SessionId::from_uuid(Uuid::now_v7()))
+        }
+
+        async fn find_session(
+            &self,
+            session_id: SessionId,
+        ) -> Result<Option<SessionDataRecord>, AcpDataError> {
+            Ok(Some(SessionDataRecord {
+                id: session_id,
+                workspace: String::from("workspace"),
+            }))
+        }
+
+        async fn run_turn_stream(
+            &self,
+            _session_id: SessionId,
+            _prompt: String,
+            _cancellation_id: CancellationId,
+        ) -> Result<TurnDataStream, AcpDataError> {
+            let (sender, stream) = TurnDataStream::channel(1);
+            *self.sender.lock().expect("sender lock") = Some(sender);
+            Ok(stream)
+        }
+
+        async fn resolve_approval(
+            &self,
+            _session_id: SessionId,
+            _continuation_id: String,
+            _approved: bool,
+        ) -> Result<Vec<TurnDataEvent>, AcpDataError> {
+            Ok(Vec::new())
+        }
+
+        async fn cancel(
+            &self,
+            cancellation_id: CancellationId,
+            _reason: String,
+        ) -> Result<(), AcpDataError> {
+            self.cancellations
+                .lock()
+                .expect("cancellation lock")
+                .push(cancellation_id);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_updates_before_terminal_and_registers_cancellation() {
+        let data = MockData::default();
+        let logic = AcpLogic::new(data.clone());
+        let session_id = SessionId::from_uuid(Uuid::now_v7()).to_string();
+        let mut stream = logic
+            .prompt_stream(PromptCommand {
+                session_id: session_id.clone(),
+                parts: vec![PromptPart::Text(String::from("hello"))],
+            })
+            .await
+            .expect("prompt stream");
+        let sender = data
+            .sender
+            .lock()
+            .expect("sender lock")
+            .clone()
+            .expect("stream sender");
+        sender
+            .send(Ok(TurnDataStreamItem::Event(TurnDataEvent::Text(
+                String::from("first"),
+            ))))
+            .await
+            .expect("send text");
+        assert_eq!(
+            stream.recv().await.expect("update").expect("valid update"),
+            PromptStreamItem::Update(PromptUpdate::Text(String::from("first")))
+        );
+        logic
+            .cancel_session(session_id)
+            .await
+            .expect("active cancellation");
+        assert_eq!(
+            data.cancellations.lock().expect("cancellation lock").len(),
+            1
+        );
+        sender
+            .send(Ok(TurnDataStreamItem::Complete {
+                awaiting_continuation: None,
+            }))
+            .await
+            .expect("send completion");
+        assert_eq!(
+            stream
+                .recv()
+                .await
+                .expect("terminal")
+                .expect("valid terminal"),
+            PromptStreamItem::Complete
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_inconsistent_approval_continuation() {
+        let data = MockData::default();
+        let logic = AcpLogic::new(data.clone());
+        let mut stream = logic
+            .prompt_stream(PromptCommand {
+                session_id: SessionId::from_uuid(Uuid::now_v7()).to_string(),
+                parts: vec![PromptPart::Text(String::from("approval"))],
+            })
+            .await
+            .expect("prompt stream");
+        let sender = data
+            .sender
+            .lock()
+            .expect("sender lock")
+            .clone()
+            .expect("stream sender");
+        sender
+            .send(Ok(TurnDataStreamItem::Complete {
+                awaiting_continuation: Some(String::from("missing")),
+            }))
+            .await
+            .expect("send completion");
+        assert_eq!(
+            stream.recv().await.expect("terminal"),
+            Err(AcpLogicError::InvalidRuntimeResult)
+        );
+    }
 }

@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 1);
@@ -59,9 +60,44 @@ pub enum DependencyTurnEvent {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct DependencyTurn {
-    pub events: Vec<DependencyTurnEvent>,
-    pub awaiting_continuation: Option<String>,
+pub enum DependencyTurnStreamItem {
+    Event(DependencyTurnEvent),
+    Complete {
+        awaiting_continuation: Option<String>,
+    },
+}
+
+pub struct DependencyTurnStream {
+    receiver: mpsc::Receiver<Result<DependencyTurnStreamItem, AcpDependencyError>>,
+}
+
+#[derive(Clone)]
+pub struct DependencyTurnStreamSender {
+    sender: mpsc::Sender<Result<DependencyTurnStreamItem, AcpDependencyError>>,
+}
+
+impl DependencyTurnStream {
+    #[must_use]
+    pub fn channel(capacity: usize) -> (DependencyTurnStreamSender, Self) {
+        let (sender, receiver) = mpsc::channel(capacity.max(1));
+        (DependencyTurnStreamSender { sender }, Self { receiver })
+    }
+
+    pub async fn recv(&mut self) -> Option<Result<DependencyTurnStreamItem, AcpDependencyError>> {
+        self.receiver.recv().await
+    }
+}
+
+impl DependencyTurnStreamSender {
+    pub async fn send(
+        &self,
+        item: Result<DependencyTurnStreamItem, AcpDependencyError>,
+    ) -> Result<(), AcpDependencyError> {
+        self.sender
+            .send(item)
+            .await
+            .map_err(|_| AcpDependencyError::Cancelled)
+    }
 }
 
 #[async_trait]
@@ -75,12 +111,12 @@ pub trait AcpRuntimeDependencyPort: Send + Sync {
         &self,
         session_id: SessionId,
     ) -> Result<Option<DependencySession>, AcpDependencyError>;
-    async fn run_turn(
+    async fn run_turn_stream(
         &self,
         session_id: SessionId,
         prompt: String,
         cancellation_id: CancellationId,
-    ) -> Result<DependencyTurn, AcpDependencyError>;
+    ) -> Result<DependencyTurnStream, AcpDependencyError>;
     async fn resolve_approval(
         &self,
         session_id: SessionId,
@@ -145,59 +181,99 @@ impl LocalRuntimeDependency {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
-        let (request_header, credit_windows) = self.negotiate(stream, request).await?;
-        let mut current: WireFrame<RuntimeResponse> = read_frame(stream, self.maximum_frame_bytes)
+        let (request_header, _credit_windows) = self.negotiate(stream, request).await?;
+        let current: WireFrame<RuntimeResponse> = read_frame(stream, self.maximum_frame_bytes)
             .await
             .map_err(|_| AcpDependencyError::Transport)?;
         if current.header.kind == FrameKind::Response {
             validate_response_header(&current.header, &request_header)?;
             return Ok(current.payload);
         }
+        Err(AcpDependencyError::UnexpectedResponse)
+    }
+
+    async fn exchange_turn<S>(
+        &self,
+        stream: &mut S,
+        request: RuntimeRequest,
+        sender: &mpsc::Sender<Result<DependencyTurnStreamItem, AcpDependencyError>>,
+    ) -> Result<(), AcpDependencyError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let (request_header, credit_windows) = self.negotiate(stream, request).await?;
         let mut expected_sequence = 1_u64;
-        let mut turn_events = Vec::new();
         loop {
+            let current: WireFrame<RuntimeResponse> = read_frame(stream, self.maximum_frame_bytes)
+                .await
+                .map_err(|_| AcpDependencyError::Transport)?;
             validate_stream_header(&current.header, &request_header, expected_sequence)?;
-            match current.header.kind {
+            let item = match current.header.kind {
                 FrameKind::StreamItem => {
                     let RuntimeResponse::TurnEvent { event, .. } = current.payload else {
                         return Err(AcpDependencyError::UnexpectedResponse);
                     };
-                    turn_events.push(event);
-                    if credit_windows {
-                        write_window_update(
-                            stream,
-                            &request_header,
-                            expected_sequence,
-                            self.maximum_frame_bytes,
-                        )
-                        .await?;
-                    }
+                    DependencyTurnStreamItem::Event(map_event(event))
                 }
                 FrameKind::StreamEnd => {
                     let RuntimeResponse::TurnComplete {
-                        first_committed_sequence,
-                        last_committed_sequence,
                         awaiting_continuation,
+                        ..
                     } = current.payload
                     else {
                         return Err(AcpDependencyError::UnexpectedResponse);
                     };
-                    return Ok(RuntimeResponse::Turn {
-                        events: turn_events,
-                        first_committed_sequence,
-                        last_committed_sequence,
-                        awaiting_continuation,
-                    });
+                    sender
+                        .send(Ok(DependencyTurnStreamItem::Complete {
+                            awaiting_continuation,
+                        }))
+                        .await
+                        .map_err(|_| AcpDependencyError::Cancelled)?;
+                    return Ok(());
                 }
                 _ => return Err(AcpDependencyError::Protocol),
+            };
+            sender
+                .send(Ok(item))
+                .await
+                .map_err(|_| AcpDependencyError::Cancelled)?;
+            if credit_windows {
+                write_window_update(
+                    stream,
+                    &request_header,
+                    expected_sequence,
+                    self.maximum_frame_bytes,
+                )
+                .await?;
             }
             expected_sequence = expected_sequence
                 .checked_add(1)
                 .ok_or(AcpDependencyError::Protocol)?;
-            current = read_frame(stream, self.maximum_frame_bytes)
-                .await
-                .map_err(|_| AcpDependencyError::Transport)?;
         }
+    }
+
+    #[cfg(unix)]
+    async fn stream_turn(
+        &self,
+        request: RuntimeRequest,
+        sender: &mpsc::Sender<Result<DependencyTurnStreamItem, AcpDependencyError>>,
+    ) -> Result<(), AcpDependencyError> {
+        let mut stream = tokio::net::UnixStream::connect(&self.endpoint)
+            .await
+            .map_err(|_| AcpDependencyError::Transport)?;
+        self.exchange_turn(&mut stream, request, sender).await
+    }
+
+    #[cfg(windows)]
+    async fn stream_turn(
+        &self,
+        request: RuntimeRequest,
+        sender: &mpsc::Sender<Result<DependencyTurnStreamItem, AcpDependencyError>>,
+    ) -> Result<(), AcpDependencyError> {
+        let mut stream = tokio::net::windows::named_pipe::ClientOptions::new()
+            .open(&self.endpoint)
+            .map_err(|_| AcpDependencyError::Transport)?;
+        self.exchange_turn(&mut stream, request, sender).await
     }
 
     async fn negotiate<S>(
@@ -291,33 +367,28 @@ impl AcpRuntimeDependencyPort for LocalRuntimeDependency {
             }))
     }
 
-    async fn run_turn(
+    async fn run_turn_stream(
         &self,
         session_id: SessionId,
         prompt: String,
         cancellation_id: CancellationId,
-    ) -> Result<DependencyTurn, AcpDependencyError> {
-        let RuntimeResponse::Turn {
-            events,
-            awaiting_continuation,
-            ..
-        } = self
-            .send(RuntimeRequest::RunTurn {
-                session_id,
-                prompt,
-                provider: String::from("deterministic-mock"),
-                model: String::from("mock-model"),
-                options: Value::Object(Map::default()),
-                cancellation_id,
-            })
-            .await?
-        else {
-            return Err(AcpDependencyError::UnexpectedResponse);
+    ) -> Result<DependencyTurnStream, AcpDependencyError> {
+        let request = RuntimeRequest::RunTurn {
+            session_id,
+            prompt,
+            provider: String::from("deterministic-mock"),
+            model: String::from("mock-model"),
+            options: Value::Object(Map::default()),
+            cancellation_id,
         };
-        Ok(DependencyTurn {
-            events: events.into_iter().map(map_event).collect(),
-            awaiting_continuation,
-        })
+        let dependency = self.clone();
+        let (sender, stream) = DependencyTurnStream::channel(1);
+        tokio::spawn(async move {
+            if let Err(error) = dependency.stream_turn(request, &sender.sender).await {
+                let _ = sender.send(Err(error)).await;
+            }
+        });
+        Ok(stream)
     }
 
     async fn resolve_approval(
@@ -484,6 +555,8 @@ pub enum AcpDependencyError {
     Protocol,
     #[error("runtime returned an unexpected ACP response")]
     UnexpectedResponse,
+    #[error("ACP runtime stream consumer disconnected")]
+    Cancelled,
 }
 
 #[cfg(test)]

@@ -25,6 +25,7 @@ try {
         "0123456789abcdef0123456789abcdef0123456789abcdef"
     )
     $env:AGENTMOD_HARNESS_PROGRAM = $harness
+    $env:AGENTMOD_HARNESS_FRAME_PACING_MS = "750"
     $env:AGENTMOD_SCHEDULER_POLL_MS = "0"
     $daemon = Start-Process -FilePath $runtime -ArgumentList "serve" `
         -WorkingDirectory $runRoot -WindowStyle Hidden -PassThru
@@ -89,23 +90,30 @@ try {
     }
     $sawText = $false
     $completed = $false
+    $textObservedAt = $null
+    $completedAt = $null
     for ($frame = 0; $frame -lt 20; $frame++) {
         $message = Read-Acp
         if ($message.method -eq "session/update" -and
             $message.params.update.sessionUpdate -eq "agent_message_chunk" -and
             $message.params.update.content.text -eq "deterministic response") {
             $sawText = $true
+            $textObservedAt = [DateTimeOffset]::UtcNow
         }
         if ($message.id -eq 3) {
             if ($message.result.stopReason -ne "end_turn") {
                 throw "ACP prompt returned the wrong stop reason"
             }
             $completed = $true
+            $completedAt = [DateTimeOffset]::UtcNow
             break
         }
     }
     if (-not $sawText -or -not $completed) {
         throw "ACP did not emit update then prompt completion"
+    }
+    if (($completedAt - $textObservedAt).TotalMilliseconds -lt 500) {
+        throw "ACP buffered the runtime stream instead of forwarding incrementally"
     }
     $journal = Join-Path $runRoot ("sessions\" + $sessionId + "\events.jsonl")
     if (@(Get-Content -LiteralPath $journal | Where-Object {
@@ -128,6 +136,8 @@ finally {
         Stop-Process -Id $daemon.Id -Force
         $daemon.WaitForExit()
     }
+    Remove-Item Env:AGENTMOD_HARNESS_FRAME_PACING_MS `
+        -ErrorAction SilentlyContinue
     Pop-Location
     if ($null -ne $runRoot -and (Test-Path -LiteralPath $runRoot)) {
         $resolved = [System.IO.Path]::GetFullPath($runRoot)

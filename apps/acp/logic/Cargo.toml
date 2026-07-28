@@ -13,6 +13,7 @@ agentmod-primitives = { path = "../../../core/primitives" }
 async-trait.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 uuid.workspace = true
 
 [lints]

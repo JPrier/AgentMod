@@ -22,7 +22,7 @@ use agent_client_protocol::{
 };
 use agentmod_acp_logic::{
     AcpLogicError, AcpLogicPort, ApprovalRequired, CreateSessionCommand, LoadSessionCommand,
-    PromptCommand, PromptPart, PromptResult, PromptUpdate,
+    PromptCommand, PromptPart, PromptStream, PromptStreamItem, PromptUpdate,
 };
 
 /// ACP service endpoint assembled around injected logic.
@@ -124,27 +124,20 @@ impl<L: AcpLogicPort + 'static> AcpService<L> {
                         Ok(parts) => parts,
                         Err(error) => return responder.respond_with_error(error),
                     };
+                    let mut stream = match prompt_logic
+                        .prompt_stream(PromptCommand {
+                            session_id,
+                            parts,
+                        })
+                        .await
+                    {
+                        Ok(stream) => stream,
+                        Err(error) => return responder.respond_with_error(map_logic(error)),
+                    };
                     let logic = Arc::clone(&prompt_logic);
                     let task_connection = connection.clone();
                     connection.spawn(async move {
-                        let result = logic
-                            .prompt(PromptCommand {
-                                session_id: session_id.clone(),
-                                parts,
-                            })
-                            .await;
-                        match result {
-                            Ok(result) => {
-                                complete_prompt(
-                                    logic,
-                                    task_connection,
-                                    responder,
-                                    result,
-                                )
-                                .await
-                            }
-                            Err(error) => responder.respond_with_error(map_logic(error)),
-                        }
+                        complete_prompt(logic, task_connection, responder, &mut stream).await
                     })?;
                     Ok(())
                 },
@@ -168,29 +161,43 @@ async fn complete_prompt<L: AcpLogicPort + 'static>(
     logic: Arc<L>,
     connection: agent_client_protocol::ConnectionTo<agent_client_protocol::Client>,
     responder: agent_client_protocol::Responder<PromptResponse>,
-    result: PromptResult,
+    stream: &mut PromptStream,
 ) -> agent_client_protocol::Result<()> {
-    emit_updates(&connection, &result.session_id, result.updates)?;
-    if result.cancelled {
-        return responder.respond(PromptResponse::new(StopReason::Cancelled));
+    while let Some(item) = stream.recv().await {
+        match item.map_err(map_logic)? {
+            PromptStreamItem::Update(update) => {
+                emit_update(&connection, &stream.session_id, update)?;
+            }
+            PromptStreamItem::Approval(approval) => {
+                let selected = connection
+                    .send_request(permission_request(&stream.session_id, &approval))
+                    .block_task()
+                    .await?;
+                let (approved, cancelled) = match selected.outcome {
+                    RequestPermissionOutcome::Selected(selected) => {
+                        (selected.option_id.to_string() == "allow-once", false)
+                    }
+                    _ => (false, true),
+                };
+                let updates = logic
+                    .resolve_approval(stream.session_id.clone(), approval, approved)
+                    .await
+                    .map_err(map_logic)?;
+                if cancelled {
+                    return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                }
+                emit_updates(&connection, &stream.session_id, updates)?;
+                return responder.respond(PromptResponse::new(StopReason::EndTurn));
+            }
+            PromptStreamItem::Complete => {
+                return responder.respond(PromptResponse::new(StopReason::EndTurn));
+            }
+            PromptStreamItem::Cancelled => {
+                return responder.respond(PromptResponse::new(StopReason::Cancelled));
+            }
+        }
     }
-    if let Some(approval) = result.approval {
-        let selected = connection
-            .send_request(permission_request(&result.session_id, &approval))
-            .block_task()
-            .await?;
-        let approved = matches!(
-            selected.outcome,
-            RequestPermissionOutcome::Selected(ref selected)
-                if selected.option_id.to_string() == "allow-once"
-        );
-        let updates = logic
-            .resolve_approval(result.session_id.clone(), approval, approved)
-            .await
-            .map_err(map_logic)?;
-        emit_updates(&connection, &result.session_id, updates)?;
-    }
-    responder.respond(PromptResponse::new(StopReason::EndTurn))
+    responder.respond_with_error(map_logic(AcpLogicError::StreamClosed))
 }
 
 fn emit_updates(
@@ -199,26 +206,34 @@ fn emit_updates(
     updates: Vec<PromptUpdate>,
 ) -> agent_client_protocol::Result<()> {
     for update in updates {
-        let update = match update {
-            PromptUpdate::Text(text) => {
-                SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into()))
-            }
-            PromptUpdate::ToolCall {
-                call_id,
-                name,
-                arguments,
-            } => SessionUpdate::ToolCall(
-                ToolCall::new(call_id, name)
-                    .status(ToolCallStatus::Pending)
-                    .raw_input(arguments),
-            ),
-            PromptUpdate::Failure { code, message } => SessionUpdate::AgentMessageChunk(
-                ContentChunk::new(format!("AgentMod error `{code}`: {message}").into()),
-            ),
-        };
-        connection.send_notification(SessionNotification::new(session_id.to_owned(), update))?;
+        emit_update(connection, session_id, update)?;
     }
     Ok(())
+}
+
+fn emit_update(
+    connection: &agent_client_protocol::ConnectionTo<agent_client_protocol::Client>,
+    session_id: &str,
+    update: PromptUpdate,
+) -> agent_client_protocol::Result<()> {
+    let update = match update {
+        PromptUpdate::Text(text) => {
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(text.into()))
+        }
+        PromptUpdate::ToolCall {
+            call_id,
+            name,
+            arguments,
+        } => SessionUpdate::ToolCall(
+            ToolCall::new(call_id, name)
+                .status(ToolCallStatus::Pending)
+                .raw_input(arguments),
+        ),
+        PromptUpdate::Failure { code, message } => SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(format!("AgentMod error `{code}`: {message}").into()),
+        ),
+    };
+    connection.send_notification(SessionNotification::new(session_id.to_owned(), update))
 }
 
 fn permission_request(session_id: &str, approval: &ApprovalRequired) -> RequestPermissionRequest {

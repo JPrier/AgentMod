@@ -89,6 +89,12 @@ pub trait RuntimeSchedulerDependencyPort: Send + Sync {
         &self,
         limit: u32,
     ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError>;
+    fn list_pending_executions(
+        &self,
+        _limit: u32,
+    ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
+        Err(RuntimeSchedulerDependencyError::Protocol)
+    }
     fn fire_runtime_event(
         &self,
         event_id: &str,
@@ -259,6 +265,18 @@ impl RuntimeSchedulerDependencyPort for ProcessSchedulerDependency {
         limit: u32,
     ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
         match self.request(&SchedulerCommand::ClaimDue { limit })? {
+            SchedulerResponse::Executions { executions } => {
+                Ok(executions.into_iter().map(from_wire_execution).collect())
+            }
+            response => remote_result(response),
+        }
+    }
+
+    fn list_pending_executions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
+        match self.request(&SchedulerCommand::ListPendingExecutions { limit })? {
             SchedulerResponse::Executions { executions } => {
                 Ok(executions.into_iter().map(from_wire_execution).collect())
             }

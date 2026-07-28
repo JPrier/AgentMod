@@ -56,9 +56,10 @@ use crate::{
         ModelRequestStartedEvent, ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent,
         ModelToolCallProposedEvent, ProcessReconciliationCompletedEvent,
         ProcessReconciliationStartedEvent, ProcessReconciliationStatus, RuntimeCommittedEvent,
-        SchedulerFiredEvent, SessionReducerError, ToolCallApprovedEvent, ToolCallProposedEvent,
-        ToolExecutionCompletedEvent, ToolExecutionDispatchedEvent, ToolExecutionFailedEvent,
-        ToolExecutionStartedEvent, ToolExecutionState, ToolOutputObservedEvent, reduce,
+        SchedulerDeliveryReconciledEvent, SchedulerFiredEvent, SessionReducerError,
+        ToolCallApprovedEvent, ToolCallProposedEvent, ToolExecutionCompletedEvent,
+        ToolExecutionDispatchedEvent, ToolExecutionFailedEvent, ToolExecutionStartedEvent,
+        ToolExecutionState, ToolOutputObservedEvent, reduce,
     },
     tool::{
         AuthorizedToolRequest, PrepareToolCommand, ToolAuthorizationOutcome, ToolEvent,
@@ -236,6 +237,7 @@ pub struct WakeScheduledTurnCommand {
     pub schedule_id: String,
     pub scheduled_for_ms: i64,
     pub proof: ContinuationWakeProof,
+    pub allow_resumed_recovery: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -264,6 +266,28 @@ pub trait DeferredTurnLogicPort: Send + Sync {
         &self,
         command: WakeScheduledTurnCommand,
     ) -> Result<WakeScheduledTurnResult, RunTurnError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecordScheduledRecoveryCommand {
+    pub sessions_root: PathBuf,
+    pub session_id: String,
+    pub execution_id: String,
+    pub schedule_id: String,
+    pub outcome: String,
+    pub continuation_id: Option<String>,
+}
+
+pub trait ScheduledRecoveryLogicPort: Send + Sync {
+    /// Commits one canonical scheduler reconciliation outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunTurnError`] when identity, history, or persistence is invalid.
+    fn record_scheduled_recovery(
+        &self,
+        command: RecordScheduledRecoveryCommand,
+    ) -> Result<Sequence, RunTurnError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -983,7 +1007,7 @@ where
                 proof: command.proof,
             })
             .map_err(RunTurnError::Continuation)?;
-        if !wake.transitioned {
+        if !wake.transitioned && !command.allow_resumed_recovery {
             return Ok(WakeScheduledTurnResult {
                 transitioned: false,
                 turn: None,
@@ -1009,6 +1033,61 @@ where
             transitioned: true,
             turn: Some(turn),
         })
+    }
+}
+
+impl<D> ScheduledRecoveryLogicPort for TurnLogic<D>
+where
+    D: Clone
+        + Send
+        + Sync
+        + EventIdentityDataPort
+        + JournalEventDataPort
+        + HarnessDataPort
+        + ContinuationDataPort
+        + agentmod_runtime_data::tool::ToolDataPort,
+{
+    fn record_scheduled_recovery(
+        &self,
+        command: RecordScheduledRecoveryCommand,
+    ) -> Result<Sequence, RunTurnError> {
+        if command.execution_id.len() != 64
+            || !command
+                .execution_id
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit())
+            || command.schedule_id.trim().is_empty()
+            || !matches!(
+                command.outcome.as_str(),
+                "succeeded" | "failed" | "indeterminate_failed" | "awaiting_approval"
+            )
+        {
+            return Err(RunTurnError::Invalid);
+        }
+        let session_id =
+            SessionId::from_str(&command.session_id).map_err(|_| RunTurnError::InvalidSession)?;
+        let session_directory = command.sessions_root.join(session_id.to_string());
+        let persistence = SessionPersistenceLogic::new(self.data.clone());
+        let loaded = persistence
+            .load_session(LoadSessionCommand {
+                session_directory: session_directory.clone(),
+                expected_session_id: session_id,
+            })
+            .map_err(RunTurnError::Persistence)?;
+        self.commit_next(
+            &persistence,
+            session_id,
+            &session_directory,
+            loaded.state.last_sequence,
+            loaded.last_event_id,
+            RuntimeCommittedEvent::SchedulerDeliveryReconciled(SchedulerDeliveryReconciledEvent {
+                execution_id: command.execution_id,
+                schedule_id: command.schedule_id,
+                outcome: command.outcome,
+                continuation_id: command.continuation_id,
+            }),
+        )
+        .map(|(sequence, _)| sequence)
     }
 }
 

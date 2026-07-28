@@ -24,3 +24,4 @@ is already implemented.
 | 0016 | Process restart reconciliation |
 | 0017 | Reconnectable process-host transport |
 | 0018 | Schedule-bound deferred continuations |
+| 0019 | Scheduler claim recovery and terminal reconciliation |

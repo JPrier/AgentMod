@@ -48,3 +48,11 @@ runtime checks exact trigger proof and the scheduler's durable claim timestamp
 against expiration, transitions pending state once, then re-enters normal
 mandatory-policy evaluation. Manual tool approvals and scheduler continuations
 are distinct types and cannot resolve through each other's endpoints.
+
+At daemon startup, pending worker claims are reconciled against canonical
+history. Work with no committed `scheduler.fired` provenance resumes through
+the normal intercepted path. Canonically completed work is not redispatched;
+the runtime commits `scheduler.delivery_reconciled` and repairs the worker's
+terminal marker. Ambiguous work that may already have crossed an external
+side-effect boundary fails closed. Operators can inspect the reconciliation
+event by execution and schedule ID in the session timeline.

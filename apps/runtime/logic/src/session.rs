@@ -352,6 +352,20 @@ pub struct SchedulerFiredEvent {
     pub scheduled_for_ms: i64,
 }
 
+/// Canonical outcome of restart reconciliation for one scheduler claim.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SchedulerDeliveryReconciledEvent {
+    /// Deterministic occurrence identifier.
+    pub execution_id: String,
+    /// Owning schedule.
+    pub schedule_id: String,
+    /// Stable recovery outcome.
+    pub outcome: String,
+    /// Pending approval continuation when recovery found an approval boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation_id: Option<String>,
+}
+
 /// Typed committed events consumed by the pure session reducer.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "event", content = "payload", rename_all = "snake_case")]
@@ -408,6 +422,8 @@ pub enum RuntimeCommittedEvent {
     SessionLifecycleChanged(SessionLifecycleChangedEvent),
     /// Records a scheduler claim before its prompt enters the normal turn path.
     SchedulerFired(SchedulerFiredEvent),
+    /// Restart recovery reconciled a durable scheduler claim.
+    SchedulerDeliveryReconciled(SchedulerDeliveryReconciledEvent),
 }
 
 impl RuntimeCommittedEvent {
@@ -441,6 +457,7 @@ impl RuntimeCommittedEvent {
             Self::ApprovalResolved(_) => "approval.resolved",
             Self::SessionLifecycleChanged(_) => "session.lifecycle_changed",
             Self::SchedulerFired(_) => "scheduler.fired",
+            Self::SchedulerDeliveryReconciled(_) => "scheduler.delivery_reconciled",
         }
     }
 }
@@ -655,7 +672,8 @@ fn apply_payload(
         | RuntimeCommittedEvent::ModelRequestFailed(_)
         | RuntimeCommittedEvent::ToolCallProposed(_)
         | RuntimeCommittedEvent::ToolCallApproved(_)
-        | RuntimeCommittedEvent::SchedulerFired(_) => Ok(()),
+        | RuntimeCommittedEvent::SchedulerFired(_)
+        | RuntimeCommittedEvent::SchedulerDeliveryReconciled(_) => Ok(()),
         RuntimeCommittedEvent::ToolExecutionDispatched(dispatched) => {
             apply_tool_dispatch(state, dispatched, event.metadata.sequence)
         }

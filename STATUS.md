@@ -66,7 +66,7 @@ and cross-platform CI evidence remain outstanding.
 | Replaceable memory providers | Integration tested | No-memory, checksum-protected file memory, and bundled `SQLite` FTS5 ranked retrieval pass dependency/data/logic tests; unapproved writes are rejected before data access and injection provenance is complete |
 | Native Web host | End-to-end validated | Separate N-tier host implements authenticated HTTP, HTML fetch, deterministic/Brave search, dependency-reconstructed action grants, restart-persistent replay denial, per-hop DNS/domain/private-IP/redirect policy, secret references, cancellation, bounded projections/concurrency and atomic artifact overflow; offline runtime search routing passes a process E2E |
 | Native browser host | End-to-end validated | Separate five-crate WebDriver host implements lifecycle, rendered navigation/inspection, final-URL policy, screenshot/download artifacts, CSS click/type/form submission, health, cancellation, keyed grants, durable replay denial and shutdown. A real compiled WebDriver fixture drives nine operations through runtime and provider continuation in `runtime_browser_loop.ps1`; Unix automation is present |
-| Durable scheduling | End-to-end validated | A separate five-crate worker and dedicated protocol implement authenticated negotiation, checksum-protected one-time/recurring/runtime-event/process-output schedules, portable atomic replacement recovery, complete execution policy, deterministic create-once claims with claim timestamps, idempotent terminal markers, corruption rejection and restart deduplication. Runtime and CLI have layer-local management/claim/execute mappings; the daemon automatically polls time triggers and observes newly committed canonical ranges for exact event IDs and process/log-stream byte ranges. Typed deferred turns are bound to an exact session, schedule and trigger proof, reject manual approval, enforce expiry against the durable claim time, transition resume-once, and then re-enter the normal intercepted provider path. `runtime_scheduler.ps1` proves a deferred turn survives daemon restart, wakes once, and cannot be manually approved. TUI management and redelivery of an interrupted nonterminal scheduler claim remain pending |
+| Durable scheduling | End-to-end validated | A separate five-crate worker and dedicated protocol implement authenticated negotiation, checksum-protected one-time/recurring/runtime-event/process-output schedules, portable atomic replacement recovery, complete execution policy, deterministic create-once claims with claim timestamps, idempotent terminal markers, corruption rejection and restart deduplication. Runtime and CLI have layer-local management/claim/execute mappings; the daemon automatically polls time triggers and observes newly committed canonical ranges for exact event IDs and process/log-stream byte ranges. Typed deferred turns are bound to an exact session, schedule and trigger proof, reject manual approval, enforce expiry against the durable claim time, transition resume-once, and then re-enter the normal intercepted provider path. Startup enumerates durable nonterminal claims: claims without canonical dispatch provenance are safely resumed, canonical terminal outcomes are reconciled without redispatch, and ambiguous in-flight work fails closed. A canonical `scheduler.delivery_reconciled` event precedes the worker terminal marker so recovery itself is repeatable. `runtime_scheduler.ps1` proves deferred wakeup; `runtime_scheduler_recovery.ps1` kills the daemon before dispatch and again after canonical model completion, then proves exactly one provider execution, reconciliation event, and terminal marker. TUI management remains pending |
 | Native MCP host | Partially implemented | Five-crate process implements initialization/version negotiation, lazy tools/resources/prompts discovery, namespacing, stdio and Streamable HTTP, session IDs, progress, cancellation, shutdown, inert managed catalog, deterministic mock and real compiled stdio fixture. Multi-event SSE and bounded resumption carry exact session/event cursors through a real loopback HTTP test. Dependency-owned request reconstruction, keyed grant verification, restart-persistent nonce consumption, runtime server-list routing, and configured external stdio progress/invocation/result projection pass focused and process E2E tests; OAuth and restart-persistent HTTP cursors remain pending |
 | Isolated plugin host | Integration tested | Five-crate process maps the versioned plugin protocol through all layers; SDK validation, keyed action grants, durable replay/state generations, approved executable roots, per-invocation crash isolation, timeout/cancellation/retry/rate limits, bounded observers and state changes are implemented; authority/cycle rejection has a real dependency test |
 
@@ -75,8 +75,7 @@ and cross-platform CI evidence remain outstanding.
 - TUI management panels for schedules, plugins, MCP, processes, artifacts,
   child agents, and LSP; core interactive streaming is implemented.
 - MCP OAuth authorization-code flow and restart-persistent HTTP cursors.
-- Schedule TUI management and crash redelivery for claimed, nonterminal
-  scheduler executions.
+- Schedule TUI management.
 
 ## Failing tests
 
@@ -91,9 +90,9 @@ followed directly with explicit planner/architect/critic assignments.
 
 ## Next tasks
 
-1. Complete ACP rich content and per-session MCP declarations.
-2. Add secure scheduled continuation wakeups with resume-once policy revalidation.
-3. Complete MCP OAuth/restart-persistent cursors and remaining TUI management panels.
+1. Complete MCP OAuth and restart-persistent HTTP cursors.
+2. Complete remaining TUI management panels, including schedules.
+3. Complete ACP rich content and per-session MCP declarations.
 
 ## Performance results
 
@@ -131,6 +130,12 @@ receipt and reconciles ordinary nonterminal dispatches from canonical state.
 Receipts owned by an already-approved durable continuation are classified and
 left to the continuation's resume-once path so startup cannot consume the
 action without also resuming its provider turn.
+Scheduler startup recovery similarly separates durable occurrence claims from
+canonical dispatch provenance. An unstarted claim may enter the ordinary
+intercepted path; a canonically terminal claim receives a reconciliation event
+before its worker marker; an ambiguous dispatched claim is terminally failed
+without redispatch. Exact execution, schedule, and optional continuation
+identity are retained in the canonical recovery event.
 Process executable policy is explicit and deny-by-default. Its sanitized child
 environment admits only non-secret platform/toolchain discovery variables plus
 configured overrides; the generic secret-name filter remains mandatory. Harness grants are
@@ -166,6 +171,11 @@ provider projection remain bounded. Machine-readable evidence is recorded in
 `docs/requirements/traceability.toml`. Scenarios 9–11 also have live runtime
 host-boundary smoke paths, though their full required multi-step scenarios
 remain partial.
+Scheduler crash recovery has separate Windows kill-injection evidence: one
+claimed occurrence survives a pre-dispatch daemon stop, then a second stop
+after canonical provider completion but before the worker marker; startup
+reconciliation commits one exact recovery event and never repeats provider
+execution. The equivalent Unix script is present but was not run here.
 
 ## N-tier compliance status
 

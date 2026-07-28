@@ -11,9 +11,10 @@ use agentmod_runtime_logic::{
     harness::ProviderEvent,
     turn::{
         ApprovalTurnLogicPort, CancelTurnCommand, CancelTurnLogicPort, CreateDeferredTurnCommand,
-        DeferredTurnLogicPort, RecoverStartupToolsCommand, ResolveTurnApprovalCommand,
-        RunScheduledTurnCommand, RunTurnCommand, RunTurnError, RunTurnStream, RunTurnStreamItem,
-        StartupToolRecoveryLogicPort, TurnLogicPort, WakeScheduledTurnCommand,
+        DeferredTurnLogicPort, RecordScheduledRecoveryCommand, RecoverStartupToolsCommand,
+        ResolveTurnApprovalCommand, RunScheduledTurnCommand, RunTurnCommand, RunTurnError,
+        RunTurnStream, RunTurnStreamItem, ScheduledRecoveryLogicPort, StartupToolRecoveryLogicPort,
+        TurnLogicPort, WakeScheduledTurnCommand,
     },
 };
 use agentmod_runtime_protocol::{
@@ -103,12 +104,22 @@ pub struct ServiceWakeScheduledTurnRequest {
     pub schedule_id: String,
     pub scheduled_for_ms: i64,
     pub proof: ServiceContinuationWakeProof,
+    pub allow_resumed_recovery: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServiceWakeScheduledTurnResponse {
     pub transitioned: bool,
     pub turn: Option<ServiceRunTurnResponse>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceRecordScheduledRecoveryRequest {
+    pub session_id: String,
+    pub execution_id: String,
+    pub schedule_id: String,
+    pub outcome: String,
+    pub continuation_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -407,6 +418,7 @@ impl<L: DeferredTurnLogicPort> TurnService<L> {
                 schedule_id: request.schedule_id,
                 scheduled_for_ms: request.scheduled_for_ms,
                 proof: to_logic_wake_proof(request.proof),
+                allow_resumed_recovery: request.allow_resumed_recovery,
             })
             .await
             .map_err(TurnServiceError::Logic)?;
@@ -443,6 +455,30 @@ impl<L: CancelTurnLogicPort> TurnService<L> {
     }
 }
 
+impl<L: ScheduledRecoveryLogicPort> TurnService<L> {
+    /// Commits one canonical scheduler reconciliation outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns a translated runtime business failure when the recovery
+    /// identity or canonical journal cannot be validated.
+    pub fn record_scheduled_recovery(
+        &self,
+        request: ServiceRecordScheduledRecoveryRequest,
+    ) -> Result<agentmod_primitives::Sequence, TurnServiceError> {
+        self.logic
+            .record_scheduled_recovery(RecordScheduledRecoveryCommand {
+                sessions_root: self.sessions_root.clone(),
+                session_id: request.session_id,
+                execution_id: request.execution_id,
+                schedule_id: request.schedule_id,
+                outcome: request.outcome,
+                continuation_id: request.continuation_id,
+            })
+            .map_err(TurnServiceError::Logic)
+    }
+}
+
 impl<L: StartupToolRecoveryLogicPort> TurnService<L> {
     /// Reconciles every durable terminal host receipt against canonical
     /// nonterminal tool dispatches before the daemon accepts connections.
@@ -475,12 +511,37 @@ impl<L: StartupToolRecoveryLogicPort> TurnService<L> {
 pub struct RuntimeDaemonService<C, T> {
     core: RuntimeService<C>,
     turns: TurnService<T>,
+    scheduler_completion_delay: std::time::Duration,
+}
+
+enum ScheduledRecoveryState {
+    NotStarted,
+    Succeeded,
+    AwaitingApproval(String),
+    Failed,
+    Indeterminate,
+}
+
+struct ScheduledRecoveryClassification {
+    state: ScheduledRecoveryState,
+    reconciliation_sequence: Option<agentmod_primitives::Sequence>,
 }
 
 impl<C, T> RuntimeDaemonService<C, T> {
     #[must_use]
     pub const fn new(core: RuntimeService<C>, turns: TurnService<T>) -> Self {
-        Self { core, turns }
+        Self {
+            core,
+            turns,
+            scheduler_completion_delay: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Adds a completion delay used only by crash-injection validation.
+    #[must_use]
+    pub const fn with_scheduler_completion_delay(mut self, delay: std::time::Duration) -> Self {
+        self.scheduler_completion_delay = delay;
+        self
     }
 }
 
@@ -490,8 +551,259 @@ where
         + agentmod_runtime_logic::registry::SessionRegistryLogicPort
         + agentmod_runtime_logic::history::SessionHistoryLogicPort
         + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort,
-    T: TurnLogicPort + DeferredTurnLogicPort,
+    T: TurnLogicPort + DeferredTurnLogicPort + ScheduledRecoveryLogicPort,
 {
+    /// Reconciles durable scheduler claims before the runtime accepts clients.
+    ///
+    /// Claims with no canonical `scheduler.fired` event are safe to execute:
+    /// the event is committed before provider or tool dispatch. Canonically
+    /// terminal claims are finalized at the worker. Ambiguous in-flight claims
+    /// fail closed and are never redispatched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sanitized error when pending claims or canonical history
+    /// cannot be read.
+    pub async fn recover_pending_schedules(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<RuntimeScheduledRun>, String> {
+        let RuntimeResponse::ScheduledExecutions { executions } = self
+            .core
+            .handle_schedule_wire(&RuntimeRequest::ListPendingScheduledExecutions { limit })
+            .map_err(|error| error.to_string())?
+        else {
+            return Err(String::from(
+                "runtime scheduler returned an invalid pending response",
+            ));
+        };
+        let mut safe_to_start = Vec::new();
+        let mut results = Vec::new();
+        for execution in executions {
+            let service_execution = ServiceScheduledExecution {
+                execution_id: execution.execution_id,
+                scheduled_for_ms: execution.scheduled_for_ms,
+                claimed_at_ms: execution.claimed_at_ms,
+                schedule: crate::from_wire_schedule(execution.schedule),
+            };
+            let classification = self.classify_scheduled_recovery(&service_execution)?;
+            match classification.state {
+                ScheduledRecoveryState::NotStarted => safe_to_start.push(service_execution),
+                ScheduledRecoveryState::Succeeded => {
+                    let sequence = self.ensure_scheduled_reconciliation(
+                        &service_execution,
+                        "succeeded",
+                        None,
+                        classification.reconciliation_sequence,
+                    )?;
+                    let terminal =
+                        self.complete_scheduled_claim(&service_execution.execution_id, true);
+                    results.push(recovered_run(
+                        service_execution,
+                        terminal,
+                        true,
+                        Some(sequence),
+                        None,
+                    ));
+                }
+                ScheduledRecoveryState::AwaitingApproval(continuation_id) => {
+                    let sequence = self.ensure_scheduled_reconciliation(
+                        &service_execution,
+                        "awaiting_approval",
+                        Some(continuation_id.clone()),
+                        classification.reconciliation_sequence,
+                    )?;
+                    let mut run =
+                        recovered_run(service_execution, false, false, Some(sequence), None);
+                    run.awaiting_continuation = Some(continuation_id);
+                    results.push(run);
+                }
+                ScheduledRecoveryState::Failed => {
+                    let sequence = self.ensure_scheduled_reconciliation(
+                        &service_execution,
+                        "failed",
+                        None,
+                        classification.reconciliation_sequence,
+                    )?;
+                    let terminal =
+                        self.complete_scheduled_claim(&service_execution.execution_id, false);
+                    results.push(recovered_run(
+                        service_execution,
+                        terminal,
+                        false,
+                        Some(sequence),
+                        None,
+                    ));
+                }
+                ScheduledRecoveryState::Indeterminate => {
+                    let sequence = self.ensure_scheduled_reconciliation(
+                        &service_execution,
+                        "indeterminate_failed",
+                        None,
+                        classification.reconciliation_sequence,
+                    )?;
+                    let terminal =
+                        self.complete_scheduled_claim(&service_execution.execution_id, false);
+                    results.push(recovered_run(
+                        service_execution,
+                        terminal,
+                        false,
+                        Some(sequence),
+                        Some(String::from(
+                            "interrupted scheduled execution was not redispatched",
+                        )),
+                    ));
+                }
+            }
+        }
+        results.extend(self.execute_scheduled_claims(safe_to_start, true).await);
+        Ok(results)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the bounded canonical scan keeps execution-boundary and terminal precedence visible"
+    )]
+    fn classify_scheduled_recovery(
+        &self,
+        execution: &ServiceScheduledExecution,
+    ) -> Result<ScheduledRecoveryClassification, String> {
+        let mut after = None;
+        let mut fired = false;
+        let mut observed_state = None;
+        loop {
+            let previous_after = after;
+            let page = self
+                .core
+                .subscribe_session(crate::ServiceSubscribeSessionRequest {
+                    session_id: execution.schedule.session_id,
+                    after,
+                    limit: 1_024,
+                })
+                .map_err(|error| error.to_string())?;
+            for event in page.events {
+                after = Some(event.sequence);
+                if event.event_type == "scheduler.fired" {
+                    let matches_execution = event
+                        .payload
+                        .get("payload")
+                        .and_then(|payload| payload.get("execution_id"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == execution.execution_id);
+                    if matches_execution {
+                        fired = true;
+                    } else if fired {
+                        return Ok(ScheduledRecoveryClassification {
+                            state: observed_state.unwrap_or(ScheduledRecoveryState::Indeterminate),
+                            reconciliation_sequence: None,
+                        });
+                    }
+                    continue;
+                }
+                if !fired {
+                    continue;
+                }
+                match event.event_type.as_str() {
+                    "scheduler.delivery_reconciled" => {
+                        let Some(payload) = event.payload.get("payload") else {
+                            continue;
+                        };
+                        let matches_execution = payload
+                            .get("execution_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == execution.execution_id);
+                        let matches_schedule = payload
+                            .get("schedule_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == execution.schedule.schedule_id);
+                        if !matches_execution || !matches_schedule {
+                            continue;
+                        }
+                        let state = match payload.get("outcome").and_then(Value::as_str) {
+                            Some("succeeded") => ScheduledRecoveryState::Succeeded,
+                            Some("failed" | "indeterminate_failed") => {
+                                ScheduledRecoveryState::Failed
+                            }
+                            Some("awaiting_approval") => {
+                                let continuation_id = payload
+                                    .get("continuation_id")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown")
+                                    .to_owned();
+                                ScheduledRecoveryState::AwaitingApproval(continuation_id)
+                            }
+                            _ => return Err(String::from("invalid scheduler recovery outcome")),
+                        };
+                        return Ok(ScheduledRecoveryClassification {
+                            state,
+                            reconciliation_sequence: Some(event.sequence),
+                        });
+                    }
+                    "model.response_completed" => {
+                        observed_state = Some(ScheduledRecoveryState::Succeeded);
+                    }
+                    "model.request_failed"
+                    | "model.request_cancelled"
+                    | "session.failed"
+                    | "session.cancelled" => {
+                        observed_state = Some(ScheduledRecoveryState::Failed);
+                    }
+                    "approval.requested" => {
+                        let continuation_id = event
+                            .payload
+                            .get("payload")
+                            .and_then(|payload| payload.get("continuation_id"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_owned();
+                        observed_state =
+                            Some(ScheduledRecoveryState::AwaitingApproval(continuation_id));
+                    }
+                    _ => {}
+                }
+            }
+            if !page.has_more {
+                break;
+            }
+            if after == previous_after {
+                return Err(String::from(
+                    "scheduler recovery history cursor did not advance",
+                ));
+            }
+        }
+        Ok(ScheduledRecoveryClassification {
+            state: if fired {
+                observed_state.unwrap_or(ScheduledRecoveryState::Indeterminate)
+            } else {
+                ScheduledRecoveryState::NotStarted
+            },
+            reconciliation_sequence: None,
+        })
+    }
+
+    fn ensure_scheduled_reconciliation(
+        &self,
+        execution: &ServiceScheduledExecution,
+        outcome: &str,
+        continuation_id: Option<String>,
+        existing: Option<agentmod_primitives::Sequence>,
+    ) -> Result<agentmod_primitives::Sequence, String> {
+        existing.map_or_else(
+            || {
+                self.turns
+                    .record_scheduled_recovery(ServiceRecordScheduledRecoveryRequest {
+                        session_id: execution.schedule.session_id.to_string(),
+                        execution_id: execution.execution_id.clone(),
+                        schedule_id: execution.schedule.schedule_id.clone(),
+                        outcome: outcome.to_owned(),
+                        continuation_id,
+                    })
+                    .map_err(|error| error.to_string())
+            },
+            Ok,
+        )
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the service maps prompt and typed continuation claims into one uniform terminal result"
@@ -499,6 +811,7 @@ where
     async fn execute_scheduled_claims(
         &self,
         executions: Vec<ServiceScheduledExecution>,
+        allow_resumed_recovery: bool,
     ) -> Vec<RuntimeScheduledRun> {
         let mut runs = Vec::with_capacity(executions.len());
         for execution in executions {
@@ -542,6 +855,7 @@ where
                                 &schedule.trigger,
                                 execution.claimed_at_ms,
                             ),
+                            allow_resumed_recovery,
                         })
                         .await;
                     match wake {
@@ -564,6 +878,9 @@ where
                     });
                 }
                 Ok(Some(result)) => {
+                    if !self.scheduler_completion_delay.is_zero() {
+                        tokio::time::sleep(self.scheduler_completion_delay).await;
+                    }
                     let terminal = self.complete_scheduled_claim(&execution_id, true);
                     runs.push(RuntimeScheduledRun {
                         execution_id,
@@ -576,6 +893,9 @@ where
                     });
                 }
                 Ok(None) => {
+                    if !self.scheduler_completion_delay.is_zero() {
+                        tokio::time::sleep(self.scheduler_completion_delay).await;
+                    }
                     let terminal = self.complete_scheduled_claim(&execution_id, true);
                     runs.push(RuntimeScheduledRun {
                         execution_id,
@@ -588,6 +908,9 @@ where
                     });
                 }
                 Err(error) => {
+                    if !self.scheduler_completion_delay.is_zero() {
+                        tokio::time::sleep(self.scheduler_completion_delay).await;
+                    }
                     let terminal = self.complete_scheduled_claim(&execution_id, false);
                     runs.push(RuntimeScheduledRun {
                         execution_id,
@@ -746,7 +1069,7 @@ where
             }
         }
         let _ = self
-            .execute_scheduled_claims(executions.into_values().collect())
+            .execute_scheduled_claims(executions.into_values().collect(), false)
             .await;
     }
 }
@@ -766,6 +1089,7 @@ where
         + ApprovalTurnLogicPort
         + CancelTurnLogicPort
         + DeferredTurnLogicPort
+        + ScheduledRecoveryLogicPort
         + Clone
         + 'static,
 {
@@ -868,7 +1192,7 @@ where
                     schedule: crate::from_wire_schedule(execution.schedule),
                 })
                 .collect();
-            let runs = self.execute_scheduled_claims(executions).await;
+            let runs = self.execute_scheduled_claims(executions, false).await;
             return Ok(RuntimeResponse::ScheduledRuns { runs });
         }
         let RuntimeRequest::RunTurn {
@@ -886,6 +1210,7 @@ where
                     | RuntimeRequest::RemoveSchedule { .. }
                     | RuntimeRequest::ListSchedules { .. }
                     | RuntimeRequest::ClaimDueSchedules { .. }
+                    | RuntimeRequest::ListPendingScheduledExecutions { .. }
                     | RuntimeRequest::CompleteScheduledExecution { .. }
             ) {
                 return self
@@ -1073,6 +1398,24 @@ where
         Ok(crate::local_rpc::RuntimeEndpointStream::from_receiver(
             receiver,
         ))
+    }
+}
+
+fn recovered_run(
+    execution: ServiceScheduledExecution,
+    terminal: bool,
+    succeeded: bool,
+    last_committed_sequence: Option<agentmod_primitives::Sequence>,
+    error: Option<String>,
+) -> RuntimeScheduledRun {
+    RuntimeScheduledRun {
+        execution_id: execution.execution_id,
+        schedule_id: execution.schedule.schedule_id,
+        terminal,
+        succeeded,
+        last_committed_sequence,
+        awaiting_continuation: None,
+        error,
     }
 }
 

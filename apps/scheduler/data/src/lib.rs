@@ -72,6 +72,12 @@ pub trait SchedulerDataPort: Send + Sync {
     fn remove(&self, schedule_id: &str) -> Result<bool, SchedulerDataError>;
     fn list(&self, limit: usize) -> Result<Vec<ScheduleDataRecord>, SchedulerDataError>;
     fn claim_due(&self, limit: usize) -> Result<Vec<ExecutionDataRecord>, SchedulerDataError>;
+    fn list_pending_executions(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<ExecutionDataRecord>, SchedulerDataError> {
+        Err(SchedulerDataError::Unavailable)
+    }
     fn fire_runtime_event(
         &self,
         event_id: &str,
@@ -125,6 +131,16 @@ impl<D: SchedulerDependencyPort> SchedulerDataPort for SchedulerData<D> {
     fn claim_due(&self, limit: usize) -> Result<Vec<ExecutionDataRecord>, SchedulerDataError> {
         self.dependency
             .claim_due(limit)
+            .map(|values| values.into_iter().map(from_execution).collect())
+            .map_err(map_error)
+    }
+
+    fn list_pending_executions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ExecutionDataRecord>, SchedulerDataError> {
+        self.dependency
+            .list_pending_executions(limit)
             .map(|values| values.into_iter().map(from_execution).collect())
             .map_err(map_error)
     }

@@ -30,6 +30,20 @@ events commit. A turn awaiting durable approval remains nonterminal. Failed
 turns receive an idempotent failure marker. Restarting the daemon cannot claim
 the same occurrence again.
 
+Before accepting RPC connections, the runtime asks the worker for bounded
+nonterminal execution records and compares each record with verified canonical
+session history. A claim with no exact `scheduler.fired` event is safe to resume
+because that event is committed before provider or tool dispatch. A claim with
+a canonical model terminal is reconciled without executing it again. An
+approval boundary remains pending. Any fired claim without a recognizable
+terminal state fails closed.
+
+Recovery commits `scheduler.delivery_reconciled`, bound to the exact execution
+and schedule, before writing the worker terminal marker. Approval recovery also
+binds the continuation ID. If the daemon stops between those two writes, the
+next startup consumes the canonical reconciliation outcome and only repairs the
+worker marker. Conflicting success and failure markers are corruption.
+
 Deferred turns use a separate `DeferredTurn` continuation payload. Creation is
 an idempotent two-step logic use case: persist the exact schedule-bound
 continuation, then store the schedule. A worker claim carries both the intended
@@ -45,6 +59,5 @@ be tuned with `AGENTMOD_SCHEDULER_POLL_MS` and
 `AGENTMOD_SCHEDULER_POLL_LIMIT`. The worker never executes payloads itself.
 Triggered schedule executions are deliberately not fed recursively back into
 the same observer pass, preventing an event schedule from immediately
-self-triggering without an explicit later committed turn. TUI management and
-redelivery of a claimed execution interrupted before runtime completion remain
-open.
+self-triggering without an explicit later committed turn. TUI management
+remains open.

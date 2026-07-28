@@ -89,6 +89,12 @@ pub trait SchedulerLogicPort: Send + Sync {
     fn remove(&self, schedule_id: &str) -> Result<bool, SchedulerLogicError>;
     fn list(&self, limit: u32) -> Result<Vec<ScheduleResult>, SchedulerLogicError>;
     fn claim_due(&self, limit: u32) -> Result<Vec<ExecutionResult>, SchedulerLogicError>;
+    fn list_pending_executions(
+        &self,
+        _limit: u32,
+    ) -> Result<Vec<ExecutionResult>, SchedulerLogicError> {
+        Err(SchedulerLogicError::Unavailable)
+    }
     fn fire_runtime_event(
         &self,
         event_id: &str,
@@ -149,6 +155,17 @@ impl<D: SchedulerDataPort> SchedulerLogicPort for SchedulerLogic<D> {
         let limit = validate_limit(limit)?;
         self.data
             .claim_due(limit)
+            .map(|values| values.into_iter().map(from_execution).collect())
+            .map_err(map_error)
+    }
+
+    fn list_pending_executions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ExecutionResult>, SchedulerLogicError> {
+        let limit = validate_limit(limit)?;
+        self.data
+            .list_pending_executions(limit)
             .map(|values| values.into_iter().map(from_execution).collect())
             .map_err(map_error)
     }

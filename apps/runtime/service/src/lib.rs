@@ -390,6 +390,21 @@ impl<L: RuntimeScheduleLogicPort> RuntimeService<L> {
                     .collect();
                 Ok(RuntimeResponse::ScheduledExecutions { executions })
             }
+            RuntimeRequest::ListPendingScheduledExecutions { limit } => {
+                let executions = self
+                    .logic
+                    .list_pending_executions(*limit)
+                    .map_err(ServiceError::Schedule)?
+                    .into_iter()
+                    .map(|execution| RuntimeScheduledExecution {
+                        execution_id: execution.execution_id,
+                        scheduled_for_ms: execution.scheduled_for_ms,
+                        claimed_at_ms: execution.claimed_at_ms,
+                        schedule: to_wire_schedule(from_logic_schedule(execution.schedule)),
+                    })
+                    .collect();
+                Ok(RuntimeResponse::ScheduledExecutions { executions })
+            }
             RuntimeRequest::CompleteScheduledExecution {
                 execution_id,
                 succeeded,

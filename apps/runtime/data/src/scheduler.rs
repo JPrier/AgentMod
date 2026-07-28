@@ -82,6 +82,14 @@ pub trait RuntimeScheduleDataPort: Send + Sync {
         &self,
         limit: u32,
     ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError>;
+    fn list_pending_executions(
+        &self,
+        _limit: u32,
+    ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError> {
+        Err(RuntimeScheduleDataError::Dependency(
+            RuntimeSchedulerDependencyError::Protocol,
+        ))
+    }
     fn fire_runtime_event(
         &self,
         event_id: &str,
@@ -133,6 +141,16 @@ impl<D: RuntimeSchedulerDependencyPort> RuntimeScheduleDataPort for crate::Runti
     ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError> {
         self.dependency
             .claim_due(limit)
+            .map(|values| values.into_iter().map(from_execution).collect())
+            .map_err(RuntimeScheduleDataError::Dependency)
+    }
+
+    fn list_pending_executions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError> {
+        self.dependency
+            .list_pending_executions(limit)
             .map(|values| values.into_iter().map(from_execution).collect())
             .map_err(RuntimeScheduleDataError::Dependency)
     }

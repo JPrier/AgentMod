@@ -89,6 +89,12 @@ pub trait SchedulerDependencyPort: Send + Sync {
     fn list(&self, limit: usize) -> Result<Vec<DependencySchedule>, SchedulerDependencyError>;
     fn claim_due(&self, limit: usize)
     -> Result<Vec<DependencyExecution>, SchedulerDependencyError>;
+    fn list_pending_executions(
+        &self,
+        _limit: usize,
+    ) -> Result<Vec<DependencyExecution>, SchedulerDependencyError> {
+        Err(SchedulerDependencyError::Invalid)
+    }
     fn fire_runtime_event(
         &self,
         event_id: &str,
@@ -360,6 +366,63 @@ impl SchedulerDependencyPort for FileSchedulerDependency {
                 Self::write_state(&path, &state)?;
             }
             Ok(result)
+        })
+    }
+
+    fn list_pending_executions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<DependencyExecution>, SchedulerDependencyError> {
+        if limit == 0 || limit > 1_000 {
+            return Err(SchedulerDependencyError::Invalid);
+        }
+        self.locked(|| {
+            let execution_root = self.root.join("executions");
+            let mut paths = fs::read_dir(&execution_root)
+                .map_err(|_| SchedulerDependencyError::Storage)?
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|value| value == "json"))
+                .collect::<Vec<_>>();
+            paths.sort();
+            let mut pending = Vec::new();
+            for path in paths {
+                let execution_id = path
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .ok_or(SchedulerDependencyError::Corrupt)?;
+                let succeeded = execution_root
+                    .join(format!("{execution_id}.succeeded"))
+                    .exists();
+                let failed = execution_root
+                    .join(format!("{execution_id}.failed"))
+                    .exists();
+                if succeeded && failed {
+                    return Err(SchedulerDependencyError::Corrupt);
+                }
+                if succeeded || failed {
+                    continue;
+                }
+                let bytes = fs::read(&path).map_err(|_| SchedulerDependencyError::Storage)?;
+                let stored: StoredExecution = serde_json::from_slice(&bytes)
+                    .map_err(|_| SchedulerDependencyError::Corrupt)?;
+                if checksum(&stored.record)? != stored.checksum
+                    || stored.record.status != ExecutionStatus::Claimed
+                    || execution_id != stored.record.execution_id
+                {
+                    return Err(SchedulerDependencyError::Corrupt);
+                }
+                pending.push(DependencyExecution {
+                    execution_id: stored.record.execution_id,
+                    scheduled_for_ms: stored.record.scheduled_for_ms,
+                    claimed_at_ms: stored.record.claimed_at_ms,
+                    schedule: stored.record.schedule,
+                });
+                if pending.len() == limit {
+                    break;
+                }
+            }
+            Ok(pending)
         })
     }
 
@@ -684,10 +747,22 @@ mod tests {
         assert!(dependency.claim_due(10).expect("second claim").is_empty());
         let restarted = FileSchedulerDependency::new(root.path().to_path_buf()).expect("restart");
         assert!(restarted.claim_due(10).expect("restart claim").is_empty());
+        assert_eq!(
+            restarted
+                .list_pending_executions(10)
+                .expect("pending after restart"),
+            claimed
+        );
         assert!(
             restarted
                 .complete_execution(&claimed[0].execution_id, true)
                 .expect("complete")
+        );
+        assert!(
+            restarted
+                .list_pending_executions(10)
+                .expect("terminal excluded")
+                .is_empty()
         );
         assert!(
             !restarted
@@ -697,6 +772,17 @@ mod tests {
         assert_eq!(
             restarted.complete_execution(&claimed[0].execution_id, false),
             Err(SchedulerDependencyError::TerminalConflict)
+        );
+        fs::write(
+            root.path()
+                .join("executions")
+                .join(format!("{}.failed", claimed[0].execution_id)),
+            b"conflicting terminal marker",
+        )
+        .expect("conflicting marker");
+        assert_eq!(
+            restarted.list_pending_executions(10),
+            Err(SchedulerDependencyError::Corrupt)
         );
     }
 

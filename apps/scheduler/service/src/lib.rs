@@ -96,6 +96,10 @@ impl<L: SchedulerLogicPort> SchedulerService<L> {
             SchedulerCommand::ClaimDue { limit } => {
                 self.logic.claim_due(limit).map_or_else(error, executions)
             }
+            SchedulerCommand::ListPendingExecutions { limit } => self
+                .logic
+                .list_pending_executions(limit)
+                .map_or_else(error, executions),
             SchedulerCommand::FireRuntimeEvent {
                 event_id,
                 event_type,

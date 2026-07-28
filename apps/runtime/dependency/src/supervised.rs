@@ -185,6 +185,13 @@ impl RuntimeSchedulerDependencyPort for SupervisedRuntimeDependencies {
         self.scheduler.claim_due(limit)
     }
 
+    fn list_pending_executions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
+        self.scheduler.list_pending_executions(limit)
+    }
+
     fn fire_runtime_event(
         &self,
         event_id: &str,

@@ -65,6 +65,11 @@ pub enum RuntimeRequest {
         /// Maximum claims.
         limit: u32,
     },
+    /// List durable nonterminal claims for restart reconciliation.
+    ListPendingScheduledExecutions {
+        /// Maximum claims.
+        limit: u32,
+    },
     /// Record the terminal result of a claimed occurrence.
     CompleteScheduledExecution {
         /// Deterministic execution identifier returned by a claim.

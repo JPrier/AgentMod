@@ -110,6 +110,12 @@ pub trait RuntimeScheduleLogicPort: Send + Sync {
         &self,
         limit: u32,
     ) -> Result<Vec<ScheduledExecution>, RuntimeScheduleLogicError>;
+    fn list_pending_executions(
+        &self,
+        _limit: u32,
+    ) -> Result<Vec<ScheduledExecution>, RuntimeScheduleLogicError> {
+        Err(RuntimeScheduleLogicError::CorruptData)
+    }
     fn fire_runtime_event(
         &self,
         command: FireRuntimeEventCommand,
@@ -170,6 +176,19 @@ impl<D: RuntimeScheduleDataPort> RuntimeScheduleLogicPort for crate::RuntimeLogi
         validate_limit(limit)?;
         self.data
             .claim_due_schedules(limit)
+            .map_err(RuntimeScheduleLogicError::Data)?
+            .into_iter()
+            .map(from_data_execution)
+            .collect()
+    }
+
+    fn list_pending_executions(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ScheduledExecution>, RuntimeScheduleLogicError> {
+        validate_limit(limit)?;
+        self.data
+            .list_pending_executions(limit)
             .map_err(RuntimeScheduleLogicError::Data)?
             .into_iter()
             .map(from_data_execution)

@@ -113,6 +113,11 @@ pub enum SchedulerCommand {
         /// Maximum executions.
         limit: u32,
     },
+    /// List durable nonterminal claims for restart reconciliation.
+    ListPendingExecutions {
+        /// Maximum executions.
+        limit: u32,
+    },
     /// Match a committed runtime event.
     FireRuntimeEvent {
         /// Canonical event ID used for idempotency.

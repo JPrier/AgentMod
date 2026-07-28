@@ -238,7 +238,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "orphaned_count": recovery.orphaned_count,
             })
         );
-        let service = RuntimeDaemonService::new(core, turns);
+        let service = RuntimeDaemonService::new(core, turns).with_scheduler_completion_delay(
+            std::time::Duration::from_millis(
+                std::env::var("AGENTMOD_SCHEDULER_COMPLETION_DELAY_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(0),
+            ),
+        );
         prepare_local_endpoint(&endpoint)?;
         let poll_interval_ms = std::env::var("AGENTMOD_SCHEDULER_POLL_MS")
             .ok()
@@ -249,6 +256,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| (1..=1_000).contains(value))
             .unwrap_or(16);
+        let scheduler_recovery = service.recover_pending_schedules(poll_limit).await?;
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "runtime.startup_scheduler_recovery",
+                "execution_count": scheduler_recovery.len(),
+                "terminal_count": scheduler_recovery.iter().filter(|run| run.terminal).count(),
+                "succeeded_count": scheduler_recovery.iter().filter(|run| run.succeeded).count(),
+                "awaiting_count": scheduler_recovery
+                    .iter()
+                    .filter(|run| run.awaiting_continuation.is_some())
+                    .count(),
+            })
+        );
         let scheduler_poller = if poll_interval_ms == 0 {
             None
         } else {

@@ -12,11 +12,11 @@ use agentmod_process_host_dependency::{
     DependencyAuthorization, DependencyCancelRequest, DependencyCleanupPolicy,
     DependencyExecutablePolicy, DependencyIdentity, DependencyListRequest, DependencyOutputStream,
     DependencyProcessInputRequest, DependencyProcessRequest, DependencyProcessState,
-    DependencyReadOutputRequest, DependencyResizeTerminalRequest, DependencyStartProcessRequest,
-    DependencyTerminalSize, ProcessDependencyConfig, ProcessDependencyError, ProcessDependencyPort,
-    TokioProcessDependency, canonical_control_operation, canonical_input_operation,
-    canonical_list_operation, canonical_read_operation, canonical_resize_operation,
-    canonical_start_operation,
+    DependencyReadOutputRequest, DependencyRecoveryState, DependencyResizeTerminalRequest,
+    DependencyStartProcessRequest, DependencyTerminalSize, ProcessDependencyConfig,
+    ProcessDependencyError, ProcessDependencyPort, TokioProcessDependency,
+    canonical_control_operation, canonical_input_operation, canonical_list_operation,
+    canonical_read_operation, canonical_resize_operation, canonical_start_operation,
 };
 use agentmod_protocol_support::authorization::{
     AuthorizationClaims, AuthorizationKey, seal_authorization,
@@ -542,4 +542,201 @@ async fn terminal_supports_input_resize_detach_reattach_and_durable_output() {
     let output = String::from_utf8_lossy(&output.bytes);
     assert!(output.contains("fixture-stderr"));
     assert!(output.contains("fixture-stdout:terminal-input"));
+}
+
+#[tokio::test]
+async fn restart_reconciles_exact_live_identity_without_redispatch_or_reattachment() {
+    let root = TempDir::new().expect("root");
+    let executable = compile_fixture(&root);
+    let original = dependency(&root);
+    let started = original
+        .start(start_request(
+            &root,
+            &executable,
+            "recovery-start",
+            "recovery-cancel",
+            "recovery-start-nonce",
+            false,
+            DependencyCleanupPolicy::Retain,
+        ))
+        .await
+        .expect("start");
+    let process_id = started.process_id.as_str().to_owned();
+    let os_process_id = started.os_process_id;
+    let os_start_time = started.os_start_time;
+    assert!(os_process_id.is_some());
+    assert!(os_start_time.is_some());
+
+    let recovered = dependency(&root);
+    let records = recovered
+        .list(DependencyListRequest {
+            authorization: authorization(
+                "owner",
+                "session",
+                "recovery-list",
+                "process.list",
+                "recovery-list-cancel",
+                "recovery-list-nonce",
+                canonical_list_operation("recovery-list-cancel").expect("canonical list"),
+            ),
+        })
+        .await
+        .expect("list recovered");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].process_id.as_str(), process_id);
+    assert_eq!(records[0].os_process_id, os_process_id);
+    assert_eq!(records[0].os_start_time, os_start_time);
+    assert_eq!(
+        records[0].recovery_state,
+        DependencyRecoveryState::RecoveredRunningUnattached
+    );
+    assert_eq!(
+        recovered
+            .reattach(control(
+                &process_id,
+                "owner",
+                "recovery-reattach",
+                "process.reattach",
+                "recovery-reattach-nonce",
+            ))
+            .await,
+        Err(ProcessDependencyError::ReattachmentUnavailable)
+    );
+
+    original
+        .cancel(DependencyCancelRequest {
+            identity: DependencyIdentity {
+                owner_id: "owner".to_owned(),
+                session_id: "session".to_owned(),
+            },
+            cancellation_id: "recovery-cancel".to_owned(),
+        })
+        .await
+        .expect("cleanup original");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let records = recovered
+        .list(DependencyListRequest {
+            authorization: authorization(
+                "owner",
+                "session",
+                "recovery-list-after-exit",
+                "process.list",
+                "recovery-list-after-exit-cancel",
+                "recovery-list-after-exit-nonce",
+                canonical_list_operation("recovery-list-after-exit-cancel")
+                    .expect("canonical list"),
+            ),
+        })
+        .await
+        .expect("list after exit");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, DependencyProcessState::Exited);
+    assert_eq!(
+        records[0].recovery_state,
+        DependencyRecoveryState::RecoveredExited
+    );
+}
+
+#[tokio::test]
+async fn restart_recovers_completed_record_and_durable_output_ranges() {
+    let root = TempDir::new().expect("root");
+    let executable = compile_fixture(&root);
+    let original = dependency(&root);
+    let started = original
+        .start(start_request(
+            &root,
+            &executable,
+            "completed-start",
+            "completed-cancel",
+            "completed-start-nonce",
+            false,
+            DependencyCleanupPolicy::Retain,
+        ))
+        .await
+        .expect("start");
+    let process_id = started.process_id.as_str().to_owned();
+    let mut input = DependencyProcessInputRequest {
+        authorization: authorization(
+            "owner",
+            "session",
+            "completed-input",
+            "process.input",
+            "completed-input-cancel",
+            "completed-input-nonce",
+            Vec::new(),
+        ),
+        process_id: process_id.clone(),
+        bytes: b"persisted\n".to_vec(),
+        close: true,
+    };
+    input.authorization = authorization(
+        "owner",
+        "session",
+        "completed-input",
+        "process.input",
+        "completed-input-cancel",
+        "completed-input-nonce",
+        canonical_input_operation(&input).expect("canonical input"),
+    );
+    original.input(input).await.expect("input");
+    original
+        .wait(control(
+            &process_id,
+            "owner",
+            "completed-wait",
+            "process.wait",
+            "completed-wait-nonce",
+        ))
+        .await
+        .expect("wait");
+    drop(original);
+
+    let recovered = dependency(&root);
+    let records = recovered
+        .list(DependencyListRequest {
+            authorization: authorization(
+                "owner",
+                "session",
+                "completed-list",
+                "process.list",
+                "completed-list-cancel",
+                "completed-list-nonce",
+                canonical_list_operation("completed-list-cancel").expect("canonical list"),
+            ),
+        })
+        .await
+        .expect("list");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].state, DependencyProcessState::Exited);
+    assert_eq!(
+        records[0].recovery_state,
+        DependencyRecoveryState::RecoveredExited
+    );
+
+    let mut read = DependencyReadOutputRequest {
+        authorization: authorization(
+            "owner",
+            "session",
+            "completed-read",
+            "process.read",
+            "completed-read-cancel",
+            "completed-read-nonce",
+            Vec::new(),
+        ),
+        process_id,
+        stream: DependencyOutputStream::Stdout,
+        offset: 0,
+        length: 4096,
+    };
+    read.authorization = authorization(
+        "owner",
+        "session",
+        "completed-read",
+        "process.read",
+        "completed-read-cancel",
+        "completed-read-nonce",
+        canonical_read_operation(&read).expect("canonical read"),
+    );
+    let output = recovered.read_output(read).await.expect("read");
+    assert!(String::from_utf8_lossy(&output.bytes).contains("fixture-stdout:persisted"));
 }

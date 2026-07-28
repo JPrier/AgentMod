@@ -7,8 +7,8 @@ use agentmod_process_host_dependency::{
     DependencyExitStatus, DependencyIdentity, DependencyListRequest, DependencyOutputStream,
     DependencyProcessInputRequest, DependencyProcessRecord, DependencyProcessRequest,
     DependencyProcessState, DependencyReadOutputRequest, DependencyReadOutputResponse,
-    DependencyResizeTerminalRequest, DependencyStartProcessRequest, DependencyTerminalSize,
-    ProcessDependencyError, ProcessDependencyPort,
+    DependencyRecoveryState, DependencyResizeTerminalRequest, DependencyStartProcessRequest,
+    DependencyTerminalSize, ProcessDependencyError, ProcessDependencyPort,
 };
 use async_trait::async_trait;
 use thiserror::Error;
@@ -128,6 +128,19 @@ pub enum ProcessDataState {
     Exited,
 }
 
+/// Data-owned restart-reconciliation classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessDataRecoveryState {
+    /// Live in this host.
+    Live,
+    /// Exact OS identity remains but inherited handles are unavailable.
+    RecoveredRunningUnattached,
+    /// Recovered as exited.
+    RecoveredExited,
+    /// Dispatch outcome was uncertain and was not repeated.
+    DispatchUncertain,
+}
+
 /// Exit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProcessDataExit {
@@ -180,6 +193,10 @@ pub struct ProcessDataRecord {
     pub terminal_size: Option<ProcessDataTerminalSize>,
     /// OS process ID.
     pub os_process_id: Option<u32>,
+    /// OS start time.
+    pub os_start_time: Option<u64>,
+    /// Reconciliation classification.
+    pub recovery_state: ProcessDataRecoveryState,
 }
 
 /// Stream.
@@ -596,6 +613,17 @@ fn map_record(value: DependencyProcessRecord) -> Result<ProcessDataRecord, Proce
         terminal: value.terminal,
         terminal_size: value.terminal_size.map(map_dependency_terminal_size),
         os_process_id: value.os_process_id,
+        os_start_time: value.os_start_time,
+        recovery_state: match value.recovery_state {
+            DependencyRecoveryState::Live => ProcessDataRecoveryState::Live,
+            DependencyRecoveryState::RecoveredRunningUnattached => {
+                ProcessDataRecoveryState::RecoveredRunningUnattached
+            }
+            DependencyRecoveryState::RecoveredExited => ProcessDataRecoveryState::RecoveredExited,
+            DependencyRecoveryState::DispatchUncertain => {
+                ProcessDataRecoveryState::DispatchUncertain
+            }
+        },
     })
 }
 
@@ -634,6 +662,7 @@ fn map_error(error: ProcessDependencyError) -> ProcessDataError {
         ProcessDependencyError::ProcessNotFound
         | ProcessDependencyError::ProcessExited
         | ProcessDependencyError::TerminalRequired
+        | ProcessDependencyError::ReattachmentUnavailable
         | ProcessDependencyError::SupervisorStopped => ProcessDataError::Lifecycle,
         _ => ProcessDataError::External,
     }

@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use thiserror::Error;
 use tokio::{
     fs::{self, File, OpenOptions},
@@ -177,6 +178,21 @@ pub enum DependencyProcessState {
     Exited,
 }
 
+/// Restart-reconciliation classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyRecoveryState {
+    /// Supervised by this process host instance.
+    Live,
+    /// The exact PID/start-time/executable identity still exists, but its
+    /// inherited handles cannot be reconstructed safely.
+    RecoveredRunningUnattached,
+    /// A durable running record no longer matches a live OS process.
+    RecoveredExited,
+    /// The host crashed between durable intent and a confirmed dispatch
+    /// receipt; execution is never repeated automatically.
+    DispatchUncertain,
+}
+
 /// Exit status.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyExitStatus {
@@ -229,6 +245,11 @@ pub struct DependencyProcessRecord {
     pub terminal_size: Option<DependencyTerminalSize>,
     /// Operating-system process identifier when available.
     pub os_process_id: Option<u32>,
+    /// OS-reported process start time, used with PID and executable to prevent
+    /// PID-reuse confusion.
+    pub os_start_time: Option<u64>,
+    /// Recovery classification.
+    pub recovery_state: DependencyRecoveryState,
 }
 
 /// Authenticated process control.
@@ -434,7 +455,7 @@ struct RegistryEntry {
     output_limit_bytes: u64,
     cleanup: DependencyCleanupPolicy,
     snapshot: Arc<RwLock<ProcessSnapshot>>,
-    control: mpsc::Sender<Control>,
+    control: Option<mpsc::Sender<Control>>,
     stdout_truncated: Arc<AtomicBool>,
     stderr_truncated: Arc<AtomicBool>,
     logs_removed: Arc<AtomicBool>,
@@ -442,6 +463,9 @@ struct RegistryEntry {
     completion: Arc<Mutex<()>>,
     terminal: bool,
     os_process_id: Option<u32>,
+    os_start_time: Option<u64>,
+    recovery_state: Arc<RwLock<DependencyRecoveryState>>,
+    durable: Arc<StdMutex<DurableProcessRecord>>,
 }
 
 #[derive(Clone, Debug)]
@@ -489,6 +513,58 @@ struct ReplayState {
     snapshot: ReplaySnapshot,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DurableLifecycle {
+    Dispatching,
+    Running,
+    Exited,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DurableExitStatus {
+    code: Option<i32>,
+    success: bool,
+    timed_out: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+struct DurableTerminalSize {
+    columns: u16,
+    rows: u16,
+    pixel_width: u16,
+    pixel_height: u16,
+}
+
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent durable lifecycle and output-integrity flags are explicit"
+)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct DurableProcessRecord {
+    schema_version: u32,
+    generation: u64,
+    process_id: String,
+    owner_id: String,
+    session_id: String,
+    executable: String,
+    resolved_executable: PathBuf,
+    working_directory: PathBuf,
+    lifecycle: DurableLifecycle,
+    exit: Option<DurableExitStatus>,
+    detached: bool,
+    terminal: bool,
+    terminal_size: Option<DurableTerminalSize>,
+    os_process_id: Option<u32>,
+    os_start_time: Option<u64>,
+    output_limit_bytes: u64,
+    cleanup: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    logs_removed: bool,
+    cleanup_failed: bool,
+}
+
 impl TokioProcessDependency {
     /// Constructs a secure dependency.
     ///
@@ -533,10 +609,11 @@ impl TokioProcessDependency {
         }
         config.executable_policy = executable_policy;
         let replay = load_replay_state(&config.storage_root)?;
+        let registry = load_process_registry(&config)?;
         Ok(Self {
             config,
             authorization_key: Arc::new(authorization_key),
-            registry: Arc::new(Mutex::new(BTreeMap::new())),
+            registry: Arc::new(Mutex::new(registry)),
             replay: Arc::new(Mutex::new(replay)),
         })
     }
@@ -614,6 +691,7 @@ impl TokioProcessDependency {
             .cloned()
             .ok_or(ProcessDependencyError::ProcessNotFound)?;
         ensure_owner(&entry, identity)?;
+        refresh_recovered_entry(&entry).await?;
         Ok(entry)
     }
 
@@ -668,6 +746,15 @@ impl TokioProcessDependency {
                 entry.cleanup_failed.store(true, Ordering::Release);
                 record.cleanup_failed = true;
             }
+        }
+        if !record.logs_removed {
+            update_durable_flags(
+                &entry.durable,
+                &entry.log_directory,
+                entry.stdout_truncated.load(Ordering::Acquire),
+                entry.stderr_truncated.load(Ordering::Acquire),
+                record.cleanup_failed,
+            )?;
         }
         self.prune_completed_registry().await;
         Ok(record)
@@ -746,6 +833,35 @@ impl ProcessDependencyPort for TokioProcessDependency {
                 return Err(redacted_io(error));
             }
         };
+        let durable = Arc::new(StdMutex::new(DurableProcessRecord {
+            schema_version: 1,
+            generation: 0,
+            process_id: process_id.as_str().to_owned(),
+            owner_id: request.authorization.identity.owner_id.clone(),
+            session_id: request.authorization.identity.session_id.clone(),
+            executable: request.executable.clone(),
+            resolved_executable: executable.clone(),
+            working_directory: working_directory.clone(),
+            lifecycle: DurableLifecycle::Dispatching,
+            exit: None,
+            detached: false,
+            terminal: request.terminal_size.is_some(),
+            terminal_size: request.terminal_size.map(Into::into),
+            os_process_id: None,
+            os_start_time: None,
+            output_limit_bytes: request.output_limit_bytes,
+            cleanup: request.cleanup.as_str().to_owned(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            logs_removed: false,
+            cleanup_failed: false,
+        }));
+        {
+            let mut record = durable
+                .lock()
+                .map_err(|_| ProcessDependencyError::RecoveryCorrupt)?;
+            persist_durable_record(&log_directory, &mut record)?;
+        }
         let stdout_truncated = Arc::new(AtomicBool::new(false));
         let stderr_truncated = Arc::new(AtomicBool::new(false));
         let snapshot = Arc::new(RwLock::new(ProcessSnapshot {
@@ -758,7 +874,7 @@ impl ProcessDependencyPort for TokioProcessDependency {
         let logs_removed = Arc::new(AtomicBool::new(false));
         let cleanup_failed = Arc::new(AtomicBool::new(false));
         let (control, receiver) = mpsc::channel(32);
-        let os_process_id = if let Some(terminal_size) = request.terminal_size {
+        let (os_process_id, os_start_time) = if let Some(terminal_size) = request.terminal_size {
             let stdout_file = stdout_file.into_std().await;
             drop(stderr_file);
             match spawn_terminal_process(
@@ -777,15 +893,17 @@ impl ProcessDependencyPort for TokioProcessDependency {
                 self.config.drain_timeout,
                 self.config.input_write_timeout,
                 self.config.max_waiters_per_process,
+                Arc::clone(&durable),
+                log_directory.clone(),
             ) {
-                Ok(process_id) => process_id,
+                Ok(identity) => identity,
                 Err(error) => {
                     let _ = fs::remove_dir_all(&log_directory).await;
                     return Err(error);
                 }
             }
         } else {
-            let mut command = Command::new(executable);
+            let mut command = Command::new(&executable);
             command
                 .args(&request.arguments)
                 .current_dir(&working_directory)
@@ -808,6 +926,8 @@ impl ProcessDependencyPort for TokioProcessDependency {
                 }
             };
             let os_process_id = child.id();
+            let os_start_time =
+                mark_durable_running(&durable, &log_directory, os_process_id, &executable)?;
             let stdout = child
                 .stdout
                 .take()
@@ -843,8 +963,12 @@ impl ProcessDependencyPort for TokioProcessDependency {
                 self.config.drain_timeout,
                 self.config.input_write_timeout,
                 self.config.max_waiters_per_process,
+                Arc::clone(&durable),
+                log_directory.clone(),
+                Arc::clone(&stdout_truncated),
+                Arc::clone(&stderr_truncated),
             ));
-            os_process_id
+            (os_process_id, os_start_time)
         };
         let entry = RegistryEntry {
             process_id: process_id.clone(),
@@ -856,7 +980,7 @@ impl ProcessDependencyPort for TokioProcessDependency {
             output_limit_bytes: request.output_limit_bytes,
             cleanup: request.cleanup,
             snapshot,
-            control,
+            control: Some(control),
             stdout_truncated,
             stderr_truncated,
             logs_removed,
@@ -864,6 +988,9 @@ impl ProcessDependencyPort for TokioProcessDependency {
             completion: Arc::new(Mutex::new(())),
             terminal: request.terminal_size.is_some(),
             os_process_id,
+            os_start_time,
+            recovery_state: Arc::new(RwLock::new(DependencyRecoveryState::Live)),
+            durable,
         };
         self.registry
             .lock()
@@ -916,6 +1043,7 @@ impl ProcessDependencyPort for TokioProcessDependency {
             response,
         })
         .await?;
+        update_durable_terminal_size(&entry.durable, &entry.log_directory, request.size)?;
         Ok(record_from_entry(&entry).await)
     }
 
@@ -962,6 +1090,7 @@ impl ProcessDependencyPort for TokioProcessDependency {
     ) -> Result<DependencyProcessRecord, ProcessDependencyError> {
         let entry = self.authorized_entry(&request, "process.detach").await?;
         entry.snapshot.write().await.detached = true;
+        update_durable_attachment(&entry.durable, &entry.log_directory, true)?;
         Ok(record_from_entry(&entry).await)
     }
 
@@ -970,7 +1099,11 @@ impl ProcessDependencyPort for TokioProcessDependency {
         request: DependencyProcessRequest,
     ) -> Result<DependencyProcessRecord, ProcessDependencyError> {
         let entry = self.authorized_entry(&request, "process.reattach").await?;
+        if *entry.recovery_state.read().await != DependencyRecoveryState::Live {
+            return Err(ProcessDependencyError::ReattachmentUnavailable);
+        }
         entry.snapshot.write().await.detached = false;
+        update_durable_attachment(&entry.durable, &entry.log_directory, false)?;
         Ok(record_from_entry(&entry).await)
     }
 
@@ -991,6 +1124,7 @@ impl ProcessDependencyPort for TokioProcessDependency {
             .collect();
         let mut records = Vec::with_capacity(entries.len());
         for entry in entries {
+            refresh_recovered_entry(&entry).await?;
             records.push(record_from_entry(&entry).await);
         }
         Ok(records)
@@ -1176,6 +1310,349 @@ fn normalize_json(value: &Value) -> Value {
     }
 }
 
+fn load_process_registry(
+    config: &ProcessDependencyConfig,
+) -> Result<BTreeMap<String, RegistryEntry>, ProcessDependencyError> {
+    std::fs::create_dir_all(&config.storage_root).map_err(redacted_io)?;
+    let storage = std::fs::canonicalize(&config.storage_root).map_err(redacted_io)?;
+    if !config.log_root.exists() {
+        if !config.log_root.starts_with(&config.storage_root) {
+            return Err(ProcessDependencyError::StorageEscape);
+        }
+        return Ok(BTreeMap::new());
+    }
+    let log_root = std::fs::canonicalize(&config.log_root).map_err(redacted_io)?;
+    if !log_root.starts_with(&storage) {
+        return Err(ProcessDependencyError::StorageEscape);
+    }
+    let mut registry = BTreeMap::new();
+    for directory in std::fs::read_dir(&log_root).map_err(redacted_io)? {
+        let directory = directory.map_err(redacted_io)?;
+        let log_directory = directory.path();
+        if !directory.file_type().map_err(redacted_io)?.is_dir() {
+            continue;
+        }
+        let Some(mut durable) = load_latest_durable_record(&log_directory)? else {
+            continue;
+        };
+        if durable.schema_version != 1
+            || durable.owner_id != config.owner_id
+            || durable.session_id != config.session_id
+            || directory.file_name().to_string_lossy() != durable.process_id
+        {
+            return Err(ProcessDependencyError::RecoveryCorrupt);
+        }
+        let process_id = DependencyProcessId::parse(durable.process_id.clone())?;
+        let (state, recovery_state) = reconcile_durable_record(&mut durable, &log_directory)?;
+        let cleanup = match durable.cleanup.as_str() {
+            "retain" => DependencyCleanupPolicy::Retain,
+            "remove_logs_on_success" => DependencyCleanupPolicy::RemoveLogsOnSuccess,
+            "remove_logs_always" => DependencyCleanupPolicy::RemoveLogsAlways,
+            _ => return Err(ProcessDependencyError::RecoveryCorrupt),
+        };
+        let exit = durable.exit.as_ref().map(|exit| DependencyExitStatus {
+            code: exit.code,
+            success: exit.success,
+            timed_out: exit.timed_out,
+        });
+        let terminal_size = durable.terminal_size.map(DependencyTerminalSize::from);
+        let snapshot = ProcessSnapshot {
+            state,
+            exit,
+            detached: durable.detached,
+            capture_error: None,
+            terminal_size,
+        };
+        let stdout_truncated = Arc::new(AtomicBool::new(durable.stdout_truncated));
+        let stderr_truncated = Arc::new(AtomicBool::new(durable.stderr_truncated));
+        let logs_removed = Arc::new(AtomicBool::new(durable.logs_removed));
+        let cleanup_failed = Arc::new(AtomicBool::new(durable.cleanup_failed));
+        registry.insert(
+            process_id.as_str().to_owned(),
+            RegistryEntry {
+                process_id,
+                identity: DependencyIdentity {
+                    owner_id: durable.owner_id.clone(),
+                    session_id: durable.session_id.clone(),
+                },
+                cancellation_id: String::new(),
+                executable: durable.executable.clone(),
+                working_directory: durable.working_directory.clone(),
+                log_directory,
+                output_limit_bytes: durable.output_limit_bytes,
+                cleanup,
+                snapshot: Arc::new(RwLock::new(snapshot)),
+                control: None,
+                stdout_truncated,
+                stderr_truncated,
+                logs_removed,
+                cleanup_failed,
+                completion: Arc::new(Mutex::new(())),
+                terminal: durable.terminal,
+                os_process_id: durable.os_process_id,
+                os_start_time: durable.os_start_time,
+                recovery_state: Arc::new(RwLock::new(recovery_state)),
+                durable: Arc::new(StdMutex::new(durable)),
+            },
+        );
+    }
+    Ok(registry)
+}
+
+fn reconcile_durable_record(
+    durable: &mut DurableProcessRecord,
+    log_directory: &Path,
+) -> Result<(DependencyProcessState, DependencyRecoveryState), ProcessDependencyError> {
+    match durable.lifecycle {
+        DurableLifecycle::Exited => Ok((
+            DependencyProcessState::Exited,
+            DependencyRecoveryState::RecoveredExited,
+        )),
+        DurableLifecycle::Dispatching => Ok((
+            DependencyProcessState::Exited,
+            DependencyRecoveryState::DispatchUncertain,
+        )),
+        DurableLifecycle::Running => {
+            let exact_process_exists = durable
+                .os_process_id
+                .zip(durable.os_start_time)
+                .is_some_and(|(pid, start_time)| {
+                    inspect_process_identity(pid).is_some_and(|identity| {
+                        identity.start_time == start_time
+                            && same_executable(&identity.executable, &durable.resolved_executable)
+                    })
+                });
+            if exact_process_exists {
+                Ok((
+                    DependencyProcessState::Running,
+                    DependencyRecoveryState::RecoveredRunningUnattached,
+                ))
+            } else {
+                durable.lifecycle = DurableLifecycle::Exited;
+                durable.exit = None;
+                persist_durable_record(log_directory, durable)?;
+                Ok((
+                    DependencyProcessState::Exited,
+                    DependencyRecoveryState::RecoveredExited,
+                ))
+            }
+        }
+    }
+}
+
+struct ProcessIdentityObservation {
+    start_time: u64,
+    executable: PathBuf,
+}
+
+fn inspect_process_identity(process_id: u32) -> Option<ProcessIdentityObservation> {
+    let pid = Pid::from_u32(process_id);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::Always)
+            .without_tasks(),
+    );
+    let process = system.process(pid)?;
+    Some(ProcessIdentityObservation {
+        start_time: process.start_time(),
+        executable: process.exe()?.to_path_buf(),
+    })
+}
+
+fn same_executable(left: &Path, right: &Path) -> bool {
+    if cfg!(windows) {
+        let left = left.to_string_lossy();
+        let right = right.to_string_lossy();
+        let left = left.strip_prefix(r"\\?\").unwrap_or(&left);
+        let right = right.strip_prefix(r"\\?\").unwrap_or(&right);
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
+}
+
+fn mark_durable_running(
+    durable: &StdMutex<DurableProcessRecord>,
+    log_directory: &Path,
+    process_id: Option<u32>,
+    executable: &Path,
+) -> Result<Option<u64>, ProcessDependencyError> {
+    let start_time = process_id
+        .and_then(inspect_process_identity)
+        .filter(|identity| same_executable(&identity.executable, executable))
+        .map(|identity| identity.start_time);
+    let mut record = durable
+        .lock()
+        .map_err(|_| ProcessDependencyError::RecoveryCorrupt)?;
+    record.lifecycle = DurableLifecycle::Running;
+    record.os_process_id = process_id;
+    record.os_start_time = start_time;
+    persist_durable_record(log_directory, &mut record)?;
+    Ok(start_time)
+}
+
+fn mark_durable_exited(
+    durable: &StdMutex<DurableProcessRecord>,
+    log_directory: &Path,
+    exit: &DependencyExitStatus,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+) -> Result<(), ProcessDependencyError> {
+    let mut record = durable
+        .lock()
+        .map_err(|_| ProcessDependencyError::RecoveryCorrupt)?;
+    record.lifecycle = DurableLifecycle::Exited;
+    record.exit = Some(DurableExitStatus {
+        code: exit.code,
+        success: exit.success,
+        timed_out: exit.timed_out,
+    });
+    record.stdout_truncated = stdout_truncated;
+    record.stderr_truncated = stderr_truncated;
+    persist_durable_record(log_directory, &mut record)
+}
+
+fn update_durable_attachment(
+    durable: &StdMutex<DurableProcessRecord>,
+    log_directory: &Path,
+    detached: bool,
+) -> Result<(), ProcessDependencyError> {
+    let mut record = durable
+        .lock()
+        .map_err(|_| ProcessDependencyError::RecoveryCorrupt)?;
+    record.detached = detached;
+    persist_durable_record(log_directory, &mut record)
+}
+
+fn update_durable_terminal_size(
+    durable: &StdMutex<DurableProcessRecord>,
+    log_directory: &Path,
+    size: DependencyTerminalSize,
+) -> Result<(), ProcessDependencyError> {
+    let mut record = durable
+        .lock()
+        .map_err(|_| ProcessDependencyError::RecoveryCorrupt)?;
+    record.terminal_size = Some(size.into());
+    persist_durable_record(log_directory, &mut record)
+}
+
+fn update_durable_flags(
+    durable: &StdMutex<DurableProcessRecord>,
+    log_directory: &Path,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    cleanup_failed: bool,
+) -> Result<(), ProcessDependencyError> {
+    let mut record = durable
+        .lock()
+        .map_err(|_| ProcessDependencyError::RecoveryCorrupt)?;
+    record.stdout_truncated = stdout_truncated;
+    record.stderr_truncated = stderr_truncated;
+    record.cleanup_failed = cleanup_failed;
+    persist_durable_record(log_directory, &mut record)
+}
+
+fn load_latest_durable_record(
+    directory: &Path,
+) -> Result<Option<DurableProcessRecord>, ProcessDependencyError> {
+    let mut records = Vec::new();
+    for entry in std::fs::read_dir(directory).map_err(redacted_io)? {
+        let path = entry.map_err(redacted_io)?.path();
+        let is_record = path.file_name().is_some_and(|name| {
+            let name = name.to_string_lossy();
+            name.starts_with("process-") && name.ends_with(".json")
+        });
+        if !is_record {
+            continue;
+        }
+        let bytes = std::fs::read(&path).map_err(redacted_io)?;
+        if let Ok(record) = serde_json::from_slice::<DurableProcessRecord>(&bytes) {
+            records.push(record);
+        } else {
+            let quarantine = path.with_extension(format!("json.corrupt-{}", Uuid::now_v7()));
+            std::fs::rename(&path, quarantine).map_err(redacted_io)?;
+            sync_directory(directory)?;
+        }
+    }
+    records.sort_by_key(|record| record.generation);
+    Ok(records.pop())
+}
+
+fn persist_durable_record(
+    directory: &Path,
+    record: &mut DurableProcessRecord,
+) -> Result<(), ProcessDependencyError> {
+    record.generation = record
+        .generation
+        .checked_add(1)
+        .ok_or(ProcessDependencyError::ResourceLimit)?;
+    let bytes = serde_json::to_vec(record).map_err(|_| ProcessDependencyError::RecoveryCorrupt)?;
+    let path = directory.join(format!("process-{:020}.json", record.generation));
+    let temporary = directory.join(format!("process-{}.tmp", Uuid::now_v7()));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(redacted_io)?;
+    file.write_all(&bytes).map_err(redacted_io)?;
+    file.sync_all().map_err(redacted_io)?;
+    std::fs::rename(&temporary, &path).map_err(redacted_io)?;
+    sync_directory(directory)?;
+    for entry in std::fs::read_dir(directory).map_err(redacted_io)? {
+        let old = entry.map_err(redacted_io)?.path();
+        let is_old_record = old != path
+            && old.file_name().is_some_and(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("process-") && name.ends_with(".json")
+            });
+        if is_old_record {
+            let _ = std::fs::remove_file(old);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), ProcessDependencyError> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(redacted_io)
+}
+
+#[cfg(windows)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the platform implementations share one fallible persistence contract"
+)]
+fn sync_directory(_path: &Path) -> Result<(), ProcessDependencyError> {
+    Ok(())
+}
+
+impl From<DependencyTerminalSize> for DurableTerminalSize {
+    fn from(value: DependencyTerminalSize) -> Self {
+        Self {
+            columns: value.columns,
+            rows: value.rows,
+            pixel_width: value.pixel_width,
+            pixel_height: value.pixel_height,
+        }
+    }
+}
+
+impl From<DurableTerminalSize> for DependencyTerminalSize {
+    fn from(value: DurableTerminalSize) -> Self {
+        Self {
+            columns: value.columns,
+            rows: value.rows,
+            pixel_width: value.pixel_width,
+            pixel_height: value.pixel_height,
+        }
+    }
+}
+
 fn load_replay_state(storage_root: &Path) -> Result<ReplayState, ProcessDependencyError> {
     let directory = storage_root.join("authorization-replay");
     std::fs::create_dir_all(&directory).map_err(redacted_io)?;
@@ -1320,6 +1797,7 @@ async fn enforce_capacity(
         .checked_mul(2)
         .ok_or(ProcessDependencyError::ResourceLimit)?;
     for entry in entries {
+        refresh_recovered_entry(&entry).await?;
         if entry.snapshot.read().await.state == DependencyProcessState::Running {
             active += 1;
         }
@@ -1437,6 +1915,47 @@ fn is_sensitive_environment_key(key: &str) -> bool {
         || upper.contains("CREDENTIAL")
 }
 
+async fn refresh_recovered_entry(entry: &RegistryEntry) -> Result<(), ProcessDependencyError> {
+    if *entry.recovery_state.read().await != DependencyRecoveryState::RecoveredRunningUnattached {
+        return Ok(());
+    }
+    let expected_executable = entry
+        .durable
+        .lock()
+        .map_err(|_| ProcessDependencyError::RecoveryCorrupt)?
+        .resolved_executable
+        .clone();
+    let exact_process_exists =
+        entry
+            .os_process_id
+            .zip(entry.os_start_time)
+            .is_some_and(|(pid, start_time)| {
+                inspect_process_identity(pid).is_some_and(|identity| {
+                    identity.start_time == start_time
+                        && same_executable(&identity.executable, &expected_executable)
+                })
+            });
+    if exact_process_exists {
+        return Ok(());
+    }
+    {
+        let mut durable = entry
+            .durable
+            .lock()
+            .map_err(|_| ProcessDependencyError::RecoveryCorrupt)?;
+        durable.lifecycle = DurableLifecycle::Exited;
+        durable.exit = None;
+        persist_durable_record(&entry.log_directory, &mut durable)?;
+    }
+    {
+        let mut snapshot = entry.snapshot.write().await;
+        snapshot.state = DependencyProcessState::Exited;
+        snapshot.exit = None;
+    }
+    *entry.recovery_state.write().await = DependencyRecoveryState::RecoveredExited;
+    Ok(())
+}
+
 fn ensure_owner(
     entry: &RegistryEntry,
     identity: &DependencyIdentity,
@@ -1449,9 +1968,18 @@ fn ensure_owner(
 }
 
 async fn wait_entry(entry: &RegistryEntry) -> Result<(), ProcessDependencyError> {
+    let snapshot = entry.snapshot.read().await;
+    if snapshot.state == DependencyProcessState::Exited {
+        return Ok(());
+    }
+    drop(snapshot);
     if entry.snapshot.read().await.exit.is_none() {
+        let control = entry
+            .control
+            .as_ref()
+            .ok_or(ProcessDependencyError::ReattachmentUnavailable)?;
         let (sender, receiver) = oneshot::channel();
-        if entry.control.send(Control::Wait(sender)).await.is_ok()
+        if control.send(Control::Wait(sender)).await.is_ok()
             && receiver.await.is_err()
             && entry.snapshot.read().await.exit.is_none()
         {
@@ -1468,9 +1996,12 @@ async fn send_control<F>(entry: &RegistryEntry, control: F) -> Result<(), Proces
 where
     F: FnOnce(oneshot::Sender<Result<(), String>>) -> Control,
 {
-    let (sender, receiver) = oneshot::channel();
-    entry
+    let control_sender = entry
         .control
+        .as_ref()
+        .ok_or(ProcessDependencyError::ReattachmentUnavailable)?;
+    let (sender, receiver) = oneshot::channel();
+    control_sender
         .send(control(sender))
         .await
         .map_err(|_| ProcessDependencyError::ProcessExited)?;
@@ -1500,6 +2031,8 @@ async fn record_from_entry(entry: &RegistryEntry) -> DependencyProcessRecord {
         terminal: entry.terminal,
         terminal_size: snapshot.terminal_size,
         os_process_id: entry.os_process_id,
+        os_start_time: entry.os_start_time,
+        recovery_state: *entry.recovery_state.read().await,
     }
 }
 
@@ -1523,7 +2056,9 @@ fn spawn_terminal_process(
     drain_timeout: Duration,
     input_write_timeout: Duration,
     max_waiters: usize,
-) -> Result<Option<u32>, ProcessDependencyError> {
+    durable: Arc<StdMutex<DurableProcessRecord>>,
+    log_directory: PathBuf,
+) -> Result<(Option<u32>, Option<u64>), ProcessDependencyError> {
     let pair = native_pty_system()
         .openpty(size.portable())
         .map_err(|_| ProcessDependencyError::Terminal)?;
@@ -1540,6 +2075,7 @@ fn spawn_terminal_process(
         .spawn_command(command)
         .map_err(|_| ProcessDependencyError::Terminal)?;
     let process_id = child.process_id();
+    let start_time = mark_durable_running(&durable, &log_directory, process_id, executable)?;
     let reader = pair
         .master
         .try_clone_reader()
@@ -1567,10 +2103,12 @@ fn spawn_terminal_process(
                 drain_timeout,
                 input_write_timeout,
                 max_waiters,
+                durable,
+                log_directory,
             );
         })
         .map_err(redacted_io)?;
-    Ok(process_id)
+    Ok((process_id, start_time))
 }
 
 #[allow(
@@ -1593,6 +2131,8 @@ fn supervise_terminal(
     drain_timeout: Duration,
     input_write_timeout: Duration,
     max_waiters: usize,
+    durable: Arc<StdMutex<DurableProcessRecord>>,
+    log_directory: PathBuf,
 ) {
     let (capture_sender, capture_receiver) = std::sync::mpsc::sync_channel(1);
     let capture_truncated = Arc::clone(&stdout_truncated);
@@ -1711,6 +2251,13 @@ fn supervise_terminal(
         state.exit = Some(exit.clone());
         state.capture_error = capture_error;
     }
+    let _ = mark_durable_exited(
+        &durable,
+        &log_directory,
+        &exit,
+        stdout_truncated.load(Ordering::Acquire),
+        false,
+    );
     for waiter in waiters {
         let _ = waiter.send(exit.clone());
     }
@@ -1784,6 +2331,10 @@ async fn supervise(
     drain_timeout: Duration,
     input_write_timeout: Duration,
     max_waiters: usize,
+    durable: Arc<StdMutex<DurableProcessRecord>>,
+    log_directory: PathBuf,
+    stdout_truncated: Arc<AtomicBool>,
+    stderr_truncated: Arc<AtomicBool>,
 ) {
     let deadline = process_timeout.map(|duration| Instant::now() + duration);
     let mut timeout_sleep =
@@ -1854,6 +2405,13 @@ async fn supervise(
         state.exit = Some(exit.clone());
         state.capture_error = capture_error;
     }
+    let _ = mark_durable_exited(
+        &durable,
+        &log_directory,
+        &exit,
+        stdout_truncated.load(Ordering::Acquire),
+        stderr_truncated.load(Ordering::Acquire),
+    );
     for waiter in waiters {
         let _ = waiter.send(exit.clone());
     }
@@ -2210,6 +2768,12 @@ pub enum ProcessDependencyError {
     /// Pseudo-terminal setup or control failed.
     #[error("pseudo-terminal operation failed")]
     Terminal,
+    /// Durable process recovery data is invalid or inconsistent.
+    #[error("process recovery record is corrupt")]
+    RecoveryCorrupt,
+    /// A recovered process exists but its inherited handles are unavailable.
+    #[error("recovered process cannot be controlled by this host")]
+    ReattachmentUnavailable,
     /// Input bound.
     #[error("process input exceeds bound")]
     InputTooLarge,
@@ -2461,5 +3025,144 @@ mod tests {
             Err(ProcessDependencyError::AuthorizationDenied)
         );
         assert!(!root.path().join("storage/logs").exists());
+    }
+
+    fn recovery_record(
+        process_id: &str,
+        lifecycle: DurableLifecycle,
+        executable: PathBuf,
+        os_process_id: Option<u32>,
+        os_start_time: Option<u64>,
+    ) -> DurableProcessRecord {
+        DurableProcessRecord {
+            schema_version: 1,
+            generation: 0,
+            process_id: process_id.to_owned(),
+            owner_id: "owner".to_owned(),
+            session_id: "session".to_owned(),
+            executable: executable.to_string_lossy().into_owned(),
+            resolved_executable: executable,
+            working_directory: std::env::current_dir().expect("cwd"),
+            lifecycle,
+            exit: None,
+            detached: true,
+            terminal: false,
+            terminal_size: None,
+            os_process_id,
+            os_start_time,
+            output_limit_bytes: 1024,
+            cleanup: "retain".to_owned(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            logs_removed: false,
+            cleanup_failed: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_intent_is_recovered_without_automatic_redispatch() {
+        let root = tempfile::tempdir().expect("root");
+        let process_id = Uuid::now_v7().to_string();
+        let directory = root.path().join("storage/logs").join(process_id.as_str());
+        std::fs::create_dir_all(&directory).expect("directory");
+        std::fs::write(directory.join("stdout.log"), []).expect("stdout");
+        std::fs::write(directory.join("stderr.log"), []).expect("stderr");
+        let mut durable = recovery_record(
+            &process_id,
+            DurableLifecycle::Dispatching,
+            std::env::current_exe().expect("executable"),
+            None,
+            None,
+        );
+        persist_durable_record(&directory, &mut durable).expect("persist");
+
+        let dependency = TokioProcessDependency::new(config(root.path())).expect("recover");
+        let entry = dependency
+            .registry
+            .lock()
+            .await
+            .get(&process_id)
+            .cloned()
+            .expect("record");
+        assert_eq!(
+            *entry.recovery_state.read().await,
+            DependencyRecoveryState::DispatchUncertain
+        );
+        assert_eq!(
+            entry.snapshot.read().await.state,
+            DependencyProcessState::Exited
+        );
+        assert!(entry.control.is_none());
+    }
+
+    #[tokio::test]
+    async fn pid_reuse_is_rejected_when_start_time_does_not_match() {
+        let root = tempfile::tempdir().expect("root");
+        let process_id = Uuid::now_v7().to_string();
+        let directory = root.path().join("storage/logs").join(process_id.as_str());
+        std::fs::create_dir_all(&directory).expect("directory");
+        std::fs::write(directory.join("stdout.log"), []).expect("stdout");
+        std::fs::write(directory.join("stderr.log"), []).expect("stderr");
+        let observed = inspect_process_identity(std::process::id()).expect("current process");
+        let mut durable = recovery_record(
+            &process_id,
+            DurableLifecycle::Running,
+            observed.executable,
+            Some(std::process::id()),
+            Some(observed.start_time.saturating_add(1)),
+        );
+        persist_durable_record(&directory, &mut durable).expect("persist");
+
+        let dependency = TokioProcessDependency::new(config(root.path())).expect("recover");
+        let entry = dependency
+            .registry
+            .lock()
+            .await
+            .get(&process_id)
+            .cloned()
+            .expect("record");
+        assert_eq!(
+            *entry.recovery_state.read().await,
+            DependencyRecoveryState::RecoveredExited
+        );
+        assert_eq!(
+            entry.snapshot.read().await.state,
+            DependencyProcessState::Exited
+        );
+        assert!(entry.control.is_none());
+        assert_eq!(
+            load_latest_durable_record(&directory)
+                .expect("load")
+                .expect("record")
+                .lifecycle,
+            DurableLifecycle::Exited
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_recovery_record_is_quarantined_without_loading_a_process() {
+        let root = tempfile::tempdir().expect("root");
+        let process_id = Uuid::now_v7().to_string();
+        let directory = root.path().join("storage/logs").join(process_id.as_str());
+        std::fs::create_dir_all(&directory).expect("directory");
+        std::fs::write(directory.join("process-00000000000000000001.json"), b"{")
+            .expect("corrupt record");
+
+        let dependency = TokioProcessDependency::new(config(root.path())).expect("recover");
+        assert!(dependency.registry.lock().await.is_empty());
+        let names: Vec<_> = std::fs::read_dir(&directory)
+            .expect("read")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            names.iter().any(|name| name.contains(".json.corrupt-")),
+            "quarantine file missing: {names:?}"
+        );
     }
 }

@@ -18,6 +18,8 @@ Foreground completion captures stdout/stderr before cleanup. Cleanup failure is 
 
 `process.start_pty` and `process.run_pty` allocate a native PTY with explicit rows, columns, and optional cell dimensions. `process.input` writes interactive bytes, `process.resize` updates the kernel or ConPTY terminal size, `process.read` with the `terminal` stream reads the durable combined terminal projection, and normal detach/reattach controls preserve the live host handle. On Windows, the capture path answers the ConPTY cursor-position query before recording the control stream so console programs cannot stall during startup.
 
+Each process log directory contains a generation-framed durable recovery record. The dependency commits `dispatching` before spawn, then records the OS PID, OS start time, resolved executable, and `running` state before the supervisor begins. Exit, detach, terminal size, truncation, and cleanup state are recorded in subsequent immutable generations. Startup scans those generations, quarantines malformed JSON, and classifies each record as recovered-exited, dispatch-uncertain, or recovered-running-unattached. A live identity requires PID, start time, and executable to match, so PID reuse cannot authorize control. Dispatch-uncertain actions are never repeated automatically.
+
 The binary processes bounded JSONL requests concurrently, uses a bounded response channel, routes cancellation IDs, and converts malformed requests and service failures into protocol `Failed` events without exiting.
 
 ## Residual limitations
@@ -25,4 +27,4 @@ The binary processes bounded JSONL requests concurrently, uses a bounded respons
 - On Windows, interruption uses documented exact-argument `taskkill /PID <pid> /T`, followed by bounded forced `/T /F` termination when needed. CTRL_BREAK is not used because safe console/process-group APIs are not available without an additional platform abstraction.
 - On Unix, each child is placed in a dedicated process group. Interrupt and kill address the group through the platform `kill` utility and fall back to the direct child if group signaling is unavailable.
 - PTY `close: true` input is rejected explicitly because the portable PTY API cannot close only the input half without also dropping the controlling terminal.
-- Durable restart reconciliation and reattachment are not yet implemented. `kill_on_drop` covers orderly pipe-host shutdown, but an abrupt host crash can leave an operating-system child, particularly on Unix. PID-only recovery remains prohibited because PID reuse makes it unsafe.
+- A process-host crash cannot recreate inherited stdin, stdout, or PTY handles. An exact surviving OS child is therefore exposed as `recovered_running_unattached`; output recorded before the crash remains readable, but input, wait, resize, interrupt, kill, and reattach fail closed. Keeping the capability host alive across runtime-daemon replacement is the remaining route to true live-handle reattachment.

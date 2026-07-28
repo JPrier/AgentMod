@@ -46,4 +46,4 @@ PTY output is a combined terminal stream and can contain ANSI or other terminal 
 
 Closing only the input half of a PTY is not portable. A PTY input request with `close: true` fails explicitly; use an application-specific EOF control byte or terminate the process.
 
-Crash-safe host restart reconciliation is not yet claimed. Current durable logs survive, but live-handle reattachment after a capability-host crash remains under implementation.
+After a host restart, completed records and retained output are recovered. AgentMod compares PID, OS start time, and resolved executable before reporting that a prior child still exists; it never repeats an uncertain dispatch. Because inherited streams and PTY handles cannot be recreated by a replacement host, such a child is reported as `recovered_running_unattached` and handle-dependent controls fail closed. Live-handle reattachment across a capability-host crash remains under implementation.

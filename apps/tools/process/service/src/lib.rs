@@ -5,8 +5,8 @@ use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 use agentmod_process_host_logic::{
     CancelProcessCommand, CleanupPolicy, ExecutionMode, InputProcessCommand, OutputRange,
     OutputStream as LogicOutputStream, ProcessAuthorization, ProcessControlCommand, ProcessId,
-    ProcessIdentity, ProcessLogicError, ProcessLogicPort, ProcessResult, ProcessStatus,
-    ReadOutputQuery, ResizeTerminalCommand, StartProcessCommand, TerminalSize,
+    ProcessIdentity, ProcessLogicError, ProcessLogicPort, ProcessRecoveryStatus, ProcessResult,
+    ProcessStatus, ReadOutputQuery, ResizeTerminalCommand, StartProcessCommand, TerminalSize,
 };
 use agentmod_tool_protocol::{OutputStream, ToolDescriptor, ToolHostCommand, ToolHostEvent};
 use serde::{Deserialize, Serialize};
@@ -524,6 +524,13 @@ fn process_json(result: &ProcessResult) -> Value {
             "pixel_height":size.pixel_height,
         })),
         "os_process_id":result.os_process_id,
+        "os_start_time":result.os_start_time,
+        "recovery_status":match result.recovery_status {
+            ProcessRecoveryStatus::Live=>"live",
+            ProcessRecoveryStatus::RecoveredRunningUnattached=>"recovered_running_unattached",
+            ProcessRecoveryStatus::RecoveredExited=>"recovered_exited",
+            ProcessRecoveryStatus::DispatchUncertain=>"dispatch_uncertain",
+        },
     })
 }
 

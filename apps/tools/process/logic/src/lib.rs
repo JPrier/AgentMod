@@ -9,8 +9,8 @@ use std::{
 use agentmod_process_host_data::{
     ProcessCancelDataRequest, ProcessControlDataRequest, ProcessDataAuthorization,
     ProcessDataCleanup, ProcessDataError, ProcessDataExit, ProcessDataId, ProcessDataIdentity,
-    ProcessDataPort, ProcessDataRecord, ProcessDataState, ProcessDataStream,
-    ProcessDataTerminalSize, ProcessInputDataRequest, ProcessOutputDataRecord,
+    ProcessDataPort, ProcessDataRecord, ProcessDataRecoveryState, ProcessDataState,
+    ProcessDataStream, ProcessDataTerminalSize, ProcessInputDataRequest, ProcessOutputDataRecord,
     ReadProcessOutputDataRequest, ResizeProcessTerminalDataRequest, StartProcessDataRequest,
 };
 use async_trait::async_trait;
@@ -136,6 +136,19 @@ pub enum ProcessStatus {
     Exited,
 }
 
+/// Logic-owned restart-reconciliation classification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessRecoveryStatus {
+    /// Live in this host.
+    Live,
+    /// Exact child still exists but inherited handles cannot be reconstructed.
+    RecoveredRunningUnattached,
+    /// Recovered as exited.
+    RecoveredExited,
+    /// Dispatch outcome was uncertain and execution was not repeated.
+    DispatchUncertain,
+}
+
 /// Exit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExitStatus {
@@ -188,6 +201,10 @@ pub struct ProcessResult {
     pub terminal_size: Option<TerminalSize>,
     /// OS process ID.
     pub os_process_id: Option<u32>,
+    /// OS start time.
+    pub os_start_time: Option<u64>,
+    /// Reconciliation classification.
+    pub recovery_status: ProcessRecoveryStatus,
 }
 
 /// Stream.
@@ -702,6 +719,15 @@ fn map_record(value: ProcessDataRecord) -> Result<ProcessResult, ProcessLogicErr
         terminal: value.terminal,
         terminal_size: value.terminal_size.map(map_data_terminal_size),
         os_process_id: value.os_process_id,
+        os_start_time: value.os_start_time,
+        recovery_status: match value.recovery_state {
+            ProcessDataRecoveryState::Live => ProcessRecoveryStatus::Live,
+            ProcessDataRecoveryState::RecoveredRunningUnattached => {
+                ProcessRecoveryStatus::RecoveredRunningUnattached
+            }
+            ProcessDataRecoveryState::RecoveredExited => ProcessRecoveryStatus::RecoveredExited,
+            ProcessDataRecoveryState::DispatchUncertain => ProcessRecoveryStatus::DispatchUncertain,
+        },
     })
 }
 

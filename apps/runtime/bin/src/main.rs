@@ -167,6 +167,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(str::to_owned)
                 .collect(),
             endpoint_root: sessions_root.join(".process-hosts"),
+            host_idle_timeout: std::time::Duration::from_millis(
+                std::env::var("AGENTMOD_PROCESS_IDLE_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(30_000),
+            ),
             maximum_frame_bytes: 16 * 1024 * 1024,
             request_timeout: std::time::Duration::from_secs(24 * 60 * 60),
             authorization_key: ProcessCapabilityDependency::derive_authorization_key(

@@ -45,6 +45,7 @@ pub struct ProcessCapabilityDependencyConfig {
     pub owner: String,
     pub allowed_executables: Vec<String>,
     pub endpoint_root: PathBuf,
+    pub host_idle_timeout: Duration,
     pub maximum_frame_bytes: usize,
     pub request_timeout: Duration,
     pub authorization_key: [u8; 32],
@@ -98,6 +99,8 @@ impl ProcessCapabilityDependency {
             || config.arguments.iter().any(|value| value.contains('\0'))
             || config.owner.trim().is_empty()
             || !config.endpoint_root.is_absolute()
+            || config.host_idle_timeout.is_zero()
+            || config.host_idle_timeout > Duration::from_secs(24 * 60 * 60)
             || config.maximum_frame_bytes == 0
             || config.request_timeout.is_zero()
             || config.authorization_key == [0; 32]
@@ -158,6 +161,10 @@ impl ProcessCapabilityDependency {
                 self.config.allowed_executables.join(";"),
             )
             .env("AGENTMOD_PROCESS_ENDPOINT", endpoint)
+            .env(
+                "AGENTMOD_PROCESS_IDLE_TIMEOUT_MS",
+                self.config.host_idle_timeout.as_millis().to_string(),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -292,10 +292,12 @@ impl ProviderExecutionDependency for StaticProviderCatalogDependency {
             .get("mock_text")
             .cloned()
             .unwrap_or_else(|| "deterministic response".to_owned());
-        let events = namespace_continuations(
-            scenario_events(scenario, text)?,
-            &request.cancellation_reference,
-        );
+        let events = if scenario == "process_action" {
+            process_action_events(&options)?
+        } else {
+            scenario_events(scenario, text)?
+        };
+        let events = namespace_continuations(events, &request.cancellation_reference);
         if events.len() > MAX_EVENTS {
             return Err(ProviderExecutionDependencyError::EventLimitExceeded);
         }
@@ -601,6 +603,75 @@ fn scenario_events(
     Ok(events)
 }
 
+fn process_action_events(
+    options: &BTreeMap<String, String>,
+) -> Result<Vec<DependencyProviderEvent>, ProviderExecutionDependencyError> {
+    let tool = options
+        .get("mock_process_tool")
+        .filter(|value| {
+            matches!(
+                value.as_str(),
+                "process.run"
+                    | "process.start"
+                    | "process.run_pty"
+                    | "process.start_pty"
+                    | "process.read"
+                    | "process.input"
+                    | "process.resize"
+                    | "process.wait"
+                    | "process.interrupt"
+                    | "process.kill"
+                    | "process.detach"
+                    | "process.reattach"
+                    | "process.list"
+            )
+        })
+        .ok_or_else(|| {
+            ProviderExecutionDependencyError::InvalidRequest(
+                "process_action requires a supported mock_process_tool".into(),
+            )
+        })?;
+    let arguments = options
+        .get("mock_process_arguments")
+        .ok_or_else(|| {
+            ProviderExecutionDependencyError::InvalidRequest(
+                "process_action requires mock_process_arguments".into(),
+            )
+        })?
+        .as_bytes();
+    if arguments.len() > 64 * 1024 {
+        return Err(ProviderExecutionDependencyError::InvalidRequest(
+            "mock_process_arguments exceeds the deterministic fixture limit".into(),
+        ));
+    }
+    let arguments: serde_json::Value = serde_json::from_slice(arguments).map_err(|_| {
+        ProviderExecutionDependencyError::InvalidRequest(
+            "mock_process_arguments must be valid JSON".into(),
+        )
+    })?;
+    if !arguments.is_object() {
+        return Err(ProviderExecutionDependencyError::InvalidRequest(
+            "mock_process_arguments must be a JSON object".into(),
+        ));
+    }
+    let arguments = serde_json::to_string(&arguments).map_err(|_| {
+        ProviderExecutionDependencyError::InvalidRequest(
+            "mock_process_arguments could not be normalized".into(),
+        )
+    })?;
+    let call_id = options
+        .get("mock_process_call_id")
+        .map_or("process-action-1", String::as_str);
+    if call_id.is_empty() || call_id.len() > 256 {
+        return Err(ProviderExecutionDependencyError::InvalidRequest(
+            "mock_process_call_id is invalid".into(),
+        ));
+    }
+    let mut events = vec![DependencyProviderEvent::Started];
+    append_tool_call(&mut events, CONTINUATION_ONE, call_id, tool, &arguments);
+    Ok(events)
+}
+
 fn namespace_continuations(
     mut events: Vec<DependencyProviderEvent>,
     request_reference: &str,
@@ -786,6 +857,7 @@ mod tests {
             "streaming_text",
             "one_tool_call",
             "one_process_call",
+            "process_action",
             "git_status",
             "web_search",
             "lsp_project_root",
@@ -894,7 +966,7 @@ mod tests {
     }
 
     fn request(scenario: &str) -> DependencyProviderExecutionRequest {
-        DependencyProviderExecutionRequest {
+        let mut request = DependencyProviderExecutionRequest {
             provider_key: "deterministic-mock".into(),
             model_key: "mock-model".into(),
             entries: vec![DependencyConversationEntry::User("hello".into())],
@@ -905,7 +977,60 @@ mod tests {
             authorization_grant: "grant".into(),
             cancellation_reference: "cancel-1".into(),
             resumed_after_continuation: false,
+        };
+        if scenario == "process_action" {
+            request.options.extend([
+                DependencyProviderOption {
+                    key: "mock_process_tool".into(),
+                    value: "process.list".into(),
+                },
+                DependencyProviderOption {
+                    key: "mock_process_arguments".into(),
+                    value: "{}".into(),
+                },
+            ]);
         }
+        request
+    }
+
+    #[test]
+    fn process_action_fixture_is_constrained_and_normalizes_json_arguments() {
+        let dependency = StaticProviderCatalogDependency::built_in();
+        let response = dependency
+            .execute_provider(request("process_action"))
+            .expect("valid process action");
+        assert!(response.events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::ToolCallProposed {
+                tool,
+                arguments_json,
+                ..
+            } if tool == "process.list" && arguments_json == "{}"
+        )));
+
+        let mut unsupported = request("process_action");
+        unsupported
+            .options
+            .iter_mut()
+            .find(|option| option.key == "mock_process_tool")
+            .expect("tool option")
+            .value = "filesystem.write".into();
+        assert!(matches!(
+            dependency.execute_provider(unsupported),
+            Err(ProviderExecutionDependencyError::InvalidRequest(_))
+        ));
+
+        let mut malformed = request("process_action");
+        malformed
+            .options
+            .iter_mut()
+            .find(|option| option.key == "mock_process_arguments")
+            .expect("arguments option")
+            .value = "[]".into();
+        assert!(matches!(
+            dependency.execute_provider(malformed),
+            Err(ProviderExecutionDependencyError::InvalidRequest(_))
+        ));
     }
 
     fn signed_grant(key: &[u8; 32], nonce: uuid::Uuid) -> String {

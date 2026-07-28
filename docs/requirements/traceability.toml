@@ -74,11 +74,11 @@ limitation = "Artifact ranges and bounded process retention are tested; runtime 
 id = "E2E-08"
 capability = "background-process"
 owner = "runtime/process-host"
-tests = ["foreground_captures_output_before_remove_always_cleanup", "cancellation_token_kills_running_process_and_owner_is_enforced", "foreground_request_can_be_cancelled_concurrently", "runtime_process_loop", "coding_task"]
+tests = ["foreground_captures_output_before_remove_always_cleanup", "cancellation_token_kills_running_process_and_owner_is_enforced", "foreground_request_can_be_cancelled_concurrently", "replacement_client_reattaches_to_the_same_live_pty", "runtime_process_loop", "runtime_process_restart", "coding_task"]
 platforms = ["windows", "linux", "macos"]
-evidence = ["apps/tools/process/dependency/tests/lifecycle.rs", "apps/tools/process/bin/tests/cancellation.rs", "apps/runtime/dependency/src/process_tool.rs", "tests/e2e/runtime_process_loop.ps1", "tests/e2e/runtime_process_loop.sh", "tests/e2e/coding_task.ps1", "tests/e2e/coding_task.sh"]
+evidence = ["apps/tools/process/dependency/tests/lifecycle.rs", "apps/tools/process/bin/tests/cancellation.rs", "apps/tools/process/bin/tests/endpoint_reconnect.rs", "apps/runtime/dependency/src/process_tool.rs", "tests/e2e/runtime_process_loop.ps1", "tests/e2e/runtime_process_loop.sh", "tests/e2e/runtime_process_restart.ps1", "tests/e2e/runtime_process_restart.sh", "tests/e2e/coding_task.ps1", "tests/e2e/coding_task.sh"]
 status = "partial"
-limitation = "The authenticated process host proves bounded foreground/background lifecycle, owner isolation, real concurrent cancellation, durable output, cleanup ordering, and runtime-daemon model-driven foreground execution; TUI disconnect, PTY, Unix descendant-tree containment, and crash reattachment remain incomplete."
+limitation = "The authenticated process host proves bounded foreground/background and native PTY lifecycle, owner isolation, real concurrent cancellation, durable output, cleanup ordering, and model-driven execution. A Windows daemon-replacement E2E preserves one live PTY host, reattaches, exchanges terminal input/output, commits exit, and proves no redispatch; Unix automation is present but is not executed in this report. TUI terminal attachment, Unix descendant-tree evidence, canonical process-reconciliation event pairs, and reattachment after a process-host crash remain incomplete; the last case intentionally fails closed because inherited handles cannot be recreated."
 
 [[requirement]]
 id = "E2E-09"

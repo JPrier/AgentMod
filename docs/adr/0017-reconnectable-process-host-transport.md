@@ -38,3 +38,8 @@ A transport failure removes the client connection but is not retried automatical
 Runtime replacement can preserve interactive PTY and process control without weakening grant checks. Dormant sessions do not retain a helper process after their final child and request. A capability-host crash still loses inherited handles and uses the fail-closed durable recovery classification from ADR 0016.
 
 The endpoint protocol adds one authenticated negotiation per new connection. Existing connections are reused until the host idles or transport fails.
+
+The daemon-replacement acceptance test uses a distinct provider tool-call ID
+for every control action. This is required because terminal receipts bind an
+execution ID to one exact request; reusing an ID for `start_pty` and
+`reattach` is rejected before transport, as intended.

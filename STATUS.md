@@ -43,7 +43,7 @@ and cross-platform CI evidence remain outstanding.
 | Deterministic harness mock provider | Integration tested | Full harness N-tier mappings; text, streaming, tool-call, malformed, timeout, rate-limit, partial-failure, cancellation, usage and disconnect scenarios |
 | Runtime action interception | Implemented and unit tested | Style-before-plugin ordering, exact replacement audit, final-proposal permission evaluation and mandatory-deny enforcement |
 | Deterministic compaction strategies | Implemented and unit tested | No-op, sliding window, typed summary, artifact handoff and artifact-safe tool-output eviction with source provenance |
-| Native process host | Integration tested | Authenticated foreground/background execution plus native PTY start/run, interactive input, resize, detach/reattach, merged durable terminal output, restart-persistent replay denial, strict owner/session scope, secret references, executable policy, and bounded concurrency/waiters pass. Recovery records commit before dispatch, bind PID + OS start time + resolved executable, reject PID reuse, preserve completed output, classify exact surviving children without redispatch, and quarantine malformed records. The host exposes authenticated versioned Unix-socket/Windows-pipe transport, survives runtime-client replacement in a separate process group, retains live PTY handles across reconnect, and exits after its last live child and request. A real Windows E2E disconnects one client, reconnects another, reattaches the same PTY, exchanges input/output, and validates idle exit. A separate forced host-crash test proves no redispatch and fail-closed inherited-handle recovery. Runtime-daemon restart coverage and canonical reconciliation events remain pending |
+| Native process host | End-to-end validated | Authenticated foreground/background execution plus native PTY start/run, interactive input, resize, detach/reattach, merged durable terminal output, restart-persistent replay denial, strict owner/session scope, secret references, executable policy, and bounded concurrency/waiters pass. Recovery records commit before dispatch, bind PID + OS start time + resolved executable, reject PID reuse, preserve completed output, classify exact surviving children without redispatch, and quarantine malformed records. The host exposes authenticated versioned Unix-socket/Windows-pipe transport, survives runtime-client replacement in a separate process group, retains live PTY handles across reconnect, and exits after its last live child and request. A real Windows daemon E2E starts one PTY, kills and replaces the runtime, reattaches through the surviving host, exchanges canonical input/output, commits exit, and proves no redispatch; equivalent Unix automation is present. A separate forced host-crash test proves no redispatch and fail-closed inherited-handle recovery. Canonical reconciliation event pairs remain pending |
 | Native filesystem host | Integration tested | Separate N-tier host with bounded read/list/glob/grep, atomic write/edit, prevalidated multi-file patch, encoding/binary handling, lazy schemas and path/symlink/device/sensitive-file controls; 13 tests |
 | Plugin manifest SDK | Implemented and unit tested | Strict TOML/JSON model, PLUG001–PLUG024 validation, authority/trust/capability/version checks and cross-plugin ordering diagnostics; 12 tests |
 | Harness continuation gate | Integration tested | Tool-call generation stops at a proposal; explicit runtime continuation issues a fresh provider request exactly once, with replacement structured context |
@@ -72,8 +72,8 @@ and cross-platform CI evidence remain outstanding.
 
 ## In progress
 
-- Runtime-daemon restart E2E and canonical reconciliation events for the
-  reconnectable process-host transport.
+- Canonical process-reconciliation event pairs for runtime replacement and
+  process-host crash recovery.
 - TUI management panels for schedules, plugins, MCP, processes, artifacts,
   child agents, and LSP; core interactive streaming is implemented.
 - MCP OAuth authorization-code flow and restart-persistent HTTP cursors.
@@ -93,7 +93,7 @@ followed directly with explicit planner/architect/critic assignments.
 
 ## Next tasks
 
-1. Complete runtime-daemon restart coverage and canonical process reconciliation events.
+1. Add canonical process-reconciliation event pairs for replacement and crash recovery.
 2. Complete low-latency ACP forwarding and permission/cancellation parity tests.
 3. Add scheduled runtime-event/output delivery, then MCP OAuth/restart-persistent cursors and remaining TUI management panels.
 
@@ -138,14 +138,16 @@ environment admits only non-secret platform/toolchain discovery variables plus
 configured overrides; the generic secret-name filter remains mandatory. Harness grants are
 ephemeral, nonce-bearing, action-digest bound, expiry
 checked, and replay limited in the harness dependency layer; ambiguous failed exchanges
-are never retried automatically. Process children use Windows tree termination or Unix process groups. Abrupt
-process-host crash reattachment and PTY isolation remain open; Web proxy upstream DNS is
+are never retried automatically. Process children use Windows tree termination or Unix process groups.
+Runtime replacement now reattaches to the surviving authenticated process host
+without redispatch; abrupt process-host crash reattachment remains intentionally
+unavailable because inherited handles cannot be recreated. Web proxy upstream DNS is
 necessarily delegated to an explicitly trusted proxy. Journal corruption/recovery,
 mandatory permission precedence, and plugin authority validation have tests.
 
 ## Acceptance scenario status
 
-All 19 scenarios remain short of cross-platform full-suite completion. Scenario
+All acceptance scenarios remain short of cross-platform full-suite completion. Scenario
 1 has a real model-driven read/edit/failing-test/fix/passing-test process E2E,
 but still lacks symbol search and multi-file edits. Scenarios 3 and 4 now pass
 their functional paths on Windows, including denial projection and daemon
@@ -154,7 +156,10 @@ daemon after a real write and durable terminal receipt but before canonical
 terminal commit, then completes from the receipt with the host unavailable;
 another Windows E2E proves startup-wide reconciliation of an interrupted
 non-approval dispatch before RPC readiness with the host unavailable. Unix
-scripts are present but not executed in this report. Scenario 12 passes its complete functional path on
+scripts are present but not executed in this report. The PTY process scenario
+now passes a Windows daemon-replacement path: one live PTY survives, reattaches,
+accepts input, exposes durable output, exits normally, and is not redispatched.
+Scenario 12 passes its complete functional path on
 Windows with a Unix script present: replay to an earlier sequence, atomic branch
 creation, explicit style replacement, independent continuation, and
 unchanged-parent comparison. A second Windows/Unix pair proves large parent
@@ -181,7 +186,9 @@ provider/tool lifecycle events, structured continuation, and an autonomous
 test/fix loop. The runtime also survives a forced daemon restart while a
 filesystem write awaits approval and resumes it through newly supervised
 host paths, and it reconciles verified receipts for unrelated nonterminal
-dispatches before accepting new RPC connections. Equivalent Unix scripts exist for earlier tool loops,
+dispatches before accepting new RPC connections. A separate forced restart
+preserves one live PTY in its surviving process host and reattaches through the
+replacement runtime without duplicate dispatch. Equivalent Unix scripts exist for these tool loops,
 but the approval scenario still needs a Unix port and execution.
 Incremental harness frames, per-event canonical commits, ordered runtime RPC
 stream frames, bounded channel backpressure, explicit one-item credit windows,

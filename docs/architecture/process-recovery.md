@@ -49,3 +49,10 @@ The runtime connects to a deterministic endpoint bound to owner, session, and wo
 A runtime connection disappearing does not terminate the host. The host retains the inherited process and PTY handles, and a replacement connection can list, attach, read, input, resize, interrupt, or kill through the normal exact-action grants. The host exits only when an idle check observes zero in-flight requests and zero live child handles.
 
 If the process host itself crashes, live handle recreation remains impossible. The durable identity model then reports `recovered_running_unattached` and continues to fail closed.
+
+`tests/e2e/runtime_process_restart.ps1` performs this path through the real
+Windows named-pipe daemon boundary. It starts one interactive PTY, forcibly
+terminates the runtime, starts a replacement runtime with the same protected
+bootstrap authority, reattaches by AgentMod process ID, exchanges input and
+terminal output, waits for exit, and proves the process directory was created
+only once. `runtime_process_restart.sh` is the equivalent Unix-socket test.

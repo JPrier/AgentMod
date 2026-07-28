@@ -4,7 +4,8 @@ use agentmod_primitives::{ContinuationId, TimestampMillis};
 use agentmod_runtime_data::continuation::{
     ContinuationDataError, ContinuationDataPort, ContinuationPayloadRecord, ContinuationRecord,
     ContinuationStateRecord, ContinuationWakeRecord, CreateContinuationDataRequest,
-    PendingToolCallPayloadRecord, ResolveContinuationDataRequest, ToolApprovalPayloadRecord,
+    DeferredTurnPayloadRecord, PendingToolCallPayloadRecord, ResolveContinuationDataRequest,
+    ToolApprovalPayloadRecord,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -96,8 +97,57 @@ pub enum ContinuationState {
 pub struct LoadContinuationResult {
     /// Current durable state.
     pub state: ContinuationState,
+    /// Durable wake condition used for scheduler proof validation.
+    pub wake_condition: ContinuationWakeCondition,
+    /// Optional expiration.
+    pub expires_at: Option<TimestampMillis>,
     /// Pending action associated with the continuation.
     pub payload: ContinuationPayload,
+}
+
+/// Scheduler-owned proof that a durable wake condition matched.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContinuationWakeProof {
+    /// Time trigger observed at the claimed occurrence.
+    At(TimestampMillis),
+    /// Exact committed event type matched by the scheduler.
+    RuntimeEvent {
+        /// Stable event type.
+        event_type: String,
+        /// Scheduler observation timestamp.
+        observed_at: TimestampMillis,
+    },
+    /// Exact process-output trigger matched by the scheduler.
+    ProcessOutput {
+        /// Runtime process identity.
+        process_id: String,
+        /// Literal bounded pattern.
+        pattern: String,
+        /// Scheduler observation timestamp.
+        observed_at: TimestampMillis,
+    },
+}
+
+/// Business command to claim a nonmanual continuation exactly once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WakeContinuationCommand {
+    /// Session containing the continuation.
+    pub session_id: String,
+    /// Durable continuation.
+    pub id: ContinuationId,
+    /// Schedule presenting the claim.
+    pub schedule_id: String,
+    /// Authenticated trigger proof.
+    pub proof: ContinuationWakeProof,
+}
+
+/// Business result for one durable wake attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WakeContinuationResult {
+    /// True only for the request that won the resume-once transition.
+    pub transitioned: bool,
+    /// Deferred action associated with the continuation.
+    pub payload: DeferredTurnContinuation,
 }
 
 /// Logic-owned durable pending action.
@@ -105,8 +155,33 @@ pub struct LoadContinuationResult {
 pub enum ContinuationPayload {
     /// Final intercepted tool call plus the turn state needed to continue.
     ToolApproval(Box<ToolApprovalContinuation>),
+    /// Complete provider turn deferred behind a scheduler-owned trigger.
+    DeferredTurn(Box<DeferredTurnContinuation>),
     /// Storage-only marker for callers without an executable action.
     Opaque(String),
+}
+
+/// Logic-owned restart-safe deferred provider turn.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeferredTurnContinuation {
+    /// Canonical session containing the deferred work.
+    pub session_id: String,
+    /// Exact schedule allowed to claim this work.
+    pub schedule_id: String,
+    /// User-authored prompt.
+    pub prompt: String,
+    /// Workspace selected for the turn.
+    pub workspace: String,
+    /// Provider adapter selected for the turn.
+    pub provider: String,
+    /// Provider model selected for the turn.
+    pub model: String,
+    /// Provider-specific request options.
+    pub options: Value,
+    /// Session style selected for execution.
+    pub style: String,
+    /// Stable cancellation identifier for the deferred turn.
+    pub cancellation_id: String,
 }
 
 /// Logic-owned restart-safe tool approval payload.
@@ -194,6 +269,19 @@ pub trait ContinuationLogicPort {
         &self,
         query: LoadContinuationQuery,
     ) -> Result<LoadContinuationResult, ContinuationLogicError>;
+
+    /// Claims a scheduler-owned, nonmanual continuation exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContinuationLogicError`] when the proof, payload, or durable
+    /// state does not authorize a wake.
+    fn wake_continuation(
+        &self,
+        _command: WakeContinuationCommand,
+    ) -> Result<WakeContinuationResult, ContinuationLogicError> {
+        Err(ContinuationLogicError::InvalidWakeProof)
+    }
 }
 
 /// Continuation business implementation over data only.
@@ -222,6 +310,7 @@ where
             return Err(ContinuationLogicError::InvalidSession);
         }
         validate_wake_condition(&command.wake_condition)?;
+        validate_expiration(command.expires_at, &command.wake_condition)?;
         validate_payload(&command.session_id, &command.payload)?;
         self.data
             .create(CreateContinuationDataRequest {
@@ -241,6 +330,13 @@ where
         &self,
         command: ResolveApprovalCommand,
     ) -> Result<ResolveApprovalResult, ContinuationLogicError> {
+        let pending = self
+            .data
+            .load(&command.session_id, &command.id.to_string())
+            .map_err(ContinuationLogicError::Data)?;
+        if !matches!(pending.wake_condition, ContinuationWakeRecord::Manual) {
+            return Err(ContinuationLogicError::InvalidWakeProof);
+        }
         let record = self
             .data
             .resolve(ResolveContinuationDataRequest {
@@ -283,7 +379,68 @@ where
                 ContinuationStateRecord::Cancelled => ContinuationState::Cancelled,
                 ContinuationStateRecord::Expired => ContinuationState::Expired,
             },
+            wake_condition: from_data_wake(record.wake_condition)?,
+            expires_at: record.expires_at_millis.map(TimestampMillis::new),
             payload,
+        })
+    }
+
+    fn wake_continuation(
+        &self,
+        command: WakeContinuationCommand,
+    ) -> Result<WakeContinuationResult, ContinuationLogicError> {
+        if command.session_id.trim().is_empty() || command.schedule_id.trim().is_empty() {
+            return Err(ContinuationLogicError::InvalidSession);
+        }
+        let loaded = self.load_continuation(LoadContinuationQuery {
+            session_id: command.session_id.clone(),
+            id: command.id,
+        })?;
+        let ContinuationPayload::DeferredTurn(payload) = loaded.payload else {
+            return Err(ContinuationLogicError::InvalidPayload);
+        };
+        if payload.schedule_id != command.schedule_id
+            || !wake_proof_matches(&loaded.wake_condition, &command.proof)
+        {
+            return Err(ContinuationLogicError::InvalidWakeProof);
+        }
+        if loaded
+            .expires_at
+            .is_some_and(|expiry| proof_timestamp(&command.proof) > expiry)
+        {
+            return Err(ContinuationLogicError::Expired);
+        }
+        match loaded.state {
+            ContinuationState::Resumed => {
+                return Ok(WakeContinuationResult {
+                    transitioned: false,
+                    payload: *payload,
+                });
+            }
+            ContinuationState::Pending => {}
+            ContinuationState::Cancelled | ContinuationState::Expired => {
+                return Err(ContinuationLogicError::InvalidResolutionState);
+            }
+        }
+        let resolved = self
+            .data
+            .resolve(ResolveContinuationDataRequest {
+                session_id: command.session_id,
+                id: command.id.to_string(),
+                approved: true,
+            })
+            .map_err(ContinuationLogicError::Data)?;
+        if resolved.state != ContinuationStateRecord::Resumed {
+            return Err(ContinuationLogicError::InvalidResolutionState);
+        }
+        let ContinuationPayload::DeferredTurn(resolved_payload) =
+            from_data_payload(resolved.payload)
+        else {
+            return Err(ContinuationLogicError::InvalidPayload);
+        };
+        Ok(WakeContinuationResult {
+            transitioned: resolved.transitioned,
+            payload: *resolved_payload,
         })
     }
 }
@@ -307,6 +464,21 @@ fn validate_wake_condition(
     }
 }
 
+fn validate_expiration(
+    expires_at: Option<TimestampMillis>,
+    wake_condition: &ContinuationWakeCondition,
+) -> Result<(), ContinuationLogicError> {
+    let Some(expires_at) = expires_at else {
+        return Ok(());
+    };
+    if expires_at.get() < 0
+        || matches!(wake_condition, ContinuationWakeCondition::At(wake_at) if wake_at > &expires_at)
+    {
+        return Err(ContinuationLogicError::InvalidExpiration);
+    }
+    Ok(())
+}
+
 fn to_data_wake(wake_condition: ContinuationWakeCondition) -> ContinuationWakeRecord {
     match wake_condition {
         ContinuationWakeCondition::Manual => ContinuationWakeRecord::Manual,
@@ -325,6 +497,71 @@ fn to_data_wake(wake_condition: ContinuationWakeCondition) -> ContinuationWakeRe
             process_id,
             pattern,
         },
+    }
+}
+
+fn from_data_wake(
+    wake_condition: ContinuationWakeRecord,
+) -> Result<ContinuationWakeCondition, ContinuationLogicError> {
+    let wake_condition = match wake_condition {
+        ContinuationWakeRecord::Manual => ContinuationWakeCondition::Manual,
+        ContinuationWakeRecord::At(value) => {
+            ContinuationWakeCondition::At(TimestampMillis::new(value))
+        }
+        ContinuationWakeRecord::RuntimeEvent {
+            event_type,
+            selector,
+        } => ContinuationWakeCondition::RuntimeEvent {
+            event_type,
+            selector,
+        },
+        ContinuationWakeRecord::ProcessOutput {
+            process_id,
+            pattern,
+        } => ContinuationWakeCondition::ProcessOutput {
+            process_id,
+            pattern,
+        },
+    };
+    validate_wake_condition(&wake_condition)?;
+    Ok(wake_condition)
+}
+
+fn wake_proof_matches(
+    condition: &ContinuationWakeCondition,
+    proof: &ContinuationWakeProof,
+) -> bool {
+    match (condition, proof) {
+        (ContinuationWakeCondition::At(expected), ContinuationWakeProof::At(observed)) => {
+            observed >= expected
+        }
+        (
+            ContinuationWakeCondition::RuntimeEvent {
+                event_type: expected,
+                selector: None,
+            },
+            ContinuationWakeProof::RuntimeEvent { event_type, .. },
+        ) => expected == event_type,
+        (
+            ContinuationWakeCondition::ProcessOutput {
+                process_id: expected_process,
+                pattern: expected_pattern,
+            },
+            ContinuationWakeProof::ProcessOutput {
+                process_id,
+                pattern,
+                ..
+            },
+        ) => expected_process == process_id && expected_pattern == pattern,
+        _ => false,
+    }
+}
+
+fn proof_timestamp(proof: &ContinuationWakeProof) -> TimestampMillis {
+    match proof {
+        ContinuationWakeProof::At(timestamp) => *timestamp,
+        ContinuationWakeProof::RuntimeEvent { observed_at, .. }
+        | ContinuationWakeProof::ProcessOutput { observed_at, .. } => *observed_at,
     }
 }
 
@@ -352,6 +589,19 @@ fn validate_payload(
                         || pending.tool.trim().is_empty()
                         || !pending.arguments.is_object()
                 }) =>
+        {
+            Err(ContinuationLogicError::InvalidPayload)
+        }
+        ContinuationPayload::DeferredTurn(turn)
+            if turn.session_id != session_id
+                || turn.schedule_id.trim().is_empty()
+                || turn.prompt.trim().is_empty()
+                || turn.workspace.trim().is_empty()
+                || turn.provider.trim().is_empty()
+                || turn.model.trim().is_empty()
+                || !turn.options.is_object()
+                || turn.style.trim().is_empty()
+                || turn.cancellation_id.trim().is_empty() =>
         {
             Err(ContinuationLogicError::InvalidPayload)
         }
@@ -389,6 +639,19 @@ fn to_data_payload(payload: ContinuationPayload) -> ContinuationPayloadRecord {
                     .collect(),
             }))
         }
+        ContinuationPayload::DeferredTurn(turn) => {
+            ContinuationPayloadRecord::DeferredTurn(Box::new(DeferredTurnPayloadRecord {
+                session_id: turn.session_id,
+                schedule_id: turn.schedule_id,
+                prompt: turn.prompt,
+                workspace: turn.workspace,
+                provider: turn.provider,
+                model: turn.model,
+                options: turn.options,
+                style: turn.style,
+                cancellation_id: turn.cancellation_id,
+            }))
+        }
         ContinuationPayload::Opaque(label) => ContinuationPayloadRecord::Opaque { label },
     }
 }
@@ -420,6 +683,19 @@ fn from_data_payload(payload: ContinuationPayloadRecord) -> ContinuationPayload 
                     .collect(),
             }))
         }
+        ContinuationPayloadRecord::DeferredTurn(turn) => {
+            ContinuationPayload::DeferredTurn(Box::new(DeferredTurnContinuation {
+                session_id: turn.session_id,
+                schedule_id: turn.schedule_id,
+                prompt: turn.prompt,
+                workspace: turn.workspace,
+                provider: turn.provider,
+                model: turn.model,
+                options: turn.options,
+                style: turn.style,
+                cancellation_id: turn.cancellation_id,
+            }))
+        }
         ContinuationPayloadRecord::Opaque { label } => ContinuationPayload::Opaque(label),
     }
 }
@@ -439,6 +715,15 @@ pub enum ContinuationLogicError {
     /// Data returned a state inconsistent with a completed resolution.
     #[error("continuation resolution returned an invalid state")]
     InvalidResolutionState,
+    /// Scheduler proof does not match the stored wake condition and schedule.
+    #[error("continuation wake proof is invalid")]
+    InvalidWakeProof,
+    /// Continuation expired before the wake proof.
+    #[error("continuation expired before wakeup")]
+    Expired,
+    /// Expiration cannot precede a time wake or the Unix epoch.
+    #[error("continuation expiration is invalid")]
+    InvalidExpiration,
     /// Continuation dataset failed.
     #[error("continuation data failed: {0}")]
     Data(#[source] ContinuationDataError),
@@ -472,10 +757,19 @@ mod tests {
 
         fn load(
             &self,
-            _session_id: &str,
-            _id: &str,
+            session_id: &str,
+            id: &str,
         ) -> Result<ContinuationRecord, ContinuationDataError> {
-            unreachable!("not used by this logic use case")
+            Ok(ContinuationRecord {
+                session_id: session_id.to_owned(),
+                id: id.to_owned(),
+                state: ContinuationStateRecord::Pending,
+                wake_condition: ContinuationWakeRecord::Manual,
+                payload: ContinuationPayloadRecord::Opaque {
+                    label: "fixture".into(),
+                },
+                expires_at_millis: None,
+            })
         }
 
         fn resolve(
@@ -495,6 +789,65 @@ mod tests {
 
     fn id() -> ContinuationId {
         ContinuationId::from_uuid(Uuid::from_u128(1))
+    }
+
+    fn deferred_payload() -> ContinuationPayloadRecord {
+        ContinuationPayloadRecord::DeferredTurn(Box::new(DeferredTurnPayloadRecord {
+            session_id: "session_1".into(),
+            schedule_id: "schedule_1".into(),
+            prompt: "continue".into(),
+            workspace: "workspace".into(),
+            provider: "mock".into(),
+            model: "mock-model".into(),
+            options: serde_json::json!({}),
+            style: "persistent-chat".into(),
+            cancellation_id: Uuid::from_u128(2).to_string(),
+        }))
+    }
+
+    struct WakeMockData {
+        resolutions: RefCell<Vec<ResolveContinuationDataRequest>>,
+        wake_condition: ContinuationWakeRecord,
+        payload: ContinuationPayloadRecord,
+        expires_at_millis: Option<i64>,
+        state: ContinuationStateRecord,
+        transitioned: bool,
+    }
+
+    impl ContinuationDataPort for WakeMockData {
+        fn create(
+            &self,
+            _request: CreateContinuationDataRequest,
+        ) -> Result<(), ContinuationDataError> {
+            unreachable!("wake tests never create")
+        }
+
+        fn load(
+            &self,
+            session_id: &str,
+            id: &str,
+        ) -> Result<ContinuationRecord, ContinuationDataError> {
+            Ok(ContinuationRecord {
+                session_id: session_id.to_owned(),
+                id: id.to_owned(),
+                state: self.state,
+                wake_condition: self.wake_condition.clone(),
+                payload: self.payload.clone(),
+                expires_at_millis: self.expires_at_millis,
+            })
+        }
+
+        fn resolve(
+            &self,
+            request: ResolveContinuationDataRequest,
+        ) -> Result<ResolveContinuationDataRecord, ContinuationDataError> {
+            self.resolutions.borrow_mut().push(request);
+            Ok(ResolveContinuationDataRecord {
+                transitioned: self.transitioned,
+                state: ContinuationStateRecord::Resumed,
+                payload: self.payload.clone(),
+            })
+        }
     }
 
     #[test]
@@ -572,6 +925,152 @@ mod tests {
                 expires_at: None,
             }),
             Err(ContinuationLogicError::InvalidWakeCondition)
+        ));
+        assert!(logic.data.creates.borrow().is_empty());
+    }
+
+    #[test]
+    fn valid_schedule_proof_wakes_deferred_turn_once() {
+        let logic = ContinuationLogic::new(WakeMockData {
+            resolutions: RefCell::new(Vec::new()),
+            wake_condition: ContinuationWakeRecord::RuntimeEvent {
+                event_type: "task.ready".into(),
+                selector: None,
+            },
+            payload: deferred_payload(),
+            expires_at_millis: None,
+            state: ContinuationStateRecord::Pending,
+            transitioned: true,
+        });
+        let result = logic
+            .wake_continuation(WakeContinuationCommand {
+                session_id: "session_1".into(),
+                id: id(),
+                schedule_id: "schedule_1".into(),
+                proof: ContinuationWakeProof::RuntimeEvent {
+                    event_type: "task.ready".into(),
+                    observed_at: TimestampMillis::new(100),
+                },
+            })
+            .expect("wake");
+        assert!(result.transitioned);
+        assert_eq!(result.payload.prompt, "continue");
+        assert_eq!(logic.data.resolutions.borrow().len(), 1);
+    }
+
+    #[test]
+    fn rejects_schedule_or_trigger_mismatch_without_transition() {
+        let logic = ContinuationLogic::new(WakeMockData {
+            resolutions: RefCell::new(Vec::new()),
+            wake_condition: ContinuationWakeRecord::ProcessOutput {
+                process_id: "process_1".into(),
+                pattern: "ready".into(),
+            },
+            payload: deferred_payload(),
+            expires_at_millis: None,
+            state: ContinuationStateRecord::Pending,
+            transitioned: true,
+        });
+        for (schedule_id, pattern) in [("schedule_other", "ready"), ("schedule_1", "different")] {
+            assert!(matches!(
+                logic.wake_continuation(WakeContinuationCommand {
+                    session_id: "session_1".into(),
+                    id: id(),
+                    schedule_id: schedule_id.into(),
+                    proof: ContinuationWakeProof::ProcessOutput {
+                        process_id: "process_1".into(),
+                        pattern: pattern.into(),
+                        observed_at: TimestampMillis::new(100),
+                    },
+                }),
+                Err(ContinuationLogicError::InvalidWakeProof)
+            ));
+        }
+        assert!(logic.data.resolutions.borrow().is_empty());
+    }
+
+    #[test]
+    fn resumed_continuation_is_an_idempotent_noop() {
+        let logic = ContinuationLogic::new(WakeMockData {
+            resolutions: RefCell::new(Vec::new()),
+            wake_condition: ContinuationWakeRecord::At(100),
+            payload: deferred_payload(),
+            expires_at_millis: None,
+            state: ContinuationStateRecord::Resumed,
+            transitioned: false,
+        });
+        let result = logic
+            .wake_continuation(WakeContinuationCommand {
+                session_id: "session_1".into(),
+                id: id(),
+                schedule_id: "schedule_1".into(),
+                proof: ContinuationWakeProof::At(TimestampMillis::new(100)),
+            })
+            .expect("duplicate wake");
+        assert!(!result.transitioned);
+        assert!(logic.data.resolutions.borrow().is_empty());
+    }
+
+    #[test]
+    fn expired_time_proof_fails_before_transition() {
+        let logic = ContinuationLogic::new(WakeMockData {
+            resolutions: RefCell::new(Vec::new()),
+            wake_condition: ContinuationWakeRecord::At(100),
+            payload: deferred_payload(),
+            expires_at_millis: Some(199),
+            state: ContinuationStateRecord::Pending,
+            transitioned: true,
+        });
+        assert!(matches!(
+            logic.wake_continuation(WakeContinuationCommand {
+                session_id: "session_1".into(),
+                id: id(),
+                schedule_id: "schedule_1".into(),
+                proof: ContinuationWakeProof::At(TimestampMillis::new(200)),
+            }),
+            Err(ContinuationLogicError::Expired)
+        ));
+        assert!(logic.data.resolutions.borrow().is_empty());
+    }
+
+    #[test]
+    fn manual_approval_cannot_resolve_scheduler_continuation() {
+        let logic = ContinuationLogic::new(WakeMockData {
+            resolutions: RefCell::new(Vec::new()),
+            wake_condition: ContinuationWakeRecord::At(100),
+            payload: deferred_payload(),
+            expires_at_millis: None,
+            state: ContinuationStateRecord::Pending,
+            transitioned: true,
+        });
+        assert!(matches!(
+            logic.resolve_approval(ResolveApprovalCommand {
+                session_id: "session_1".into(),
+                id: id(),
+                approved: true,
+            }),
+            Err(ContinuationLogicError::InvalidWakeProof)
+        ));
+        assert!(logic.data.resolutions.borrow().is_empty());
+    }
+
+    #[test]
+    fn rejects_expiration_before_time_wake() {
+        let logic = ContinuationLogic::new(MockData {
+            creates: RefCell::new(Vec::new()),
+            resolutions: RefCell::new(Vec::new()),
+            state: ContinuationStateRecord::Pending,
+            transitioned: false,
+        });
+        assert!(matches!(
+            logic.create_continuation(CreateContinuationCommand {
+                session_id: "session_1".into(),
+                id: id(),
+                wake_condition: ContinuationWakeCondition::At(TimestampMillis::new(200)),
+                payload: ContinuationPayload::Opaque("fixture".into()),
+                expires_at: Some(TimestampMillis::new(199)),
+            }),
+            Err(ContinuationLogicError::InvalidExpiration)
         ));
         assert!(logic.data.creates.borrow().is_empty());
     }

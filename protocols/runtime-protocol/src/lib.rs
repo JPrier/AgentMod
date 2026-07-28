@@ -77,6 +77,33 @@ pub enum RuntimeRequest {
         /// Maximum claims processed by this invocation.
         limit: u32,
     },
+    /// Persist one schedule-bound turn continuation before storing its schedule.
+    CreateDeferredTurn {
+        /// Existing durable session.
+        session_id: SessionId,
+        /// Opaque resume-once continuation identifier.
+        continuation_id: String,
+        /// Exact schedule allowed to wake this continuation.
+        schedule_id: String,
+        /// User-authored prompt to execute after a valid wake.
+        prompt: String,
+        /// Explicit workspace retained for provenance validation.
+        workspace: String,
+        /// Explicit provider.
+        provider: String,
+        /// Explicit model.
+        model: String,
+        /// Provider and scheduled-execution policy options.
+        options: Value,
+        /// Explicit session style retained for provenance validation.
+        style: String,
+        /// Stable cancellation identifier for the eventual provider request.
+        cancellation_id: CancellationId,
+        /// Exact wake condition.
+        trigger: RuntimeScheduleTrigger,
+        /// Optional absolute expiration timestamp.
+        expires_at_ms: Option<i64>,
+    },
     /// Run one durable user turn through the selected provider.
     RunTurn {
         /// Existing durable session.
@@ -215,6 +242,11 @@ pub enum RuntimeResponse {
     ScheduledRuns {
         /// Per-occurrence outcomes.
         runs: Vec<RuntimeScheduledRun>,
+    },
+    /// A schedule-bound resume-once continuation was persisted.
+    DeferredTurnCreated {
+        /// Opaque persisted continuation identifier.
+        continuation_id: String,
     },
     /// One turn reached a provider pause or completion boundary.
     Turn {
@@ -371,6 +403,9 @@ pub struct RuntimeScheduledExecution {
     pub execution_id: String,
     /// Trigger occurrence timestamp.
     pub scheduled_for_ms: i64,
+    /// Unix timestamp when the scheduler durably claimed this occurrence.
+    #[serde(default)]
+    pub claimed_at_ms: i64,
     /// Immutable schedule projection at claim time.
     pub schedule: RuntimeScheduleSpec,
 }

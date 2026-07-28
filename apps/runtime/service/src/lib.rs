@@ -384,6 +384,7 @@ impl<L: RuntimeScheduleLogicPort> RuntimeService<L> {
                     .map(|execution| RuntimeScheduledExecution {
                         execution_id: execution.execution_id,
                         scheduled_for_ms: execution.scheduled_for_ms,
+                        claimed_at_ms: execution.claimed_at_ms,
                         schedule: to_wire_schedule(from_logic_schedule(execution.schedule)),
                     })
                     .collect();
@@ -641,6 +642,7 @@ struct ServiceScheduleStoreResult {
 struct ServiceScheduledExecution {
     execution_id: String,
     scheduled_for_ms: i64,
+    claimed_at_ms: i64,
     schedule: ServiceSchedule,
 }
 
@@ -764,6 +766,7 @@ fn from_logic_execution(value: ScheduledExecution) -> ServiceScheduledExecution 
     ServiceScheduledExecution {
         execution_id: value.execution_id,
         scheduled_for_ms: value.scheduled_for_ms,
+        claimed_at_ms: value.claimed_at_ms,
         schedule: from_logic_schedule(value.schedule),
     }
 }

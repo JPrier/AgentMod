@@ -7,7 +7,8 @@
 
 use agentmod_cli_dependency::{
     CliDependencyPort, DependencyBranchSessionRequest, DependencyCancelTurnRequest,
-    DependencyCreateSessionRequest, DependencyInspectSessionRequest, DependencyListSessionsRequest,
+    DependencyCreateDeferredTurnRequest, DependencyCreateSessionRequest,
+    DependencyInspectSessionRequest, DependencyListSessionsRequest,
     DependencyResolveApprovalRequest, DependencyRunTurnRequest, DependencyRunTurnStream,
     DependencyRunTurnStreamItem, DependencyRuntimeAvailability, DependencyRuntimeHealthRequest,
     DependencySchedule, DependencySchedulePayload, DependencyScheduleTrigger,
@@ -179,6 +180,7 @@ pub struct ScheduleDataRecord {
 pub struct ScheduledExecutionDataRecord {
     pub execution_id: String,
     pub scheduled_for_ms: i64,
+    pub claimed_at_ms: i64,
     pub schedule: ScheduleDataRecord,
 }
 
@@ -186,6 +188,22 @@ pub struct ScheduledExecutionDataRecord {
 pub struct ScheduleStoreDataRecord {
     pub schedule_id: String,
     pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CreateDeferredTurnDataRequest {
+    pub session_id: SessionId,
+    pub continuation_id: String,
+    pub schedule_id: String,
+    pub prompt: String,
+    pub workspace: String,
+    pub provider: String,
+    pub model: String,
+    pub options: Value,
+    pub style: String,
+    pub cancellation_id: CancellationId,
+    pub trigger: ScheduleDataTrigger,
+    pub expires_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -417,6 +435,13 @@ pub trait CliDataPort {
         &self,
         _schedule: ScheduleDataRecord,
     ) -> Result<ScheduleStoreDataRecord, DataError> {
+        Err(schedule_unavailable())
+    }
+
+    fn create_deferred_turn(
+        &self,
+        _request: CreateDeferredTurnDataRequest,
+    ) -> Result<(), DataError> {
         Err(schedule_unavailable())
     }
 
@@ -689,6 +714,28 @@ where
             .map_err(|error| runtime_error(&error))
     }
 
+    fn create_deferred_turn(
+        &self,
+        request: CreateDeferredTurnDataRequest,
+    ) -> Result<(), DataError> {
+        self.dependency
+            .create_deferred_turn(DependencyCreateDeferredTurnRequest {
+                session_id: request.session_id,
+                continuation_id: request.continuation_id,
+                schedule_id: request.schedule_id,
+                prompt: request.prompt,
+                workspace: request.workspace,
+                provider: request.provider,
+                model: request.model,
+                options: request.options,
+                style: request.style,
+                cancellation_id: request.cancellation_id,
+                trigger: to_dependency_trigger(request.trigger),
+                expires_at_ms: request.expires_at_ms,
+            })
+            .map_err(|error| runtime_error(&error))
+    }
+
     fn remove_schedule(&self, schedule_id: &str) -> Result<bool, DataError> {
         self.dependency
             .remove_schedule(schedule_id)
@@ -754,26 +801,7 @@ fn to_dependency_schedule(value: ScheduleDataRecord) -> DependencySchedule {
         model: value.model,
         token_budget: value.token_budget,
         cost_budget_micros: value.cost_budget_micros,
-        trigger: match value.trigger {
-            ScheduleDataTrigger::AtMillis(value) => DependencyScheduleTrigger::AtMillis(value),
-            ScheduleDataTrigger::Interval {
-                starts_at_ms,
-                every_ms,
-            } => DependencyScheduleTrigger::Interval {
-                starts_at_ms,
-                every_ms,
-            },
-            ScheduleDataTrigger::RuntimeEvent { event_type } => {
-                DependencyScheduleTrigger::RuntimeEvent { event_type }
-            }
-            ScheduleDataTrigger::ProcessOutput {
-                process_id,
-                contains,
-            } => DependencyScheduleTrigger::ProcessOutput {
-                process_id,
-                contains,
-            },
-        },
+        trigger: to_dependency_trigger(value.trigger),
         payload: match value.payload {
             ScheduleDataPayload::Prompt { prompt } => DependencySchedulePayload::Prompt { prompt },
             ScheduleDataPayload::Continuation { continuation_id } => {
@@ -781,6 +809,29 @@ fn to_dependency_schedule(value: ScheduleDataRecord) -> DependencySchedule {
             }
         },
         active: value.active,
+    }
+}
+
+fn to_dependency_trigger(value: ScheduleDataTrigger) -> DependencyScheduleTrigger {
+    match value {
+        ScheduleDataTrigger::AtMillis(value) => DependencyScheduleTrigger::AtMillis(value),
+        ScheduleDataTrigger::Interval {
+            starts_at_ms,
+            every_ms,
+        } => DependencyScheduleTrigger::Interval {
+            starts_at_ms,
+            every_ms,
+        },
+        ScheduleDataTrigger::RuntimeEvent { event_type } => {
+            DependencyScheduleTrigger::RuntimeEvent { event_type }
+        }
+        ScheduleDataTrigger::ProcessOutput {
+            process_id,
+            contains,
+        } => DependencyScheduleTrigger::ProcessOutput {
+            process_id,
+            contains,
+        },
     }
 }
 
@@ -830,6 +881,7 @@ fn from_dependency_execution(value: DependencyScheduledExecution) -> ScheduledEx
     ScheduledExecutionDataRecord {
         execution_id: value.execution_id,
         scheduled_for_ms: value.scheduled_for_ms,
+        claimed_at_ms: value.claimed_at_ms,
         schedule: from_dependency_schedule(value.schedule),
     }
 }

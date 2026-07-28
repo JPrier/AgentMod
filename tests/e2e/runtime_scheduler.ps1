@@ -161,24 +161,79 @@ try {
         throw "runtime-event delivery bypassed or recursively repeated the provider path"
     }
 
+    $deferredAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 5000
+    $deferredStored = & $cli schedule add "restart-deferred-turn" `
+        --session $created.session_id `
+        --prompt "resume this durable turn after restart" `
+        --at-ms $deferredAt --deferred --json | ConvertFrom-Json
+    if ($deferredStored.schedule_id -ne "restart-deferred-turn" -or
+        $deferredStored.replayed) {
+        throw "deferred schedule was not stored"
+    }
+    $withDeferred = & $cli schedule list --json | ConvertFrom-Json
+    $deferredSchedule = @($withDeferred.schedules | Where-Object {
+        $_.schedule_id -eq "restart-deferred-turn"
+    })[0]
+    $deferredContinuation = $deferredSchedule.payload.value.continuation_id
+    if ([string]::IsNullOrWhiteSpace($deferredContinuation)) {
+        throw "deferred continuation identity was not inspectable"
+    }
+    & $cli approval resolve $created.session_id $deferredContinuation `
+        approve --json 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        throw "manual approval bypassed the scheduler wake condition"
+    }
+
     Stop-Process -Id $daemon.Id -Force
     $daemon.WaitForExit()
     $daemon = Start-Runtime
     Wait-Runtime
+    $deferredRan = $false
+    for ($attempt = 0; $attempt -lt 100; $attempt++) {
+        try {
+            $eventsAfter = @(Get-Content $journalPath | ForEach-Object {
+                ($_ | ConvertFrom-Json).event
+            })
+        }
+        catch {
+            Start-Sleep -Milliseconds 100
+            continue
+        }
+        if (@($eventsAfter | Where-Object {
+            $_.metadata.event_type -eq "scheduler.fired"
+        }).Count -eq 3) {
+            $deferredRan = $true
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $deferredRan) {
+        throw "deferred continuation did not wake after restart"
+    }
+    if (@($eventsAfter | Where-Object {
+        $_.metadata.event_type -eq "scheduler.fired"
+    }).Count -ne 3) {
+        throw "time, event, or continuation delivery duplicated after restart"
+    }
+    if (@($eventsAfter | Where-Object {
+        $_.metadata.event_type -eq "model.response_completed"
+    }).Count -ne 4) {
+        throw "deferred continuation bypassed the provider path"
+    }
+    $continuationPath = Join-Path $runRoot (
+        "sessions\" + $created.session_id + "\continuations\" +
+        $deferredContinuation + ".json"
+    )
+    $continuationRecord = Get-Content $continuationPath | ConvertFrom-Json
+    if ($continuationRecord.state -ne "resumed") {
+        throw "deferred continuation did not durably transition once"
+    }
     $afterRestart = & $cli schedule run --limit 4 --json |
         ConvertFrom-Json
     if (@($afterRestart.runs).Count -ne 0) {
         throw "completed occurrence executed again after restart"
     }
-    $eventsAfter = @(Get-Content $journalPath | ForEach-Object {
-        ($_ | ConvertFrom-Json).event
-    })
-    if (@($eventsAfter | Where-Object {
-        $_.metadata.event_type -eq "scheduler.fired"
-    }).Count -ne 2) {
-        throw "time or runtime-event delivery duplicated after restart"
-    }
-    Write-Output "runtime-owned time and event schedule E2E passed"
+    Write-Output "runtime-owned time, event, and deferred continuation schedule E2E passed"
 }
 finally {
     if ($null -ne $daemon -and -not $daemon.HasExited) {

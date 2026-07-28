@@ -186,6 +186,7 @@ pub struct DependencySchedule {
 pub struct DependencyScheduledExecution {
     pub execution_id: String,
     pub scheduled_for_ms: i64,
+    pub claimed_at_ms: i64,
     pub schedule: DependencySchedule,
 }
 
@@ -193,6 +194,22 @@ pub struct DependencyScheduledExecution {
 pub struct DependencyScheduleStoreResult {
     pub schedule_id: String,
     pub replayed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DependencyCreateDeferredTurnRequest {
+    pub session_id: SessionId,
+    pub continuation_id: String,
+    pub schedule_id: String,
+    pub prompt: String,
+    pub workspace: String,
+    pub provider: String,
+    pub model: String,
+    pub options: Value,
+    pub style: String,
+    pub cancellation_id: CancellationId,
+    pub trigger: DependencyScheduleTrigger,
+    pub expires_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -427,6 +444,13 @@ pub trait CliDependencyPort {
         &self,
         _schedule: DependencySchedule,
     ) -> Result<DependencyScheduleStoreResult, DependencyError> {
+        Err(DependencyError::UnsupportedRuntimeRequest)
+    }
+
+    fn create_deferred_turn(
+        &self,
+        _request: DependencyCreateDeferredTurnRequest,
+    ) -> Result<(), DependencyError> {
         Err(DependencyError::UnsupportedRuntimeRequest)
     }
 
@@ -1201,6 +1225,36 @@ impl CliDependencyPort for LocalRuntimeClient {
         })
     }
 
+    fn create_deferred_turn(
+        &self,
+        request: DependencyCreateDeferredTurnRequest,
+    ) -> Result<(), DependencyError> {
+        let continuation_id = request.continuation_id;
+        let RuntimeResponse::DeferredTurnCreated {
+            continuation_id: created,
+        } = self.send_local(RuntimeRequest::CreateDeferredTurn {
+            session_id: request.session_id,
+            continuation_id: continuation_id.clone(),
+            schedule_id: request.schedule_id,
+            prompt: request.prompt,
+            workspace: request.workspace,
+            provider: request.provider,
+            model: request.model,
+            options: request.options,
+            style: request.style,
+            cancellation_id: request.cancellation_id,
+            trigger: to_wire_trigger(request.trigger),
+            expires_at_ms: request.expires_at_ms,
+        })?
+        else {
+            return Err(DependencyError::UnexpectedRuntimeResponse);
+        };
+        if created != continuation_id {
+            return Err(DependencyError::UnexpectedRuntimeResponse);
+        }
+        Ok(())
+    }
+
     fn remove_schedule(&self, schedule_id: &str) -> Result<bool, DependencyError> {
         let RuntimeResponse::ScheduleRemoved { existed } =
             self.send_local(RuntimeRequest::RemoveSchedule {
@@ -1235,6 +1289,7 @@ impl CliDependencyPort for LocalRuntimeClient {
             .map(|execution| DependencyScheduledExecution {
                 execution_id: execution.execution_id,
                 scheduled_for_ms: execution.scheduled_for_ms,
+                claimed_at_ms: execution.claimed_at_ms,
                 schedule: from_wire_schedule(execution.schedule),
             })
             .collect())
@@ -1292,26 +1347,7 @@ fn to_wire_schedule(value: DependencySchedule) -> RuntimeScheduleSpec {
         model: value.model,
         token_budget: value.token_budget,
         cost_budget_micros: value.cost_budget_micros,
-        trigger: match value.trigger {
-            DependencyScheduleTrigger::AtMillis(value) => RuntimeScheduleTrigger::AtMillis(value),
-            DependencyScheduleTrigger::Interval {
-                starts_at_ms,
-                every_ms,
-            } => RuntimeScheduleTrigger::Interval {
-                starts_at_ms,
-                every_ms,
-            },
-            DependencyScheduleTrigger::RuntimeEvent { event_type } => {
-                RuntimeScheduleTrigger::RuntimeEvent { event_type }
-            }
-            DependencyScheduleTrigger::ProcessOutput {
-                process_id,
-                contains,
-            } => RuntimeScheduleTrigger::ProcessOutput {
-                process_id,
-                contains,
-            },
-        },
+        trigger: to_wire_trigger(value.trigger),
         payload: match value.payload {
             DependencySchedulePayload::Prompt { prompt } => {
                 RuntimeSchedulePayload::Prompt { prompt }
@@ -1321,6 +1357,29 @@ fn to_wire_schedule(value: DependencySchedule) -> RuntimeScheduleSpec {
             }
         },
         active: value.active,
+    }
+}
+
+fn to_wire_trigger(value: DependencyScheduleTrigger) -> RuntimeScheduleTrigger {
+    match value {
+        DependencyScheduleTrigger::AtMillis(value) => RuntimeScheduleTrigger::AtMillis(value),
+        DependencyScheduleTrigger::Interval {
+            starts_at_ms,
+            every_ms,
+        } => RuntimeScheduleTrigger::Interval {
+            starts_at_ms,
+            every_ms,
+        },
+        DependencyScheduleTrigger::RuntimeEvent { event_type } => {
+            RuntimeScheduleTrigger::RuntimeEvent { event_type }
+        }
+        DependencyScheduleTrigger::ProcessOutput {
+            process_id,
+            contains,
+        } => RuntimeScheduleTrigger::ProcessOutput {
+            process_id,
+            contains,
+        },
     }
 }
 

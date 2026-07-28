@@ -30,10 +30,21 @@ events commit. A turn awaiting durable approval remains nonterminal. Failed
 turns receive an idempotent failure marker. Restarting the daemon cannot claim
 the same occurrence again.
 
+Deferred turns use a separate `DeferredTurn` continuation payload. Creation is
+an idempotent two-step logic use case: persist the exact schedule-bound
+continuation, then store the schedule. A worker claim carries both the intended
+occurrence and its durable claim timestamp. Runtime logic verifies the session,
+schedule, trigger proof, and expiration before a pending-to-resumed
+compare-and-set. Only the transition winner commits `scheduler.fired` and enters
+the normal provider/tool policy path. Manual approval endpoints reject these
+continuations, and repeated claims become successful no-ops rather than
+re-executing the turn.
+
 The daemon polls automatically with a bounded missed-tick policy; polling can
 be tuned with `AGENTMOD_SCHEDULER_POLL_MS` and
 `AGENTMOD_SCHEDULER_POLL_LIMIT`. The worker never executes payloads itself.
 Triggered schedule executions are deliberately not fed recursively back into
 the same observer pass, preventing an event schedule from immediately
-self-triggering without an explicit later committed turn. Continuation-wakeup
-execution and TUI management remain open.
+self-triggering without an explicit later committed turn. TUI management and
+redelivery of a claimed execution interrupted before runtime completion remain
+open.

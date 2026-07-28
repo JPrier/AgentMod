@@ -150,3 +150,8 @@ Replay and branch isolation are covered by `runtime_replay_branch.ps1` and
 gap-free reconnect cursors are covered by `runtime_session_reconnect.ps1` and
 `runtime_session_reconnect.sh`. Durable runtime scheduling is covered by
 `runtime_scheduler.ps1` and `runtime_scheduler.sh`.
+
+`schedule add` accepts time, runtime-event, and exact process-output triggers.
+Pass `--deferred` to bind the prompt to a durable resume-once continuation;
+`--expires-at-ms` adds an absolute expiry. Deferred schedules reject
+`--every-ms`.

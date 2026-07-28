@@ -4,11 +4,12 @@ use std::ffi::OsString;
 
 use agentmod_cli_logic::{
     BranchSessionCommand, BranchSessionResult, CancelTurnCommand, CliLogicPort,
-    CreateSessionCommand, DoctorResult, DoctorState, InspectSessionCommand, InspectSessionResult,
-    ListSessionsCommand, ResolveApprovalCommand, ResolveApprovalResult, RunDoctorCommand,
-    RunTurnCommand, RunTurnResult, RunTurnStream, RunTurnStreamItem,
-    ScheduleCommand as LogicScheduleCommand, SchedulePayload, ScheduleResult, ScheduleTrigger,
-    SessionEventPageResult, SessionSummaryResult, SubscribeSessionCommand, TurnEvent,
+    CreateSessionCommand, DeferredScheduleCommand, DoctorResult, DoctorState,
+    InspectSessionCommand, InspectSessionResult, ListSessionsCommand, ResolveApprovalCommand,
+    ResolveApprovalResult, RunDoctorCommand, RunTurnCommand, RunTurnResult, RunTurnStream,
+    RunTurnStreamItem, ScheduleCommand as LogicScheduleCommand, SchedulePayload, ScheduleResult,
+    ScheduleTrigger, SessionEventPageResult, SessionSummaryResult, SubscribeSessionCommand,
+    TurnEvent,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use thiserror::Error;
@@ -24,6 +25,10 @@ pub struct CliArguments {
 
 /// Clap-owned command variants.
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Clap owns this cold-path parsed command and boxing would leak allocation into endpoint mapping"
+)]
 pub enum CliCommand {
     /// Run one durable agent turn.
     Run {
@@ -108,6 +113,12 @@ pub enum ScheduleCommand {
         /// Scheduled prompt.
         #[arg(long)]
         prompt: String,
+        /// Persist the turn as a resume-once continuation bound to this schedule.
+        #[arg(long)]
+        deferred: bool,
+        /// Optional absolute continuation expiry in Unix milliseconds.
+        #[arg(long, requires = "deferred")]
+        expires_at_ms: Option<i64>,
         /// First Unix timestamp in milliseconds. Required for time triggers.
         #[arg(long)]
         at_ms: Option<i64>,
@@ -534,6 +545,8 @@ where
                     schedule_id,
                     session,
                     prompt,
+                    deferred,
+                    expires_at_ms,
                     at_ms,
                     every_ms,
                     on_event,
@@ -552,6 +565,8 @@ where
                     schedule_id,
                     &session,
                     prompt,
+                    deferred,
+                    expires_at_ms,
                     at_ms,
                     every_ms,
                     on_event,
@@ -591,11 +606,17 @@ where
         clippy::too_many_arguments,
         reason = "the CLI endpoint explicitly maps every user-visible schedule policy field"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the schedule endpoint maps trigger, identity, deferred continuation, and rendering fields explicitly"
+    )]
     fn add_schedule(
         &self,
         schedule_id: String,
         session: &str,
         prompt: String,
+        deferred: bool,
+        expires_at_ms: Option<i64>,
         at_ms: Option<i64>,
         every_ms: Option<u64>,
         on_event: Option<String>,
@@ -653,24 +674,69 @@ where
             let digest = blake3::hash(format!("{schedule_id}:{trigger_key}").as_bytes());
             format!("cli:{}", digest.to_hex())
         });
-        let result = self
-            .logic
-            .upsert_schedule(LogicScheduleCommand {
-                schedule_id,
-                session_id,
-                idempotency_id,
-                style,
-                workspace,
-                permission_policy,
-                provider,
-                model,
-                token_budget,
-                cost_budget_micros,
-                trigger,
-                payload: SchedulePayload::Prompt { prompt },
-                active: true,
-            })
-            .map_err(logic_error)?;
+        let result = if deferred {
+            if matches!(trigger, ScheduleTrigger::Interval { .. }) {
+                return Err(ServiceError::Arguments {
+                    detail: String::from(
+                        "deferred schedules are resume-once and do not support --every-ms",
+                    ),
+                });
+            }
+            let identity = blake3::hash(
+                format!("{schedule_id}:{trigger_key}:{idempotency_id}:deferred").as_bytes(),
+            );
+            let continuation_id = uuid_string_from_hash(identity.as_bytes());
+            let cancellation_identity =
+                blake3::hash(format!("{continuation_id}:cancellation").as_bytes());
+            let cancellation_id = uuid_string_from_hash(cancellation_identity.as_bytes())
+                .parse()
+                .map_err(|_| ServiceError::Arguments {
+                    detail: String::from("generated cancellation identity is invalid"),
+                })?;
+            self.logic
+                .defer_schedule(DeferredScheduleCommand {
+                    schedule: LogicScheduleCommand {
+                        schedule_id,
+                        session_id,
+                        idempotency_id,
+                        style,
+                        workspace,
+                        permission_policy,
+                        provider,
+                        model,
+                        token_budget,
+                        cost_budget_micros,
+                        trigger,
+                        payload: SchedulePayload::Continuation {
+                            continuation_id: continuation_id.clone(),
+                        },
+                        active: true,
+                    },
+                    continuation_id,
+                    prompt,
+                    cancellation_id,
+                    expires_at_ms,
+                })
+                .map_err(logic_error)?
+        } else {
+            self.logic
+                .upsert_schedule(LogicScheduleCommand {
+                    schedule_id,
+                    session_id,
+                    idempotency_id,
+                    style,
+                    workspace,
+                    permission_policy,
+                    provider,
+                    model,
+                    token_budget,
+                    cost_budget_micros,
+                    trigger,
+                    payload: SchedulePayload::Prompt { prompt },
+                    active: true,
+                })
+                .map_err(logic_error)?
+        };
         let value = serde_json::json!({
             "schedule_id": result.schedule_id,
             "replayed": result.replayed
@@ -745,6 +811,7 @@ where
                 serde_json::json!({
                     "execution_id": execution.execution_id,
                     "scheduled_for_ms": execution.scheduled_for_ms,
+                    "claimed_at_ms": execution.claimed_at_ms,
                     "schedule": render_schedule_value(&execution.schedule)
                 })
             })
@@ -1273,6 +1340,18 @@ fn render_schedule_value(value: &ScheduleResult) -> serde_json::Value {
     })
 }
 
+fn uuid_string_from_hash(bytes: &[u8; 32]) -> String {
+    let hex = blake3::Hash::from_bytes(*bytes).to_hex();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 fn render_inspection(
     result: &InspectSessionResult,
     replay: bool,
@@ -1594,6 +1673,7 @@ mod tests {
         successful: bool,
         observed: RefCell<Vec<RunDoctorCommand>>,
         observed_schedules: RefCell<Vec<LogicScheduleCommand>>,
+        observed_deferred: RefCell<Vec<DeferredScheduleCommand>>,
     }
 
     impl CliLogicPort for MockLogic {
@@ -1717,6 +1797,18 @@ mod tests {
                 replayed: false,
             })
         }
+
+        fn defer_schedule(
+            &self,
+            command: DeferredScheduleCommand,
+        ) -> Result<ScheduleStoreResult, LogicError> {
+            let schedule_id = command.schedule.schedule_id.clone();
+            self.observed_deferred.borrow_mut().push(command);
+            Ok(ScheduleStoreResult {
+                schedule_id,
+                replayed: false,
+            })
+        }
     }
 
     fn service(state: DoctorState, successful: bool) -> CliService<MockLogic> {
@@ -1726,6 +1818,7 @@ mod tests {
                 successful,
                 observed: RefCell::new(Vec::new()),
                 observed_schedules: RefCell::new(Vec::new()),
+                observed_deferred: RefCell::new(Vec::new()),
             },
             CliServiceConfig {
                 runtime_endpoint_label: "local-runtime".into(),
@@ -1885,6 +1978,44 @@ mod tests {
             ScheduleTrigger::ProcessOutput {
                 process_id: String::from("process-42"),
                 contains: String::from("READY")
+            }
+        );
+    }
+
+    #[test]
+    fn schedule_add_deferred_maps_resume_once_continuation() {
+        let service = service(DoctorState::Ready, true);
+        service
+            .run_from([
+                "agentmod",
+                "schedule",
+                "add",
+                "deferred-ready",
+                "--session",
+                "00000000-0000-0000-0000-000000000001",
+                "--prompt",
+                "continue after ready",
+                "--process-id",
+                "process-42",
+                "--contains",
+                "READY",
+                "--deferred",
+                "--expires-at-ms",
+                "9999999999999",
+            ])
+            .expect("deferred schedule");
+        let deferred = service.logic.observed_deferred.borrow();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].expires_at_ms, Some(9_999_999_999_999));
+        assert!(matches!(
+            deferred[0].schedule.payload,
+            SchedulePayload::Continuation { .. }
+        ));
+        assert_eq!(
+            deferred[0].schedule.trigger,
+            ScheduleTrigger::ProcessOutput {
+                process_id: String::from("process-42"),
+                contains: String::from("READY"),
             }
         );
     }

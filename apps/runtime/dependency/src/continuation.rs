@@ -79,6 +79,9 @@ pub struct DependencyTransitionContinuationResponse {
 pub trait ContinuationDependencyPort {
     /// Creates a new pending continuation without overwriting an existing ID.
     ///
+    /// An exact replay is accepted so a caller can safely retry after losing
+    /// the response. Reusing the ID for different content remains an error.
+    ///
     /// # Errors
     ///
     /// Returns [`ContinuationDependencyError`] for invalid input or storage failure.
@@ -260,6 +263,14 @@ impl ContinuationDependencyPort for FileContinuationDependency {
         validate_id(&request.record.session_id)?;
         let id = request.record.id.clone();
         self.with_lock(&request.record.session_id, &id, || {
+            if self.record_path(&request.record.session_id, &id)?.exists() {
+                let existing = self.read_record(&request.record.session_id, &id)?;
+                return if existing == request.record {
+                    Ok(())
+                } else {
+                    Err(ContinuationDependencyError::AlreadyExists(id.clone()))
+                };
+            }
             self.write_new(&request.record)
         })
     }
@@ -518,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_path_like_identifiers_and_duplicate_creation() {
+    fn rejects_path_like_identifiers_and_conflicting_duplicate_creation() {
         let directory = tempfile::tempdir().expect("temp directory");
         let store = FileContinuationDependency::new(directory.path().into());
         assert!(matches!(
@@ -532,9 +543,16 @@ mod tests {
                 record: pending("same"),
             })
             .expect("first create");
+        store
+            .create_continuation(DependencyCreateContinuationRequest {
+                record: pending("same"),
+            })
+            .expect("exact replay");
+        let mut conflicting = pending("same");
+        conflicting.payload_json = br#"{"kind":"different"}"#.to_vec();
         assert!(matches!(
             store.create_continuation(DependencyCreateContinuationRequest {
-                record: pending("same")
+                record: conflicting
             }),
             Err(ContinuationDependencyError::AlreadyExists(_))
         ));

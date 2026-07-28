@@ -16,6 +16,21 @@ The CLI exposes these as `--at-ms`, `--at-ms` plus `--every-ms`,
 `--on-event`, and `--process-id` plus `--contains`. Exactly one trigger form is
 required.
 
+Add `--deferred` to persist a resume-once turn continuation rather than a plain
+prompt payload. `--expires-at-ms` is optional and is valid only with
+`--deferred`. Deferred schedules cannot be recurring because their continuation
+may transition only once.
+
+```sh
+agentmod schedule add wait-for-build \
+  --session <session-id> \
+  --prompt "inspect the completed build" \
+  --process-id <process-id> \
+  --contains "BUILD READY" \
+  --deferred \
+  --expires-at-ms 1893456000000
+```
+
 The scheduler creates a deterministic execution ID from the schedule and source
 occurrence. Claims and terminal markers are checksum protected. Canonical
 runtime events use their event IDs as source identities. Process reads use
@@ -27,7 +42,9 @@ submitted only after their source events commit. A matched prompt commits
 `scheduler.fired` and then runs as a normal agent turn. Failed observer delivery
 does not roll back an already committed source turn.
 
-Continuation payloads are persisted but currently fail closed at runtime.
-Automatically resolving a manual tool-approval continuation would bypass the
-user decision; scheduled wakeups require a separately typed deferred-action
-payload and mandatory-policy revalidation.
+Deferred continuation payloads retain the exact session, schedule, prompt,
+workspace, provider, model, style, options, and cancellation identity. The
+runtime checks exact trigger proof and the scheduler's durable claim timestamp
+against expiration, transitions pending state once, then re-enters normal
+mandatory-policy evaluation. Manual tool approvals and scheduler continuations
+are distinct types and cannot resolve through each other's endpoints.

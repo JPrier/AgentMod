@@ -67,6 +67,8 @@ pub struct DependencySchedule {
 pub struct DependencyExecution {
     pub execution_id: String,
     pub scheduled_for_ms: i64,
+    /// Unix timestamp when the claim record was created.
+    pub claimed_at_ms: i64,
     pub schedule: DependencySchedule,
 }
 
@@ -180,6 +182,7 @@ impl FileSchedulerDependency {
         schedule: &DependencySchedule,
         source: &str,
         scheduled_for_ms: i64,
+        claimed_at_ms: i64,
     ) -> Result<Option<DependencyExecution>, SchedulerDependencyError> {
         let occurrence = if source == "time" {
             scheduled_for_ms.to_string()
@@ -193,6 +196,7 @@ impl FileSchedulerDependency {
         let execution = DependencyExecution {
             execution_id: digest.clone(),
             scheduled_for_ms,
+            claimed_at_ms,
             schedule: schedule.clone(),
         };
         let stored = StoredExecution {
@@ -223,7 +227,8 @@ impl FileSchedulerDependency {
             for schedule in self.list_unlocked(10_000)? {
                 if schedule.active
                     && predicate(&schedule.trigger)
-                    && let Some(execution) = self.claim(&schedule, source_id, scheduled_for_ms)?
+                    && let Some(execution) =
+                        self.claim(&schedule, source_id, scheduled_for_ms, scheduled_for_ms)?
                 {
                     result.push(execution);
                 }
@@ -333,7 +338,7 @@ impl SchedulerDependencyPort for FileSchedulerDependency {
                     let Some(due) = state.next_due_ms.filter(|due| *due <= now) else {
                         break;
                     };
-                    if let Some(execution) = self.claim(&state.schedule, "time", due)? {
+                    if let Some(execution) = self.claim(&state.schedule, "time", due, now)? {
                         result.push(execution);
                     }
                     match state.schedule.trigger {
@@ -478,6 +483,8 @@ enum ExecutionStatus {
 struct ExecutionRecord {
     execution_id: String,
     scheduled_for_ms: i64,
+    #[serde(default)]
+    claimed_at_ms: i64,
     schedule: DependencySchedule,
     status: ExecutionStatus,
 }
@@ -492,6 +499,7 @@ fn execution_record(value: &DependencyExecution, status: ExecutionStatus) -> Exe
     ExecutionRecord {
         execution_id: value.execution_id.clone(),
         scheduled_for_ms: value.scheduled_for_ms,
+        claimed_at_ms: value.claimed_at_ms,
         schedule: value.schedule.clone(),
         status,
     }
@@ -672,6 +680,7 @@ mod tests {
 
         let claimed = dependency.claim_due(10).expect("claim");
         assert_eq!(claimed.len(), 1);
+        assert!(claimed[0].claimed_at_ms >= claimed[0].scheduled_for_ms);
         assert!(dependency.claim_due(10).expect("second claim").is_empty());
         let restarted = FileSchedulerDependency::new(root.path().to_path_buf()).expect("restart");
         assert!(restarted.claim_due(10).expect("restart claim").is_empty());

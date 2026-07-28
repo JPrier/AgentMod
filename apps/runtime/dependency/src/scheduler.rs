@@ -65,6 +65,7 @@ pub struct DependencyRuntimeSchedule {
 pub struct DependencyScheduledExecution {
     pub execution_id: String,
     pub scheduled_for_ms: i64,
+    pub claimed_at_ms: i64,
     pub schedule: DependencyRuntimeSchedule,
 }
 
@@ -464,6 +465,7 @@ fn from_wire_execution(value: ScheduledExecution) -> DependencyScheduledExecutio
     DependencyScheduledExecution {
         execution_id: value.execution_id,
         scheduled_for_ms: value.scheduled_for_ms,
+        claimed_at_ms: value.claimed_at_ms,
         schedule: from_wire_schedule(value.schedule),
     }
 }

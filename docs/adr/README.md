@@ -20,3 +20,7 @@ is already implemented.
 | 0012 | Tool-host boundaries |
 | 0013 | N-tier enforcement |
 | 0014 | Layer-local type policy |
+| 0015 | Native PTY implementation |
+| 0016 | Process restart reconciliation |
+| 0017 | Reconnectable process-host transport |
+| 0018 | Schedule-bound deferred continuations |

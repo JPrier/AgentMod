@@ -69,11 +69,38 @@ done
 test "$(grep -c '"event_type":"scheduler.fired"' "$journal")" -eq 2
 test "$(grep -c '"event_type":"model.response_completed"' "$journal")" -eq 3
 
+deferred_at=$(( $(date +%s) * 1000 + 5000 ))
+"$cli" schedule add restart-deferred-turn --session "$session_id" \
+  --prompt "resume this durable turn after restart" \
+  --at-ms "$deferred_at" --deferred --json >/dev/null
+with_deferred="$("$cli" schedule list --json)"
+deferred_continuation="$(
+  printf '%s' "$with_deferred" |
+    grep -o '"continuation_id":"[^"]*"' |
+    tail -n 1 |
+    cut -d'"' -f4
+)"
+test -n "$deferred_continuation"
+if "$cli" approval resolve "$session_id" "$deferred_continuation" \
+  approve --json >/dev/null 2>&1; then
+  echo "manual approval bypassed scheduler continuation" >&2
+  exit 1
+fi
+
 kill "$daemon_pid"
 wait "$daemon_pid" 2>/dev/null || true
 daemon_pid=""
 start_runtime
+for _ in $(seq 1 100); do
+  if [[ "$(grep -c '"event_type":"scheduler.fired"' "$journal" || true)" -eq 3 ]]; then
+    break
+  fi
+  sleep 0.1
+done
+test "$(grep -c '"event_type":"scheduler.fired"' "$journal")" -eq 3
+test "$(grep -c '"event_type":"model.response_completed"' "$journal")" -eq 4
+continuation="$run_root/sessions/$session_id/continuations/$deferred_continuation.json"
+grep -q '"state":"resumed"' "$continuation"
 after="$("$cli" schedule run --limit 4 --json)"
 printf '%s' "$after" | grep -q '"runs":\[\]'
-test "$(grep -c '"event_type":"scheduler.fired"' "$journal")" -eq 2
-echo "runtime-owned time and event schedule E2E passed"
+echo "runtime-owned time, event, and deferred continuation schedule E2E passed"

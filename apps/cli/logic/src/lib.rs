@@ -9,12 +9,12 @@
 )]
 
 use agentmod_cli_data::{
-    BranchSessionDataRequest, CancelTurnDataRequest, CliDataPort, CreateSessionDataRequest,
-    InspectSessionDataRequest, ListSessionsDataRequest, ResolveApprovalDataRequest,
-    RunTurnDataRequest, RunTurnDataStream, RunTurnDataStreamItem, RuntimeHealthDataAvailability,
-    RuntimeHealthDataRequest, ScheduleDataPayload, ScheduleDataRecord, ScheduleDataTrigger,
-    ScheduledExecutionDataRecord, ScheduledRunDataRecord, SubscribeSessionDataRequest,
-    TurnDataEvent,
+    BranchSessionDataRequest, CancelTurnDataRequest, CliDataPort, CreateDeferredTurnDataRequest,
+    CreateSessionDataRequest, InspectSessionDataRequest, ListSessionsDataRequest,
+    ResolveApprovalDataRequest, RunTurnDataRequest, RunTurnDataStream, RunTurnDataStreamItem,
+    RuntimeHealthDataAvailability, RuntimeHealthDataRequest, ScheduleDataPayload,
+    ScheduleDataRecord, ScheduleDataTrigger, ScheduledExecutionDataRecord, ScheduledRunDataRecord,
+    SubscribeSessionDataRequest, TurnDataEvent,
 };
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use serde_json::Value;
@@ -213,6 +213,7 @@ pub struct ScheduleResult {
 pub struct ScheduledExecutionResult {
     pub execution_id: String,
     pub scheduled_for_ms: i64,
+    pub claimed_at_ms: i64,
     pub schedule: ScheduleResult,
 }
 
@@ -220,6 +221,15 @@ pub struct ScheduledExecutionResult {
 pub struct ScheduleStoreResult {
     pub schedule_id: String,
     pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeferredScheduleCommand {
+    pub schedule: ScheduleCommand,
+    pub continuation_id: String,
+    pub prompt: String,
+    pub cancellation_id: CancellationId,
+    pub expires_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -445,6 +455,13 @@ pub trait CliLogicPort {
     fn upsert_schedule(
         &self,
         _schedule: ScheduleCommand,
+    ) -> Result<ScheduleStoreResult, LogicError> {
+        Err(LogicError::ScheduleData)
+    }
+
+    fn defer_schedule(
+        &self,
+        _command: DeferredScheduleCommand,
     ) -> Result<ScheduleStoreResult, LogicError> {
         Err(LogicError::ScheduleData)
     }
@@ -740,6 +757,53 @@ where
             .map_err(|_| LogicError::ScheduleData)
     }
 
+    fn defer_schedule(
+        &self,
+        command: DeferredScheduleCommand,
+    ) -> Result<ScheduleStoreResult, LogicError> {
+        validate_schedule(&command.schedule)?;
+        if command.prompt.trim().is_empty()
+            || command.continuation_id.trim().is_empty()
+            || matches!(&command.schedule.trigger, ScheduleTrigger::Interval { .. })
+            || !matches!(
+                &command.schedule.payload,
+                SchedulePayload::Continuation { continuation_id }
+                    if continuation_id == &command.continuation_id
+            )
+        {
+            return Err(LogicError::InvalidScheduleRequest);
+        }
+        self.data
+            .create_deferred_turn(CreateDeferredTurnDataRequest {
+                session_id: command.schedule.session_id,
+                continuation_id: command.continuation_id,
+                schedule_id: command.schedule.schedule_id.clone(),
+                prompt: command.prompt,
+                workspace: command.schedule.workspace.clone(),
+                provider: command.schedule.provider.clone(),
+                model: command.schedule.model.clone(),
+                options: serde_json::json!({
+                    "token_budget": command.schedule.token_budget,
+                    "cost_budget_micros": command.schedule.cost_budget_micros,
+                    "permission_policy": command.schedule.permission_policy,
+                    "style": command.schedule.style,
+                    "workspace": command.schedule.workspace,
+                }),
+                style: command.schedule.style.clone(),
+                cancellation_id: command.cancellation_id,
+                trigger: to_data_trigger(command.schedule.trigger.clone()),
+                expires_at_ms: command.expires_at_ms,
+            })
+            .map_err(|_| LogicError::ScheduleData)?;
+        self.data
+            .upsert_schedule(to_data_schedule(command.schedule))
+            .map(|value| ScheduleStoreResult {
+                schedule_id: value.schedule_id,
+                replayed: value.replayed,
+            })
+            .map_err(|_| LogicError::ScheduleData)
+    }
+
     fn remove_schedule(&self, schedule_id: &str) -> Result<bool, LogicError> {
         validate_schedule_id(schedule_id)?;
         self.data
@@ -852,26 +916,7 @@ fn to_data_schedule(value: ScheduleCommand) -> ScheduleDataRecord {
         model: value.model,
         token_budget: value.token_budget,
         cost_budget_micros: value.cost_budget_micros,
-        trigger: match value.trigger {
-            ScheduleTrigger::AtMillis(value) => ScheduleDataTrigger::AtMillis(value),
-            ScheduleTrigger::Interval {
-                starts_at_ms,
-                every_ms,
-            } => ScheduleDataTrigger::Interval {
-                starts_at_ms,
-                every_ms,
-            },
-            ScheduleTrigger::RuntimeEvent { event_type } => {
-                ScheduleDataTrigger::RuntimeEvent { event_type }
-            }
-            ScheduleTrigger::ProcessOutput {
-                process_id,
-                contains,
-            } => ScheduleDataTrigger::ProcessOutput {
-                process_id,
-                contains,
-            },
-        },
+        trigger: to_data_trigger(value.trigger),
         payload: match value.payload {
             SchedulePayload::Prompt { prompt } => ScheduleDataPayload::Prompt { prompt },
             SchedulePayload::Continuation { continuation_id } => {
@@ -879,6 +924,29 @@ fn to_data_schedule(value: ScheduleCommand) -> ScheduleDataRecord {
             }
         },
         active: value.active,
+    }
+}
+
+fn to_data_trigger(value: ScheduleTrigger) -> ScheduleDataTrigger {
+    match value {
+        ScheduleTrigger::AtMillis(value) => ScheduleDataTrigger::AtMillis(value),
+        ScheduleTrigger::Interval {
+            starts_at_ms,
+            every_ms,
+        } => ScheduleDataTrigger::Interval {
+            starts_at_ms,
+            every_ms,
+        },
+        ScheduleTrigger::RuntimeEvent { event_type } => {
+            ScheduleDataTrigger::RuntimeEvent { event_type }
+        }
+        ScheduleTrigger::ProcessOutput {
+            process_id,
+            contains,
+        } => ScheduleDataTrigger::ProcessOutput {
+            process_id,
+            contains,
+        },
     }
 }
 
@@ -928,6 +996,7 @@ fn from_data_execution(value: ScheduledExecutionDataRecord) -> ScheduledExecutio
     ScheduledExecutionResult {
         execution_id: value.execution_id,
         scheduled_for_ms: value.scheduled_for_ms,
+        claimed_at_ms: value.claimed_at_ms,
         schedule: from_data_schedule(value.schedule),
     }
 }
@@ -1050,6 +1119,8 @@ mod tests {
     struct MockData {
         availability: RuntimeHealthDataAvailability,
         observed: RefCell<Vec<RuntimeHealthDataRequest>>,
+        deferred: RefCell<Vec<CreateDeferredTurnDataRequest>>,
+        schedules: RefCell<Vec<ScheduleDataRecord>>,
     }
 
     impl CliDataPort for MockData {
@@ -1151,12 +1222,34 @@ mod tests {
                 awaiting_continuation: None,
             })
         }
+
+        fn create_deferred_turn(
+            &self,
+            request: CreateDeferredTurnDataRequest,
+        ) -> Result<(), DataError> {
+            self.deferred.borrow_mut().push(request);
+            Ok(())
+        }
+
+        fn upsert_schedule(
+            &self,
+            schedule: ScheduleDataRecord,
+        ) -> Result<agentmod_cli_data::ScheduleStoreDataRecord, DataError> {
+            let schedule_id = schedule.schedule_id.clone();
+            self.schedules.borrow_mut().push(schedule);
+            Ok(agentmod_cli_data::ScheduleStoreDataRecord {
+                schedule_id,
+                replayed: false,
+            })
+        }
     }
 
     fn logic(availability: RuntimeHealthDataAvailability) -> CliLogic<MockData> {
         CliLogic::new(MockData {
             availability,
             observed: RefCell::new(Vec::new()),
+            deferred: RefCell::new(Vec::new()),
+            schedules: RefCell::new(Vec::new()),
         })
     }
 
@@ -1209,5 +1302,45 @@ mod tests {
             .expect("doctor result");
         assert_eq!(result.state, DoctorState::Unavailable);
         assert!(!result.successful);
+    }
+
+    #[test]
+    fn deferred_schedule_persists_continuation_before_schedule() {
+        let logic = logic(RuntimeHealthDataAvailability::Ready);
+        let session_id = SessionId::from_uuid(uuid::Uuid::from_u128(1));
+        let cancellation_id = CancellationId::from_uuid(uuid::Uuid::from_u128(2));
+        let result = logic
+            .defer_schedule(DeferredScheduleCommand {
+                schedule: ScheduleCommand {
+                    schedule_id: "schedule_1".into(),
+                    session_id,
+                    idempotency_id: "request_1".into(),
+                    style: "persistent-chat".into(),
+                    workspace: "workspace".into(),
+                    permission_policy: "interactive".into(),
+                    provider: "deterministic-mock".into(),
+                    model: "mock-model".into(),
+                    token_budget: 1_000,
+                    cost_budget_micros: 0,
+                    trigger: ScheduleTrigger::RuntimeEvent {
+                        event_type: "task.ready".into(),
+                    },
+                    payload: SchedulePayload::Continuation {
+                        continuation_id: "continuation_1".into(),
+                    },
+                    active: true,
+                },
+                continuation_id: "continuation_1".into(),
+                prompt: "continue".into(),
+                cancellation_id,
+                expires_at_ms: None,
+            })
+            .expect("defer");
+        assert_eq!(result.schedule_id, "schedule_1");
+        let deferred = logic.data.deferred.borrow();
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].schedule_id, "schedule_1");
+        assert_eq!(deferred[0].prompt, "continue");
+        assert_eq!(logic.data.schedules.borrow().len(), 1);
     }
 }

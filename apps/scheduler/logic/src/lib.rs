@@ -74,6 +74,7 @@ pub struct ScheduleResult {
 pub struct ExecutionResult {
     pub execution_id: String,
     pub scheduled_for_ms: i64,
+    pub claimed_at_ms: i64,
     pub schedule: ScheduleResult,
 }
 
@@ -349,6 +350,7 @@ fn from_execution(value: ExecutionDataRecord) -> ExecutionResult {
     ExecutionResult {
         execution_id: value.execution_id,
         scheduled_for_ms: value.scheduled_for_ms,
+        claimed_at_ms: value.claimed_at_ms,
         schedule: from_schedule(value.schedule),
     }
 }

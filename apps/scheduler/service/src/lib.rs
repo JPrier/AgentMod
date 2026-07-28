@@ -138,6 +138,7 @@ fn executions(values: Vec<ExecutionResult>) -> SchedulerResponse {
             .map(|value| ScheduledExecution {
                 execution_id: value.execution_id,
                 scheduled_for_ms: value.scheduled_for_ms,
+                claimed_at_ms: value.claimed_at_ms,
                 schedule: to_wire_schedule(value.schedule),
             })
             .collect(),

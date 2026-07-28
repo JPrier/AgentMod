@@ -7,15 +7,18 @@
 use std::path::PathBuf;
 
 use agentmod_runtime_logic::{
+    continuation::{ContinuationWakeCondition, ContinuationWakeProof},
     harness::ProviderEvent,
     turn::{
-        ApprovalTurnLogicPort, CancelTurnCommand, CancelTurnLogicPort, RecoverStartupToolsCommand,
-        ResolveTurnApprovalCommand, RunScheduledTurnCommand, RunTurnCommand, RunTurnError,
-        RunTurnStream, RunTurnStreamItem, StartupToolRecoveryLogicPort, TurnLogicPort,
+        ApprovalTurnLogicPort, CancelTurnCommand, CancelTurnLogicPort, CreateDeferredTurnCommand,
+        DeferredTurnLogicPort, RecoverStartupToolsCommand, ResolveTurnApprovalCommand,
+        RunScheduledTurnCommand, RunTurnCommand, RunTurnError, RunTurnStream, RunTurnStreamItem,
+        StartupToolRecoveryLogicPort, TurnLogicPort, WakeScheduledTurnCommand,
     },
 };
 use agentmod_runtime_protocol::{
-    RuntimeProviderEvent, RuntimeRequest, RuntimeResponse, RuntimeScheduledRun,
+    RuntimeProviderEvent, RuntimeRequest, RuntimeResponse, RuntimeScheduleTrigger,
+    RuntimeScheduledRun,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -48,6 +51,64 @@ pub struct ServiceRunScheduledTurnRequest {
     pub schedule_id: String,
     pub scheduled_for_ms: i64,
     pub turn: ServiceRunTurnRequest,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServiceCreateDeferredTurnRequest {
+    pub session_id: String,
+    pub continuation_id: String,
+    pub schedule_id: String,
+    pub prompt: String,
+    pub workspace: String,
+    pub provider: String,
+    pub model: String,
+    pub options: Value,
+    pub style: String,
+    pub cancellation_id: String,
+    pub wake_condition: ServiceContinuationWakeCondition,
+    pub expires_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceContinuationWakeCondition {
+    AtMillis(i64),
+    RuntimeEvent {
+        event_type: String,
+    },
+    ProcessOutput {
+        process_id: String,
+        contains: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceContinuationWakeProof {
+    AtMillis(i64),
+    RuntimeEvent {
+        event_type: String,
+        observed_at_ms: i64,
+    },
+    ProcessOutput {
+        process_id: String,
+        contains: String,
+        observed_at_ms: i64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceWakeScheduledTurnRequest {
+    pub session_id: String,
+    pub continuation_id: String,
+    pub execution_id: String,
+    pub schedule_id: String,
+    pub scheduled_for_ms: i64,
+    pub proof: ServiceContinuationWakeProof,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServiceWakeScheduledTurnResponse {
+    pub transitioned: bool,
+    pub turn: Option<ServiceRunTurnResponse>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -288,6 +349,79 @@ impl<L: ApprovalTurnLogicPort> TurnService<L> {
     }
 }
 
+impl<L: DeferredTurnLogicPort> TurnService<L> {
+    /// Persists a schedule-bound resume-once continuation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnServiceError`] for invalid endpoint input or business failure.
+    pub fn create_deferred_turn(
+        &self,
+        request: ServiceCreateDeferredTurnRequest,
+    ) -> Result<(), TurnServiceError> {
+        if request.prompt.trim().is_empty()
+            || request.schedule_id.trim().is_empty()
+            || request.workspace.trim().is_empty()
+            || request.provider.trim().is_empty()
+            || request.model.trim().is_empty()
+            || request.style.trim().is_empty()
+        {
+            return Err(TurnServiceError::Invalid);
+        }
+        self.logic
+            .create_deferred_turn(CreateDeferredTurnCommand {
+                session_id: request.session_id,
+                continuation_id: request.continuation_id,
+                schedule_id: request.schedule_id,
+                prompt: request.prompt,
+                workspace: request.workspace,
+                provider: request.provider,
+                model: request.model,
+                options: request.options,
+                style: request.style,
+                cancellation_id: request.cancellation_id,
+                wake_condition: to_logic_wake_condition(request.wake_condition),
+                expires_at: request
+                    .expires_at_ms
+                    .map(agentmod_primitives::TimestampMillis::new),
+            })
+            .map_err(TurnServiceError::Logic)
+    }
+
+    /// Claims and executes a schedule-bound continuation through the normal turn path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnServiceError`] for an invalid proof or business failure.
+    pub async fn wake_scheduled_turn(
+        &self,
+        request: ServiceWakeScheduledTurnRequest,
+    ) -> Result<ServiceWakeScheduledTurnResponse, TurnServiceError> {
+        let result = self
+            .logic
+            .wake_scheduled_turn(WakeScheduledTurnCommand {
+                sessions_root: self.sessions_root.clone(),
+                session_id: request.session_id,
+                continuation_id: request.continuation_id,
+                execution_id: request.execution_id,
+                schedule_id: request.schedule_id,
+                scheduled_for_ms: request.scheduled_for_ms,
+                proof: to_logic_wake_proof(request.proof),
+            })
+            .await
+            .map_err(TurnServiceError::Logic)?;
+        Ok(ServiceWakeScheduledTurnResponse {
+            transitioned: result.transitioned,
+            turn: result.turn.map(|turn| ServiceRunTurnResponse {
+                events: turn.events.into_iter().map(map_event).collect(),
+                first_committed_sequence: turn.first_committed_sequence,
+                last_committed_sequence: turn.last_committed_sequence,
+                awaiting_continuation: turn.awaiting_continuation,
+            }),
+        })
+    }
+}
+
 impl<L: CancelTurnLogicPort> TurnService<L> {
     /// Cancels one active provider request.
     ///
@@ -356,8 +490,12 @@ where
         + agentmod_runtime_logic::registry::SessionRegistryLogicPort
         + agentmod_runtime_logic::history::SessionHistoryLogicPort
         + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort,
-    T: TurnLogicPort,
+    T: TurnLogicPort + DeferredTurnLogicPort,
 {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the service maps prompt and typed continuation claims into one uniform terminal result"
+    )]
     async fn execute_scheduled_claims(
         &self,
         executions: Vec<ServiceScheduledExecution>,
@@ -366,46 +504,55 @@ where
         for execution in executions {
             let execution_id = execution.execution_id;
             let schedule = execution.schedule;
-            let ServiceSchedulePayload::Prompt { prompt } = schedule.payload else {
-                let terminal = self.complete_scheduled_claim(&execution_id, false);
-                runs.push(RuntimeScheduledRun {
-                    execution_id,
-                    schedule_id: schedule.schedule_id,
-                    terminal,
-                    succeeded: false,
-                    last_committed_sequence: None,
-                    awaiting_continuation: None,
-                    error: Some(String::from(
-                        "continuation wake schedules require a deferred-action payload",
-                    )),
-                });
-                continue;
+            let turn = match schedule.payload {
+                ServiceSchedulePayload::Prompt { prompt } => self
+                    .turns
+                    .run_scheduled_turn(ServiceRunScheduledTurnRequest {
+                        execution_id: execution_id.clone(),
+                        schedule_id: schedule.schedule_id.clone(),
+                        scheduled_for_ms: execution.scheduled_for_ms,
+                        turn: ServiceRunTurnRequest {
+                            session_id: schedule.session_id.to_string(),
+                            prompt,
+                            provider: schedule.provider,
+                            model: schedule.model,
+                            options: serde_json::json!({
+                                "scheduled_execution_id": execution_id,
+                                "token_budget": schedule.token_budget,
+                                "cost_budget_micros": schedule.cost_budget_micros,
+                                "permission_policy": schedule.permission_policy,
+                                "style": schedule.style,
+                                "workspace": schedule.workspace
+                            }),
+                            cancellation_id: cancellation_id_from_execution(&execution_id),
+                        },
+                    })
+                    .await
+                    .map(Some),
+                ServiceSchedulePayload::Continuation { continuation_id } => {
+                    let wake = self
+                        .turns
+                        .wake_scheduled_turn(ServiceWakeScheduledTurnRequest {
+                            session_id: schedule.session_id.to_string(),
+                            continuation_id,
+                            execution_id: execution_id.clone(),
+                            schedule_id: schedule.schedule_id.clone(),
+                            scheduled_for_ms: execution.scheduled_for_ms,
+                            proof: wake_proof_from_schedule(
+                                &schedule.trigger,
+                                execution.claimed_at_ms,
+                            ),
+                        })
+                        .await;
+                    match wake {
+                        Ok(result) if !result.transitioned => Ok(None),
+                        Ok(result) => Ok(result.turn),
+                        Err(error) => Err(error),
+                    }
+                }
             };
-            let turn = self
-                .turns
-                .run_scheduled_turn(ServiceRunScheduledTurnRequest {
-                    execution_id: execution_id.clone(),
-                    schedule_id: schedule.schedule_id.clone(),
-                    scheduled_for_ms: execution.scheduled_for_ms,
-                    turn: ServiceRunTurnRequest {
-                        session_id: schedule.session_id.to_string(),
-                        prompt,
-                        provider: schedule.provider,
-                        model: schedule.model,
-                        options: serde_json::json!({
-                            "scheduled_execution_id": execution_id,
-                            "token_budget": schedule.token_budget,
-                            "cost_budget_micros": schedule.cost_budget_micros,
-                            "permission_policy": schedule.permission_policy,
-                            "style": schedule.style,
-                            "workspace": schedule.workspace
-                        }),
-                        cancellation_id: cancellation_id_from_execution(&execution_id),
-                    },
-                })
-                .await;
             match turn {
-                Ok(result) if result.awaiting_continuation.is_some() => {
+                Ok(Some(result)) if result.awaiting_continuation.is_some() => {
                     runs.push(RuntimeScheduledRun {
                         execution_id,
                         schedule_id: schedule.schedule_id,
@@ -416,7 +563,7 @@ where
                         error: None,
                     });
                 }
-                Ok(result) => {
+                Ok(Some(result)) => {
                     let terminal = self.complete_scheduled_claim(&execution_id, true);
                     runs.push(RuntimeScheduledRun {
                         execution_id,
@@ -424,6 +571,18 @@ where
                         terminal,
                         succeeded: true,
                         last_committed_sequence: Some(result.last_committed_sequence),
+                        awaiting_continuation: None,
+                        error: None,
+                    });
+                }
+                Ok(None) => {
+                    let terminal = self.complete_scheduled_claim(&execution_id, true);
+                    runs.push(RuntimeScheduledRun {
+                        execution_id,
+                        schedule_id: schedule.schedule_id,
+                        terminal,
+                        succeeded: true,
+                        last_committed_sequence: None,
                         awaiting_continuation: None,
                         error: None,
                     });
@@ -603,7 +762,12 @@ where
         + Send
         + Sync
         + 'static,
-    T: TurnLogicPort + ApprovalTurnLogicPort + CancelTurnLogicPort + Clone + 'static,
+    T: TurnLogicPort
+        + ApprovalTurnLogicPort
+        + CancelTurnLogicPort
+        + DeferredTurnLogicPort
+        + Clone
+        + 'static,
 {
     #[allow(
         clippy::too_many_lines,
@@ -648,6 +812,43 @@ where
                 .map_err(|error| error.to_string())?;
             return Ok(RuntimeResponse::Cancelled);
         }
+        if let RuntimeRequest::CreateDeferredTurn {
+            session_id,
+            continuation_id,
+            schedule_id,
+            prompt,
+            workspace,
+            provider,
+            model,
+            options,
+            style,
+            cancellation_id,
+            trigger,
+            expires_at_ms,
+        } = request
+        {
+            let wake_condition = wake_condition_from_wire(trigger)
+                .ok_or_else(|| String::from("interval deferred continuations are unsupported"))?;
+            self.turns
+                .create_deferred_turn(ServiceCreateDeferredTurnRequest {
+                    session_id: session_id.to_string(),
+                    continuation_id: continuation_id.clone(),
+                    schedule_id: schedule_id.clone(),
+                    prompt: prompt.clone(),
+                    workspace: workspace.clone(),
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    options: options.clone(),
+                    style: style.clone(),
+                    cancellation_id: cancellation_id.to_string(),
+                    wake_condition,
+                    expires_at_ms: *expires_at_ms,
+                })
+                .map_err(|error| error.to_string())?;
+            return Ok(RuntimeResponse::DeferredTurnCreated {
+                continuation_id: continuation_id.clone(),
+            });
+        }
         if let RuntimeRequest::RunDueSchedules { limit } = request {
             let RuntimeResponse::ScheduledExecutions { executions } = self
                 .core
@@ -663,6 +864,7 @@ where
                 .map(|execution| ServiceScheduledExecution {
                     execution_id: execution.execution_id,
                     scheduled_for_ms: execution.scheduled_for_ms,
+                    claimed_at_ms: execution.claimed_at_ms,
                     schedule: crate::from_wire_schedule(execution.schedule),
                 })
                 .collect();
@@ -871,6 +1073,100 @@ where
         Ok(crate::local_rpc::RuntimeEndpointStream::from_receiver(
             receiver,
         ))
+    }
+}
+
+fn wake_condition_from_wire(
+    trigger: &RuntimeScheduleTrigger,
+) -> Option<ServiceContinuationWakeCondition> {
+    match trigger {
+        RuntimeScheduleTrigger::AtMillis(value) => {
+            Some(ServiceContinuationWakeCondition::AtMillis(*value))
+        }
+        RuntimeScheduleTrigger::Interval { .. } => None,
+        RuntimeScheduleTrigger::RuntimeEvent { event_type } => {
+            Some(ServiceContinuationWakeCondition::RuntimeEvent {
+                event_type: event_type.clone(),
+            })
+        }
+        RuntimeScheduleTrigger::ProcessOutput {
+            process_id,
+            contains,
+        } => Some(ServiceContinuationWakeCondition::ProcessOutput {
+            process_id: process_id.clone(),
+            contains: contains.clone(),
+        }),
+    }
+}
+
+fn wake_proof_from_schedule(
+    trigger: &crate::ServiceScheduleTrigger,
+    scheduled_for_ms: i64,
+) -> ServiceContinuationWakeProof {
+    match trigger {
+        crate::ServiceScheduleTrigger::AtMillis(_)
+        | crate::ServiceScheduleTrigger::Interval { .. } => {
+            ServiceContinuationWakeProof::AtMillis(scheduled_for_ms)
+        }
+        crate::ServiceScheduleTrigger::RuntimeEvent { event_type } => {
+            ServiceContinuationWakeProof::RuntimeEvent {
+                event_type: event_type.clone(),
+                observed_at_ms: scheduled_for_ms,
+            }
+        }
+        crate::ServiceScheduleTrigger::ProcessOutput {
+            process_id,
+            contains,
+        } => ServiceContinuationWakeProof::ProcessOutput {
+            process_id: process_id.clone(),
+            contains: contains.clone(),
+            observed_at_ms: scheduled_for_ms,
+        },
+    }
+}
+
+fn to_logic_wake_condition(value: ServiceContinuationWakeCondition) -> ContinuationWakeCondition {
+    match value {
+        ServiceContinuationWakeCondition::AtMillis(value) => {
+            ContinuationWakeCondition::At(agentmod_primitives::TimestampMillis::new(value))
+        }
+        ServiceContinuationWakeCondition::RuntimeEvent { event_type } => {
+            ContinuationWakeCondition::RuntimeEvent {
+                event_type,
+                selector: None,
+            }
+        }
+        ServiceContinuationWakeCondition::ProcessOutput {
+            process_id,
+            contains,
+        } => ContinuationWakeCondition::ProcessOutput {
+            process_id,
+            pattern: contains,
+        },
+    }
+}
+
+fn to_logic_wake_proof(value: ServiceContinuationWakeProof) -> ContinuationWakeProof {
+    match value {
+        ServiceContinuationWakeProof::AtMillis(value) => {
+            ContinuationWakeProof::At(agentmod_primitives::TimestampMillis::new(value))
+        }
+        ServiceContinuationWakeProof::RuntimeEvent {
+            event_type,
+            observed_at_ms,
+        } => ContinuationWakeProof::RuntimeEvent {
+            event_type,
+            observed_at: agentmod_primitives::TimestampMillis::new(observed_at_ms),
+        },
+        ServiceContinuationWakeProof::ProcessOutput {
+            process_id,
+            contains,
+            observed_at_ms,
+        } => ContinuationWakeProof::ProcessOutput {
+            process_id,
+            pattern: contains,
+            observed_at: agentmod_primitives::TimestampMillis::new(observed_at_ms),
+        },
     }
 }
 

@@ -148,6 +148,9 @@ pub struct ScheduledExecution {
     pub execution_id: String,
     /// Scheduled time or trigger observation time.
     pub scheduled_for_ms: i64,
+    /// Unix timestamp when the worker durably claimed this occurrence.
+    #[serde(default)]
+    pub claimed_at_ms: i64,
     /// Complete schedule snapshot.
     pub schedule: ScheduleSpec,
 }

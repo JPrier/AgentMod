@@ -14,7 +14,9 @@ use std::{
 use agentmod_event_model::{
     EventClassification, EventEnvelope, EventMetadata, EventOrigin, EventScope,
 };
-use agentmod_primitives::{CausationId, ContinuationId, Sequence, SessionId, Version};
+use agentmod_primitives::{
+    CausationId, ContinuationId, Sequence, SessionId, TimestampMillis, Version,
+};
 use agentmod_runtime_data::{
     continuation::ContinuationDataPort,
     harness::HarnessDataPort,
@@ -30,9 +32,10 @@ use crate::{
     action::ConsequentialAction,
     continuation::{
         ApprovalDisposition, ContinuationLogic, ContinuationLogicPort, ContinuationPayload,
-        ContinuationState, ContinuationWakeCondition, CreateContinuationCommand,
-        LoadContinuationQuery, PendingToolCallContinuation, ResolveApprovalCommand,
-        ToolApprovalContinuation,
+        ContinuationState, ContinuationWakeCondition, ContinuationWakeProof,
+        CreateContinuationCommand, DeferredTurnContinuation, LoadContinuationQuery,
+        PendingToolCallContinuation, ResolveApprovalCommand, ToolApprovalContinuation,
+        WakeContinuationCommand,
     },
     conversation::{
         ConversationEntry, ConversationEntryId, TextEntry, ToolCallEntry, ToolResultEntry,
@@ -206,6 +209,61 @@ pub trait ApprovalTurnLogicPort: Send + Sync {
         &self,
         command: ResolveTurnApprovalCommand,
     ) -> Result<ResolveTurnApprovalResult, RunTurnError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateDeferredTurnCommand {
+    pub session_id: String,
+    pub continuation_id: String,
+    pub schedule_id: String,
+    pub prompt: String,
+    pub workspace: String,
+    pub provider: String,
+    pub model: String,
+    pub options: Value,
+    pub style: String,
+    pub cancellation_id: String,
+    pub wake_condition: ContinuationWakeCondition,
+    pub expires_at: Option<TimestampMillis>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WakeScheduledTurnCommand {
+    pub sessions_root: PathBuf,
+    pub session_id: String,
+    pub continuation_id: String,
+    pub execution_id: String,
+    pub schedule_id: String,
+    pub scheduled_for_ms: i64,
+    pub proof: ContinuationWakeProof,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WakeScheduledTurnResult {
+    pub transitioned: bool,
+    pub turn: Option<RunTurnResult>,
+}
+
+#[async_trait]
+pub trait DeferredTurnLogicPort: Send + Sync {
+    /// Persists one exact schedule-bound turn continuation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunTurnError`] when identifiers, wake policy, or persistence
+    /// are invalid.
+    fn create_deferred_turn(&self, command: CreateDeferredTurnCommand) -> Result<(), RunTurnError>;
+
+    /// Claims and executes a deferred turn after an authenticated scheduler wake.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunTurnError`] when the wake proof is invalid or execution
+    /// cannot enter the normal scheduled turn path.
+    async fn wake_scheduled_turn(
+        &self,
+        command: WakeScheduledTurnCommand,
+    ) -> Result<WakeScheduledTurnResult, RunTurnError>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -870,6 +928,87 @@ where
                 })
             }
         }
+    }
+}
+
+#[async_trait]
+impl<D> DeferredTurnLogicPort for TurnLogic<D>
+where
+    D: Clone
+        + Send
+        + Sync
+        + EventIdentityDataPort
+        + JournalEventDataPort
+        + HarnessDataPort
+        + ContinuationDataPort
+        + agentmod_runtime_data::tool::ToolDataPort
+        + 'static,
+{
+    fn create_deferred_turn(&self, command: CreateDeferredTurnCommand) -> Result<(), RunTurnError> {
+        let continuation_id = ContinuationId::from_str(&command.continuation_id)
+            .map_err(|_| RunTurnError::InvalidContinuation)?;
+        SessionId::from_str(&command.session_id).map_err(|_| RunTurnError::InvalidSession)?;
+        ContinuationLogic::new(self.data.clone())
+            .create_continuation(CreateContinuationCommand {
+                session_id: command.session_id.clone(),
+                id: continuation_id,
+                wake_condition: command.wake_condition,
+                payload: ContinuationPayload::DeferredTurn(Box::new(DeferredTurnContinuation {
+                    session_id: command.session_id,
+                    schedule_id: command.schedule_id,
+                    prompt: command.prompt,
+                    workspace: command.workspace,
+                    provider: command.provider,
+                    model: command.model,
+                    options: command.options,
+                    style: command.style,
+                    cancellation_id: command.cancellation_id,
+                })),
+                expires_at: command.expires_at,
+            })
+            .map_err(RunTurnError::Continuation)
+    }
+
+    async fn wake_scheduled_turn(
+        &self,
+        command: WakeScheduledTurnCommand,
+    ) -> Result<WakeScheduledTurnResult, RunTurnError> {
+        let continuation_id = ContinuationId::from_str(&command.continuation_id)
+            .map_err(|_| RunTurnError::InvalidContinuation)?;
+        let wake = ContinuationLogic::new(self.data.clone())
+            .wake_continuation(WakeContinuationCommand {
+                session_id: command.session_id.clone(),
+                id: continuation_id,
+                schedule_id: command.schedule_id.clone(),
+                proof: command.proof,
+            })
+            .map_err(RunTurnError::Continuation)?;
+        if !wake.transitioned {
+            return Ok(WakeScheduledTurnResult {
+                transitioned: false,
+                turn: None,
+            });
+        }
+        let turn = self
+            .run_scheduled_turn(RunScheduledTurnCommand {
+                execution_id: command.execution_id,
+                schedule_id: command.schedule_id,
+                scheduled_for_ms: command.scheduled_for_ms,
+                turn: RunTurnCommand {
+                    sessions_root: command.sessions_root,
+                    session_id: wake.payload.session_id,
+                    prompt: wake.payload.prompt,
+                    provider: wake.payload.provider,
+                    model: wake.payload.model,
+                    options: wake.payload.options,
+                    cancellation_id: wake.payload.cancellation_id,
+                },
+            })
+            .await?;
+        Ok(WakeScheduledTurnResult {
+            transitioned: true,
+            turn: Some(turn),
+        })
     }
 }
 

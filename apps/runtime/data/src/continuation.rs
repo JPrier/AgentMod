@@ -51,11 +51,36 @@ pub enum ContinuationStateRecord {
 pub enum ContinuationPayloadRecord {
     /// An intercepted provider tool call waiting for user approval.
     ToolApproval(Box<ToolApprovalPayloadRecord>),
+    /// A complete provider turn deferred until an authenticated scheduler claim.
+    DeferredTurn(Box<DeferredTurnPayloadRecord>),
     /// Generic fixture payload used by storage-only callers.
     Opaque {
         /// Stable non-secret label.
         label: String,
     },
+}
+
+/// Data-owned restart-safe deferred provider turn.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DeferredTurnPayloadRecord {
+    /// Session identifier used for defense-in-depth validation.
+    pub session_id: String,
+    /// Schedule allowed to claim this continuation.
+    pub schedule_id: String,
+    /// User-authored prompt.
+    pub prompt: String,
+    /// Canonical workspace text.
+    pub workspace: String,
+    /// Provider selected for the resumed turn.
+    pub provider: String,
+    /// Model selected for the resumed turn.
+    pub model: String,
+    /// Provider-specific options.
+    pub options: serde_json::Value,
+    /// Explicit session style.
+    pub style: String,
+    /// Stable cancellation identity for the deferred turn.
+    pub cancellation_id: String,
 }
 
 /// Data-owned restart-safe tool approval payload.

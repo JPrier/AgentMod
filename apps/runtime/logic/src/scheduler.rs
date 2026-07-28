@@ -75,6 +75,7 @@ pub struct RuntimeSchedule {
 pub struct ScheduledExecution {
     pub execution_id: String,
     pub scheduled_for_ms: i64,
+    pub claimed_at_ms: i64,
     pub schedule: RuntimeSchedule,
 }
 
@@ -387,6 +388,7 @@ fn from_data_execution(
     Ok(ScheduledExecution {
         execution_id: value.execution_id,
         scheduled_for_ms: value.scheduled_for_ms,
+        claimed_at_ms: value.claimed_at_ms,
         schedule: from_data_schedule(value.schedule)?,
     })
 }

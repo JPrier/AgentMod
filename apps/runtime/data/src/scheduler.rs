@@ -81,6 +81,17 @@ pub trait RuntimeScheduleDataPort: Send + Sync {
         &self,
         limit: u32,
     ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError>;
+    fn fire_runtime_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError>;
+    fn fire_process_output(
+        &self,
+        output_id: &str,
+        process_id: &str,
+        output: &str,
+    ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError>;
     fn complete_scheduled_execution(
         &self,
         execution_id: &str,
@@ -121,6 +132,29 @@ impl<D: RuntimeSchedulerDependencyPort> RuntimeScheduleDataPort for crate::Runti
     ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError> {
         self.dependency
             .claim_due(limit)
+            .map(|values| values.into_iter().map(from_execution).collect())
+            .map_err(RuntimeScheduleDataError::Dependency)
+    }
+
+    fn fire_runtime_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError> {
+        self.dependency
+            .fire_runtime_event(event_id, event_type)
+            .map(|values| values.into_iter().map(from_execution).collect())
+            .map_err(RuntimeScheduleDataError::Dependency)
+    }
+
+    fn fire_process_output(
+        &self,
+        output_id: &str,
+        process_id: &str,
+        output: &str,
+    ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError> {
+        self.dependency
+            .fire_process_output(output_id, process_id, output)
             .map(|values| values.into_iter().map(from_execution).collect())
             .map_err(RuntimeScheduleDataError::Dependency)
     }

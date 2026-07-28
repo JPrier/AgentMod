@@ -185,6 +185,24 @@ impl RuntimeSchedulerDependencyPort for SupervisedRuntimeDependencies {
         self.scheduler.claim_due(limit)
     }
 
+    fn fire_runtime_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
+        self.scheduler.fire_runtime_event(event_id, event_type)
+    }
+
+    fn fire_process_output(
+        &self,
+        output_id: &str,
+        process_id: &str,
+        output: &str,
+    ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
+        self.scheduler
+            .fire_process_output(output_id, process_id, output)
+    }
+
     fn complete_execution(
         &self,
         execution_id: &str,

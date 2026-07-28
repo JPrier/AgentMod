@@ -42,7 +42,9 @@ session_id="$(printf '%s' "$created" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1
   --prompt "execute scheduled development work" --at-ms 0 --json >/dev/null
 journal="$run_root/sessions/$session_id/events.jsonl"
 for _ in $(seq 1 50); do
-  if [[ -f "$journal" ]] && [[ "$(grep -c '"event_type":"scheduler.fired"' "$journal" || true)" -eq 1 ]]; then
+  if [[ -f "$journal" ]] &&
+    [[ "$(grep -c '"event_type":"scheduler.fired"' "$journal" || true)" -eq 1 ]] &&
+    [[ "$(grep -c '"event_type":"model.response_completed"' "$journal" || true)" -eq 1 ]]; then
     break
   fi
   sleep 0.1
@@ -54,11 +56,24 @@ test -f "$run_root/scheduler/executions/$execution_id.succeeded"
 manual="$("$cli" schedule run --limit 4 --json)"
 printf '%s' "$manual" | grep -q '"runs":\[\]'
 
+"$cli" schedule add after-model-response --session "$session_id" \
+  --prompt "review the committed model response" \
+  --on-event model.response_completed --json >/dev/null
+"$cli" run "emit one runtime event" --session "$session_id" --json >/dev/null
+for _ in $(seq 1 50); do
+  if [[ "$(grep -c '"event_type":"scheduler.fired"' "$journal" || true)" -eq 2 ]]; then
+    break
+  fi
+  sleep 0.1
+done
+test "$(grep -c '"event_type":"scheduler.fired"' "$journal")" -eq 2
+test "$(grep -c '"event_type":"model.response_completed"' "$journal")" -eq 3
+
 kill "$daemon_pid"
 wait "$daemon_pid" 2>/dev/null || true
 daemon_pid=""
 start_runtime
 after="$("$cli" schedule run --limit 4 --json)"
 printf '%s' "$after" | grep -q '"runs":\[\]'
-test "$(grep -c '"event_type":"scheduler.fired"' "$journal")" -eq 1
-echo "runtime-owned scheduled turn E2E passed"
+test "$(grep -c '"event_type":"scheduler.fired"' "$journal")" -eq 2
+echo "runtime-owned time and event schedule E2E passed"

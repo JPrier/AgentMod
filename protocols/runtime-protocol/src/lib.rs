@@ -1,6 +1,6 @@
 //! Runtime wire contracts. Receiving services must map these into service-owned types.
 
-use agentmod_primitives::{ArtifactId, CancellationId, Sequence, SessionId};
+use agentmod_primitives::{ArtifactId, CancellationId, EventId, Sequence, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -245,6 +245,9 @@ pub enum RuntimeResponse {
     },
     /// One verified canonical session event delivered after a reconnect cursor.
     SessionEvent {
+        /// Canonical event identity used for durable trigger deduplication.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id: Option<EventId>,
         /// Canonical session sequence.
         sequence: Sequence,
         /// Stable typed event name.
@@ -394,6 +397,9 @@ pub struct RuntimeScheduledRun {
 /// One verified canonical event in a reconnect page.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RuntimeSessionEvent {
+    /// Canonical event identity when supplied by a compatible runtime.
+    #[serde(default)]
+    pub event_id: Option<EventId>,
     /// Canonical sequence.
     pub sequence: Sequence,
     /// Stable typed event name.

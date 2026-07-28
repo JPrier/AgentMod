@@ -113,6 +113,29 @@ impl scheduler::RuntimeSchedulerDependencyPort for LocalRuntimeDependencies {
         Err(scheduler::RuntimeSchedulerDependencyError::InvalidConfiguration)
     }
 
+    fn fire_runtime_event(
+        &self,
+        _event_id: &str,
+        _event_type: &str,
+    ) -> Result<
+        Vec<scheduler::DependencyScheduledExecution>,
+        scheduler::RuntimeSchedulerDependencyError,
+    > {
+        Err(scheduler::RuntimeSchedulerDependencyError::InvalidConfiguration)
+    }
+
+    fn fire_process_output(
+        &self,
+        _output_id: &str,
+        _process_id: &str,
+        _output: &str,
+    ) -> Result<
+        Vec<scheduler::DependencyScheduledExecution>,
+        scheduler::RuntimeSchedulerDependencyError,
+    > {
+        Err(scheduler::RuntimeSchedulerDependencyError::InvalidConfiguration)
+    }
+
     fn complete_execution(
         &self,
         _execution_id: &str,

@@ -7,6 +7,7 @@ use std::{
 };
 
 use crate::StaticProviderCatalogDependency;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 
 const MAX_EVENTS: usize = 64;
 const CONTINUATION_ONE: &str = "018f6f83-7b80-7000-8000-000000000101";
@@ -631,14 +632,21 @@ fn process_action_events(
                 "process_action requires a supported mock_process_tool".into(),
             )
         })?;
-    let arguments = options
-        .get("mock_process_arguments")
-        .ok_or_else(|| {
+    let decoded_arguments;
+    let arguments = if let Some(arguments) = options.get("mock_process_arguments") {
+        arguments.as_bytes()
+    } else if let Some(arguments) = options.get("mock_process_arguments_base64") {
+        decoded_arguments = STANDARD.decode(arguments).map_err(|_| {
             ProviderExecutionDependencyError::InvalidRequest(
-                "process_action requires mock_process_arguments".into(),
+                "mock_process_arguments_base64 must be valid base64".into(),
             )
-        })?
-        .as_bytes();
+        })?;
+        decoded_arguments.as_slice()
+    } else {
+        return Err(ProviderExecutionDependencyError::InvalidRequest(
+            "process_action requires mock_process_arguments".into(),
+        ));
+    };
     if arguments.len() > 64 * 1024 {
         return Err(ProviderExecutionDependencyError::InvalidRequest(
             "mock_process_arguments exceeds the deterministic fixture limit".into(),
@@ -1031,6 +1039,29 @@ mod tests {
             dependency.execute_provider(malformed),
             Err(ProviderExecutionDependencyError::InvalidRequest(_))
         ));
+    }
+
+    #[test]
+    fn process_action_fixture_accepts_bounded_base64_json_arguments() {
+        let dependency = StaticProviderCatalogDependency::built_in();
+        let mut value = request("process_action");
+        value
+            .options
+            .retain(|option| option.key != "mock_process_arguments");
+        value.options.push(DependencyProviderOption {
+            key: "mock_process_arguments_base64".into(),
+            value: STANDARD.encode(br#"{"process_id":"process-1"}"#),
+        });
+        let response = dependency
+            .execute_provider(value)
+            .expect("base64 arguments");
+        assert!(response.events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::ToolCallProposed {
+                arguments_json,
+                ..
+            } if arguments_json == r#"{"process_id":"process-1"}"#
+        )));
     }
 
     fn signed_grant(key: &[u8; 32], nonce: uuid::Uuid) -> String {

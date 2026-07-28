@@ -234,6 +234,18 @@ pub struct ToolExecutionDispatchedEvent {
 pub struct ToolOutputObservedEvent {
     /// Provider tool-call identifier.
     pub call_id: String,
+    /// Exact supervised process identity when this output came from a process operation.
+    #[serde(default)]
+    pub process_id: Option<String>,
+    /// Durable process-log stream used to identify an exact output range.
+    #[serde(default)]
+    pub source_stream: Option<String>,
+    /// Inclusive process-log range start when emitted by `process.read`.
+    #[serde(default)]
+    pub source_offset: Option<u64>,
+    /// Exclusive process-log range end when emitted by `process.read`.
+    #[serde(default)]
+    pub source_end: Option<u64>,
     /// Stable output stream.
     pub stream: String,
     /// Bounded visible fragment.

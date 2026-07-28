@@ -4,13 +4,15 @@ $repository = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Push-Location $repository
 try {
     cargo build -p agentmod-runtime -p agentmod-harness `
-        -p agentmod-filesystem-host -p agentmod-process-host -p agentmod-cli
+        -p agentmod-filesystem-host -p agentmod-process-host `
+        -p agentmod-scheduler -p agentmod-cli
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
     $runtime = (Resolve-Path "target\debug\agentmod-runtime.exe").Path
     $harness = (Resolve-Path "target\debug\agentmod-harness.exe").Path
     $filesystem = (Resolve-Path "target\debug\agentmod-filesystem-host.exe").Path
     $processHost = (Resolve-Path "target\debug\agentmod-process-host.exe").Path
+    $scheduler = (Resolve-Path "target\debug\agentmod-scheduler.exe").Path
     $cli = (Resolve-Path "target\debug\agentmod.exe").Path
     $runRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
         "agentmod-process-restart-e2e-" + [guid]::NewGuid().ToString("N")
@@ -50,6 +52,8 @@ fn main() {
     $env:AGENTMOD_HARNESS_PROGRAM = $harness
     $env:AGENTMOD_FILESYSTEM_HOST_PROGRAM = $filesystem
     $env:AGENTMOD_PROCESS_HOST_PROGRAM = $processHost
+    $env:AGENTMOD_SCHEDULER_PROGRAM = $scheduler
+    $env:AGENTMOD_SCHEDULER_ROOT = Join-Path $runRoot "scheduler"
     $env:AGENTMOD_PROCESS_ALLOWED_EXECUTABLES = $fixture
     $env:AGENTMOD_PROCESS_IDLE_TIMEOUT_MS = "750"
     $env:AGENTMOD_PERMISSION_MODE = "allow"
@@ -89,19 +93,30 @@ fn main() {
             [string]$Tool,
             [hashtable]$Arguments
         )
+        if ($Arguments.ContainsKey("executable")) {
+            $Arguments["executable"] = $Arguments["executable"].Replace("\", "/")
+        }
         $argumentJson = $Arguments | ConvertTo-Json -Compress -Depth 12
+        $encodedArgumentJson = [Convert]::ToBase64String(
+            [Text.Encoding]::UTF8.GetBytes($argumentJson)
+        )
         $callId = "process-action-" + [guid]::NewGuid().ToString("N")
         $response = & $cli run "execute deterministic process action" `
             --session $Session `
             --option 'mock_scenario="process_action"' `
             --option "mock_process_tool=$Tool" `
-            --option "mock_process_arguments=$argumentJson" `
+            --option "mock_process_arguments_base64=$encodedArgumentJson" `
             --option "mock_process_call_id=$callId" `
             --json
         if ($LASTEXITCODE -ne 0) {
             throw "process action failed: $Tool"
         }
-        return $response | ConvertFrom-Json
+        $parsed = $response | ConvertFrom-Json
+        $failed = @($parsed.events | Where-Object { $_.event -eq "failed" })
+        if ($failed.Count -ne 0) {
+            throw "process action $Tool returned provider failure: $response"
+        }
+        return $parsed
     }
 
     try {
@@ -140,6 +155,15 @@ fn main() {
 
         Invoke-ProcessAction -Session $created.session_id `
             -Tool "process.reattach" -Arguments @{ process_id = $processId } | Out-Null
+        & $cli schedule add "on-process-echo" `
+            --session $created.session_id `
+            --prompt "inspect the newly observed process output" `
+            --process-id $processId `
+            --contains "echo:hello-after-runtime-restart" `
+            --json | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "process-output schedule was not stored"
+        }
         Invoke-ProcessAction -Session $created.session_id `
             -Tool "process.input" -Arguments @{
                 process_id = $processId
@@ -169,7 +193,68 @@ fn main() {
         if (-not $observed) {
             throw "reattached PTY output did not enter canonical history"
         }
+        $scheduleRan = $false
+        for ($attempt = 0; $attempt -lt 50; $attempt++) {
+            try {
+                $scheduled = @(
+                    Get-Content -LiteralPath $journalPath |
+                        ForEach-Object { ($_ | ConvertFrom-Json).event } |
+                        Where-Object {
+                            $_.metadata.event_type -eq "scheduler.fired" -and
+                            $_.payload.payload.schedule_id -eq "on-process-echo"
+                        }
+                )
+            }
+            catch {
+                Start-Sleep -Milliseconds 50
+                continue
+            }
+            if ($scheduled.Count -eq 1) {
+                $scheduleRan = $true
+                break
+            }
+            Start-Sleep -Milliseconds 50
+        }
+        if (-not $scheduleRan) {
+            throw "matching process output did not execute its schedule"
+        }
+        Invoke-ProcessAction -Session $created.session_id `
+            -Tool "process.read" -Arguments @{
+                process_id = $processId
+                stream = "terminal"
+                offset = 0
+                length = 65536
+            } | Out-Null
+        Start-Sleep -Milliseconds 250
+        $sameRangeDeliveries = @(
+            Get-Content -LiteralPath $journalPath |
+                ForEach-Object { ($_ | ConvertFrom-Json).event } |
+                Where-Object {
+                    $_.metadata.event_type -eq "scheduler.fired" -and
+                    $_.payload.payload.schedule_id -eq "on-process-echo"
+                }
+        )
+        if ($sameRangeDeliveries.Count -ne 1) {
+            throw "the same durable process-output range executed more than once"
+        }
 
+        Stop-Process -Id $daemon.Id -Force
+        Wait-Process -Id $daemon.Id -ErrorAction SilentlyContinue
+        $daemon = Start-TestRuntime
+        Wait-TestRuntime
+        $scheduledAfterRestart = @(
+            Get-Content -LiteralPath $journalPath |
+                ForEach-Object { ($_ | ConvertFrom-Json).event } |
+                Where-Object {
+                    $_.metadata.event_type -eq "scheduler.fired" -and
+                    $_.payload.payload.schedule_id -eq "on-process-echo"
+                }
+        )
+        if ($scheduledAfterRestart.Count -ne 1) {
+            throw "process-output delivery duplicated after restart"
+        }
+        Invoke-ProcessAction -Session $created.session_id `
+            -Tool "process.reattach" -Arguments @{ process_id = $processId } | Out-Null
         Invoke-ProcessAction -Session $created.session_id `
             -Tool "process.input" -Arguments @{
                 process_id = $processId
@@ -209,34 +294,42 @@ fn main() {
                 $_.event.metadata.event_type -eq "process.reconciliation_completed"
             }
         )
-        if ($reconciliationStarted.Count -ne 1 -or
-            $reconciliationCompleted.Count -ne 1) {
-            throw "expected one canonical process reconciliation event pair"
+        if ($reconciliationStarted.Count -ne 2 -or
+            $reconciliationCompleted.Count -ne 2) {
+            throw "expected one canonical reconciliation pair per runtime restart"
         }
-        if ($reconciliationStarted[0].event.payload.payload.process_id -ne $processId -or
-            $reconciliationCompleted[0].event.payload.payload.process_id -ne $processId -or
-            $reconciliationCompleted[0].event.payload.payload.status -ne "live") {
+        foreach ($event in $reconciliationStarted + $reconciliationCompleted) {
+            if ($event.event.payload.payload.process_id -ne $processId) {
+                throw "canonical process reconciliation identity is incorrect"
+            }
+        }
+        if (@($reconciliationCompleted | Where-Object {
+            $_.event.payload.payload.status -ne "live"
+        }).Count -ne 0) {
             throw "canonical process reconciliation classification is incorrect"
         }
-        $reconciliationCallId = (
-            $reconciliationCompleted[0].event.payload.payload.call_id
-        )
-        $terminal = @(
-            $records | Where-Object {
-                $_.event.metadata.event_type -eq "tool.execution_completed" -and
-                $_.event.payload.payload.call_id -eq $reconciliationCallId
+        foreach ($completed in $reconciliationCompleted) {
+            $started = @($reconciliationStarted | Where-Object {
+                $_.event.payload.payload.call_id -eq
+                    $completed.event.payload.payload.call_id
+            })
+            $terminal = @(
+                $records | Where-Object {
+                    $_.event.metadata.event_type -eq "tool.execution_completed" -and
+                    $_.event.payload.payload.call_id -eq
+                        $completed.event.payload.payload.call_id
+                }
+            )
+            if ($started.Count -ne 1 -or $terminal.Count -ne 1 -or
+                $started[0].sequence -ge $completed.sequence -or
+                $completed.sequence -ge $terminal[0].sequence) {
+                throw "canonical process reconciliation ordering is incorrect"
             }
-        )
-        if ($terminal.Count -ne 1 -or
-            $reconciliationStarted[0].sequence -ge
-                $reconciliationCompleted[0].sequence -or
-            $reconciliationCompleted[0].sequence -ge $terminal[0].sequence) {
-            throw "canonical process reconciliation ordering is incorrect"
         }
         $succeeded = $true
         Write-Output (
             "runtime restart preserved one PTY, reattached it, exchanged input/output, " +
-            "and committed exit without redispatch"
+            "delivered output once, and committed exit without redispatch"
         )
     }
     finally {

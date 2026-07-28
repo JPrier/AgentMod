@@ -1863,7 +1863,7 @@ fn enforce_executable_policy(
 
 fn normalize_executable_policy_key(value: &str) -> String {
     if cfg!(windows) {
-        value.to_ascii_lowercase()
+        value.replace('/', "\\").to_ascii_lowercase()
     } else {
         value.to_owned()
     }

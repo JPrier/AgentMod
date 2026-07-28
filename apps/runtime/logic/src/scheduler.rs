@@ -84,6 +84,19 @@ pub struct ScheduleStoreResult {
     pub replayed: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FireRuntimeEventCommand {
+    pub event_id: String,
+    pub event_type: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FireProcessOutputCommand {
+    pub output_id: String,
+    pub process_id: String,
+    pub output: String,
+}
+
 pub trait RuntimeScheduleLogicPort: Send + Sync {
     fn upsert_schedule(
         &self,
@@ -95,6 +108,14 @@ pub trait RuntimeScheduleLogicPort: Send + Sync {
     fn claim_due_schedules(
         &self,
         limit: u32,
+    ) -> Result<Vec<ScheduledExecution>, RuntimeScheduleLogicError>;
+    fn fire_runtime_event(
+        &self,
+        command: FireRuntimeEventCommand,
+    ) -> Result<Vec<ScheduledExecution>, RuntimeScheduleLogicError>;
+    fn fire_process_output(
+        &self,
+        command: FireProcessOutputCommand,
     ) -> Result<Vec<ScheduledExecution>, RuntimeScheduleLogicError>;
     fn complete_scheduled_execution(
         &self,
@@ -148,6 +169,37 @@ impl<D: RuntimeScheduleDataPort> RuntimeScheduleLogicPort for crate::RuntimeLogi
         validate_limit(limit)?;
         self.data
             .claim_due_schedules(limit)
+            .map_err(RuntimeScheduleLogicError::Data)?
+            .into_iter()
+            .map(from_data_execution)
+            .collect()
+    }
+
+    fn fire_runtime_event(
+        &self,
+        command: FireRuntimeEventCommand,
+    ) -> Result<Vec<ScheduledExecution>, RuntimeScheduleLogicError> {
+        validate_id(&command.event_id)?;
+        validate_text(&command.event_type, 256)?;
+        self.data
+            .fire_runtime_event(&command.event_id, &command.event_type)
+            .map_err(RuntimeScheduleLogicError::Data)?
+            .into_iter()
+            .map(from_data_execution)
+            .collect()
+    }
+
+    fn fire_process_output(
+        &self,
+        command: FireProcessOutputCommand,
+    ) -> Result<Vec<ScheduledExecution>, RuntimeScheduleLogicError> {
+        validate_id(&command.output_id)?;
+        validate_id(&command.process_id)?;
+        if command.output.len() > 64 * 1024 {
+            return Err(RuntimeScheduleLogicError::Invalid);
+        }
+        self.data
+            .fire_process_output(&command.output_id, &command.process_id, &command.output)
             .map_err(RuntimeScheduleLogicError::Data)?
             .into_iter()
             .map(from_data_execution)

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use agentmod_event_model::{
     ArtifactReference, EventClassification, EventEnvelope, EventMetadata, EventOrigin, EventScope,
 };
-use agentmod_primitives::{ArtifactId, ContentHash, Sequence, SessionId, Version};
+use agentmod_primitives::{ArtifactId, ContentHash, EventId, Sequence, SessionId, Version};
 use agentmod_runtime_data::{
     identity::{AllocateEventIdentityDataRequest, EventIdentityDataError, EventIdentityDataPort},
     journal::{JournalDataError, JournalEventDataPort, ScanEventsDataRequest},
@@ -71,6 +71,8 @@ pub struct SubscribeSessionCommand {
 /// One logic-owned canonical event projection.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionEventResult {
+    /// Canonical event identifier.
+    pub event_id: EventId,
     /// Canonical sequence.
     pub sequence: Sequence,
     /// Stable typed event name.
@@ -253,6 +255,7 @@ where
                 let payload = serde_json::to_value(event.payload)
                     .map_err(|error| SessionHistoryLogicError::EventMapping(error.to_string()))?;
                 Ok(SessionEventResult {
+                    event_id: event.metadata.event_id,
                     sequence: event.metadata.sequence,
                     event_type: event.metadata.event_type,
                     payload,

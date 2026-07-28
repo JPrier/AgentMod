@@ -4,7 +4,8 @@ set -eu
 repository=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$repository"
 cargo build -p agentmod-runtime -p agentmod-harness \
-    -p agentmod-filesystem-host -p agentmod-process-host -p agentmod-cli
+    -p agentmod-filesystem-host -p agentmod-process-host \
+    -p agentmod-scheduler -p agentmod-cli
 
 run_root=$(mktemp -d "${TMPDIR:-/tmp}/agentmod-process-restart-e2e.XXXXXX")
 workspace="$run_root/workspace"
@@ -34,6 +35,8 @@ export AGENTMOD_RUNTIME_AUTH_TOKEN="0123456789abcdef0123456789abcdef0123456789ab
 export AGENTMOD_HARNESS_PROGRAM="$repository/target/debug/agentmod-harness"
 export AGENTMOD_FILESYSTEM_HOST_PROGRAM="$repository/target/debug/agentmod-filesystem-host"
 export AGENTMOD_PROCESS_HOST_PROGRAM="$repository/target/debug/agentmod-process-host"
+export AGENTMOD_SCHEDULER_PROGRAM="$repository/target/debug/agentmod-scheduler"
+export AGENTMOD_SCHEDULER_ROOT="$run_root/scheduler"
 export AGENTMOD_PROCESS_ALLOWED_EXECUTABLES="$fixture"
 export AGENTMOD_PROCESS_IDLE_TIMEOUT_MS=750
 export AGENTMOD_PERMISSION_MODE=allow
@@ -98,6 +101,10 @@ daemon_pid=
 start_runtime
 
 process_action "$session_id" process.reattach "{\"process_id\":\"$process_id\"}"
+"$cli" schedule add on-process-echo --session "$session_id" \
+    --prompt "inspect the newly observed process output" \
+    --process-id "$process_id" --contains "echo:hello-after-runtime-restart" \
+    --json >/dev/null
 process_action "$session_id" process.input \
     "{\"process_id\":\"$process_id\",\"content\":\"hello-after-runtime-restart\\r\\n\",\"close\":false}"
 journal="$run_root/sessions/$session_id/events.jsonl"
@@ -112,6 +119,29 @@ until grep -F 'echo:hello-after-runtime-restart' "$journal" >/dev/null 2>&1; do
     fi
     sleep 0.05
 done
+attempt=0
+until [ "$(grep '"event_type":"scheduler.fired"' "$journal" 2>/dev/null |
+    grep -c '"schedule_id":"on-process-echo"' || true)" -eq 1 ]; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 50 ]; then
+        echo "matching process output did not execute its schedule" >&2
+        exit 1
+    fi
+    sleep 0.05
+done
+process_action "$session_id" process.read \
+    "{\"process_id\":\"$process_id\",\"stream\":\"terminal\",\"offset\":0,\"length\":65536}"
+sleep 0.25
+[ "$(grep '"event_type":"scheduler.fired"' "$journal" |
+    grep -c '"schedule_id":"on-process-echo"')" -eq 1 ]
+
+kill -9 "$daemon_pid"
+wait "$daemon_pid" 2>/dev/null || true
+daemon_pid=
+start_runtime
+[ "$(grep '"event_type":"scheduler.fired"' "$journal" |
+    grep -c '"schedule_id":"on-process-echo"')" -eq 1 ]
+process_action "$session_id" process.reattach "{\"process_id\":\"$process_id\"}"
 process_action "$session_id" process.input \
     "{\"process_id\":\"$process_id\",\"content\":\"exit\\r\\n\",\"close\":false}"
 process_action "$session_id" process.wait "{\"process_id\":\"$process_id\"}"
@@ -121,7 +151,7 @@ process_count=$(find "$process_root" -mindepth 1 -maxdepth 1 -type d | wc -l | t
 for tool in process.start_pty process.reattach process.input process.read process.wait; do
     grep -F "$tool" "$journal" >/dev/null
 done
-[ "$(grep -c '"event_type":"process.reconciliation_started"' "$journal")" = 1 ]
-[ "$(grep -c '"event_type":"process.reconciliation_completed"' "$journal")" = 1 ]
+[ "$(grep -c '"event_type":"process.reconciliation_started"' "$journal")" = 2 ]
+[ "$(grep -c '"event_type":"process.reconciliation_completed"' "$journal")" = 2 ]
 grep -F '"status":"live"' "$journal" >/dev/null
-echo "runtime restart preserved one PTY, reattached it, exchanged input/output, and committed exit without redispatch"
+echo "runtime restart preserved one PTY, delivered output once, and committed exit without redispatch"

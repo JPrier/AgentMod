@@ -15,8 +15,11 @@ agentmod session replay <id> [--at <sequence>] [--json]
 agentmod session branch <id> --at <sequence> [--style <id>] [--json]
 agentmod session events <id> [--after <sequence>] [--limit <count>] [--json]
 agentmod approval resolve <session-id> <continuation-id> <approve|deny> [--json]
-agentmod schedule add <schedule-id> --session <id> --prompt <text> --at-ms <unix-ms>
-             [--every-ms <ms>] [--idempotency-id <id>]
+agentmod schedule add <schedule-id> --session <id> --prompt <text>
+             (--at-ms <unix-ms> [--every-ms <ms>] |
+              --on-event <event-type> |
+              --process-id <id> --contains <literal>)
+             [--idempotency-id <id>]
              [--style <id>] [--workspace <path>]
              [--permission-policy <id>] [--provider <id>] [--model <id>]
              [--token-budget <count>] [--cost-budget-micros <count>] [--json]
@@ -80,8 +83,9 @@ The winning request resumes the canonical turn. Repeating the same decision
 returns `transitioned: false` and does not execute the tool again. `deny`
 commits a structured permission-denied tool result and lets the model continue.
 
-`schedule add` stores a one-time prompt occurrence or a fixed interval when
-`--every-ms` is present. Every schedule carries explicit style, workspace,
+`schedule add` stores exactly one trigger: a one-time occurrence, a fixed
+interval when `--every-ms` accompanies `--at-ms`, a canonical runtime event,
+or a literal match in one exact process's durable output. Every schedule carries explicit style, workspace,
 permission policy, provider, model, token budget, and cost budget. `schedule
 run` is the normal headless-worker cycle: it atomically claims due occurrences,
 commits `scheduler.fired`, executes prompts through the ordinary intercepted

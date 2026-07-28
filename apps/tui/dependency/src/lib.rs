@@ -239,10 +239,12 @@ impl LocalRuntimeDependency {
                     match current.payload {
                         RuntimeResponse::TurnEvent { event, .. } => turn_events.push(event),
                         RuntimeResponse::SessionEvent {
+                            event_id,
                             sequence,
                             event_type,
                             payload,
                         } => session_events.push(RuntimeSessionEvent {
+                            event_id,
                             sequence,
                             event_type,
                             payload,

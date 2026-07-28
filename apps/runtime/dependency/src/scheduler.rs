@@ -88,6 +88,17 @@ pub trait RuntimeSchedulerDependencyPort: Send + Sync {
         &self,
         limit: u32,
     ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError>;
+    fn fire_runtime_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError>;
+    fn fire_process_output(
+        &self,
+        output_id: &str,
+        process_id: &str,
+        output: &str,
+    ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError>;
     fn complete_execution(
         &self,
         execution_id: &str,
@@ -247,6 +258,40 @@ impl RuntimeSchedulerDependencyPort for ProcessSchedulerDependency {
         limit: u32,
     ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
         match self.request(&SchedulerCommand::ClaimDue { limit })? {
+            SchedulerResponse::Executions { executions } => {
+                Ok(executions.into_iter().map(from_wire_execution).collect())
+            }
+            response => remote_result(response),
+        }
+    }
+
+    fn fire_runtime_event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+    ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
+        match self.request(&SchedulerCommand::FireRuntimeEvent {
+            event_id: event_id.to_owned(),
+            event_type: event_type.to_owned(),
+        })? {
+            SchedulerResponse::Executions { executions } => {
+                Ok(executions.into_iter().map(from_wire_execution).collect())
+            }
+            response => remote_result(response),
+        }
+    }
+
+    fn fire_process_output(
+        &self,
+        output_id: &str,
+        process_id: &str,
+        output: &str,
+    ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
+        match self.request(&SchedulerCommand::FireProcessOutput {
+            output_id: output_id.to_owned(),
+            process_id: process_id.to_owned(),
+            output: output.to_owned(),
+        })? {
             SchedulerResponse::Executions { executions } => {
                 Ok(executions.into_iter().map(from_wire_execution).collect())
             }

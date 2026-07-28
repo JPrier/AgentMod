@@ -1669,6 +1669,49 @@ where
         let mut artifact = None;
         let mut truncated = false;
         let mut cancelled = false;
+        let output_process_id = if executable.tool.starts_with("process.") {
+            tool_events
+                .iter()
+                .find_map(|event| match event {
+                    ToolEvent::Completed { result, .. } => result
+                        .get("process_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    _ => None,
+                })
+                .or_else(|| {
+                    executable
+                        .arguments
+                        .get("process_id")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+        } else {
+            None
+        };
+        let output_range = if executable.tool == "process.read" {
+            executable
+                .arguments
+                .get("offset")
+                .and_then(Value::as_u64)
+                .zip(tool_events.iter().find_map(|event| match event {
+                    ToolEvent::Completed { result, .. } => {
+                        result.get("next_offset").and_then(Value::as_u64)
+                    }
+                    _ => None,
+                }))
+        } else {
+            None
+        };
+        let output_source_stream = if executable.tool == "process.read" {
+            executable
+                .arguments
+                .get("stream")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        };
         let observed_event_count = match dispatch_mode {
             ToolDispatchMode::Fresh => 0,
             ToolDispatchMode::Reconcile {
@@ -1724,6 +1767,10 @@ where
                     total,
                 } => RuntimeCommittedEvent::ToolOutputObserved(ToolOutputObservedEvent {
                     call_id,
+                    process_id: output_process_id.clone(),
+                    source_stream: None,
+                    source_offset: None,
+                    source_end: None,
                     stream: "progress".into(),
                     content: format!("{message} ({completed:?}/{total:?})"),
                 }),
@@ -1733,6 +1780,10 @@ where
                     content,
                 } => RuntimeCommittedEvent::ToolOutputObserved(ToolOutputObservedEvent {
                     call_id,
+                    process_id: output_process_id.clone(),
+                    source_stream: output_source_stream.clone(),
+                    source_offset: output_range.map(|(start, _)| start),
+                    source_end: output_range.map(|(_, end)| end),
                     stream: match stream {
                         ToolOutputStream::Standard => "standard",
                         ToolOutputStream::Error => "error",

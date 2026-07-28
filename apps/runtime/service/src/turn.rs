@@ -15,15 +15,14 @@ use agentmod_runtime_logic::{
     },
 };
 use agentmod_runtime_protocol::{
-    RuntimeProviderEvent, RuntimeRequest, RuntimeResponse, RuntimeSchedulePayload,
-    RuntimeScheduledRun,
+    RuntimeProviderEvent, RuntimeRequest, RuntimeResponse, RuntimeScheduledRun,
 };
 use async_trait::async_trait;
 use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::RuntimeService;
+use crate::{RuntimeService, ServiceSchedulePayload, ServiceScheduledExecution};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServiceRunTurnRequest {
@@ -351,6 +350,248 @@ impl<C, T> RuntimeDaemonService<C, T> {
     }
 }
 
+impl<C, T> RuntimeDaemonService<C, T>
+where
+    C: agentmod_runtime_logic::RuntimeLogicPort
+        + agentmod_runtime_logic::registry::SessionRegistryLogicPort
+        + agentmod_runtime_logic::history::SessionHistoryLogicPort
+        + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort,
+    T: TurnLogicPort,
+{
+    async fn execute_scheduled_claims(
+        &self,
+        executions: Vec<ServiceScheduledExecution>,
+    ) -> Vec<RuntimeScheduledRun> {
+        let mut runs = Vec::with_capacity(executions.len());
+        for execution in executions {
+            let execution_id = execution.execution_id;
+            let schedule = execution.schedule;
+            let ServiceSchedulePayload::Prompt { prompt } = schedule.payload else {
+                let terminal = self.complete_scheduled_claim(&execution_id, false);
+                runs.push(RuntimeScheduledRun {
+                    execution_id,
+                    schedule_id: schedule.schedule_id,
+                    terminal,
+                    succeeded: false,
+                    last_committed_sequence: None,
+                    awaiting_continuation: None,
+                    error: Some(String::from(
+                        "continuation wake schedules require a deferred-action payload",
+                    )),
+                });
+                continue;
+            };
+            let turn = self
+                .turns
+                .run_scheduled_turn(ServiceRunScheduledTurnRequest {
+                    execution_id: execution_id.clone(),
+                    schedule_id: schedule.schedule_id.clone(),
+                    scheduled_for_ms: execution.scheduled_for_ms,
+                    turn: ServiceRunTurnRequest {
+                        session_id: schedule.session_id.to_string(),
+                        prompt,
+                        provider: schedule.provider,
+                        model: schedule.model,
+                        options: serde_json::json!({
+                            "scheduled_execution_id": execution_id,
+                            "token_budget": schedule.token_budget,
+                            "cost_budget_micros": schedule.cost_budget_micros,
+                            "permission_policy": schedule.permission_policy,
+                            "style": schedule.style,
+                            "workspace": schedule.workspace
+                        }),
+                        cancellation_id: cancellation_id_from_execution(&execution_id),
+                    },
+                })
+                .await;
+            match turn {
+                Ok(result) if result.awaiting_continuation.is_some() => {
+                    runs.push(RuntimeScheduledRun {
+                        execution_id,
+                        schedule_id: schedule.schedule_id,
+                        terminal: false,
+                        succeeded: false,
+                        last_committed_sequence: Some(result.last_committed_sequence),
+                        awaiting_continuation: result.awaiting_continuation,
+                        error: None,
+                    });
+                }
+                Ok(result) => {
+                    let terminal = self.complete_scheduled_claim(&execution_id, true);
+                    runs.push(RuntimeScheduledRun {
+                        execution_id,
+                        schedule_id: schedule.schedule_id,
+                        terminal,
+                        succeeded: true,
+                        last_committed_sequence: Some(result.last_committed_sequence),
+                        awaiting_continuation: None,
+                        error: None,
+                    });
+                }
+                Err(error) => {
+                    let terminal = self.complete_scheduled_claim(&execution_id, false);
+                    runs.push(RuntimeScheduledRun {
+                        execution_id,
+                        schedule_id: schedule.schedule_id,
+                        terminal,
+                        succeeded: false,
+                        last_committed_sequence: None,
+                        awaiting_continuation: None,
+                        error: Some(error.to_string()),
+                    });
+                }
+            }
+        }
+        runs
+    }
+
+    fn complete_scheduled_claim(&self, execution_id: &str, succeeded: bool) -> bool {
+        let response =
+            self.core
+                .handle_schedule_wire(&RuntimeRequest::CompleteScheduledExecution {
+                    execution_id: execution_id.to_owned(),
+                    succeeded,
+                });
+        matches!(
+            response,
+            Ok(RuntimeResponse::ScheduledExecutionCompleted { changed: true })
+        )
+    }
+
+    fn collect_scheduled_matches(
+        &self,
+        event: &crate::ServiceSessionEvent,
+        executions: &mut std::collections::BTreeMap<String, ServiceScheduledExecution>,
+    ) {
+        match self
+            .core
+            .fire_runtime_event(event.event_id.to_string(), event.event_type.clone())
+        {
+            Ok(values) => {
+                for execution in values {
+                    executions.insert(execution.execution_id.clone(), execution);
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "runtime.scheduler_observation_failed",
+                        "source_event_id": event.event_id,
+                        "source_event_type": event.event_type,
+                        "reason": "runtime_event_delivery_unavailable"
+                    })
+                );
+            }
+        }
+        if event.event_type != "tool.output_observed" {
+            return;
+        }
+        let Some(payload) = event.payload.get("payload") else {
+            return;
+        };
+        let (Some(process_id), Some(output)) = (
+            payload.get("process_id").and_then(Value::as_str),
+            payload.get("content").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        let output_id = match (
+            payload.get("source_stream").and_then(Value::as_str),
+            payload.get("source_offset").and_then(Value::as_u64),
+            payload.get("source_end").and_then(Value::as_u64),
+        ) {
+            (Some(stream), Some(start), Some(end)) => {
+                format!("process-output:{process_id}:{stream}:{start}:{end}")
+            }
+            _ => event.event_id.to_string(),
+        };
+        match self
+            .core
+            .fire_process_output(output_id, process_id.to_owned(), output.to_owned())
+        {
+            Ok(values) => {
+                for execution in values {
+                    executions.insert(execution.execution_id.clone(), execution);
+                }
+            }
+            Err(_) => {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "runtime.scheduler_observation_failed",
+                        "source_event_id": event.event_id,
+                        "source_event_type": event.event_type,
+                        "reason": "process_output_delivery_unavailable"
+                    })
+                );
+            }
+        }
+    }
+
+    async fn observe_committed_range(
+        &self,
+        session_id: agentmod_primitives::SessionId,
+        first: agentmod_primitives::Sequence,
+        last: agentmod_primitives::Sequence,
+    ) {
+        let mut after = first
+            .get()
+            .checked_sub(1)
+            .and_then(|value| (value > 0).then_some(value))
+            .and_then(|value| agentmod_primitives::Sequence::new(value).ok());
+        let mut executions = std::collections::BTreeMap::new();
+        loop {
+            let page = self
+                .core
+                .subscribe_session(crate::ServiceSubscribeSessionRequest {
+                    session_id,
+                    after,
+                    limit: 1_024,
+                });
+            let Ok(page) = page else {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "runtime.scheduler_observation_failed",
+                        "session_id": session_id,
+                        "reason": "canonical_event_page_unavailable"
+                    })
+                );
+                return;
+            };
+            let previous_after = after;
+            for event in page
+                .events
+                .into_iter()
+                .take_while(|event| event.sequence <= last)
+            {
+                after = Some(event.sequence);
+                self.collect_scheduled_matches(&event, &mut executions);
+            }
+            if after.is_some_and(|sequence| sequence >= last) {
+                break;
+            }
+            if after == previous_after || !page.has_more {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "runtime.scheduler_observation_failed",
+                        "session_id": session_id,
+                        "reason": "canonical_event_range_incomplete",
+                        "last_observed_sequence": after,
+                        "expected_last_sequence": last,
+                    })
+                );
+                break;
+            }
+        }
+        let _ = self
+            .execute_scheduled_claims(executions.into_values().collect())
+            .await;
+    }
+}
+
 #[async_trait]
 impl<C, T> crate::local_rpc::RuntimeWireEndpoint for RuntimeDaemonService<C, T>
 where
@@ -358,9 +599,11 @@ where
         + agentmod_runtime_logic::registry::SessionRegistryLogicPort
         + agentmod_runtime_logic::history::SessionHistoryLogicPort
         + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort
+        + Clone
         + Send
-        + Sync,
-    T: TurnLogicPort + ApprovalTurnLogicPort + CancelTurnLogicPort,
+        + Sync
+        + 'static,
+    T: TurnLogicPort + ApprovalTurnLogicPort + CancelTurnLogicPort + Clone + 'static,
 {
     #[allow(
         clippy::too_many_lines,
@@ -415,121 +658,15 @@ where
                     "runtime scheduler returned an invalid claim response",
                 ));
             };
-            let mut runs = Vec::with_capacity(executions.len());
-            for execution in executions {
-                let execution_id = execution.execution_id;
-                let schedule = execution.schedule;
-                let RuntimeSchedulePayload::Prompt { prompt } = schedule.payload else {
-                    let changed = self
-                        .core
-                        .handle_schedule_wire(&RuntimeRequest::CompleteScheduledExecution {
-                            execution_id: execution_id.clone(),
-                            succeeded: false,
-                        })
-                        .map_err(|error| error.to_string())?;
-                    let RuntimeResponse::ScheduledExecutionCompleted { changed } = changed else {
-                        return Err(String::from(
-                            "runtime scheduler returned an invalid completion response",
-                        ));
-                    };
-                    runs.push(RuntimeScheduledRun {
-                        execution_id,
-                        schedule_id: schedule.schedule_id,
-                        terminal: changed,
-                        succeeded: false,
-                        last_committed_sequence: None,
-                        awaiting_continuation: None,
-                        error: Some(String::from(
-                            "continuation wake schedules are not executable by this endpoint",
-                        )),
-                    });
-                    continue;
-                };
-                let turn = self
-                    .turns
-                    .run_scheduled_turn(ServiceRunScheduledTurnRequest {
-                        execution_id: execution_id.clone(),
-                        schedule_id: schedule.schedule_id.clone(),
-                        scheduled_for_ms: execution.scheduled_for_ms,
-                        turn: ServiceRunTurnRequest {
-                            session_id: schedule.session_id.to_string(),
-                            prompt,
-                            provider: schedule.provider,
-                            model: schedule.model,
-                            options: serde_json::json!({
-                                "scheduled_execution_id": execution_id,
-                                "token_budget": schedule.token_budget,
-                                "cost_budget_micros": schedule.cost_budget_micros,
-                                "permission_policy": schedule.permission_policy,
-                                "style": schedule.style,
-                                "workspace": schedule.workspace
-                            }),
-                            cancellation_id: cancellation_id_from_execution(&execution_id),
-                        },
-                    })
-                    .await;
-                match turn {
-                    Ok(result) if result.awaiting_continuation.is_some() => {
-                        runs.push(RuntimeScheduledRun {
-                            execution_id,
-                            schedule_id: schedule.schedule_id,
-                            terminal: false,
-                            succeeded: false,
-                            last_committed_sequence: Some(result.last_committed_sequence),
-                            awaiting_continuation: result.awaiting_continuation,
-                            error: None,
-                        });
-                    }
-                    Ok(result) => {
-                        let response = self
-                            .core
-                            .handle_schedule_wire(&RuntimeRequest::CompleteScheduledExecution {
-                                execution_id: execution_id.clone(),
-                                succeeded: true,
-                            })
-                            .map_err(|error| error.to_string())?;
-                        let RuntimeResponse::ScheduledExecutionCompleted { changed } = response
-                        else {
-                            return Err(String::from(
-                                "runtime scheduler returned an invalid completion response",
-                            ));
-                        };
-                        runs.push(RuntimeScheduledRun {
-                            execution_id,
-                            schedule_id: schedule.schedule_id,
-                            terminal: changed,
-                            succeeded: true,
-                            last_committed_sequence: Some(result.last_committed_sequence),
-                            awaiting_continuation: None,
-                            error: None,
-                        });
-                    }
-                    Err(error) => {
-                        let response = self
-                            .core
-                            .handle_schedule_wire(&RuntimeRequest::CompleteScheduledExecution {
-                                execution_id: execution_id.clone(),
-                                succeeded: false,
-                            })
-                            .map_err(|completion| completion.to_string())?;
-                        let RuntimeResponse::ScheduledExecutionCompleted { changed } = response
-                        else {
-                            return Err(String::from(
-                                "runtime scheduler returned an invalid completion response",
-                            ));
-                        };
-                        runs.push(RuntimeScheduledRun {
-                            execution_id,
-                            schedule_id: schedule.schedule_id,
-                            terminal: changed,
-                            succeeded: false,
-                            last_committed_sequence: None,
-                            awaiting_continuation: None,
-                            error: Some(error.to_string()),
-                        });
-                    }
-                }
-            }
+            let executions = executions
+                .into_iter()
+                .map(|execution| ServiceScheduledExecution {
+                    execution_id: execution.execution_id,
+                    scheduled_for_ms: execution.scheduled_for_ms,
+                    schedule: crate::from_wire_schedule(execution.schedule),
+                })
+                .collect();
+            let runs = self.execute_scheduled_claims(executions).await;
             return Ok(RuntimeResponse::ScheduledRuns { runs });
         }
         let RuntimeRequest::RunTurn {
@@ -571,6 +708,12 @@ where
             })
             .await
             .map_err(|error| error.to_string())?;
+        self.observe_committed_range(
+            *session_id,
+            response.first_committed_sequence,
+            response.last_committed_sequence,
+        )
+        .await;
         Ok(RuntimeResponse::Turn {
             events: response.events.into_iter().map(to_wire_event).collect(),
             first_committed_sequence: response.first_committed_sequence,
@@ -617,6 +760,7 @@ where
                     if sender
                         .send(Ok(crate::local_rpc::RuntimeEndpointFrame {
                             response: RuntimeResponse::SessionEvent {
+                                event_id: Some(event.event_id),
                                 sequence: event.sequence,
                                 event_type: event.event_type,
                                 payload: event.payload,
@@ -670,38 +814,57 @@ where
             })
             .await
             .map_err(|error| error.to_string())?;
+        let observer = self.clone();
+        let observed_session = *session_id;
         let (sender, receiver) = mpsc::channel(16);
         tokio::spawn(async move {
             while let Some(item) = turn.next().await {
-                let frame = item
-                    .map(|item| match item {
-                        ServiceTurnStreamItem::Event {
-                            event,
-                            committed_sequence,
-                        } => crate::local_rpc::RuntimeEndpointFrame {
+                let item = match item {
+                    Ok(item) => item,
+                    Err(error) => {
+                        let _ = sender.send(Err(error.to_string())).await;
+                        break;
+                    }
+                };
+                match item {
+                    ServiceTurnStreamItem::Event {
+                        event,
+                        committed_sequence,
+                    } => {
+                        let frame = crate::local_rpc::RuntimeEndpointFrame {
                             response: RuntimeResponse::TurnEvent {
                                 event: to_wire_event(event),
                                 committed_sequence,
                             },
                             terminal: false,
-                        },
-                        ServiceTurnStreamItem::Complete {
-                            first_committed_sequence,
-                            last_committed_sequence,
-                            awaiting_continuation,
-                        } => crate::local_rpc::RuntimeEndpointFrame {
+                        };
+                        if sender.send(Ok(frame)).await.is_err() {
+                            break;
+                        }
+                    }
+                    ServiceTurnStreamItem::Complete {
+                        first_committed_sequence,
+                        last_committed_sequence,
+                        awaiting_continuation,
+                    } => {
+                        let frame = crate::local_rpc::RuntimeEndpointFrame {
                             response: RuntimeResponse::TurnComplete {
                                 first_committed_sequence,
                                 last_committed_sequence,
                                 awaiting_continuation,
                             },
                             terminal: true,
-                        },
-                    })
-                    .map_err(|error| error.to_string());
-                let terminal = frame.as_ref().is_ok_and(|frame| frame.terminal);
-                if sender.send(frame).await.is_err() || terminal {
-                    break;
+                        };
+                        let _ = sender.send(Ok(frame)).await;
+                        observer
+                            .observe_committed_range(
+                                observed_session,
+                                first_committed_sequence,
+                                last_committed_sequence,
+                            )
+                            .await;
+                        break;
+                    }
                 }
             }
         });

@@ -193,6 +193,7 @@ mod tests {
             session_id,
             continuation_id: id.to_string(),
             approved: true,
+            resume_after_resolution: true,
         };
         assert_eq!(
             restarted_service

@@ -18,8 +18,9 @@ use agentmod_runtime_logic::{
         SessionRegistryLogicPort,
     },
     scheduler::{
-        RuntimeSchedule, RuntimeScheduleLogicError, RuntimeScheduleLogicPort, SchedulePayload,
-        ScheduleTrigger, UpsertScheduleCommand,
+        FireProcessOutputCommand, FireRuntimeEventCommand, RuntimeSchedule,
+        RuntimeScheduleLogicError, RuntimeScheduleLogicPort, SchedulePayload, ScheduleTrigger,
+        ScheduledExecution, UpsertScheduleCommand,
     },
 };
 use agentmod_runtime_protocol::{
@@ -218,6 +219,7 @@ where
                 .events
                 .into_iter()
                 .map(|event| ServiceSessionEvent {
+                    event_id: event.event_id,
                     sequence: event.sequence,
                     event_type: event.event_type,
                     payload: event.payload,
@@ -428,6 +430,36 @@ impl<L: RuntimeScheduleLogicPort> RuntimeService<L> {
             replayed: result.replayed,
         })
     }
+
+    fn fire_runtime_event(
+        &self,
+        event_id: String,
+        event_type: String,
+    ) -> Result<Vec<ServiceScheduledExecution>, ServiceError> {
+        self.logic
+            .fire_runtime_event(FireRuntimeEventCommand {
+                event_id,
+                event_type,
+            })
+            .map(|values| values.into_iter().map(from_logic_execution).collect())
+            .map_err(ServiceError::Schedule)
+    }
+
+    fn fire_process_output(
+        &self,
+        output_id: String,
+        process_id: String,
+        output: String,
+    ) -> Result<Vec<ServiceScheduledExecution>, ServiceError> {
+        self.logic
+            .fire_process_output(FireProcessOutputCommand {
+                output_id,
+                process_id,
+                output,
+            })
+            .map(|values| values.into_iter().map(from_logic_execution).collect())
+            .map_err(ServiceError::Schedule)
+    }
 }
 
 /// Service-owned create-session request.
@@ -513,6 +545,8 @@ pub struct ServiceSubscribeSessionRequest {
 /// One service-owned canonical event projection.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServiceSessionEvent {
+    /// Canonical event identity.
+    pub event_id: agentmod_primitives::EventId,
     /// Canonical sequence.
     pub sequence: agentmod_primitives::Sequence,
     /// Stable event type.
@@ -601,6 +635,13 @@ enum ServiceSchedulePayload {
 struct ServiceScheduleStoreResult {
     schedule_id: String,
     replayed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ServiceScheduledExecution {
+    execution_id: String,
+    scheduled_for_ms: i64,
+    schedule: ServiceSchedule,
 }
 
 fn from_wire_schedule(value: RuntimeScheduleSpec) -> ServiceSchedule {
@@ -716,6 +757,14 @@ fn from_logic_schedule(value: RuntimeSchedule) -> ServiceSchedule {
             }
         },
         active: value.active,
+    }
+}
+
+fn from_logic_execution(value: ScheduledExecution) -> ServiceScheduledExecution {
+    ServiceScheduledExecution {
+        execution_id: value.execution_id,
+        scheduled_for_ms: value.scheduled_for_ms,
+        schedule: from_logic_schedule(value.schedule),
     }
 }
 

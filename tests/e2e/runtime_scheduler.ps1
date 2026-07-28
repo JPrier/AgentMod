@@ -75,9 +75,13 @@ try {
                 Start-Sleep -Milliseconds 100
                 continue
             }
-            if (@($candidateEvents | Where-Object {
+            $firedCount = @($candidateEvents | Where-Object {
                 $_.metadata.event_type -eq "scheduler.fired"
-            }).Count -eq 1) {
+            }).Count
+            $responseCount = @($candidateEvents | Where-Object {
+                $_.metadata.event_type -eq "model.response_completed"
+            }).Count
+            if ($firedCount -eq 1 -and $responseCount -eq 1) {
                 $automaticallyRan = $true
                 break
             }
@@ -119,6 +123,44 @@ try {
         throw "scheduled occurrence was not durably completed"
     }
 
+    $eventStored = & $cli schedule add "after-model-response" `
+        --session $created.session_id `
+        --prompt "review the committed model response" `
+        --on-event "model.response_completed" --json | ConvertFrom-Json
+    if ($eventStored.schedule_id -ne "after-model-response" -or
+        $eventStored.replayed) {
+        throw "runtime-event schedule was not stored"
+    }
+    & $cli run "emit one runtime event" --session $created.session_id `
+        --json | Out-Null
+    $eventDeliveryRan = $false
+    for ($attempt = 0; $attempt -lt 50; $attempt++) {
+        try {
+            $eventDeliveryEvents = @(Get-Content $journalPath | ForEach-Object {
+                ($_ | ConvertFrom-Json).event
+            })
+        }
+        catch {
+            Start-Sleep -Milliseconds 100
+            continue
+        }
+        if (@($eventDeliveryEvents | Where-Object {
+            $_.metadata.event_type -eq "scheduler.fired"
+        }).Count -eq 2) {
+            $eventDeliveryRan = $true
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if (-not $eventDeliveryRan) {
+        throw "committed runtime event did not execute its matching schedule"
+    }
+    if (@($eventDeliveryEvents | Where-Object {
+        $_.metadata.event_type -eq "model.response_completed"
+    }).Count -ne 3) {
+        throw "runtime-event delivery bypassed or recursively repeated the provider path"
+    }
+
     Stop-Process -Id $daemon.Id -Force
     $daemon.WaitForExit()
     $daemon = Start-Runtime
@@ -133,10 +175,10 @@ try {
     })
     if (@($eventsAfter | Where-Object {
         $_.metadata.event_type -eq "scheduler.fired"
-    }).Count -ne 1) {
-        throw "scheduler event duplicated after restart"
+    }).Count -ne 2) {
+        throw "time or runtime-event delivery duplicated after restart"
     }
-    Write-Output "runtime-owned scheduled turn E2E passed"
+    Write-Output "runtime-owned time and event schedule E2E passed"
 }
 finally {
     if ($null -ne $daemon -and -not $daemon.HasExited) {

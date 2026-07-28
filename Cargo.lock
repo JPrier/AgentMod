@@ -257,6 +257,7 @@ version = "0.1.0"
 dependencies = [
  "agentmod-cli-logic",
  "agentmod-primitives",
+ "blake3",
  "clap",
  "serde_json",
  "thiserror 2.0.19",
@@ -465,6 +466,7 @@ dependencies = [
 name = "agentmod-harness-dependency"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "blake3",
  "serde_json",
  "thiserror 2.0.19",

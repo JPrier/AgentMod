@@ -98,7 +98,7 @@ pub enum CliCommand {
     reason = "Clap owns this cold-path parsed command and explicit fields preserve endpoint isolation"
 )]
 pub enum ScheduleCommand {
-    /// Create or replace a one-time or fixed-interval prompt schedule.
+    /// Create or replace a time-, event-, or process-output-triggered prompt schedule.
     Add {
         /// Stable schedule identifier.
         schedule_id: String,
@@ -108,12 +108,21 @@ pub enum ScheduleCommand {
         /// Scheduled prompt.
         #[arg(long)]
         prompt: String,
-        /// First Unix timestamp in milliseconds.
+        /// First Unix timestamp in milliseconds. Required for time triggers.
         #[arg(long)]
-        at_ms: i64,
-        /// Optional fixed interval in milliseconds.
-        #[arg(long)]
+        at_ms: Option<i64>,
+        /// Optional fixed interval in milliseconds. Requires `--at-ms`.
+        #[arg(long, requires = "at_ms")]
         every_ms: Option<u64>,
+        /// Canonical runtime event type to match.
+        #[arg(long, conflicts_with_all = ["at_ms", "every_ms", "process_id", "contains"])]
+        on_event: Option<String>,
+        /// Exact process identity for an output trigger.
+        #[arg(long, requires = "contains", conflicts_with_all = ["at_ms", "every_ms", "on_event"])]
+        process_id: Option<String>,
+        /// Literal output text to match for `--process-id`.
+        #[arg(long, requires = "process_id", conflicts_with_all = ["at_ms", "every_ms", "on_event"])]
+        contains: Option<String>,
         /// Explicit idempotency key; generated when omitted.
         #[arg(long)]
         idempotency_id: Option<String>,
@@ -527,6 +536,9 @@ where
                     prompt,
                     at_ms,
                     every_ms,
+                    on_event,
+                    process_id,
+                    contains,
                     idempotency_id,
                     style,
                     workspace,
@@ -542,6 +554,9 @@ where
                     prompt,
                     at_ms,
                     every_ms,
+                    on_event,
+                    process_id,
+                    contains,
                     idempotency_id,
                     style,
                     workspace,
@@ -581,8 +596,11 @@ where
         schedule_id: String,
         session: &str,
         prompt: String,
-        at_ms: i64,
+        at_ms: Option<i64>,
         every_ms: Option<u64>,
+        on_event: Option<String>,
+        process_id: Option<String>,
+        contains: Option<String>,
         idempotency_id: Option<String>,
         style: String,
         workspace: String,
@@ -596,7 +614,45 @@ where
         let session_id = session.parse().map_err(|_| ServiceError::Arguments {
             detail: String::from("session must be a valid UUID"),
         })?;
-        let idempotency_id = idempotency_id.unwrap_or_else(|| format!("cli:{schedule_id}:{at_ms}"));
+        let trigger = match (at_ms, every_ms, on_event, process_id, contains) {
+            (Some(at_ms), None, None, None, None) => ScheduleTrigger::AtMillis(at_ms),
+            (Some(starts_at_ms), Some(every_ms), None, None, None) => ScheduleTrigger::Interval {
+                starts_at_ms,
+                every_ms,
+            },
+            (None, None, Some(event_type), None, None) => {
+                ScheduleTrigger::RuntimeEvent { event_type }
+            }
+            (None, None, None, Some(process_id), Some(contains)) => {
+                ScheduleTrigger::ProcessOutput {
+                    process_id,
+                    contains,
+                }
+            }
+            _ => {
+                return Err(ServiceError::Arguments {
+                    detail: String::from(
+                        "schedule add requires exactly one trigger: --at-ms, --on-event, or --process-id with --contains",
+                    ),
+                });
+            }
+        };
+        let trigger_key = match &trigger {
+            ScheduleTrigger::AtMillis(value) => format!("at:{value}"),
+            ScheduleTrigger::Interval {
+                starts_at_ms,
+                every_ms,
+            } => format!("interval:{starts_at_ms}:{every_ms}"),
+            ScheduleTrigger::RuntimeEvent { event_type } => format!("event:{event_type}"),
+            ScheduleTrigger::ProcessOutput {
+                process_id,
+                contains,
+            } => format!("output:{process_id}:{contains}"),
+        };
+        let idempotency_id = idempotency_id.unwrap_or_else(|| {
+            let digest = blake3::hash(format!("{schedule_id}:{trigger_key}").as_bytes());
+            format!("cli:{}", digest.to_hex())
+        });
         let result = self
             .logic
             .upsert_schedule(LogicScheduleCommand {
@@ -610,12 +666,7 @@ where
                 model,
                 token_budget,
                 cost_budget_micros,
-                trigger: every_ms.map_or(ScheduleTrigger::AtMillis(at_ms), |every_ms| {
-                    ScheduleTrigger::Interval {
-                        starts_at_ms: at_ms,
-                        every_ms,
-                    }
-                }),
+                trigger,
                 payload: SchedulePayload::Prompt { prompt },
                 active: true,
             })
@@ -1530,7 +1581,9 @@ pub enum ServiceError {
 mod tests {
     use std::cell::RefCell;
 
-    use agentmod_cli_logic::{CreateSessionResult, DoctorCheck, LogicError, SessionSummaryResult};
+    use agentmod_cli_logic::{
+        CreateSessionResult, DoctorCheck, LogicError, ScheduleStoreResult, SessionSummaryResult,
+    };
     use agentmod_primitives::{Sequence, SessionId};
     use uuid::Uuid;
 
@@ -1540,6 +1593,7 @@ mod tests {
         state: DoctorState,
         successful: bool,
         observed: RefCell<Vec<RunDoctorCommand>>,
+        observed_schedules: RefCell<Vec<LogicScheduleCommand>>,
     }
 
     impl CliLogicPort for MockLogic {
@@ -1651,6 +1705,18 @@ mod tests {
                 awaiting_continuation: None,
             })
         }
+
+        fn upsert_schedule(
+            &self,
+            schedule: LogicScheduleCommand,
+        ) -> Result<ScheduleStoreResult, LogicError> {
+            let schedule_id = schedule.schedule_id.clone();
+            self.observed_schedules.borrow_mut().push(schedule);
+            Ok(ScheduleStoreResult {
+                schedule_id,
+                replayed: false,
+            })
+        }
     }
 
     fn service(state: DoctorState, successful: bool) -> CliService<MockLogic> {
@@ -1659,6 +1725,7 @@ mod tests {
                 state,
                 successful,
                 observed: RefCell::new(Vec::new()),
+                observed_schedules: RefCell::new(Vec::new()),
             },
             CliServiceConfig {
                 runtime_endpoint_label: "local-runtime".into(),
@@ -1763,5 +1830,79 @@ mod tests {
         assert_eq!(json["command"], "run");
         assert_eq!(json["last_committed_sequence"], 3);
         assert_eq!(json["events"][1]["text"], "done");
+    }
+
+    #[test]
+    fn schedule_add_maps_runtime_event_trigger() {
+        let service = service(DoctorState::Ready, true);
+        service
+            .run_from([
+                "agentmod",
+                "schedule",
+                "add",
+                "on-model-complete",
+                "--session",
+                "00000000-0000-0000-0000-000000000001",
+                "--prompt",
+                "review the completed turn",
+                "--on-event",
+                "model.response_completed",
+                "--json",
+            ])
+            .expect("schedule");
+        let schedules = service.logic.observed_schedules.borrow();
+        assert_eq!(schedules.len(), 1);
+        assert_eq!(
+            schedules[0].trigger,
+            ScheduleTrigger::RuntimeEvent {
+                event_type: String::from("model.response_completed")
+            }
+        );
+    }
+
+    #[test]
+    fn schedule_add_maps_exact_process_output_trigger() {
+        let service = service(DoctorState::Ready, true);
+        service
+            .run_from([
+                "agentmod",
+                "schedule",
+                "add",
+                "on-ready",
+                "--session",
+                "00000000-0000-0000-0000-000000000001",
+                "--prompt",
+                "inspect the ready service",
+                "--process-id",
+                "process-42",
+                "--contains",
+                "READY",
+            ])
+            .expect("schedule");
+        let schedules = service.logic.observed_schedules.borrow();
+        assert_eq!(
+            schedules[0].trigger,
+            ScheduleTrigger::ProcessOutput {
+                process_id: String::from("process-42"),
+                contains: String::from("READY")
+            }
+        );
+    }
+
+    #[test]
+    fn schedule_add_rejects_missing_trigger() {
+        let error = service(DoctorState::Ready, true)
+            .run_from([
+                "agentmod",
+                "schedule",
+                "add",
+                "missing-trigger",
+                "--session",
+                "00000000-0000-0000-0000-000000000001",
+                "--prompt",
+                "must not be stored",
+            ])
+            .expect_err("missing trigger");
+        assert!(matches!(error, ServiceError::Arguments { .. }));
     }
 }

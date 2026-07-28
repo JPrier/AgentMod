@@ -195,6 +195,44 @@ fn main() {
                 throw "canonical history is missing $tool"
             }
         }
+        $records = @(
+            Get-Content -LiteralPath $journalPath |
+                ForEach-Object { $_ | ConvertFrom-Json }
+        )
+        $reconciliationStarted = @(
+            $records | Where-Object {
+                $_.event.metadata.event_type -eq "process.reconciliation_started"
+            }
+        )
+        $reconciliationCompleted = @(
+            $records | Where-Object {
+                $_.event.metadata.event_type -eq "process.reconciliation_completed"
+            }
+        )
+        if ($reconciliationStarted.Count -ne 1 -or
+            $reconciliationCompleted.Count -ne 1) {
+            throw "expected one canonical process reconciliation event pair"
+        }
+        if ($reconciliationStarted[0].event.payload.payload.process_id -ne $processId -or
+            $reconciliationCompleted[0].event.payload.payload.process_id -ne $processId -or
+            $reconciliationCompleted[0].event.payload.payload.status -ne "live") {
+            throw "canonical process reconciliation classification is incorrect"
+        }
+        $reconciliationCallId = (
+            $reconciliationCompleted[0].event.payload.payload.call_id
+        )
+        $terminal = @(
+            $records | Where-Object {
+                $_.event.metadata.event_type -eq "tool.execution_completed" -and
+                $_.event.payload.payload.call_id -eq $reconciliationCallId
+            }
+        )
+        if ($terminal.Count -ne 1 -or
+            $reconciliationStarted[0].sequence -ge
+                $reconciliationCompleted[0].sequence -or
+            $reconciliationCompleted[0].sequence -ge $terminal[0].sequence) {
+            throw "canonical process reconciliation ordering is incorrect"
+        }
         $succeeded = $true
         Write-Output (
             "runtime restart preserved one PTY, reattached it, exchanged input/output, " +

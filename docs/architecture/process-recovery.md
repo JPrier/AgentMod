@@ -56,3 +56,11 @@ terminates the runtime, starts a replacement runtime with the same protected
 bootstrap authority, reattaches by AgentMod process ID, exchanges input and
 terminal output, waits for exit, and proves the process directory was created
 only once. `runtime_process_restart.sh` is the equivalent Unix-socket test.
+
+The runtime commits `process.reconciliation_started` before the reattach
+dispatch and `process.reconciliation_completed` after receiving the safe host
+classification but before the terminal tool event. The session reducer keeps
+the pair keyed by call ID and rejects missing starts, mismatched process IDs,
+and duplicate completion. If a daemon fails between the reconciliation result
+and terminal tool commit, receipt recovery observes the completed reducer state
+and does not emit a duplicate classification.

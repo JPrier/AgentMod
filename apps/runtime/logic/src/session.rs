@@ -266,6 +266,42 @@ pub struct ToolExecutionFailedEvent {
     pub retryable: bool,
 }
 
+/// Runtime-to-process-host reconciliation began.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProcessReconciliationStartedEvent {
+    /// Provider tool-call identifier that owns this exact reconciliation.
+    pub call_id: String,
+    /// `AgentMod` process identity being reconciled.
+    pub process_id: String,
+}
+
+/// Stable terminal process-reconciliation classification.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessReconciliationStatus {
+    /// The surviving capability host retained the live process handles.
+    Live,
+    /// The exact child exists but inherited handles cannot be reconstructed.
+    RecoveredRunningUnattached,
+    /// The durable record was reconciled to an exited process.
+    RecoveredExited,
+    /// Dispatch may have occurred and therefore is never repeated.
+    DispatchUncertain,
+    /// Reconciliation failed before a safe process classification was returned.
+    Failed,
+}
+
+/// Runtime-to-process-host reconciliation reached a canonical outcome.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProcessReconciliationCompletedEvent {
+    /// Provider tool-call identifier that owns this exact reconciliation.
+    pub call_id: String,
+    /// `AgentMod` process identity that was reconciled.
+    pub process_id: String,
+    /// Safe result reported through the process-host boundary.
+    pub status: ProcessReconciliationStatus,
+}
+
 /// Approval request payload.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ApprovalRequestedEvent {
@@ -348,6 +384,10 @@ pub enum RuntimeCommittedEvent {
     ToolExecutionCompleted(ToolExecutionCompletedEvent),
     /// Records failed or cancelled isolated tool execution.
     ToolExecutionFailed(ToolExecutionFailedEvent),
+    /// Records reconciliation intent before contacting the process host.
+    ProcessReconciliationStarted(ProcessReconciliationStartedEvent),
+    /// Records the terminal reconciliation classification.
+    ProcessReconciliationCompleted(ProcessReconciliationCompletedEvent),
     /// Creates a durable approval continuation.
     ApprovalRequested(ApprovalRequestedEvent),
     /// Resolves a durable approval.
@@ -383,6 +423,8 @@ impl RuntimeCommittedEvent {
             Self::ToolOutputObserved(_) => "tool.output_observed",
             Self::ToolExecutionCompleted(_) => "tool.execution_completed",
             Self::ToolExecutionFailed(_) => "tool.execution_failed",
+            Self::ProcessReconciliationStarted(_) => "process.reconciliation_started",
+            Self::ProcessReconciliationCompleted(_) => "process.reconciliation_completed",
             Self::ApprovalRequested(_) => "approval.requested",
             Self::ApprovalResolved(_) => "approval.resolved",
             Self::SessionLifecycleChanged(_) => "session.lifecycle_changed",
@@ -412,6 +454,9 @@ pub struct SessionState {
     /// Durable tool-dispatch outbox projection keyed by provider call ID.
     #[serde(default)]
     pub tool_executions: BTreeMap<String, ToolExecutionRecord>,
+    /// Restart/reconnect reconciliation state keyed by provider call ID.
+    #[serde(default)]
+    pub process_reconciliations: BTreeMap<String, ProcessReconciliationRecord>,
     /// Last applied sequence.
     pub last_sequence: Sequence,
     /// Integrity checksum of the last applied event.
@@ -457,6 +502,21 @@ pub struct ToolExecutionRecord {
     /// Number of host lifecycle items durably projected into the journal.
     #[serde(default)]
     pub observed_event_count: u64,
+}
+
+/// Replay-derived process reconciliation record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProcessReconciliationRecord {
+    /// Provider tool-call identifier.
+    pub call_id: String,
+    /// `AgentMod` process identity.
+    pub process_id: String,
+    /// Sequence at which reconciliation intent became canonical.
+    pub started_at: Sequence,
+    /// Terminal classification, absent while reconciliation is incomplete.
+    pub status: Option<ProcessReconciliationStatus>,
+    /// Sequence at which the terminal classification became canonical.
+    pub completed_at: Option<Sequence>,
 }
 
 /// Applies one verified committed event without dispatching external effects.
@@ -537,6 +597,7 @@ fn initialize(
         conversation: ConversationState::new(),
         approvals: BTreeMap::new(),
         tool_executions: BTreeMap::new(),
+        process_reconciliations: BTreeMap::new(),
         last_sequence: event.metadata.sequence,
         last_event_checksum: event.integrity_checksum,
     })
@@ -607,6 +668,12 @@ fn apply_payload(
         }
         RuntimeCommittedEvent::ToolExecutionFailed(failed) => {
             mark_tool_terminal(state, &failed.call_id, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ProcessReconciliationStarted(started) => {
+            apply_process_reconciliation_started(state, started, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ProcessReconciliationCompleted(completed) => {
+            apply_process_reconciliation_completed(state, completed, event.metadata.sequence)
         }
         RuntimeCommittedEvent::ApprovalRequested(requested) => {
             if state.approvals.contains_key(&requested.continuation_id) {
@@ -722,6 +789,47 @@ fn increment_tool_event_count(
             .checked_add(1)
             .ok_or(SessionReducerError::ToolEventCountOverflow)?;
     }
+    Ok(())
+}
+
+fn apply_process_reconciliation_started(
+    state: &mut SessionState,
+    started: &ProcessReconciliationStartedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if started.call_id.trim().is_empty()
+        || started.process_id.trim().is_empty()
+        || state.process_reconciliations.contains_key(&started.call_id)
+    {
+        return Err(SessionReducerError::InvalidProcessReconciliationTransition);
+    }
+    state.process_reconciliations.insert(
+        started.call_id.clone(),
+        ProcessReconciliationRecord {
+            call_id: started.call_id.clone(),
+            process_id: started.process_id.clone(),
+            started_at: sequence,
+            status: None,
+            completed_at: None,
+        },
+    );
+    Ok(())
+}
+
+fn apply_process_reconciliation_completed(
+    state: &mut SessionState,
+    completed: &ProcessReconciliationCompletedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = state
+        .process_reconciliations
+        .get_mut(&completed.call_id)
+        .ok_or(SessionReducerError::InvalidProcessReconciliationTransition)?;
+    if record.process_id != completed.process_id || record.completed_at.is_some() {
+        return Err(SessionReducerError::InvalidProcessReconciliationTransition);
+    }
+    record.status = Some(completed.status);
+    record.completed_at = Some(sequence);
     Ok(())
 }
 
@@ -852,6 +960,9 @@ pub enum SessionReducerError {
     /// Host lifecycle event accounting exceeded its bounded integer.
     #[error("tool execution event count overflowed")]
     ToolEventCountOverflow,
+    /// Process reconciliation did not follow one start and one completion.
+    #[error("process reconciliation state transition is invalid")]
+    InvalidProcessReconciliationTransition,
     /// Lifecycle transition is illegal.
     #[error("invalid lifecycle transition from {from:?} to {to:?}")]
     InvalidLifecycleTransition {
@@ -1056,6 +1167,60 @@ mod tests {
             execution.terminal_at,
             Some(Sequence::new(4).expect("sequence"))
         );
+    }
+
+    #[test]
+    fn process_reconciliation_replays_as_one_exact_pair() {
+        let events = vec![
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::ProcessReconciliationStarted(
+                    ProcessReconciliationStartedEvent {
+                        call_id: "reattach-1".into(),
+                        process_id: "process-1".into(),
+                    },
+                ),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::ProcessReconciliationCompleted(
+                    ProcessReconciliationCompletedEvent {
+                        call_id: "reattach-1".into(),
+                        process_id: "process-1".into(),
+                        status: ProcessReconciliationStatus::Live,
+                    },
+                ),
+            ),
+        ];
+        let state = replay(&events).expect("replay");
+        let reconciliation = &state.process_reconciliations["reattach-1"];
+        assert_eq!(reconciliation.process_id, "process-1");
+        assert_eq!(
+            reconciliation.status,
+            Some(ProcessReconciliationStatus::Live)
+        );
+        assert_eq!(
+            reconciliation.completed_at,
+            Some(Sequence::new(3).expect("sequence"))
+        );
+
+        assert!(matches!(
+            reduce(
+                Some(state),
+                &envelope(
+                    4,
+                    RuntimeCommittedEvent::ProcessReconciliationCompleted(
+                        ProcessReconciliationCompletedEvent {
+                            call_id: "reattach-1".into(),
+                            process_id: "process-1".into(),
+                            status: ProcessReconciliationStatus::Live,
+                        },
+                    )
+                )
+            ),
+            Err(SessionReducerError::InvalidProcessReconciliationTransition)
+        ));
     }
 
     #[test]

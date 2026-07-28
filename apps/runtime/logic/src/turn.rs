@@ -51,8 +51,9 @@ use crate::{
         ConversationEntryCommittedEvent, ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent,
         ModelRequestCancelledEvent, ModelRequestFailedEvent, ModelRequestProposedEvent,
         ModelRequestStartedEvent, ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent,
-        ModelToolCallProposedEvent, RuntimeCommittedEvent, SchedulerFiredEvent,
-        SessionReducerError, ToolCallApprovedEvent, ToolCallProposedEvent,
+        ModelToolCallProposedEvent, ProcessReconciliationCompletedEvent,
+        ProcessReconciliationStartedEvent, ProcessReconciliationStatus, RuntimeCommittedEvent,
+        SchedulerFiredEvent, SessionReducerError, ToolCallApprovedEvent, ToolCallProposedEvent,
         ToolExecutionCompletedEvent, ToolExecutionDispatchedEvent, ToolExecutionFailedEvent,
         ToolExecutionStartedEvent, ToolExecutionState, ToolOutputObservedEvent, reduce,
     },
@@ -65,6 +66,31 @@ use crate::{
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_STEPS: usize = 16;
 const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
+
+fn process_reconciliation_id(action: &crate::action::ToolCallAction) -> Option<String> {
+    (action.tool == "process.reattach")
+        .then(|| {
+            action
+                .arguments
+                .get("process_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .flatten()
+}
+
+fn process_reconciliation_status(result: &Value) -> ProcessReconciliationStatus {
+    match result.get("recovery_status").and_then(Value::as_str) {
+        Some("live") => ProcessReconciliationStatus::Live,
+        Some("recovered_running_unattached") => {
+            ProcessReconciliationStatus::RecoveredRunningUnattached
+        }
+        Some("recovered_exited") => ProcessReconciliationStatus::RecoveredExited,
+        Some("dispatch_uncertain") => ProcessReconciliationStatus::DispatchUncertain,
+        _ => ProcessReconciliationStatus::Failed,
+    }
+}
 
 #[derive(Clone, Copy)]
 struct JournalPosition {
@@ -1379,11 +1405,13 @@ where
             return Err(RunTurnError::Tool(ToolExecutionError::InvalidReplacement));
         };
         let executable = executable.clone();
+        let reconciliation_process_id = process_reconciliation_id(&executable);
         let action_digest = authorized
             .executable
             .digest()
             .map_err(|_| RunTurnError::Event)?;
         let execution_id = authorized.original.id.0.clone();
+        let mut reconciliation_completed = false;
         if dispatch_mode == ToolDispatchMode::Fresh {
             (position.sequence, position.event_id) = self.commit_next(
                 persistence,
@@ -1397,6 +1425,21 @@ where
                     action_digest,
                 }),
             )?;
+            if let Some(process_id) = &reconciliation_process_id {
+                (position.sequence, position.event_id) = self.commit_next(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position.sequence,
+                    position.event_id,
+                    RuntimeCommittedEvent::ProcessReconciliationStarted(
+                        ProcessReconciliationStartedEvent {
+                            call_id: call_id.to_owned(),
+                            process_id: process_id.clone(),
+                        },
+                    ),
+                )?;
+            }
             (position.sequence, position.event_id) = self.commit_next(
                 persistence,
                 session_id,
@@ -1409,6 +1452,34 @@ where
                     action_digest,
                 }),
             )?;
+        } else if let Some(process_id) = &reconciliation_process_id {
+            let state = persistence
+                .load_session(LoadSessionCommand {
+                    session_directory: session_directory.to_owned(),
+                    expected_session_id: session_id,
+                })
+                .map_err(RunTurnError::Persistence)?
+                .state;
+            if let Some(record) = state.process_reconciliations.get(call_id) {
+                if record.process_id != *process_id {
+                    return Err(RunTurnError::InvalidContinuationPayload);
+                }
+                reconciliation_completed = record.completed_at.is_some();
+            } else {
+                (position.sequence, position.event_id) = self.commit_next(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position.sequence,
+                    position.event_id,
+                    RuntimeCommittedEvent::ProcessReconciliationStarted(
+                        ProcessReconciliationStartedEvent {
+                            call_id: call_id.to_owned(),
+                            process_id: process_id.clone(),
+                        },
+                    ),
+                )?;
+            }
         }
         let receipt_only = matches!(dispatch_mode, ToolDispatchMode::Reconcile { .. });
         let tool_events = match self
@@ -1421,6 +1492,20 @@ where
                 return Err(RunTurnError::AmbiguousToolExecution(call_id.to_owned()));
             }
             Err(error) => {
+                if let Some(process_id) = &reconciliation_process_id
+                    && !reconciliation_completed
+                {
+                    (position.sequence, position.event_id) = self
+                        .commit_process_reconciliation_completed(
+                            persistence,
+                            session_id,
+                            session_directory,
+                            position,
+                            call_id,
+                            process_id,
+                            ProcessReconciliationStatus::Failed,
+                        )?;
+                }
                 (position.sequence, position.event_id) = self.commit_tool_failure(
                     persistence,
                     session_id,
@@ -1461,6 +1546,34 @@ where
             return Err(RunTurnError::InvalidContinuationPayload);
         }
         for event in tool_events.into_iter().skip(observed_event_count) {
+            if let Some(process_id) = &reconciliation_process_id
+                && !reconciliation_completed
+            {
+                let status = match &event {
+                    ToolEvent::Completed { result, .. } => {
+                        Some(process_reconciliation_status(result))
+                    }
+                    ToolEvent::Failed { .. } | ToolEvent::Cancelled { .. } => {
+                        Some(ProcessReconciliationStatus::Failed)
+                    }
+                    ToolEvent::Started { .. }
+                    | ToolEvent::Progress { .. }
+                    | ToolEvent::Output { .. } => None,
+                };
+                if let Some(status) = status {
+                    (position.sequence, position.event_id) = self
+                        .commit_process_reconciliation_completed(
+                            persistence,
+                            session_id,
+                            session_directory,
+                            position,
+                            call_id,
+                            process_id,
+                            status,
+                        )?;
+                    reconciliation_completed = true;
+                }
+            }
             let payload = match event {
                 ToolEvent::Started { call_id } => {
                     RuntimeCommittedEvent::ToolExecutionStarted(ToolExecutionStartedEvent {
@@ -1550,6 +1663,33 @@ where
             &final_result,
             artifact.as_deref(),
             truncated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_process_reconciliation_completed(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        position: JournalPosition,
+        call_id: &str,
+        process_id: &str,
+        status: ProcessReconciliationStatus,
+    ) -> Result<(Sequence, agentmod_primitives::EventId), RunTurnError> {
+        self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ProcessReconciliationCompleted(
+                ProcessReconciliationCompletedEvent {
+                    call_id: call_id.into(),
+                    process_id: process_id.into(),
+                    status,
+                },
+            ),
         )
     }
 
@@ -2443,6 +2583,28 @@ mod tests {
                 Some(ToolExecutionState::Terminal),
             ),
             ApprovalRecoveryAction::Idempotent
+        );
+    }
+
+    #[test]
+    fn process_reconciliation_classification_is_bounded_and_explicit() {
+        assert_eq!(
+            process_reconciliation_status(&json!({"recovery_status":"live"})),
+            ProcessReconciliationStatus::Live
+        );
+        assert_eq!(
+            process_reconciliation_status(
+                &json!({"recovery_status":"recovered_running_unattached"})
+            ),
+            ProcessReconciliationStatus::RecoveredRunningUnattached
+        );
+        assert_eq!(
+            process_reconciliation_status(&json!({"recovery_status":"dispatch_uncertain"})),
+            ProcessReconciliationStatus::DispatchUncertain
+        );
+        assert_eq!(
+            process_reconciliation_status(&json!({"recovery_status":"unexpected"})),
+            ProcessReconciliationStatus::Failed
         );
     }
 

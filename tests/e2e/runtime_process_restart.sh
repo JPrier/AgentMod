@@ -121,4 +121,7 @@ process_count=$(find "$process_root" -mindepth 1 -maxdepth 1 -type d | wc -l | t
 for tool in process.start_pty process.reattach process.input process.read process.wait; do
     grep -F "$tool" "$journal" >/dev/null
 done
+[ "$(grep -c '"event_type":"process.reconciliation_started"' "$journal")" = 1 ]
+[ "$(grep -c '"event_type":"process.reconciliation_completed"' "$journal")" = 1 ]
+grep -F '"status":"live"' "$journal" >/dev/null
 echo "runtime restart preserved one PTY, reattached it, exchanged input/output, and committed exit without redispatch"

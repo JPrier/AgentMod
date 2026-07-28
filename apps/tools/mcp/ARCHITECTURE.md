@@ -23,6 +23,14 @@ an event ID triggers at most three GET resumptions carrying the exact
 `MCP-Session-Id` and `Last-Event-ID`; progress is retained and only the selected
 JSON-RPC request's terminal result is accepted.
 
+Streamable HTTP recovery state is stored as an atomically replaced,
+checksum-protected dependency record. It binds the configured server identity,
+runtime owner/session, MCP session ID, last event ID, pending JSON-RPC request
+ID, and normalized operation digest. A new host instance resumes only an exact
+pending operation with GET; a different operation or changed server identity
+fails closed. The previous cursor is suppressed if a server replays it, and a
+terminal result clears the pending request before the next operation.
+
 `apps/tools/mcp/catalog/catalog.json` is an inert curated catalog. Every entry is
 disabled by default and requires explicit installation and activation; the host never
 downloads or executes catalog entries automatically.
@@ -30,15 +38,15 @@ downloads or executes catalog entries automatically.
 Tests include deterministic mock discovery/calls, a real compiled stdio MCP fixture
 covering initialization, protocol negotiation, tool discovery, progress, invocation,
 and shutdown, and a real loopback HTTP fixture which verifies session/cursor-bound
-SSE resumption. `tests/e2e/runtime_mcp_invoke.ps1` compiles a standalone external
+SSE resumption, including destruction and reconstruction of the dependency
+between progress and terminal delivery. `tests/e2e/runtime_mcp_invoke.ps1`
+compiles a standalone external
 stdio server and proves a configured call through the CLI, runtime policy, host,
 canonical progress/result events, provider continuation, and durable authorization
 replay state; the matching Unix script exercises the same topology.
 
 Current limitations:
 
-- Streamable HTTP session/event cursors survive reconnects within the host process;
-  persistence across a host restart is not implemented.
 - OAuth authorization-code flows are pending. Bearer credentials are supported only
   through environment-backed secret references.
 - Resource templates and prompt argument schemas are preserved only in raw provider

@@ -85,8 +85,8 @@ The Windows process E2Es are `runtime_git_loop.ps1`,
 present. The invocation fixture emits a real MCP progress notification and
 terminal tool result, both of which are committed before provider continuation.
 
-Process restart reconciliation, interactive browser authentication handoff, runtime-wide tool discovery, active cross-host
-cancellation, MCP OAuth and restart-persistent HTTP cursors, and broader
-reconnect/recovery acceptance tests remain open. In-process MCP HTTP reconnect
-is covered by a real loopback server test which verifies exact session and event
-cursor headers.
+Interactive browser authentication handoff, runtime-wide tool discovery, active
+cross-host cancellation, MCP OAuth, and broader reconnect/recovery acceptance
+tests remain open. MCP HTTP recovery is covered by a real loopback server test
+which reconstructs the dependency and verifies exact session, operation, and
+event-cursor binding.

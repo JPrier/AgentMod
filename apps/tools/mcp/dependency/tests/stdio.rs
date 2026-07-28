@@ -45,6 +45,7 @@ async fn stdio_server_negotiates_discovers_and_invokes() {
         authorization_session: "session".to_owned(),
         authorization_key_hex: encode_hex(&KEY),
         authorization_replay_root: root.path().join("authorization-replay"),
+        http_state_root: root.path().join("http-state"),
     })
     .expect("dependency");
     let capabilities = dependency

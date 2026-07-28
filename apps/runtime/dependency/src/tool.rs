@@ -298,11 +298,21 @@ impl ProcessToolHostDependency {
                     .join("artifacts")
                     .join("mcp")
                     .join("authorization-replay");
+                let http_state_root = self
+                    .config
+                    .state_root
+                    .as_ref()
+                    .ok_or(ToolHostDependencyError::InvalidConfiguration)?
+                    .join(session_id.to_string())
+                    .join("artifacts")
+                    .join("mcp")
+                    .join("http-state");
                 command
                     .env("AGENTMOD_MCP_AUTH_KEY", authorization_key)
                     .env("AGENTMOD_MCP_OWNER", &self.config.owner)
                     .env("AGENTMOD_MCP_SESSION", session_id.to_string())
-                    .env("AGENTMOD_MCP_REPLAY_ROOT", replay_root);
+                    .env("AGENTMOD_MCP_REPLAY_ROOT", replay_root)
+                    .env("AGENTMOD_MCP_HTTP_STATE_ROOT", http_state_root);
                 if let Some(servers) = std::env::var_os("AGENTMOD_MCP_SERVERS_JSON") {
                     command.env("AGENTMOD_MCP_SERVERS_JSON", servers);
                 }

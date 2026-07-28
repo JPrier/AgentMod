@@ -95,6 +95,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         authorization_replay_root: std::env::var_os("AGENTMOD_MCP_REPLAY_ROOT")
             .map(std::path::PathBuf::from)
             .ok_or("AGENTMOD_MCP_REPLAY_ROOT is required")?,
+        http_state_root: std::env::var_os("AGENTMOD_MCP_HTTP_STATE_ROOT")
+            .map(std::path::PathBuf::from)
+            .ok_or("AGENTMOD_MCP_HTTP_STATE_ROOT is required")?,
     })?;
     let shutdown = dependency.clone();
     let service = Arc::new(McpHostService::new(McpLogic::new(McpData::new(dependency))));

@@ -1,9 +1,10 @@
 //! MCP transport, lifecycle, capability, and protocol adapters.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
+    fs,
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -96,6 +97,8 @@ pub struct McpDependencyConfig {
     pub authorization_key_hex: String,
     /// Durable single-use nonce records.
     pub authorization_replay_root: PathBuf,
+    /// Durable Streamable HTTP session, cursor, and pending-request records.
+    pub http_state_root: PathBuf,
 }
 
 /// Dependency-owned exact action authorization.
@@ -256,17 +259,192 @@ struct StdioConnection {
     stdout: BufReader<ChildStdout>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PendingHttpRequest {
+    request_id: String,
+    operation_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct DurableHttpState {
+    schema_version: u32,
+    server_id: String,
+    server_identity: String,
+    owner: String,
+    authorization_session: String,
+    session_id: Option<String>,
+    last_event_id: Option<String>,
+    pending_request: Option<PendingHttpRequest>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct StoredHttpState {
+    checksum: String,
+    state: DurableHttpState,
+}
+
 #[derive(Default)]
 struct RuntimeState {
     initialized: bool,
     session_id: Option<String>,
     last_event_id: Option<String>,
+    pending_request: Option<PendingHttpRequest>,
     stdio: Option<StdioConnection>,
 }
 
 struct Server {
     config: DependencyServerConfig,
+    http_state_path: Option<PathBuf>,
+    identity: String,
+    http_request_lock: Mutex<()>,
     state: Mutex<RuntimeState>,
+}
+
+fn server_identity(
+    server: &DependencyServerConfig,
+    owner: &str,
+    authorization_session: &str,
+) -> Result<String, McpDependencyError> {
+    let transport = match &server.transport {
+        DependencyTransportConfig::StreamableHttp {
+            url,
+            bearer_token_environment,
+        } => json!({
+            "transport": "streamable_http",
+            "url": url,
+            "bearer_token_environment": bearer_token_environment,
+        }),
+        DependencyTransportConfig::Stdio { .. } => json!({"transport":"stdio"}),
+        DependencyTransportConfig::Mock { .. } => json!({"transport":"mock"}),
+    };
+    serde_json::to_vec(&json!({
+        "server_id": server.id,
+        "owner": owner,
+        "authorization_session": authorization_session,
+        "transport": transport,
+    }))
+    .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+    .map_err(|_| McpDependencyError::InvalidConfiguration)
+}
+
+fn load_http_state(
+    path: &Path,
+    server: &DependencyServerConfig,
+    identity: &str,
+    owner: &str,
+    authorization_session: &str,
+) -> Result<Option<DurableHttpState>, McpDependencyError> {
+    let backup = path.with_extension("backup");
+    let primary = read_http_state(path);
+    let fallback = read_http_state(&backup);
+    let selected = match (primary, fallback) {
+        (Ok(Some(state)), _) => {
+            if backup.exists() {
+                fs::remove_file(&backup).map_err(|_| McpDependencyError::HttpState)?;
+            }
+            Some(state)
+        }
+        (Ok(None) | Err(_), Ok(Some(state))) => {
+            if path.exists() {
+                fs::remove_file(path).map_err(|_| McpDependencyError::HttpState)?;
+            }
+            fs::rename(&backup, path).map_err(|_| McpDependencyError::HttpState)?;
+            Some(state)
+        }
+        (Ok(None), Ok(None)) => None,
+        (Ok(None), Err(_)) | (Err(_), Ok(None) | Err(_)) => {
+            return Err(McpDependencyError::HttpState);
+        }
+    };
+    let Some(state) = selected else {
+        return Ok(None);
+    };
+    if state.schema_version != 1
+        || state.server_id != server.id
+        || state.server_identity != identity
+        || state.owner != owner
+        || state.authorization_session != authorization_session
+        || state
+            .session_id
+            .as_deref()
+            .is_some_and(|value| !valid_http_identifier(value))
+        || state
+            .last_event_id
+            .as_deref()
+            .is_some_and(|value| !valid_http_identifier(value))
+        || state.pending_request.as_ref().is_some_and(|pending| {
+            !valid_http_identifier(&pending.request_id)
+                || pending.operation_hash.len() != 64
+                || !pending
+                    .operation_hash
+                    .bytes()
+                    .all(|value| value.is_ascii_hexdigit())
+                || state.session_id.is_none()
+                || state.last_event_id.is_none()
+        })
+    {
+        return Err(McpDependencyError::HttpState);
+    }
+    Ok(Some(state))
+}
+
+fn read_http_state(path: &Path) -> Result<Option<DurableHttpState>, McpDependencyError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).map_err(|_| McpDependencyError::HttpState)?;
+    let stored: StoredHttpState =
+        serde_json::from_slice(&bytes).map_err(|_| McpDependencyError::HttpState)?;
+    let checksum = serde_json::to_vec(&stored.state)
+        .map(|value| blake3::hash(&value).to_hex().to_string())
+        .map_err(|_| McpDependencyError::HttpState)?;
+    if checksum != stored.checksum {
+        return Err(McpDependencyError::HttpState);
+    }
+    Ok(Some(stored.state))
+}
+
+fn write_http_state(path: &Path, state: &DurableHttpState) -> Result<(), McpDependencyError> {
+    let bytes = serde_json::to_vec(state).map_err(|_| McpDependencyError::HttpState)?;
+    let stored = StoredHttpState {
+        checksum: blake3::hash(&bytes).to_hex().to_string(),
+        state: state.clone(),
+    };
+    let temporary = path.with_extension(format!("{}.next", uuid::Uuid::now_v7()));
+    let backup = path.with_extension("backup");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| McpDependencyError::HttpState)?;
+    serde_json::to_writer(&mut file, &stored).map_err(|_| McpDependencyError::HttpState)?;
+    file.write_all(b"\n")
+        .and_then(|()| file.sync_all())
+        .map_err(|_| McpDependencyError::HttpState)?;
+    if backup.exists() {
+        fs::remove_file(&backup).map_err(|_| McpDependencyError::HttpState)?;
+    }
+    if path.exists() {
+        fs::rename(path, &backup).map_err(|_| McpDependencyError::HttpState)?;
+    }
+    if fs::rename(&temporary, path).is_err() {
+        if backup.exists() {
+            let _ = fs::rename(&backup, path);
+        }
+        let _ = fs::remove_file(&temporary);
+        return Err(McpDependencyError::HttpState);
+    }
+    if backup.exists() {
+        fs::remove_file(backup).map_err(|_| McpDependencyError::HttpState)?;
+    }
+    Ok(())
+}
+
+fn valid_http_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 1_024
+        && !value.chars().any(char::is_control)
+        && !value.contains(['\r', '\n'])
 }
 
 /// First-party MCP dependency.
@@ -295,29 +473,65 @@ impl McpDependency {
             || config.authorization_owner.trim().is_empty()
             || config.authorization_session.trim().is_empty()
             || config.authorization_replay_root.as_os_str().is_empty()
+            || config.http_state_root.as_os_str().is_empty()
         {
             return Err(McpDependencyError::InvalidConfiguration);
         }
         let authorization_key = AuthorizationKey::from_hex(&config.authorization_key_hex)
             .map_err(|_| McpDependencyError::InvalidConfiguration)?;
         config.authorization_key_hex.clear();
-        std::fs::create_dir_all(&config.authorization_replay_root)
-            .map_err(|_| McpDependencyError::ReplayState)?;
-        let mut servers = BTreeMap::new();
+        let mut server_ids = BTreeSet::new();
         for server in &config.servers {
             validate_server(server)?;
-            if servers
-                .insert(
-                    server.id.clone(),
-                    Arc::new(Server {
-                        config: server.clone(),
-                        state: Mutex::new(RuntimeState::default()),
-                    }),
-                )
-                .is_some()
-            {
+            if !server_ids.insert(server.id.clone()) {
                 return Err(McpDependencyError::InvalidConfiguration);
             }
+        }
+        std::fs::create_dir_all(&config.authorization_replay_root)
+            .map_err(|_| McpDependencyError::ReplayState)?;
+        fs::create_dir_all(&config.http_state_root).map_err(|_| McpDependencyError::HttpState)?;
+        let mut servers = BTreeMap::new();
+        for server in &config.servers {
+            let identity = server_identity(
+                server,
+                &config.authorization_owner,
+                &config.authorization_session,
+            )?;
+            let http_state_path = matches!(
+                server.transport,
+                DependencyTransportConfig::StreamableHttp { .. }
+            )
+            .then(|| config.http_state_root.join(format!("{}.json", server.id)));
+            let durable = http_state_path
+                .as_deref()
+                .map(|path| {
+                    load_http_state(
+                        path,
+                        server,
+                        &identity,
+                        &config.authorization_owner,
+                        &config.authorization_session,
+                    )
+                })
+                .transpose()?
+                .flatten();
+            servers.insert(
+                server.id.clone(),
+                Arc::new(Server {
+                    config: server.clone(),
+                    http_state_path,
+                    identity,
+                    http_request_lock: Mutex::new(()),
+                    state: Mutex::new(RuntimeState {
+                        session_id: durable.as_ref().and_then(|state| state.session_id.clone()),
+                        last_event_id: durable
+                            .as_ref()
+                            .and_then(|state| state.last_event_id.clone()),
+                        pending_request: durable.and_then(|state| state.pending_request),
+                        ..RuntimeState::default()
+                    }),
+                }),
+            );
         }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -533,11 +747,83 @@ impl McpDependency {
         }
     }
 
+    fn persist_http_runtime_state(
+        &self,
+        server: &Server,
+        state: &RuntimeState,
+    ) -> Result<(), McpDependencyError> {
+        let Some(path) = &server.http_state_path else {
+            return Ok(());
+        };
+        write_http_state(
+            path,
+            &DurableHttpState {
+                schema_version: 1,
+                server_id: server.config.id.clone(),
+                server_identity: server.identity.clone(),
+                owner: self.config.authorization_owner.clone(),
+                authorization_session: self.config.authorization_session.clone(),
+                session_id: state.session_id.clone(),
+                last_event_id: state.last_event_id.clone(),
+                pending_request: state.pending_request.clone(),
+            },
+        )
+    }
+
+    async fn update_http_session(
+        &self,
+        server: &Server,
+        response: &reqwest::Response,
+    ) -> Result<(), McpDependencyError> {
+        let Some(session) = response
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Ok(());
+        };
+        if !valid_http_identifier(session) {
+            return Err(McpDependencyError::Protocol);
+        }
+        let mut state = server.state.lock().await;
+        if state.session_id.as_deref() != Some(session) {
+            state.last_event_id = None;
+            state.pending_request = None;
+        }
+        state.session_id = Some(session.to_owned());
+        self.persist_http_runtime_state(server, &state)
+    }
+
+    async fn update_http_cursor(
+        &self,
+        server: &Server,
+        last_event_id: Option<String>,
+        pending_request: Option<PendingHttpRequest>,
+    ) -> Result<(), McpDependencyError> {
+        if last_event_id
+            .as_deref()
+            .is_some_and(|value| !valid_http_identifier(value))
+        {
+            return Err(McpDependencyError::Protocol);
+        }
+        let mut state = server.state.lock().await;
+        if let Some(last_event_id) = last_event_id {
+            state.last_event_id = Some(last_event_id);
+        }
+        state.pending_request = pending_request;
+        self.persist_http_runtime_state(server, &state)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the transport transaction keeps durable pending-state writes adjacent to each network boundary"
+    )]
     async fn http_request(
         &self,
         server: &Server,
         request: Value,
     ) -> Result<(Value, Vec<DependencyProgress>), McpDependencyError> {
+        let _request_guard = server.http_request_lock.lock().await;
         let DependencyTransportConfig::StreamableHttp {
             url,
             bearer_token_environment,
@@ -549,6 +835,34 @@ impl McpDependency {
             .get("id")
             .and_then(Value::as_str)
             .ok_or(McpDependencyError::Protocol)?;
+        let operation_hash = http_operation_hash(&request)?;
+        let persisted = {
+            let state = server.state.lock().await;
+            state.pending_request.clone().map(|pending| {
+                (
+                    pending,
+                    state.session_id.clone(),
+                    state.last_event_id.clone(),
+                )
+            })
+        };
+        if let Some((pending, Some(session_id), Some(last_event_id))) = persisted {
+            if pending.operation_hash != operation_hash {
+                return Err(McpDependencyError::CursorConflict);
+            }
+            return self
+                .resume_http_request(
+                    server,
+                    url,
+                    bearer_token_environment.as_deref(),
+                    &pending.request_id,
+                    &operation_hash,
+                    session_id,
+                    last_event_id,
+                    Vec::new(),
+                )
+                .await;
+        }
         let mut builder = self
             .client
             .post(url)
@@ -566,31 +880,78 @@ impl McpDependency {
             .send()
             .await
             .map_err(|_| McpDependencyError::Transport)?;
-        update_http_session(server, &response).await;
+        self.update_http_session(server, &response).await?;
         if !response.status().is_success() {
             return Err(McpDependencyError::RemoteError);
         }
-        let mut parsed =
-            read_http_response(response, request_id, self.config.maximum_message_bytes).await?;
-        if let Some(event_id) = &parsed.last_event_id {
-            server.state.lock().await.last_event_id = Some(event_id.clone());
-        }
+        let previous_event_id = server.state.lock().await.last_event_id.clone();
+        let parsed = read_http_response(
+            response,
+            request_id,
+            self.config.maximum_message_bytes,
+            previous_event_id.as_deref(),
+        )
+        .await?;
         if let Some(result) = parsed.result {
+            self.update_http_cursor(server, parsed.last_event_id, None)
+                .await?;
             return Ok((result, parsed.progress));
         }
-        let mut last_event_id = parsed
+        let last_event_id = parsed
             .last_event_id
-            .or_else(|| server.state.try_lock().ok()?.last_event_id.clone())
+            .or(previous_event_id)
             .ok_or(McpDependencyError::Protocol)?;
+        let session_id = server
+            .state
+            .lock()
+            .await
+            .session_id
+            .clone()
+            .ok_or(McpDependencyError::Protocol)?;
+        self.update_http_cursor(
+            server,
+            Some(last_event_id.clone()),
+            Some(PendingHttpRequest {
+                request_id: request_id.to_owned(),
+                operation_hash: operation_hash.clone(),
+            }),
+        )
+        .await?;
+        self.resume_http_request(
+            server,
+            url,
+            bearer_token_environment.as_deref(),
+            request_id,
+            &operation_hash,
+            session_id,
+            last_event_id,
+            parsed.progress,
+        )
+        .await
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the dependency binds every durable HTTP resumption identity explicitly"
+    )]
+    async fn resume_http_request(
+        &self,
+        server: &Server,
+        url: &str,
+        bearer_token_environment: Option<&str>,
+        request_id: &str,
+        operation_hash: &str,
+        session_id: String,
+        mut last_event_id: String,
+        mut progress: Vec<DependencyProgress>,
+    ) -> Result<(Value, Vec<DependencyProgress>), McpDependencyError> {
         for _ in 0..HTTP_RESUME_ATTEMPTS {
             let mut resume = self
                 .client
                 .get(url)
                 .header("accept", "text/event-stream")
-                .header("last-event-id", &last_event_id);
-            if let Some(session_id) = server.state.lock().await.session_id.clone() {
-                resume = resume.header("mcp-session-id", session_id);
-            }
+                .header("last-event-id", &last_event_id)
+                .header("mcp-session-id", &session_id);
             if let Some(variable) = bearer_token_environment {
                 let token =
                     std::env::var(variable).map_err(|_| McpDependencyError::SecretUnavailable)?;
@@ -600,20 +961,38 @@ impl McpDependency {
                 .send()
                 .await
                 .map_err(|_| McpDependencyError::Transport)?;
-            update_http_session(server, &response).await;
+            self.update_http_session(server, &response).await?;
+            if server.state.lock().await.session_id.as_deref() != Some(session_id.as_str()) {
+                return Err(McpDependencyError::Protocol);
+            }
             if !response.status().is_success() {
                 return Err(McpDependencyError::RemoteError);
             }
-            let resumed =
-                read_http_response(response, request_id, self.config.maximum_message_bytes).await?;
-            parsed.progress.extend(resumed.progress);
+            let resumed = read_http_response(
+                response,
+                request_id,
+                self.config.maximum_message_bytes,
+                Some(&last_event_id),
+            )
+            .await?;
+            progress.extend(resumed.progress);
             if let Some(event_id) = resumed.last_event_id {
                 last_event_id.clone_from(&event_id);
-                server.state.lock().await.last_event_id = Some(event_id);
             }
             if let Some(result) = resumed.result {
-                return Ok((result, parsed.progress));
+                self.update_http_cursor(server, Some(last_event_id), None)
+                    .await?;
+                return Ok((result, progress));
             }
+            self.update_http_cursor(
+                server,
+                Some(last_event_id.clone()),
+                Some(PendingHttpRequest {
+                    request_id: request_id.to_owned(),
+                    operation_hash: operation_hash.to_owned(),
+                }),
+            )
+            .await?;
         }
         Err(McpDependencyError::ResumeExhausted)
     }
@@ -625,24 +1004,11 @@ struct ParsedHttpResponse {
     last_event_id: Option<String>,
 }
 
-async fn update_http_session(server: &Server, response: &reqwest::Response) {
-    if let Some(session) = response
-        .headers()
-        .get("mcp-session-id")
-        .and_then(|value| value.to_str().ok())
-    {
-        let mut state = server.state.lock().await;
-        if state.session_id.as_deref() != Some(session) {
-            state.last_event_id = None;
-        }
-        state.session_id = Some(session.to_owned());
-    }
-}
-
 async fn read_http_response(
     response: reqwest::Response,
     request_id: &str,
     maximum_message_bytes: usize,
+    previous_event_id: Option<&str>,
 ) -> Result<ParsedHttpResponse, McpDependencyError> {
     let is_sse = response
         .headers()
@@ -657,7 +1023,7 @@ async fn read_http_response(
         return Err(McpDependencyError::MessageTooLarge);
     }
     if is_sse || bytes.starts_with(b"data:") || bytes.starts_with(b"id:") {
-        parse_sse_response(&bytes, request_id)
+        parse_sse_response(&bytes, request_id, previous_event_id)
     } else {
         let value: Value =
             serde_json::from_slice(&bytes).map_err(|_| McpDependencyError::Protocol)?;
@@ -673,22 +1039,30 @@ async fn read_http_response(
 fn parse_sse_response(
     bytes: &[u8],
     request_id: &str,
+    previous_event_id: Option<&str>,
 ) -> Result<ParsedHttpResponse, McpDependencyError> {
     let text = std::str::from_utf8(bytes).map_err(|_| McpDependencyError::Protocol)?;
     let mut result = None;
     let mut progress = Vec::new();
-    let mut last_event_id = None;
+    let mut last_event_id = previous_event_id.map(str::to_owned);
     let mut event_id = None;
     let mut data = Vec::new();
+    let mut saw_frame = false;
     for line in text.lines().chain(std::iter::once("")) {
         let line = line.strip_suffix('\r').unwrap_or(line);
         if line.is_empty() {
             if data.is_empty() {
                 event_id = None;
             } else {
+                saw_frame = true;
                 let value: Value = serde_json::from_str(&data.join("\n"))
                     .map_err(|_| McpDependencyError::Protocol)?;
-                if let Some(id) = event_id.take().filter(|id: &String| !id.is_empty()) {
+                let id = event_id.take().filter(|id: &String| !id.is_empty());
+                if id.as_deref() == last_event_id.as_deref() {
+                    data.clear();
+                    continue;
+                }
+                if let Some(id) = id {
                     last_event_id = Some(id);
                 }
                 if value.get("method").and_then(Value::as_str) == Some("notifications/progress") {
@@ -716,7 +1090,7 @@ fn parse_sse_response(
             data.push(value.trim_start().to_owned());
         }
     }
-    if result.is_none() && progress.is_empty() && last_event_id.is_none() {
+    if result.is_none() && progress.is_empty() && !saw_frame {
         return Err(McpDependencyError::Protocol);
     }
     Ok(ParsedHttpResponse {
@@ -895,6 +1269,17 @@ fn canonical_operation(
     let normalized = normalize_json(arguments);
     serde_json::to_vec(&(action, cancellation_id, normalized))
         .map_err(|_| McpDependencyError::Authorization)
+}
+
+fn http_operation_hash(request: &Value) -> Result<String, McpDependencyError> {
+    let mut operation = request.clone();
+    operation
+        .as_object_mut()
+        .ok_or(McpDependencyError::Protocol)?
+        .remove("id");
+    serde_json::to_vec(&normalize_json(&operation))
+        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        .map_err(|_| McpDependencyError::Protocol)
 }
 
 fn normalize_json(value: &Value) -> Value {
@@ -1088,6 +1473,9 @@ pub enum McpDependencyError {
     /// Durable replay state could not be read or written safely.
     #[error("MCP authorization replay state unavailable")]
     ReplayState,
+    /// Durable HTTP session or cursor state is corrupt or unavailable.
+    #[error("MCP HTTP recovery state unavailable")]
+    HttpState,
     /// Transport failed.
     #[error("MCP transport failed")]
     Transport,
@@ -1103,6 +1491,9 @@ pub enum McpDependencyError {
     /// Resumable Streamable HTTP never produced the requested terminal result.
     #[error("MCP resumable HTTP attempts were exhausted")]
     ResumeExhausted,
+    /// A different operation attempted to reuse a pending server cursor.
+    #[error("MCP resumable HTTP cursor is bound to another operation")]
+    CursorConflict,
     /// Request cancelled.
     #[error("MCP request was cancelled")]
     Cancelled,
@@ -1157,6 +1548,7 @@ mod tests {
             authorization_session: "session".into(),
             authorization_key_hex: encode_hex(&KEY),
             authorization_replay_root: root.join("replay"),
+            http_state_root: root.join("http-state"),
         })
         .expect("dependency")
     }
@@ -1330,6 +1722,7 @@ mod tests {
 
     #[test]
     fn unsafe_stdio_environment_and_plain_http_are_rejected() {
+        let root = tempfile::tempdir().expect("root");
         let bad = McpDependency::new(McpDependencyConfig {
             servers: vec![DependencyServerConfig {
                 id: "bad".to_owned(),
@@ -1348,9 +1741,85 @@ mod tests {
             authorization_owner: "owner".into(),
             authorization_session: "session".into(),
             authorization_key_hex: encode_hex(&KEY),
-            authorization_replay_root: PathBuf::from("replay"),
+            authorization_replay_root: root.path().join("replay"),
+            http_state_root: root.path().join("http-state"),
         });
         assert!(matches!(bad, Err(McpDependencyError::InvalidConfiguration)));
+    }
+
+    #[test]
+    fn persisted_http_state_is_bound_to_exact_server_owner_and_session() {
+        let root = tempfile::tempdir().expect("root");
+        let config = |url: &str, owner: &str, session: &str| McpDependencyConfig {
+            servers: vec![DependencyServerConfig {
+                id: "bound".into(),
+                display_name: "Bound".into(),
+                active: true,
+                transport: DependencyTransportConfig::StreamableHttp {
+                    url: url.to_owned(),
+                    bearer_token_environment: None,
+                },
+            }],
+            client_name: "agentmod".into(),
+            client_version: "0.1.0".into(),
+            request_timeout: Duration::from_secs(1),
+            maximum_message_bytes: 1024,
+            maximum_servers: 1,
+            authorization_owner: owner.to_owned(),
+            authorization_session: session.to_owned(),
+            authorization_key_hex: encode_hex(&KEY),
+            authorization_replay_root: root.path().join("replay"),
+            http_state_root: root.path().join("http-state"),
+        };
+        let dependency = McpDependency::new(config("http://127.0.0.1:1/mcp", "owner", "session"))
+            .expect("dependency");
+        let server = dependency.server("bound").expect("server");
+        write_http_state(
+            server.http_state_path.as_deref().expect("state path"),
+            &DurableHttpState {
+                schema_version: 1,
+                server_id: "bound".into(),
+                server_identity: server.identity.clone(),
+                owner: "owner".into(),
+                authorization_session: "session".into(),
+                session_id: Some("mcp-session".into()),
+                last_event_id: Some("event-1".into()),
+                pending_request: Some(PendingHttpRequest {
+                    request_id: "request-1".into(),
+                    operation_hash: "a".repeat(64),
+                }),
+            },
+        )
+        .expect("write state");
+        let state_path = server.http_state_path.clone().expect("state path");
+        drop(server);
+        drop(dependency);
+
+        let backup = state_path.with_extension("backup");
+        fs::rename(&state_path, &backup).expect("interrupted backup");
+        fs::write(&state_path, b"truncated").expect("corrupt primary");
+        let recovered = McpDependency::new(config("http://127.0.0.1:1/mcp", "owner", "session"))
+            .expect("backup recovery");
+        drop(recovered);
+        assert!(state_path.exists());
+        assert!(!backup.exists());
+        assert!(matches!(
+            McpDependency::new(config("http://127.0.0.1:2/mcp", "owner", "session")),
+            Err(McpDependencyError::HttpState)
+        ));
+        assert!(matches!(
+            McpDependency::new(config("http://127.0.0.1:1/mcp", "other", "session")),
+            Err(McpDependencyError::HttpState)
+        ));
+        assert!(matches!(
+            McpDependency::new(config("http://127.0.0.1:1/mcp", "owner", "other")),
+            Err(McpDependencyError::HttpState)
+        ));
+        fs::write(&state_path, b"corrupt").expect("corrupt state");
+        assert!(matches!(
+            McpDependency::new(config("http://127.0.0.1:1/mcp", "owner", "session")),
+            Err(McpDependencyError::HttpState)
+        ));
     }
 
     #[tokio::test]
@@ -1423,6 +1892,7 @@ mod tests {
             authorization_session: "session".into(),
             authorization_key_hex: encode_hex(&KEY),
             authorization_replay_root: root.path().join("replay"),
+            http_state_root: root.path().join("http-state"),
         })
         .expect("dependency");
         let server = dependency.server("http-fixture").expect("server");
@@ -1439,6 +1909,124 @@ mod tests {
         server_task.await.expect("server task");
     }
 
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the restart fixture asserts every POST/GET cursor boundary in one server lifecycle"
+    )]
+    async fn streamable_http_pending_cursor_resumes_after_dependency_restart() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_task = tokio::spawn(async move {
+            let mut request_id = String::new();
+            for index in 1..=4 {
+                let (mut connection, _) = listener.accept().await.expect("connection");
+                let request = read_test_http_request(&mut connection).await;
+                if index == 1 {
+                    assert!(request.starts_with("POST /mcp "));
+                    let body = request.split_once("\r\n\r\n").expect("body").1;
+                    let message: Value = serde_json::from_str(body).expect("request JSON");
+                    request_id = message["id"].as_str().expect("request ID").to_owned();
+                } else {
+                    assert!(request.starts_with("GET /mcp "));
+                    let lower = request.to_ascii_lowercase();
+                    assert!(
+                        lower.contains(&format!("\r\nlast-event-id: restart-{}\r\n", index - 1))
+                    );
+                    assert!(lower.contains("\r\nmcp-session-id: restart-session\r\n"));
+                }
+                let body = format!(
+                    "id: restart-{index}\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progress\":{index}}}}}\n\n"
+                );
+                write_test_http_response(
+                    &mut connection,
+                    &body,
+                    &[
+                        ("content-type", "text/event-stream"),
+                        ("mcp-session-id", "restart-session"),
+                    ],
+                )
+                .await;
+            }
+
+            let (mut recovered, _) = listener.accept().await.expect("recovered GET");
+            let recovered_request = read_test_http_request(&mut recovered).await;
+            let lower = recovered_request.to_ascii_lowercase();
+            assert!(recovered_request.starts_with("GET /mcp "));
+            assert!(lower.contains("\r\nlast-event-id: restart-4\r\n"));
+            assert!(lower.contains("\r\nmcp-session-id: restart-session\r\n"));
+            let body = format!(
+                "id: restart-5\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"value\":\"recovered\"}}}}\n\n"
+            );
+            write_test_http_response(
+                &mut recovered,
+                &body,
+                &[
+                    ("content-type", "text/event-stream"),
+                    ("mcp-session-id", "restart-session"),
+                ],
+            )
+            .await;
+        });
+        let root = tempfile::tempdir().expect("root");
+        let make_dependency = || {
+            McpDependency::new(McpDependencyConfig {
+                servers: vec![DependencyServerConfig {
+                    id: "restart-fixture".into(),
+                    display_name: "Restart fixture".into(),
+                    active: true,
+                    transport: DependencyTransportConfig::StreamableHttp {
+                        url: format!("http://{address}/mcp"),
+                        bearer_token_environment: None,
+                    },
+                }],
+                client_name: "agentmod".into(),
+                client_version: "0.1.0".into(),
+                request_timeout: Duration::from_secs(2),
+                maximum_message_bytes: 64 * 1024,
+                maximum_servers: 1,
+                authorization_owner: "owner".into(),
+                authorization_session: "session".into(),
+                authorization_key_hex: encode_hex(&KEY),
+                authorization_replay_root: root.path().join("replay"),
+                http_state_root: root.path().join("http-state"),
+            })
+            .expect("dependency")
+        };
+        let dependency = make_dependency();
+        let server = dependency.server("restart-fixture").expect("server");
+        assert_eq!(
+            dependency
+                .request(&server, "fixture/restart", json!({"value":1}), None)
+                .await,
+            Err(McpDependencyError::ResumeExhausted)
+        );
+        drop(server);
+        drop(dependency);
+
+        let recovered = make_dependency();
+        let server = recovered.server("restart-fixture").expect("server");
+        assert_eq!(
+            recovered
+                .request(&server, "fixture/other", json!({"value":1}), None)
+                .await,
+            Err(McpDependencyError::CursorConflict)
+        );
+        let (result, progress) = recovered
+            .request(&server, "fixture/restart", json!({"value":1}), None)
+            .await
+            .expect("recovered result");
+        assert_eq!(result["value"], "recovered");
+        assert!(progress.is_empty());
+        let state = server.state.lock().await;
+        assert_eq!(state.last_event_id.as_deref(), Some("restart-5"));
+        assert!(state.pending_request.is_none());
+        drop(state);
+        server_task.await.expect("server task");
+    }
+
     #[test]
     fn multi_event_sse_preserves_progress_cursor_and_terminal_result() {
         let parsed = parse_sse_response(
@@ -1452,6 +2040,7 @@ data: {"jsonrpc":"2.0","id":"request-1","result":{"content":[{"type":"text","tex
 
 "#,
             "request-1",
+            None,
         )
         .expect("SSE");
         assert_eq!(parsed.last_event_id.as_deref(), Some("event-42"));
@@ -1464,6 +2053,25 @@ data: {"jsonrpc":"2.0","id":"request-1","result":{"content":[{"type":"text","tex
     }
 
     #[test]
+    fn sse_duplicate_cursor_is_suppressed_before_progress_projection() {
+        let parsed = parse_sse_response(
+            br#"id: event-41
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":41}}
+
+id: event-42
+data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":42}}
+
+"#,
+            "request-duplicate",
+            Some("event-41"),
+        )
+        .expect("SSE");
+        assert_eq!(parsed.last_event_id.as_deref(), Some("event-42"));
+        assert_eq!(parsed.progress.len(), 1);
+        assert_eq!(parsed.progress[0].value["progress"], 42);
+    }
+
+    #[test]
     fn progress_only_sse_retains_resume_cursor_without_fabricating_result() {
         let parsed = parse_sse_response(
             br#"id: resumable-7
@@ -1471,6 +2079,7 @@ data: {"jsonrpc":"2.0","method":"notifications/progress","params":{"progress":7}
 
 "#,
             "request-2",
+            None,
         )
         .expect("SSE");
         assert_eq!(parsed.last_event_id.as_deref(), Some("resumable-7"));
@@ -1487,6 +2096,7 @@ data: {"jsonrpc":"2.0","id":"request-3","error":{"code":-32603,"message":"failed
 
 "#,
                 "request-3",
+                None,
             )
             .err(),
             Some(McpDependencyError::RemoteError)

@@ -84,11 +84,11 @@ limitation = "The authenticated process host proves bounded foreground/backgroun
 id = "E2E-09"
 capability = "mcp"
 owner = "mcp-host/runtime"
-tests = ["acceptance::mcp", "tests::streamable_http_resumes_with_exact_session_and_event_cursor", "tests::multi_event_sse_preserves_progress_cursor_and_terminal_result", "runtime_mcp_loop", "runtime_mcp_invoke"]
+tests = ["acceptance::mcp", "tests::streamable_http_resumes_with_exact_session_and_event_cursor", "tests::streamable_http_pending_cursor_resumes_after_dependency_restart", "tests::persisted_http_state_is_bound_to_exact_server_owner_and_session", "tests::sse_duplicate_cursor_is_suppressed_before_progress_projection", "tests::multi_event_sse_preserves_progress_cursor_and_terminal_result", "runtime_mcp_loop", "runtime_mcp_invoke"]
 platforms = ["windows", "linux", "macos"]
 evidence = ["apps/tools/mcp/dependency/src/lib.rs", "apps/tools/mcp/ARCHITECTURE.md", "apps/runtime/dependency/src/tool.rs", "tests/fixtures/mcp_stdio_server.rs", "tests/e2e/runtime_mcp_loop.ps1", "tests/e2e/runtime_mcp_loop.sh", "tests/e2e/runtime_mcp_invoke.ps1", "tests/e2e/runtime_mcp_invoke.sh"]
 status = "partial"
-limitation = "The separate MCP host covers discovery, namespacing, stdio and Streamable HTTP, progress, cancellation, and a real multi-event SSE resumption fixture which verifies exact MCP session and Last-Event-ID headers. Live runtime server-list and configured external stdio invocation paths are process-tested on Windows with Unix scripts present; the invocation test proves canonical progress, result projection, provider continuation, keyed authorization, and durable replay state. Restart-persistent HTTP cursors and OAuth remain incomplete."
+limitation = "The separate MCP host covers discovery, namespacing, stdio and Streamable HTTP, progress, cancellation, and real multi-event SSE resumption fixtures which verify exact MCP session and Last-Event-ID headers across dependency reconstruction, operation/server/session binding, and duplicate suppression. Live runtime server-list and configured external stdio invocation paths are process-tested on Windows with Unix scripts present; the invocation test proves canonical progress, result projection, provider continuation, keyed authorization, and durable replay state. OAuth remains incomplete."
 
 [[requirement]]
 id = "E2E-10"

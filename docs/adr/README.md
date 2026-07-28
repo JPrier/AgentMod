@@ -25,3 +25,4 @@ is already implemented.
 | 0017 | Reconnectable process-host transport |
 | 0018 | Schedule-bound deferred continuations |
 | 0019 | Scheduler claim recovery and terminal reconciliation |
+| 0020 | MCP Streamable HTTP recovery state |

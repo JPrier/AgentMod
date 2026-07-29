@@ -8,7 +8,7 @@ use agentmod_session_style_sdk::{
     BuiltInStyle, CompactionStrategy, CompileContext, CompiledSessionStyle, DecisionCapability,
     GraphSource, MemoryInjectionLocation, MemoryRetrievalTiming, MemoryWritePolicy,
     StyleCompilerLimits, built_in_manifest, built_in_manifest_for_version, compile_style,
-    compile_style_set, parse_json, parse_toml, to_json, to_toml,
+    compile_style_set, declarative_graph_manifest, parse_json, parse_toml, to_json, to_toml,
 };
 use proptest::prelude::*;
 
@@ -242,12 +242,7 @@ fn ephemeral_turn_version_selection_and_cache_identity_are_exact_and_determinist
         .expect("exact current version");
     assert_eq!(manifest, built_in_manifest(BuiltInStyle::EphemeralTurn));
 
-    for semantic in [
-        BuiltInStyle::PersistentChat,
-        BuiltInStyle::ResearchLoop,
-        BuiltInStyle::PlannerWorker,
-        BuiltInStyle::DeclarativeGraph,
-    ] {
+    for semantic in [BuiltInStyle::PersistentChat, BuiltInStyle::PlannerWorker] {
         assert!(built_in_manifest_for_version(semantic, "1.0.0").is_some());
         assert!(built_in_manifest_for_version(semantic, "1.1.0").is_none());
     }
@@ -278,6 +273,312 @@ fn ephemeral_turn_version_selection_and_cache_identity_are_exact_and_determinist
 
     let json = to_json(&manifest).expect("ephemeral JSON");
     let toml = to_toml(&manifest).expect("ephemeral TOML");
+    assert_eq!(parse_json(&json).expect("JSON round trip"), manifest);
+    assert_eq!(parse_toml(&toml).expect("TOML round trip"), manifest);
+}
+
+#[test]
+fn research_loop_1_1_declares_bounded_context_and_capabilities() {
+    let manifest = built_in_manifest(BuiltInStyle::ResearchLoop);
+    assert_eq!(manifest.identity.id, "research-loop");
+    assert_eq!(manifest.identity.version, "1.1.0");
+    assert_eq!(manifest.budgets.max_iterations, 16);
+    assert_eq!(manifest.compaction.strategy, CompactionStrategy::None);
+    assert_eq!(manifest.child_agents.max_children, 0);
+    assert_eq!(
+        manifest.required_capabilities,
+        ["approval", "artifacts", "context", "model", "tools"]
+    );
+    assert_eq!(manifest.allowed_tool_groups, ["filesystem"]);
+    assert_eq!(
+        manifest.memory.retrieval_timing,
+        MemoryRetrievalTiming::IterationStart
+    );
+    assert_eq!(
+        manifest.memory.injection_location,
+        MemoryInjectionLocation::ContextArtifact
+    );
+}
+
+#[test]
+fn research_loop_1_1_compiles_deterministic_iteration_control() {
+    let manifest = built_in_manifest(BuiltInStyle::ResearchLoop);
+    let compiled = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("research-loop 1.1 compiles");
+    let nodes = &compiled.graph.nodes;
+    let node = |id: &str| {
+        nodes
+            .iter()
+            .find(|node| node.id == id)
+            .unwrap_or_else(|| panic!("missing node {id}"))
+    };
+    assert_eq!(node("fresh-context").kind, NodeKind::ContextTransform);
+    assert_eq!(node("research").kind, NodeKind::ModelCall);
+    assert_eq!(node("tool").kind, NodeKind::ToolExecutionGate);
+    assert_eq!(node("tool").tool.as_deref(), Some("filesystem.read"));
+    assert_eq!(node("persist").kind, NodeKind::PersistArtifact);
+    assert_eq!(node("repeat").kind, NodeKind::Loop);
+    assert_eq!(node("repeat").max_iterations, Some(16));
+    assert_eq!(node("done").kind, NodeKind::CompleteSession);
+    assert!(
+        nodes.iter().all(|node| node.kind != NodeKind::Review),
+        "the built-in must not invent a reviewer-enable control input"
+    );
+    assert_eq!(compiled.graph.budget.max_steps, 500);
+    assert_eq!(compiled.graph.budget.max_tokens, 750_000);
+    assert_eq!(compiled.graph.budget.max_cost_micros, 75_000_000);
+    assert_eq!(compiled.graph.budget.max_duration_ms, 2_700_000);
+    assert_eq!(
+        compiled
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| matches!(
+                node.kind,
+                NodeKind::CompleteTurn | NodeKind::CompleteSession | NodeKind::Fail
+            ))
+            .map(|node| (node.id.as_str(), node.kind))
+            .collect::<Vec<_>>(),
+        [("done", NodeKind::CompleteSession)]
+    );
+
+    let edge = |from: &str, variables: &serde_json::Value| {
+        let from = node(from);
+        let eligible = compiled
+            .graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == from.index)
+            .filter(|edge| {
+                edge.condition
+                    .as_ref()
+                    .is_none_or(|condition| condition.evaluate(variables).unwrap())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            eligible.len(),
+            1,
+            "expected exactly one transition from {from:?}"
+        );
+        (
+            nodes[eligible[0].to].id.as_str(),
+            eligible[0].label.as_deref(),
+        )
+    };
+    assert_eq!(edge("fresh-context", &serde_json::json!({})).0, "research");
+    assert_eq!(edge("research", &serde_json::json!({})).0, "tool");
+    assert_eq!(edge("tool", &serde_json::json!({})).0, "persist");
+    assert_eq!(edge("persist", &serde_json::json!({})).0, "repeat");
+    assert_eq!(
+        edge(
+            "repeat",
+            &serde_json::json!({"completion":{"criteria_met":false}})
+        ),
+        ("fresh-context", Some("continue"))
+    );
+    assert_eq!(
+        edge(
+            "repeat",
+            &serde_json::json!({"completion":{"criteria_met":true}})
+        ),
+        ("done", Some("complete"))
+    );
+    assert!(
+        compiled
+            .graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == node("repeat").index)
+            .all(|edge| edge
+                .condition
+                .as_ref()
+                .expect("completion condition")
+                .evaluate(&serde_json::json!({}))
+                .is_err()),
+        "completion must be an explicit runtime-owned input"
+    );
+}
+
+#[test]
+fn research_loop_version_and_cache_identity_are_exact_and_deterministic() {
+    assert!(
+        built_in_manifest_for_version(BuiltInStyle::ResearchLoop, "1.0.0").is_none(),
+        "persisted 1.0.0 selectors must not bind to research-loop 1.1.0"
+    );
+    let manifest = built_in_manifest_for_version(BuiltInStyle::ResearchLoop, "1.1.0")
+        .expect("exact current research-loop version");
+    assert_eq!(manifest, built_in_manifest(BuiltInStyle::ResearchLoop));
+
+    let first = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("first deterministic compile");
+    let second = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("second deterministic compile");
+    assert_eq!(first, second);
+    assert_eq!(first.style_version, "1.1.0");
+    assert_eq!(
+        first.cache_key.style_content_hash.to_hex(),
+        "e5bc6f185f79121fb01c3cb8895480bcac05d4184a93f8a2e1e4bea955c30da3"
+    );
+    assert_eq!(
+        first.cache_key.combined_hash.to_hex(),
+        "a0581c68fa4ee97611434c794213f5d23ca25010f4228293fd7547f2e1609e56"
+    );
+
+    let json = to_json(&manifest).expect("research JSON");
+    let toml = to_toml(&manifest).expect("research TOML");
+    assert_eq!(parse_json(&json).expect("JSON round trip"), manifest);
+    assert_eq!(parse_toml(&toml).expect("TOML round trip"), manifest);
+}
+
+#[test]
+fn declarative_graph_1_1_declares_the_acceptance_fixture_capabilities() {
+    let manifest = built_in_manifest(BuiltInStyle::DeclarativeGraph);
+    assert_eq!(manifest.identity.id, "declarative-graph");
+    assert_eq!(manifest.identity.version, "1.1.0");
+    assert_eq!(manifest.budgets.max_iterations, 3);
+    assert_eq!(manifest.required_capabilities, ["approval", "tools"]);
+    assert_eq!(manifest.allowed_tool_groups, ["filesystem"]);
+    assert_eq!(manifest.compaction.strategy, CompactionStrategy::None);
+    assert_eq!(manifest.memory.provider, "none");
+    assert_eq!(manifest.child_agents.max_children, 0);
+
+    let GraphSource::Inline { source } = &manifest.graph else {
+        panic!("built-in graph must be inline");
+    };
+    assert_eq!(
+        declarative_graph_manifest(source),
+        manifest,
+        "the user-graph wrapper must retain the exact acceptance fixture"
+    );
+}
+
+#[test]
+fn declarative_graph_1_1_compiles_branch_approval_tool_loop_and_terminal_nodes() {
+    let manifest = built_in_manifest(BuiltInStyle::DeclarativeGraph);
+    let compiled = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("declarative-graph 1.1 compiles");
+    let nodes = &compiled.graph.nodes;
+    let node = |id: &str| {
+        nodes
+            .iter()
+            .find(|node| node.id == id)
+            .unwrap_or_else(|| panic!("missing node {id}"))
+    };
+    assert_eq!(node("branch").kind, NodeKind::ConditionalBranch);
+    assert_eq!(node("approval").kind, NodeKind::UserApproval);
+    assert_eq!(node("tool").kind, NodeKind::ToolExecutionGate);
+    assert_eq!(node("tool").tool.as_deref(), Some("filesystem.read"));
+    assert_eq!(node("repeat").kind, NodeKind::Loop);
+    assert_eq!(node("repeat").max_iterations, Some(3));
+    assert_eq!(node("done").kind, NodeKind::CompleteSession);
+    assert_eq!(compiled.graph.budget.max_steps, 64);
+    assert_eq!(compiled.graph.budget.max_tokens, 1_000);
+    assert_eq!(compiled.graph.budget.max_cost_micros, 1_000);
+    assert_eq!(compiled.graph.budget.max_duration_ms, 10_000);
+
+    let approval = node("approval");
+    assert!(approval.tool.is_none());
+    assert!(approval.provider.is_none());
+    assert!(approval.read_scopes.is_empty());
+    assert!(approval.write_scopes.is_empty());
+
+    let edge = |from: &str, variables: &serde_json::Value| {
+        let from = node(from);
+        compiled
+            .graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == from.index)
+            .filter(|edge| {
+                edge.condition
+                    .as_ref()
+                    .is_none_or(|condition| condition.evaluate(variables).unwrap())
+            })
+            .map(|edge| (nodes[edge.to].id.as_str(), edge.label.as_deref()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        edge(
+            "branch",
+            &serde_json::json!({"request":{"requires_approval":true}})
+        ),
+        [("approval", Some("require-approval"))]
+    );
+    assert_eq!(
+        edge(
+            "branch",
+            &serde_json::json!({"request":{"requires_approval":false}})
+        ),
+        [("tool", Some("skip-approval"))]
+    );
+    assert_eq!(edge("approval", &serde_json::json!({})), [("tool", None)]);
+    assert_eq!(edge("tool", &serde_json::json!({})), [("repeat", None)]);
+    assert_eq!(
+        edge(
+            "repeat",
+            &serde_json::json!({"iteration":{"remaining":true}})
+        ),
+        [("tool", Some("continue"))]
+    );
+    assert_eq!(
+        edge(
+            "repeat",
+            &serde_json::json!({"iteration":{"remaining":false}})
+        ),
+        [("done", Some("complete"))]
+    );
+    for control in ["branch", "repeat"] {
+        assert!(
+            compiled
+                .graph
+                .edges
+                .iter()
+                .filter(|edge| edge.from == node(control).index)
+                .all(|edge| edge
+                    .condition
+                    .as_ref()
+                    .expect("control edge condition")
+                    .evaluate(&serde_json::json!({}))
+                    .is_err()),
+            "{control} must fail closed when its runtime control input is absent"
+        );
+    }
+    assert!(
+        compiled
+            .graph
+            .edges
+            .iter()
+            .all(|edge| edge.from != node("done").index)
+    );
+}
+
+#[test]
+fn declarative_graph_version_and_cache_identity_are_exact_and_deterministic() {
+    assert!(
+        built_in_manifest_for_version(BuiltInStyle::DeclarativeGraph, "1.0.0").is_none(),
+        "persisted 1.0.0 selectors must not bind to declarative-graph 1.1.0"
+    );
+    let manifest = built_in_manifest_for_version(BuiltInStyle::DeclarativeGraph, "1.1.0")
+        .expect("exact current declarative-graph version");
+    assert_eq!(manifest, built_in_manifest(BuiltInStyle::DeclarativeGraph));
+
+    let first = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("first deterministic compile");
+    let second = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("second deterministic compile");
+    assert_eq!(first, second);
+    assert_eq!(first.style_version, "1.1.0");
+    assert_eq!(
+        first.cache_key.style_content_hash.to_hex(),
+        "45777c6850f12ec74b36cbc7a7082f79f8f1ae56dae716fe663be87de5c00486"
+    );
+    assert_eq!(
+        first.cache_key.combined_hash.to_hex(),
+        "78e81c532d97d8832c265520121f8717d1bc73e8498ed05f652bc33d1e470685"
+    );
+
+    let json = to_json(&manifest).expect("declarative JSON");
+    let toml = to_toml(&manifest).expect("declarative TOML");
     assert_eq!(parse_json(&json).expect("JSON round trip"), manifest);
     assert_eq!(parse_toml(&toml).expect("TOML round trip"), manifest);
 }

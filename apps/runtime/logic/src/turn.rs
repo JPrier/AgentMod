@@ -80,7 +80,8 @@ use crate::{
         ToolExecutionState, ToolExecutionTerminalOutcome, ToolOutputObservedEvent, reduce,
     },
     style_executor::{
-        CompiledStyleExecutor, StyleExecutorError, StyleNodeCursor, StyleNodeDirective,
+        CompiledStyleExecutor, StyleAdapterKind, StyleExecutorError, StyleNodeCursor,
+        StyleNodeDirective,
     },
     tool::{
         AuthorizedToolRequest, PrepareToolCommand, ToolAuthorizationOutcome, ToolEvent,
@@ -99,6 +100,7 @@ const MAX_PROVIDER_PROJECTION_BYTES: u64 = 16 * 1024 * 1024;
 enum ContextCompositionBoundary {
     TurnStart,
     BeforeModelRequest,
+    BeforeTurnCompletion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -550,11 +552,99 @@ where
             &session_directory,
             preflight,
         )?;
+        if let Some(visible_text) = recoverable_ephemeral_pre_assistant(&preflight.state, &command)
+        {
+            let first_committed_sequence = current_run_user_sequence(&preflight.state, &command)?;
+            let mut execution = Self::resume_active_style_turn(
+                &preflight.state,
+                JournalPosition {
+                    sequence: preflight.state.last_sequence,
+                    event_id: preflight.last_event_id,
+                },
+            )?
+            .ok_or(RunTurnError::StyleGraphMismatch)?;
+            let recovered_events = (!visible_text.is_empty())
+                .then_some(ProviderEvent::Text(visible_text))
+                .into_iter()
+                .collect::<Vec<_>>();
+            let assistant_position = self.commit_visible_assistant(
+                &persistence,
+                session_id,
+                session_directory.clone(),
+                execution.position.sequence,
+                execution.position.event_id,
+                &command.cancellation_id,
+                &recovered_events,
+            )?;
+            let position = self
+                .discard_ephemeral_projection(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    assistant_position,
+                    &command,
+                )
+                .await?;
+            execution.position = position;
+            self.complete_terminal_style_node(
+                &persistence,
+                session_id,
+                &session_directory,
+                &mut execution,
+                Some(format!(
+                    "turn-assistant-recovered:{}",
+                    command.cancellation_id
+                )),
+            )?;
+            return Ok(RunTurnResult {
+                events: Vec::new(),
+                first_committed_sequence,
+                last_committed_sequence: execution.position.sequence,
+                awaiting_continuation: None,
+            });
+        }
+        if recoverable_ephemeral_cleanup_retry(&preflight.state, &command)
+            || recoverable_ephemeral_discard(&preflight.state, &command)
+            || recoverable_ephemeral_discard_phase(&preflight.state, &command)
+        {
+            let first_committed_sequence = current_run_user_sequence(&preflight.state, &command)?;
+            let mut execution = Self::resume_active_style_turn(
+                &preflight.state,
+                JournalPosition {
+                    sequence: preflight.state.last_sequence,
+                    event_id: preflight.last_event_id,
+                },
+            )?
+            .ok_or(RunTurnError::StyleGraphMismatch)?;
+            let position = self
+                .discard_ephemeral_projection(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    execution.position,
+                    &command,
+                )
+                .await?;
+            execution.position = position;
+            self.complete_terminal_style_node(
+                &persistence,
+                session_id,
+                &session_directory,
+                &mut execution,
+                Some(format!("turn-recovered:{}", command.cancellation_id)),
+            )?;
+            return Ok(RunTurnResult {
+                events: Vec::new(),
+                first_committed_sequence,
+                last_committed_sequence: execution.position.sequence,
+                awaiting_continuation: None,
+            });
+        }
         let (style_driven, resume_context) = match preflight.state.style_binding.as_ref() {
             Some(binding) => {
                 let executor = CompiledStyleExecutor::from_binding(binding)
                     .map_err(RunTurnError::StyleExecutor)?;
-                if !executor.supports_persistent_turn() {
+                if executor.adapter_kind().is_none() {
                     return Err(RunTurnError::UnsupportedStyleExecution(binding.id.clone()));
                 }
                 match binding.memory.retrieval_timing.as_str() {
@@ -639,46 +729,111 @@ where
         };
         let (state, provider_position) = if style_turn.is_some() {
             let composed = async {
-                if resume_context
-                    && latest_context_boundary_at_head(&state)
-                        .is_some_and(|identity| identity.boundary == "before_model_request")
-                {
-                    return self
-                        .compose_style_context(
+                let execution = style_turn
+                    .as_mut()
+                    .ok_or(RunTurnError::StyleGraphMismatch)?;
+                match execution.executor.adapter_kind().ok_or_else(|| {
+                    RunTurnError::UnsupportedStyleExecution(
+                        execution.executor.compiled().style_id.clone(),
+                    )
+                })? {
+                    StyleAdapterKind::PersistentTurn => {
+                        if resume_context
+                            && latest_context_boundary_at_head(&state)
+                                .is_some_and(|identity| identity.boundary == "before_model_request")
+                        {
+                            return self
+                                .compose_style_context(
+                                    &persistence,
+                                    session_id,
+                                    &session_directory,
+                                    state,
+                                    provider_position,
+                                    &command,
+                                    ContextCompositionBoundary::BeforeModelRequest,
+                                    ContextCompositionOrigin::UserTurn,
+                                )
+                                .await;
+                        }
+                        let (state, position) = self
+                            .compose_style_context(
+                                &persistence,
+                                session_id,
+                                &session_directory,
+                                state,
+                                provider_position,
+                                &command,
+                                ContextCompositionBoundary::TurnStart,
+                                ContextCompositionOrigin::UserTurn,
+                            )
+                            .await?;
+                        self.compose_style_context(
                             &persistence,
                             session_id,
                             &session_directory,
                             state,
-                            provider_position,
+                            position,
                             &command,
                             ContextCompositionBoundary::BeforeModelRequest,
                             ContextCompositionOrigin::UserTurn,
                         )
-                        .await;
+                        .await
+                    }
+                    StyleAdapterKind::EphemeralTurn => {
+                        let (state, position) = match execution.current.directive {
+                            StyleNodeDirective::ContextTransform => {
+                                let (_state, position) = self
+                                    .compose_style_context(
+                                        &persistence,
+                                        session_id,
+                                        &session_directory,
+                                        state,
+                                        provider_position,
+                                        &command,
+                                        ContextCompositionBoundary::TurnStart,
+                                        ContextCompositionOrigin::UserTurn,
+                                    )
+                                    .await?;
+                                execution.position = position;
+                                self.complete_and_enter_next(
+                                    &persistence,
+                                    session_id,
+                                    &session_directory,
+                                    execution,
+                                    Some(format!("fresh-context:{}", command.cancellation_id)),
+                                )?;
+                                if execution.current.directive != StyleNodeDirective::ModelCall {
+                                    return Err(RunTurnError::UnexpectedStyleNode {
+                                        expected: "model_call",
+                                        actual: execution.current.id.clone(),
+                                    });
+                                }
+                                (
+                                    Self::load_state(&persistence, session_id, &session_directory)?,
+                                    execution.position,
+                                )
+                            }
+                            StyleNodeDirective::ModelCall => (state, provider_position),
+                            _ => {
+                                return Err(RunTurnError::UnexpectedStyleNode {
+                                    expected: "context_transform or model_call",
+                                    actual: execution.current.id.clone(),
+                                });
+                            }
+                        };
+                        self.compose_style_context(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            state,
+                            position,
+                            &command,
+                            ContextCompositionBoundary::BeforeModelRequest,
+                            ContextCompositionOrigin::UserTurn,
+                        )
+                        .await
+                    }
                 }
-                let (state, position) = self
-                    .compose_style_context(
-                        &persistence,
-                        session_id,
-                        &session_directory,
-                        state,
-                        provider_position,
-                        &command,
-                        ContextCompositionBoundary::TurnStart,
-                        ContextCompositionOrigin::UserTurn,
-                    )
-                    .await?;
-                self.compose_style_context(
-                    &persistence,
-                    session_id,
-                    &session_directory,
-                    state,
-                    position,
-                    &command,
-                    ContextCompositionBoundary::BeforeModelRequest,
-                    ContextCompositionOrigin::UserTurn,
-                )
-                .await
             }
             .await;
             match composed {
@@ -860,10 +1015,18 @@ where
                 });
             }
         }
+        let assistant_events = Self::assistant_events_for_completion(
+            &persistence,
+            session_id,
+            &session_directory,
+            style_turn.as_ref(),
+            &command,
+            &events,
+        )?;
         let assistant_position = self.commit_visible_assistant(
             &persistence,
             session_id,
-            session_directory,
+            session_directory.clone(),
             style_turn
                 .as_ref()
                 .map_or(observed.sequence, |value| value.position.sequence),
@@ -871,8 +1034,22 @@ where
                 .as_ref()
                 .map_or(observed.event_id, |value| value.position.event_id),
             &command.cancellation_id,
-            &events,
+            &assistant_events,
         )?;
+        let assistant_position = if style_turn.as_ref().is_some_and(|execution| {
+            execution.executor.adapter_kind() == Some(StyleAdapterKind::EphemeralTurn)
+        }) {
+            self.discard_ephemeral_projection(
+                &persistence,
+                session_id,
+                &session_directory,
+                assistant_position,
+                &command,
+            )
+            .await?
+        } else {
+            assistant_position
+        };
         let last_sequence = if let Some(execution) = style_turn.as_mut() {
             execution.position = assistant_position;
             self.complete_terminal_style_node(
@@ -1387,6 +1564,14 @@ where
                         });
                     }
                 }
+                let assistant_events = Self::assistant_events_for_completion(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    style_turn.as_ref(),
+                    &resumed_turn,
+                    &events,
+                )?;
                 let assistant_position = self.commit_visible_assistant(
                     &persistence,
                     session_id,
@@ -1398,8 +1583,22 @@ where
                         .as_ref()
                         .map_or(position.event_id, |value| value.position.event_id),
                     &resumed_turn.cancellation_id,
-                    &events,
+                    &assistant_events,
                 )?;
+                let assistant_position = if style_turn.as_ref().is_some_and(|execution| {
+                    execution.executor.adapter_kind() == Some(StyleAdapterKind::EphemeralTurn)
+                }) {
+                    self.discard_ephemeral_projection(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        assistant_position,
+                        &resumed_turn,
+                    )
+                    .await?
+                } else {
+                    assistant_position
+                };
                 let last_committed_position = if let Some(execution) = style_turn.as_mut() {
                     execution.position = assistant_position;
                     self.complete_terminal_style_node(
@@ -1727,6 +1926,13 @@ where
             .style_binding
             .clone()
             .ok_or(RunTurnError::StyleMigrationRequired)?;
+        let adapter_kind = CompiledStyleExecutor::from_binding(&binding)
+            .map_err(RunTurnError::StyleExecutor)?
+            .adapter_kind()
+            .ok_or_else(|| RunTurnError::UnsupportedStyleExecution(binding.id.clone()))?;
+        let fresh_ephemeral_context = adapter_kind == StyleAdapterKind::EphemeralTurn
+            && boundary == ContextCompositionBoundary::TurnStart
+            && origin == ContextCompositionOrigin::UserTurn;
         let (next_state, next_position, boundary_identity, completed_phases, already_completed) =
             self.begin_or_resume_context_boundary(
                 persistence,
@@ -1771,11 +1977,19 @@ where
                 memory_phase.clone(),
             )?;
             state = Self::load_state(persistence, session_id, session_directory)?;
-            let mut replacement =
-                projection_without_retrieved_memory(state.conversation.provider_projection());
+            let mut replacement = if fresh_ephemeral_context {
+                vec![ConversationEntry::UserMessage(
+                    current_run_user(&state, command)?.clone(),
+                )]
+            } else {
+                projection_without_retrieved_memory(state.conversation.provider_projection())
+            };
             let should_retrieve = binding.memory.provider != "none"
                 && retrieve_now
                 && binding.memory.injection_location != "none";
+            let fresh_source_sequence = fresh_ephemeral_context
+                .then(|| current_run_user_sequence(&state, command))
+                .transpose()?;
             let mut reserved_identity = None;
             let injection_sequence = position
                 .sequence
@@ -1868,7 +2082,7 @@ where
                     &binding.memory.injection_location,
                 )?;
             }
-            if replacement == state.conversation.provider_projection() {
+            if replacement == state.conversation.provider_projection() && !fresh_ephemeral_context {
                 position = self.commit_context_phase_completed(
                     persistence,
                     session_id,
@@ -1886,12 +2100,21 @@ where
                 };
                 let provenance = ProjectionProvenance {
                     projection_id: format!(
-                        "memory:{}:{}",
+                        "{}:{}:{}",
+                        if fresh_ephemeral_context {
+                            "ephemeral-fresh-context"
+                        } else {
+                            "memory"
+                        },
                         command.cancellation_id,
                         injection_sequence.get()
                     ),
-                    source_range: None,
-                    method: format!("memory:{}", binding.memory.provider),
+                    source_range: fresh_source_sequence.map(|sequence| (sequence, sequence)),
+                    method: if fresh_ephemeral_context {
+                        String::from("ephemeral_fresh_context")
+                    } else {
+                        format!("memory:{}", binding.memory.provider)
+                    },
                     committed_at: injection_sequence,
                     artifact_id: None,
                 };
@@ -1899,7 +2122,11 @@ where
                     &binding.id,
                     &state.workspace,
                     &command.cancellation_id,
-                    "memory",
+                    if fresh_ephemeral_context {
+                        "fresh_context"
+                    } else {
+                        "memory"
+                    },
                     &replacement,
                 )
                 .await?;
@@ -2104,6 +2331,7 @@ where
         let boundary_name = match boundary {
             ContextCompositionBoundary::TurnStart => "turn_start",
             ContextCompositionBoundary::BeforeModelRequest => "before_model_request",
+            ContextCompositionBoundary::BeforeTurnCompletion => "before_turn_completion",
         };
         if let Some(existing) = execution.context_boundaries.iter().rev().find(|candidate| {
             candidate.identity.node_id == active.node_id
@@ -2225,6 +2453,121 @@ where
         let position = JournalPosition { sequence, event_id };
         let state = Self::load_state(persistence, session_id, session_directory)?;
         Ok((state, position))
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fail-closed discard boundary keeps phase evidence, authorization, replacement, and boundary completion adjacent"
+    )]
+    async fn discard_ephemeral_projection(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        position: JournalPosition,
+        command: &RunTurnCommand,
+    ) -> Result<JournalPosition, RunTurnError> {
+        let mut state = Self::load_state(persistence, session_id, session_directory)?;
+        let binding = state
+            .style_binding
+            .clone()
+            .ok_or(RunTurnError::StyleMigrationRequired)?;
+        if CompiledStyleExecutor::from_binding(&binding)
+            .map_err(RunTurnError::StyleExecutor)?
+            .adapter_kind()
+            != Some(StyleAdapterKind::EphemeralTurn)
+        {
+            return Err(RunTurnError::UnsupportedStyleExecution(binding.id));
+        }
+        let (next_state, mut position, boundary_identity, completed_phases, already_completed) =
+            self.begin_or_resume_context_boundary(
+                persistence,
+                session_id,
+                session_directory,
+                &state,
+                position,
+                command,
+                ContextCompositionBoundary::BeforeTurnCompletion,
+                ContextCompositionOrigin::UserTurn,
+            )?;
+        state = next_state;
+        if already_completed {
+            return Ok(position);
+        }
+        if completed_phases.iter().any(|phase| phase == "discard") {
+            return self
+                .complete_context_boundary(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    &state,
+                    position,
+                    boundary_identity,
+                )
+                .map(|(_, position)| position);
+        }
+        if context_phase_started(&state, &boundary_identity, "discard") {
+            return Err(RunTurnError::AmbiguousContextPhase(String::from("discard")));
+        }
+        let phase = ContextPhaseIdentity {
+            boundary: boundary_identity.clone(),
+            phase: String::from("discard"),
+        };
+        position = self.commit_context_phase_started(
+            persistence,
+            session_id,
+            session_directory,
+            position,
+            phase.clone(),
+        )?;
+        state = Self::load_state(persistence, session_id, session_directory)?;
+        let replacement = Vec::new();
+        self.authorize_context_replacement(
+            &binding.id,
+            &state.workspace,
+            &command.cancellation_id,
+            "ephemeral_turn_discard",
+            &replacement,
+        )
+        .await?;
+        let committed_at = position
+            .sequence
+            .checked_next()
+            .map_err(|_| RunTurnError::SequenceOverflow)?;
+        let identity = self
+            .data
+            .allocate_event_identity(AllocateEventIdentityDataRequest)
+            .map_err(RunTurnError::Identity)?;
+        position = Self::commit_context_replacement_with_identity(
+            persistence,
+            session_id,
+            session_directory,
+            position,
+            identity,
+            replacement,
+            ProjectionProvenance {
+                projection_id: format!(
+                    "ephemeral-turn-discard:{}:{}",
+                    command.cancellation_id,
+                    committed_at.get()
+                ),
+                source_range: None,
+                method: String::from("ephemeral_discard"),
+                committed_at,
+                artifact_id: None,
+            },
+            Some(phase),
+        )?;
+        state = Self::load_state(persistence, session_id, session_directory)?;
+        self.complete_context_boundary(
+            persistence,
+            session_id,
+            session_directory,
+            &state,
+            position,
+            boundary_identity,
+        )
+        .map(|(_, position)| position)
     }
 
     async fn authorize_context_replacement(
@@ -3501,9 +3844,20 @@ where
             )?;
         }
         let current = executor.entry().map_err(RunTurnError::StyleExecutor)?;
-        if current.directive != StyleNodeDirective::ModelCall {
+        let expected_entry = match executor.adapter_kind() {
+            Some(StyleAdapterKind::PersistentTurn) => StyleNodeDirective::ModelCall,
+            Some(StyleAdapterKind::EphemeralTurn) => StyleNodeDirective::ContextTransform,
+            None => {
+                return Err(RunTurnError::UnsupportedStyleExecution(binding.id.clone()));
+            }
+        };
+        if current.directive != expected_entry {
             return Err(RunTurnError::UnexpectedStyleNode {
-                expected: "model_call",
+                expected: match expected_entry {
+                    StyleNodeDirective::ModelCall => "model_call",
+                    StyleNodeDirective::ContextTransform => "context_transform",
+                    _ => unreachable!("supported entry adapter is exhaustive"),
+                },
                 actual: current.id,
             });
         }
@@ -3561,11 +3915,11 @@ where
         };
         let executor =
             CompiledStyleExecutor::from_binding(binding).map_err(RunTurnError::StyleExecutor)?;
-        // Unsupported graphs must remain mutation-free until their runtime
-        // adapter exists.
-        if !executor.supports_persistent_turn() {
+        let Some(adapter_kind) = executor.adapter_kind() else {
+            // Unsupported graphs must remain mutation-free until their runtime
+            // adapter exists.
             return Ok(loaded);
-        }
+        };
         let max_steps = binding
             .budgets
             .max_steps
@@ -3576,6 +3930,9 @@ where
         if execution.graph.as_ref() != &executor.compiled().graph {
             return Err(RunTurnError::StyleGraphMismatch);
         }
+        let Some(execution) = loaded.state.style_execution.as_ref() else {
+            return Ok(loaded);
+        };
         if let StyleExecutionControlState::AwaitingTransition(completed) = &execution.control {
             let from = executor
                 .node(&completed.node_id)
@@ -3618,7 +3975,12 @@ where
         let destination = executor
             .node(&selected.to_node_id)
             .map_err(RunTurnError::StyleExecutor)?;
-        if destination.directive.requires_effect_evidence() {
+        let recoverable_fresh_model_entry = adapter_kind == StyleAdapterKind::EphemeralTurn
+            && destination.directive == StyleNodeDirective::ModelCall
+            && executor
+                .node(&selected.from_node_id)
+                .is_ok_and(|source| source.directive == StyleNodeDirective::ContextTransform);
+        if destination.directive.requires_effect_evidence() && !recoverable_fresh_model_entry {
             return Err(RunTurnError::StyleControlRecoveryRequired {
                 node: destination.id,
                 phase: "awaiting_destination_entry",
@@ -3673,7 +4035,7 @@ where
         };
         let executor =
             CompiledStyleExecutor::from_binding(binding).map_err(RunTurnError::StyleExecutor)?;
-        if !executor.supports_persistent_turn() {
+        if executor.adapter_kind().is_none() {
             return Ok(None);
         }
         let canonical = state
@@ -4166,6 +4528,32 @@ where
         Ok(JournalPosition { sequence, event_id })
     }
 
+    fn assistant_events_for_completion(
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        style_turn: Option<&ActiveStyleTurn>,
+        command: &RunTurnCommand,
+        fallback: &[ProviderEvent],
+    ) -> Result<Vec<ProviderEvent>, RunTurnError> {
+        if !style_turn.is_some_and(|execution| {
+            execution.executor.adapter_kind() == Some(StyleAdapterKind::EphemeralTurn)
+        }) {
+            return Ok(fallback.to_vec());
+        }
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        let execution = state
+            .style_execution
+            .as_ref()
+            .ok_or(RunTurnError::StyleGraphMismatch)?;
+        let evidence = matching_ephemeral_model_evidence(&state, execution, command)
+            .ok_or_else(|| RunTurnError::StyleRecoveryRequired(String::from("assistant")))?;
+        Ok((!evidence.visible_text.is_empty())
+            .then_some(ProviderEvent::Text(evidence.visible_text.clone()))
+            .into_iter()
+            .collect())
+    }
+
     fn seal_event(
         &self,
         session_id: SessionId,
@@ -4232,25 +4620,357 @@ fn recoverable_context_retry(
     state: &crate::session::SessionState,
     command: &RunTurnCommand,
 ) -> bool {
+    let Some(binding) = state.style_binding.as_ref() else {
+        return false;
+    };
+    let Ok(executor) = CompiledStyleExecutor::from_binding(binding) else {
+        return false;
+    };
+    let Some(adapter_kind) = executor.adapter_kind() else {
+        return false;
+    };
     let Some(execution) = state.style_execution.as_ref() else {
         return false;
     };
     let Some(active) = execution.active_node.as_ref() else {
         return false;
     };
-    let is_model_node = execution.graph.nodes.iter().any(|node| {
-        node.id == active.node_id && node.kind == agentmod_graph_engine::NodeKind::ModelCall
-    });
     let Ok(request_hash) = current_context_request_hash(state, command) else {
         return false;
     };
-    is_model_node
-        && execution.context_boundaries.iter().rev().any(|boundary| {
-            boundary.identity.node_id == active.node_id
-                && boundary.identity.run_id == command.cancellation_id
-                && request_hash == boundary.identity.request_hash
-                && boundary.last_sequence == state.last_sequence
+    let boundary_at_head = execution.context_boundaries.iter().rev().any(|boundary| {
+        boundary.identity.node_id == active.node_id
+            && boundary.identity.run_id == command.cancellation_id
+            && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+            && request_hash == boundary.identity.request_hash
+            && boundary.last_sequence == state.last_sequence
+    });
+    let pristine_entry = execution.active_node_entered_at == Some(state.last_sequence);
+    let active_kind = execution
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.id == active.node_id)
+        .map(|node| node.kind);
+    match (adapter_kind, active_kind) {
+        (StyleAdapterKind::PersistentTurn, Some(agentmod_graph_engine::NodeKind::ModelCall)) => {
+            pristine_entry || boundary_at_head
+        }
+        (
+            StyleAdapterKind::EphemeralTurn,
+            Some(agentmod_graph_engine::NodeKind::ContextTransform),
+        ) => pristine_entry || boundary_at_head,
+        (StyleAdapterKind::EphemeralTurn, Some(agentmod_graph_engine::NodeKind::ModelCall)) => {
+            boundary_at_head
+                || (pristine_entry
+                    && execution.context_boundaries.iter().rev().any(|boundary| {
+                        boundary.completed_at.is_some()
+                            && boundary.identity.boundary == "turn_start"
+                            && boundary.identity.run_id == command.cancellation_id
+                            && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+                            && boundary.identity.request_hash == request_hash
+                            && exact_compiled_edge(
+                                &execution.graph,
+                                &boundary.identity.node_id,
+                                &active.node_id,
+                                agentmod_graph_engine::NodeKind::ContextTransform,
+                                agentmod_graph_engine::NodeKind::ModelCall,
+                            )
+                    }))
+        }
+        _ => false,
+    }
+}
+
+fn exact_compiled_edge(
+    graph: &agentmod_graph_engine::ExecutableGraph,
+    from_id: &str,
+    to_id: &str,
+    from_kind: agentmod_graph_engine::NodeKind,
+    to_kind: agentmod_graph_engine::NodeKind,
+) -> bool {
+    let Some(from) = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == from_id && node.kind == from_kind)
+    else {
+        return false;
+    };
+    let Some(to) = graph
+        .nodes
+        .iter()
+        .find(|node| node.id == to_id && node.kind == to_kind)
+    else {
+        return false;
+    };
+    graph
+        .edges
+        .iter()
+        .any(|edge| edge.from == from.index && edge.to == to.index)
+}
+
+fn recoverable_ephemeral_discard(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> bool {
+    let Some(execution) = state.style_execution.as_ref() else {
+        return false;
+    };
+    let Some(active) = execution.active_node.as_ref() else {
+        return false;
+    };
+    let Ok(request_hash) = current_context_request_hash(state, command) else {
+        return false;
+    };
+    let is_complete_turn = execution.graph.nodes.iter().any(|node| {
+        node.id == active.node_id && node.kind == agentmod_graph_engine::NodeKind::CompleteTurn
+    });
+    let Some(provenance) = state.conversation.projection_provenance() else {
+        return false;
+    };
+    let Some(run_id) = provenance
+        .projection_id
+        .strip_prefix("ephemeral-turn-discard:")
+        .and_then(|suffix| suffix.rsplit_once(':').map(|(run_id, _)| run_id))
+    else {
+        return false;
+    };
+    let Some(model_evidence) = matching_ephemeral_model_evidence(state, execution, command) else {
+        return false;
+    };
+    let Some(completed_at) = model_evidence.completed_at else {
+        return false;
+    };
+    let latest_assistant_matches = state.conversation.history().iter().rev().any(|entry| {
+        matches!(
+            entry,
+            ConversationEntry::AssistantMessage(assistant)
+                if assistant.source_sequence > completed_at
+                    &&
+                assistant.id.0.strip_prefix("assistant:").is_some_and(
+                    |suffix| suffix.ends_with(&format!(":{run_id}"))
+                )
+        )
+    });
+    let completed_boundary_at_head = execution.context_boundaries.last().is_some_and(|boundary| {
+        boundary.identity.node_id == active.node_id
+            && boundary.identity.boundary == "before_turn_completion"
+            && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+            && boundary.identity.run_id == run_id
+            && boundary.identity.run_id == command.cancellation_id
+            && boundary.identity.request_hash == request_hash
+            && boundary.completed_phases.as_slice() == ["discard"]
+            && boundary.completed_at == Some(state.last_sequence)
+    });
+    is_complete_turn
+        && provenance.method == "ephemeral_discard"
+        && provenance.committed_at.checked_next().ok() == Some(state.last_sequence)
+        && state.conversation.provider_projection().is_empty()
+        && (latest_assistant_matches || model_evidence.visible_text.is_empty())
+        && completed_boundary_at_head
+}
+
+fn recoverable_ephemeral_discard_phase(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> bool {
+    let Some(execution) = state.style_execution.as_ref() else {
+        return false;
+    };
+    let Some(active) = execution.active_node.as_ref() else {
+        return false;
+    };
+    let is_complete_turn = execution.graph.nodes.iter().any(|node| {
+        node.id == active.node_id && node.kind == agentmod_graph_engine::NodeKind::CompleteTurn
+    });
+    let Some(boundary) = execution.context_boundaries.last() else {
+        return false;
+    };
+    let Some(provenance) = state.conversation.projection_provenance() else {
+        return false;
+    };
+    let Ok(request_hash) = current_context_request_hash(state, command) else {
+        return false;
+    };
+    let Some(model_evidence) = matching_ephemeral_model_evidence(state, execution, command) else {
+        return false;
+    };
+    let Some(completed_at) = model_evidence.completed_at else {
+        return false;
+    };
+    let assistant_matches = state.conversation.history().iter().rev().any(|entry| {
+        matches!(
+            entry,
+            ConversationEntry::AssistantMessage(assistant)
+                if assistant.source_sequence > completed_at
+                    && assistant.id.0.strip_prefix("assistant:").is_some_and(
+                        |suffix| suffix.ends_with(&format!(":{}", command.cancellation_id))
+                    )
+        )
+    });
+    is_complete_turn
+        && boundary.identity.node_id == active.node_id
+        && boundary.identity.boundary == "before_turn_completion"
+        && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+        && boundary.identity.run_id == command.cancellation_id
+        && boundary.identity.request_hash == request_hash
+        && boundary.started_phases.as_slice() == ["discard"]
+        && boundary.completed_phases.as_slice() == ["discard"]
+        && boundary.completed_at.is_none()
+        && boundary.last_sequence == state.last_sequence
+        && provenance.method == "ephemeral_discard"
+        && provenance.committed_at == state.last_sequence
+        && provenance.projection_id.starts_with(&format!(
+            "ephemeral-turn-discard:{}:",
+            boundary.identity.run_id
+        ))
+        && state.conversation.provider_projection().is_empty()
+        && (assistant_matches || model_evidence.visible_text.is_empty())
+}
+
+fn matching_ephemeral_model_evidence<'a>(
+    state: &crate::session::SessionState,
+    execution: &'a crate::session::StyleExecutionState,
+    command: &RunTurnCommand,
+) -> Option<&'a crate::session::ModelExecutionEvidence> {
+    let user = current_run_user(state, command).ok()?;
+    let request_hash = current_context_request_hash(state, command).ok()?;
+    let evidence = execution.latest_model_execution.as_ref()?;
+    let completed_at = evidence.completed_at?;
+    (evidence.cancellation_id == command.cancellation_id
+        && evidence.response_completed
+        && evidence.user_sequence == Some(user.source_sequence)
+        && evidence.started_at > user.source_sequence
+        && completed_at >= evidence.started_at
+        && completed_at < state.last_sequence)
+        .then_some(())?;
+    execution.context_boundaries.iter().rev().find(|boundary| {
+        boundary.identity.boundary == "before_model_request"
+            && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+            && boundary.identity.run_id == command.cancellation_id
+            && boundary.identity.request_hash == request_hash
+            && boundary.completed_at.is_some_and(|sequence| {
+                sequence > user.source_sequence && sequence < evidence.started_at
+            })
+            && execution.graph.nodes.iter().any(|node| {
+                node.id == boundary.identity.node_id
+                    && node.kind == agentmod_graph_engine::NodeKind::ModelCall
+            })
+    })?;
+    Some(evidence)
+}
+
+fn recoverable_ephemeral_pre_assistant(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> Option<String> {
+    let binding = state.style_binding.as_ref()?;
+    let executor = CompiledStyleExecutor::from_binding(binding).ok()?;
+    (executor.adapter_kind() == Some(StyleAdapterKind::EphemeralTurn)).then_some(())?;
+    let execution = state.style_execution.as_ref()?;
+    let active = execution.active_node.as_ref()?;
+    (execution.active_node_entered_at == Some(state.last_sequence)).then_some(())?;
+    execution
+        .graph
+        .nodes
+        .iter()
+        .any(|node| {
+            node.id == active.node_id && node.kind == agentmod_graph_engine::NodeKind::CompleteTurn
         })
+        .then_some(())?;
+    let evidence = matching_ephemeral_model_evidence(state, execution, command)?;
+    let completed_at = evidence.completed_at?;
+    let completed_tool = execution.completed_nodes.last()?;
+    let transition = execution.transitions.last()?;
+    (execution.graph.nodes.iter().any(|node| {
+        node.id == completed_tool.node_id
+            && node.kind == agentmod_graph_engine::NodeKind::ToolExecutionGate
+    }) && transition.from_node_id == completed_tool.node_id
+        && transition.to_node_id == active.node_id
+        && completed_tool.step.checked_add(1) == Some(active.step)
+        && transition.step == completed_tool.step
+        && exact_compiled_edge(
+            &execution.graph,
+            &completed_tool.node_id,
+            &active.node_id,
+            agentmod_graph_engine::NodeKind::ToolExecutionGate,
+            agentmod_graph_engine::NodeKind::CompleteTurn,
+        ))
+    .then_some(())?;
+    state
+        .tool_executions
+        .values()
+        .all(|record| record.state == ToolExecutionState::Terminal)
+        .then_some(())?;
+    (!state.conversation.history().iter().any(|entry| {
+        matches!(
+            entry,
+            ConversationEntry::AssistantMessage(assistant)
+                if assistant.source_sequence > completed_at
+                    && assistant.id.0.strip_prefix("assistant:").is_some_and(
+                        |suffix| suffix.ends_with(&format!(":{}", command.cancellation_id))
+                    )
+        )
+    }))
+    .then(|| evidence.visible_text.clone())
+}
+
+fn recoverable_ephemeral_cleanup_retry(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> bool {
+    let Some(binding) = state.style_binding.as_ref() else {
+        return false;
+    };
+    let Ok(executor) = CompiledStyleExecutor::from_binding(binding) else {
+        return false;
+    };
+    if executor.adapter_kind() != Some(StyleAdapterKind::EphemeralTurn) {
+        return false;
+    }
+    let Some(execution) = state.style_execution.as_ref() else {
+        return false;
+    };
+    let Some(active) = execution.active_node.as_ref() else {
+        return false;
+    };
+    if !execution.graph.nodes.iter().any(|node| {
+        node.id == active.node_id && node.kind == agentmod_graph_engine::NodeKind::CompleteTurn
+    }) {
+        return false;
+    }
+    let Ok(request_hash) = current_context_request_hash(state, command) else {
+        return false;
+    };
+    let Some(model_evidence) = matching_ephemeral_model_evidence(state, execution, command) else {
+        return false;
+    };
+    let Some(model_completed_at) = model_evidence.completed_at else {
+        return false;
+    };
+    let latest_assistant_is_head = state.conversation.history().iter().rev().any(|entry| {
+        matches!(
+            entry,
+            ConversationEntry::AssistantMessage(assistant)
+                if assistant.source_sequence == state.last_sequence
+                    && assistant.source_sequence > model_completed_at
+                    && assistant.id.0.strip_prefix("assistant:").is_some_and(
+                        |suffix| suffix.ends_with(&format!(":{}", command.cancellation_id))
+                    )
+        )
+    });
+    let pristine_discard_boundary = execution.context_boundaries.last().is_some_and(|boundary| {
+        boundary.identity.node_id == active.node_id
+            && boundary.identity.boundary == "before_turn_completion"
+            && boundary.identity.run_id == command.cancellation_id
+            && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+            && boundary.identity.request_hash == request_hash
+            && boundary.started_phases.is_empty()
+            && boundary.completed_phases.is_empty()
+            && boundary.completed_at.is_none()
+            && boundary.last_sequence == state.last_sequence
+    });
+    latest_assistant_is_head || pristine_discard_boundary
 }
 
 fn latest_context_boundary_at_head(
@@ -5029,11 +5749,11 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        permission::{PermissionEffect, PermissionPolicy},
+        permission::{PermissionEffect, PermissionMatcher, PermissionPolicy, PermissionRule},
         session::{
             ApprovalRequestedEvent, ApprovalResolvedEvent, ModelRequestCancelledEvent,
             RuntimeCommittedEvent, SessionCreatedEvent, StyleExecutionInitializedEvent,
-            StyleNodeCompletedEvent, StyleNodeEnteredEvent, StyleTransitionSelectedEvent,
+            StyleNodeCompletedEvent, StyleNodeEnteredEvent, StyleTransitionSelectedEvent, replay,
         },
         style_executor::tests::binding,
     };
@@ -5350,6 +6070,18 @@ mod tests {
         .expect("data event")
     }
 
+    fn typed_event(
+        sequence: u64,
+        payload: RuntimeCommittedEvent,
+    ) -> EventEnvelope<RuntimeCommittedEvent> {
+        let mapped = data_event(sequence, payload);
+        EventEnvelope::seal(
+            mapped.metadata,
+            serde_json::from_value(mapped.payload).expect("typed payload"),
+        )
+        .expect("typed event")
+    }
+
     fn created_event() -> EventEnvelope<Value> {
         data_event(
             1,
@@ -5380,6 +6112,26 @@ mod tests {
                 "mandatory allow",
             ),
         }
+    }
+
+    fn tool_approval_policy() -> ProviderExecutionPolicy {
+        let mut value = policy(PermissionEffect::Allow);
+        value.user_policy = PermissionPolicy::new(
+            "user",
+            vec![PermissionRule {
+                id: String::from("ask-tools"),
+                priority: 100,
+                matcher: PermissionMatcher {
+                    action: Some(String::from("tool_call")),
+                    ..PermissionMatcher::default()
+                },
+                effect: PermissionEffect::Ask,
+                reason: String::from("fixture tool approval"),
+            }],
+            PermissionEffect::Allow,
+            "allow non-tool actions",
+        );
+        value
     }
 
     #[tokio::test]
@@ -5453,6 +6205,40 @@ mod tests {
         value.compaction.strategy = String::from("none");
         value.compaction.trigger_tokens = None;
         value
+    }
+
+    fn ephemeral_created_events() -> Vec<EventEnvelope<Value>> {
+        let binding = binding(BuiltInStyle::EphemeralTurn);
+        vec![data_event(
+            1,
+            RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                workspace: String::from("fixture-workspace"),
+                style: binding.id.clone(),
+                style_binding: Some(Box::new(binding)),
+            }),
+        )]
+    }
+
+    fn successful_harness_reply(text: &str) -> HarnessDataReply {
+        HarnessDataReply::Events(vec![
+            HarnessDataEvent::Started,
+            HarnessDataEvent::Text(text.to_owned()),
+            HarnessDataEvent::Completed {
+                reason: String::from("stop"),
+                input_tokens: 4,
+                output_tokens: 1,
+            },
+        ])
+    }
+
+    fn load_mock_state(data: &MockTurnData) -> crate::session::SessionState {
+        SessionPersistenceLogic::new(data.clone())
+            .load_session(LoadSessionCommand {
+                session_directory: PathBuf::from("sessions").join(session_id().to_string()),
+                expected_session_id: session_id(),
+            })
+            .expect("replay fixture")
+            .state
     }
 
     fn text_entry(id: &str, text: &str, sequence: u64) -> TextEntry {
@@ -5816,6 +6602,732 @@ mod tests {
             data.state.harness_commands.lock().expect("commands").len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_turns_use_one_fresh_projection_and_discard_provider_state() {
+        let data = MockTurnData::with_scenario(
+            ephemeral_created_events(),
+            vec![
+                Ok(successful_harness_reply("turn-one-secret-output")),
+                Ok(successful_harness_reply("turn-two-output")),
+            ],
+            Err(ToolDataError::Unavailable),
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        logic
+            .run_turn(command())
+            .await
+            .expect("first ephemeral turn");
+        let first = load_mock_state(&data);
+        assert!(first.conversation.provider_projection().is_empty());
+        assert_eq!(
+            data.state
+                .events
+                .lock()
+                .expect("events")
+                .iter()
+                .filter(|event| event
+                    .payload
+                    .to_string()
+                    .contains("ephemeral_fresh_context"))
+                .count(),
+            1
+        );
+
+        let mut second = command();
+        second.prompt = String::from("second input without inherited state");
+        second.cancellation_id = String::from("cancel-2");
+        logic
+            .run_turn(second.clone())
+            .await
+            .expect("second ephemeral turn");
+
+        let state = load_mock_state(&data);
+        assert!(state.conversation.provider_projection().is_empty());
+        assert_eq!(
+            state
+                .conversation
+                .history()
+                .iter()
+                .filter(|entry| matches!(entry, ConversationEntry::UserMessage(_)))
+                .count(),
+            2
+        );
+        assert_eq!(
+            data.state
+                .events
+                .lock()
+                .expect("events")
+                .iter()
+                .filter(|event| event
+                    .payload
+                    .to_string()
+                    .contains("ephemeral_fresh_context"))
+                .count(),
+            2,
+            "each turn commits exactly one fresh-context replacement"
+        );
+        let commands = data.state.harness_commands.lock().expect("commands");
+        assert_eq!(commands.len(), 2);
+        let HarnessDataCommand::Execute { entries, .. } = &commands[1] else {
+            panic!("execute command");
+        };
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            entries.as_slice(),
+            [agentmod_runtime_data::harness::HarnessDataEntry::User(value)]
+                if value == &second.prompt
+        ));
+        assert!(
+            !format!("{entries:?}").contains("turn-one-secret-output"),
+            "discarded provider-visible output must not leak into the next turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn ephemeral_context_kill_cuts_resume_without_duplicate_effects() {
+        let seed = MockTurnData::with_scenario(
+            ephemeral_created_events(),
+            vec![Ok(successful_harness_reply("seed-output"))],
+            Err(ToolDataError::Unavailable),
+        );
+        TurnLogic::new(seed.clone(), policy(PermissionEffect::Allow))
+            .run_turn(command())
+            .await
+            .expect("seed complete turn");
+        let full = seed.state.events.lock().expect("events").clone();
+        let cuts = [
+            full.iter()
+                .position(|event| {
+                    event.metadata.event_type == "context.projection_replaced"
+                        && event
+                            .payload
+                            .to_string()
+                            .contains("ephemeral_fresh_context")
+                })
+                .expect("fresh replacement"),
+            full.iter()
+                .position(|event| {
+                    event.metadata.event_type == "style.node_completed"
+                        && event.payload.to_string().contains("fresh-context")
+                })
+                .expect("context node completion"),
+            full.iter()
+                .position(|event| {
+                    event.metadata.event_type == "style.node_entered"
+                        && event.payload.to_string().contains("\"respond\"")
+                })
+                .expect("model node entry"),
+        ];
+
+        for cut in cuts {
+            let data = MockTurnData::with_events(
+                Ok(successful_harness_reply("recovered-output")),
+                full[..=cut].to_vec(),
+            );
+            TurnLogic::new(data.clone(), policy(PermissionEffect::Allow))
+                .run_turn(command())
+                .await
+                .expect("recover exact context cut");
+
+            assert_eq!(
+                data.state.harness_commands.lock().expect("commands").len(),
+                1,
+                "recovery issues exactly the not-yet-proposed model request"
+            );
+            let state = load_mock_state(&data);
+            assert!(state.conversation.provider_projection().is_empty());
+            assert_eq!(
+                state
+                    .conversation
+                    .history()
+                    .iter()
+                    .filter(|entry| matches!(entry, ConversationEntry::UserMessage(_)))
+                    .count(),
+                1
+            );
+            let events = data.state.events.lock().expect("events");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event
+                        .payload
+                        .to_string()
+                        .contains("ephemeral_fresh_context"))
+                    .count(),
+                1,
+                "fresh replacement must not be duplicated at any recovery cut"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.metadata.event_type == "model.request_proposed")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the reducer fixture spells out both prohibited effect-evidence gaps"
+    )]
+    async fn ephemeral_nodes_cannot_complete_without_fresh_and_discard_evidence() {
+        let binding = binding(BuiltInStyle::EphemeralTurn);
+        let graph = CompiledStyleExecutor::from_binding(&binding)
+            .expect("executor")
+            .compiled()
+            .graph
+            .clone();
+        let fresh_state = replay(&[
+            typed_event(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture-workspace"),
+                    style: binding.id.clone(),
+                    style_binding: Some(Box::new(binding)),
+                }),
+            ),
+            typed_event(
+                2,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(graph),
+                    },
+                )),
+            ),
+            typed_event(
+                3,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("fresh-context"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+        ])
+        .expect("fresh active state");
+        assert!(matches!(
+            reduce(
+                Some(fresh_state),
+                &typed_event(
+                    4,
+                    RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                        node_id: String::from("fresh-context"),
+                        attempt: 1,
+                        loop_iteration: 0,
+                        step: 1,
+                        result_reference: None,
+                        artifact_reference: None,
+                    }),
+                ),
+            ),
+            Err(SessionReducerError::InvalidStyleExecutionTransition)
+        ));
+
+        let seed = MockTurnData::with_scenario(
+            ephemeral_created_events(),
+            vec![Ok(successful_harness_reply("seed-output"))],
+            Err(ToolDataError::Unavailable),
+        );
+        TurnLogic::new(seed.clone(), policy(PermissionEffect::Allow))
+            .run_turn(command())
+            .await
+            .expect("seed turn");
+        let full = seed.state.events.lock().expect("events").clone();
+        let done_cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "style.node_entered"
+                    && event.payload.to_string().contains("\"done\"")
+            })
+            .expect("done entry");
+        let truncated = MockTurnData::with_events(
+            Err(HarnessDataError::Unavailable),
+            full[..=done_cut].to_vec(),
+        );
+        let state = load_mock_state(&truncated);
+        let active = state
+            .style_execution
+            .as_ref()
+            .and_then(|execution| execution.active_node.as_ref())
+            .expect("active done")
+            .clone();
+        let next = state
+            .last_sequence
+            .checked_next()
+            .expect("next sequence")
+            .get();
+        assert!(matches!(
+            reduce(
+                Some(state),
+                &typed_event(
+                    next,
+                    RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                        node_id: active.node_id,
+                        attempt: active.attempt,
+                        loop_iteration: active.loop_iteration,
+                        step: active.step,
+                        result_reference: None,
+                        artifact_reference: None,
+                    }),
+                ),
+            ),
+            Err(SessionReducerError::InvalidStyleExecutionTransition)
+        ));
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the recovery matrix keeps every terminal journal cut and request-identity mismatch visible"
+    )]
+    async fn ephemeral_terminal_cleanup_recovery_never_redispatches_model_or_duplicates_user() {
+        let seed = MockTurnData::with_scenario(
+            ephemeral_created_events(),
+            vec![Ok(successful_harness_reply("seed-output"))],
+            Err(ToolDataError::Unavailable),
+        );
+        TurnLogic::new(seed.clone(), policy(PermissionEffect::Allow))
+            .run_turn(command())
+            .await
+            .expect("seed complete turn");
+        let full = seed.state.events.lock().expect("events").clone();
+        let pre_assistant_cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "style.node_entered"
+                    && event.payload.to_string().contains("\"done\"")
+            })
+            .expect("complete-turn entry");
+        let assistant_cut = full
+            .iter()
+            .rposition(|event| event.metadata.event_type == "conversation.entry_committed")
+            .expect("assistant entry");
+        let discard_phase_cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "context.phase_started"
+                    && event.payload.to_string().contains("\"discard\"")
+            })
+            .expect("discard phase started");
+        let discard_replacement_cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "context.projection_replaced"
+                    && event.payload.to_string().contains("ephemeral_discard")
+            })
+            .expect("discard replacement");
+        let discard_boundary_cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "context.boundary_completed"
+                    && event.payload.to_string().contains("before_turn_completion")
+            })
+            .expect("discard boundary completed");
+
+        for cut in [
+            pre_assistant_cut,
+            assistant_cut,
+            discard_replacement_cut,
+            discard_boundary_cut,
+        ] {
+            let data = MockTurnData::with_events(
+                Err(HarnessDataError::Unavailable),
+                full[..=cut].to_vec(),
+            );
+            let result = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow))
+                .run_turn(command())
+                .await
+                .expect("recover terminal cleanup");
+            assert!(result.events.is_empty());
+            assert!(
+                data.state
+                    .harness_commands
+                    .lock()
+                    .expect("commands")
+                    .is_empty(),
+                "terminal cleanup recovery must not redispatch the model"
+            );
+            let state = load_mock_state(&data);
+            assert!(state.conversation.provider_projection().is_empty());
+            assert!(
+                state
+                    .style_execution
+                    .expect("execution")
+                    .active_node
+                    .is_none()
+            );
+            assert_eq!(
+                state
+                    .conversation
+                    .history()
+                    .iter()
+                    .filter(|entry| matches!(entry, ConversationEntry::UserMessage(_)))
+                    .count(),
+                1,
+                "cleanup recovery must not commit a duplicate user turn"
+            );
+        }
+
+        let ambiguous = MockTurnData::with_events(
+            Err(HarnessDataError::Unavailable),
+            full[..=discard_phase_cut].to_vec(),
+        );
+        let before = ambiguous.event_types();
+        let error = TurnLogic::new(ambiguous.clone(), policy(PermissionEffect::Allow))
+            .run_turn(command())
+            .await
+            .expect_err("started discard pipeline is ambiguous");
+        assert!(matches!(
+            error,
+            RunTurnError::StyleRecoveryRequired(ref node) if node == "done"
+        ));
+        assert_eq!(ambiguous.event_types(), before);
+        assert!(
+            ambiguous
+                .state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+
+        let variants = [
+            {
+                let mut value = command();
+                value.provider = String::from("different-provider");
+                value
+            },
+            {
+                let mut value = command();
+                value.model = String::from("different-model");
+                value
+            },
+            {
+                let mut value = command();
+                value.options = json!({"temperature":0.5});
+                value
+            },
+        ];
+        for cut in [pre_assistant_cut, assistant_cut, discard_boundary_cut] {
+            for mismatched in variants.clone() {
+                let data = MockTurnData::with_events(
+                    Err(HarnessDataError::Unavailable),
+                    full[..=cut].to_vec(),
+                );
+                let before = data.event_types();
+                let error = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow))
+                    .run_turn(mismatched)
+                    .await
+                    .expect_err("changed request identity must fail closed");
+                assert!(matches!(error, RunTurnError::StyleRecoveryRequired(_)));
+                assert_eq!(data.event_types(), before);
+                assert!(
+                    data.state
+                        .harness_commands
+                        .lock()
+                        .expect("commands")
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn ephemeral_zero_text_terminal_cuts_recover_without_redispatch() {
+        let seed = MockTurnData::with_scenario(
+            ephemeral_created_events(),
+            vec![Ok(HarnessDataReply::Events(vec![
+                HarnessDataEvent::Started,
+                HarnessDataEvent::Completed {
+                    reason: String::from("stop"),
+                    input_tokens: 1,
+                    output_tokens: 0,
+                },
+            ]))],
+            Err(ToolDataError::Unavailable),
+        );
+        TurnLogic::new(seed.clone(), policy(PermissionEffect::Allow))
+            .run_turn(command())
+            .await
+            .expect("seed zero-text turn");
+        let full = seed.state.events.lock().expect("events").clone();
+        let cuts = [
+            full.iter()
+                .position(|event| {
+                    event.metadata.event_type == "style.node_entered"
+                        && event.payload.to_string().contains("\"done\"")
+                })
+                .expect("complete-turn entry"),
+            full.iter()
+                .position(|event| {
+                    event.metadata.event_type == "context.projection_replaced"
+                        && event.payload.to_string().contains("ephemeral_discard")
+                })
+                .expect("discard replacement"),
+            full.iter()
+                .position(|event| {
+                    event.metadata.event_type == "context.boundary_completed"
+                        && event.payload.to_string().contains("before_turn_completion")
+                })
+                .expect("discard boundary"),
+        ];
+        for cut in cuts {
+            let data = MockTurnData::with_events(
+                Err(HarnessDataError::Unavailable),
+                full[..=cut].to_vec(),
+            );
+            TurnLogic::new(data.clone(), policy(PermissionEffect::Allow))
+                .run_turn(command())
+                .await
+                .expect("recover zero-text cut");
+            assert!(
+                data.state
+                    .harness_commands
+                    .lock()
+                    .expect("commands")
+                    .is_empty()
+            );
+            let state = load_mock_state(&data);
+            assert!(state.conversation.provider_projection().is_empty());
+            assert!(
+                !state
+                    .conversation
+                    .history()
+                    .iter()
+                    .any(|entry| matches!(entry, ConversationEntry::AssistantMessage(_)))
+            );
+            assert!(
+                state
+                    .style_execution
+                    .expect("execution")
+                    .active_node
+                    .is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ephemeral_pre_assistant_recovery_concatenates_same_run_provider_exchanges() {
+        let seed = MockTurnData::with_scenario(
+            ephemeral_created_events(),
+            vec![
+                Ok(HarnessDataReply::Events(vec![
+                    HarnessDataEvent::Started,
+                    HarnessDataEvent::Text(String::from("initial ")),
+                    HarnessDataEvent::ToolProposed {
+                        continuation_id: String::from("continue-1"),
+                        call_id: String::from("call-1"),
+                        tool: String::from("filesystem.read"),
+                        arguments: json!({"path":"README.md"}),
+                    },
+                ])),
+                Ok(HarnessDataReply::Events(vec![
+                    HarnessDataEvent::Started,
+                    HarnessDataEvent::Text(String::from("final")),
+                    HarnessDataEvent::Completed {
+                        reason: String::from("stop"),
+                        input_tokens: 2,
+                        output_tokens: 2,
+                    },
+                ])),
+            ],
+            Ok(vec![
+                ToolDataEvent::Started {
+                    call_id: String::from("call-1"),
+                },
+                ToolDataEvent::Completed {
+                    call_id: String::from("call-1"),
+                    result: json!({"content":"fixture"}),
+                    artifact: None,
+                    truncated: false,
+                },
+            ]),
+        );
+        TurnLogic::new(seed.clone(), policy(PermissionEffect::Allow))
+            .run_turn(command())
+            .await
+            .expect("seed multi-exchange turn");
+        let full = seed.state.events.lock().expect("events").clone();
+        let done_cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "style.node_entered"
+                    && event.payload.to_string().contains("\"done\"")
+            })
+            .expect("complete-turn entry");
+        let data = MockTurnData::with_events(
+            Err(HarnessDataError::Unavailable),
+            full[..=done_cut].to_vec(),
+        );
+
+        TurnLogic::new(data.clone(), policy(PermissionEffect::Allow))
+            .run_turn(command())
+            .await
+            .expect("recover multi-exchange assistant");
+
+        assert!(
+            data.state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty(),
+            "recovery must not redispatch either provider exchange"
+        );
+        let state = load_mock_state(&data);
+        let assistants = state
+            .conversation
+            .history()
+            .iter()
+            .filter_map(|entry| match entry {
+                ConversationEntry::AssistantMessage(assistant) => Some(assistant.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistants, ["initial final"]);
+        assert!(state.conversation.provider_projection().is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture proves normal and crash-recovered approval completion use the identical turn aggregate"
+    )]
+    async fn ephemeral_approval_completion_uses_the_canonical_turn_text_aggregate() {
+        let data = MockTurnData::with_scenario(
+            ephemeral_created_events(),
+            vec![
+                Ok(HarnessDataReply::Events(vec![
+                    HarnessDataEvent::Started,
+                    HarnessDataEvent::Text(String::from("initial ")),
+                    HarnessDataEvent::ToolProposed {
+                        continuation_id: String::from("continue-1"),
+                        call_id: String::from("call-1"),
+                        tool: String::from("filesystem.read"),
+                        arguments: json!({"path":"README.md"}),
+                    },
+                ])),
+                Ok(HarnessDataReply::Events(vec![
+                    HarnessDataEvent::Started,
+                    HarnessDataEvent::Text(String::from("final")),
+                    HarnessDataEvent::Completed {
+                        reason: String::from("stop"),
+                        input_tokens: 2,
+                        output_tokens: 2,
+                    },
+                ])),
+            ],
+            Ok(vec![
+                ToolDataEvent::Started {
+                    call_id: String::from("call-1"),
+                },
+                ToolDataEvent::Completed {
+                    call_id: String::from("call-1"),
+                    result: json!({"content":"fixture"}),
+                    artifact: None,
+                    truncated: false,
+                },
+            ]),
+        );
+        let logic = TurnLogic::new(data.clone(), tool_approval_policy());
+        let awaiting = logic
+            .run_turn(command())
+            .await
+            .expect("request tool approval");
+        let continuation_id = awaiting
+            .awaiting_continuation
+            .expect("approval continuation");
+        *data.state.continuation.lock().expect("continuation") = Some(ContinuationRecord {
+            session_id: session_id().to_string(),
+            id: continuation_id.clone(),
+            state: ContinuationStateRecord::Pending,
+            wake_condition: ContinuationWakeRecord::Manual,
+            payload: ContinuationPayloadRecord::ToolApproval(Box::new(ToolApprovalPayloadRecord {
+                session_id: session_id().to_string(),
+                workspace: String::from("fixture-workspace"),
+                call_id: String::from("call-1"),
+                tool: String::from("filesystem.read"),
+                arguments: json!({"path":"README.md"}),
+                cancellation_id: String::from("cancel-1"),
+                provider: String::from("deterministic-mock"),
+                model: String::from("fixture"),
+                options: json!({}),
+                style: String::from("ephemeral-turn"),
+                harness_continuation: String::from("continue-1"),
+                remaining_tool_calls: Vec::new(),
+            })),
+            expires_at_millis: None,
+        });
+
+        logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id,
+                approved: true,
+                resume_after_resolution: true,
+            })
+            .await
+            .expect("resume approved ephemeral tool");
+
+        let state = load_mock_state(&data);
+        let assistants = state
+            .conversation
+            .history()
+            .iter()
+            .filter_map(|entry| match entry {
+                ConversationEntry::AssistantMessage(assistant) => Some(assistant.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistants, ["initial final"]);
+        assert!(state.conversation.provider_projection().is_empty());
+        assert_eq!(
+            data.state.harness_commands.lock().expect("commands").len(),
+            2
+        );
+
+        let full = data.state.events.lock().expect("events").clone();
+        let done_cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "style.node_entered"
+                    && event.payload.to_string().contains("\"done\"")
+            })
+            .expect("complete-turn entry");
+        let recovery = MockTurnData::with_events(
+            Err(HarnessDataError::Unavailable),
+            full[..=done_cut].to_vec(),
+        );
+        TurnLogic::new(recovery.clone(), tool_approval_policy())
+            .run_turn(command())
+            .await
+            .expect("recover approval-resumed complete turn");
+        assert!(
+            recovery
+                .state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty(),
+            "approval recovery must not redispatch provider or tool work"
+        );
+        let recovered = load_mock_state(&recovery);
+        let recovered_assistants = recovered
+            .conversation
+            .history()
+            .iter()
+            .filter_map(|entry| match entry {
+                ConversationEntry::AssistantMessage(assistant) => Some(assistant.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(recovered_assistants, ["initial final"]);
+        assert!(recovered.conversation.provider_projection().is_empty());
     }
 
     #[tokio::test]

@@ -50,6 +50,17 @@ provider projection. A retry may reuse a completed phase only when provider,
 model, canonical options, current input, and run identity still match; a crash
 after an interceptor starts but before its completion fails closed.
 
+Ephemeral-turn graphs use the same lifecycle rather than a parallel context
+path. Their `turn_start` memory phase replaces the provider projection with the
+current typed user input plus only style-selected records and records
+`ephemeral_fresh_context` provenance. After the visible assistant entry is
+committed, a `before_turn_completion` boundary runs one authorized `discard`
+phase and records an empty projection with `ephemeral_discard` provenance.
+Canonical history is never removed or converted into a fabricated user
+handoff. Replay permits only the exact compiled context-transform-to-model edge
+with matching run and request identity, and can finish already committed
+discard evidence without redispatching the model.
+
 Projection pressure uses a deterministic approximate-token estimator over the
 complete provider wire representation and a separate exact 16-MiB serialized
 safety cap. Provider token counters and compaction checkpoints are

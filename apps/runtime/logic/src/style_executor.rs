@@ -36,6 +36,13 @@ pub(crate) enum StyleNodeDirective {
     Fail,
 }
 
+/// Runtime adapter selected from the exact validated compiled graph.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StyleAdapterKind {
+    PersistentTurn,
+    EphemeralTurn,
+}
+
 impl StyleNodeDirective {
     /// Returns whether restart recovery must not infer that this node's
     /// externally observable work has or has not happened from graph control
@@ -199,6 +206,48 @@ impl CompiledStyleExecutor {
         }
         let Ok(Some(to_complete)) =
             self.transition(model_to_tools.to.index, &serde_json::json!({}))
+        else {
+            return false;
+        };
+        to_complete.to.directive == StyleNodeDirective::CompleteTurn
+            && self
+                .transition(to_complete.to.index, &serde_json::json!({}))
+                .is_ok_and(|transition| transition.is_none())
+    }
+
+    /// Classifies the exact supported turn lifecycle from compiled semantics.
+    pub(crate) fn adapter_kind(&self) -> Option<StyleAdapterKind> {
+        if self.supports_persistent_turn() {
+            return Some(StyleAdapterKind::PersistentTurn);
+        }
+        self.supports_ephemeral_turn()
+            .then_some(StyleAdapterKind::EphemeralTurn)
+    }
+
+    /// Returns whether this graph is the exact fresh-context turn lifecycle.
+    fn supports_ephemeral_turn(&self) -> bool {
+        if self.compiled.graph.nodes.len() != 4 || self.compiled.graph.edges.len() != 3 {
+            return false;
+        }
+        let Ok(entry) = self.entry() else {
+            return false;
+        };
+        if entry.directive != StyleNodeDirective::ContextTransform {
+            return false;
+        }
+        let Ok(Some(to_model)) = self.transition(entry.index, &serde_json::json!({})) else {
+            return false;
+        };
+        if to_model.to.directive != StyleNodeDirective::ModelCall {
+            return false;
+        }
+        let Ok(Some(to_tools)) = self.transition(to_model.to.index, &serde_json::json!({})) else {
+            return false;
+        };
+        if to_tools.to.directive != StyleNodeDirective::ToolExecutionGate {
+            return false;
+        }
+        let Ok(Some(to_complete)) = self.transition(to_tools.to.index, &serde_json::json!({}))
         else {
             return false;
         };
@@ -429,18 +478,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn ephemeral_turn_selects_the_fresh_context_adapter_from_compiled_semantics() {
+        let executor = CompiledStyleExecutor::from_binding(&binding(BuiltInStyle::EphemeralTurn))
+            .expect("executor");
+        assert_eq!(
+            executor.adapter_kind(),
+            Some(super::StyleAdapterKind::EphemeralTurn)
+        );
+        assert_eq!(
+            executor.entry().expect("entry").directive,
+            StyleNodeDirective::ContextTransform
+        );
+    }
+
+    #[test]
     fn research_loop_uses_compiled_conditions_and_rejects_missing_variables() {
         let executor = CompiledStyleExecutor::from_binding(&binding(BuiltInStyle::ResearchLoop))
             .expect("executor");
         assert!(!executor.supports_persistent_turn());
         let loop_node = executor.node("repeat").expect("loop");
         let repeat = executor
-            .transition(loop_node.index, &json!({"iteration":{"remaining":true}}))
+            .transition(
+                loop_node.index,
+                &json!({"completion":{"criteria_met":false}}),
+            )
             .expect("repeat transition")
             .expect("repeat");
-        assert_eq!(repeat.to.id, "research");
+        assert_eq!(repeat.to.id, "fresh-context");
         let done = executor
-            .transition(loop_node.index, &json!({"iteration":{"remaining":false}}))
+            .transition(
+                loop_node.index,
+                &json!({"completion":{"criteria_met":true}}),
+            )
             .expect("done transition")
             .expect("done");
         assert_eq!(done.to.id, "done");

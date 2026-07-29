@@ -28,6 +28,11 @@ Terminal tool state retains a bounded success/failure outcome and exact action
 digest. Approval recovery compares the reconstructed full proposal digest,
 repairs an absent or call-only typed provider conversation pair without
 redispatch, and rejects conflicting, reversed, or digest-mismatched history.
+Ephemeral turns use the same typed context boundary/phase events for fresh
+projection construction and terminal projection discard. The reducer verifies
+their compiled-node placement, phase order, projection measurements, and exact
+request identity, so restart repair can advance committed orchestration state
+without inferring or redispatching a provider effect.
 
 The specification's complete taxonomy is still broader than the implemented
 typed set: detailed plugin lifecycle, frontend connection lifecycle,

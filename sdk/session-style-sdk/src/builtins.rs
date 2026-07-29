@@ -70,7 +70,7 @@ fn manifest_from_parts(style: BuiltInStyle, parts: BuiltInParts) -> SessionStyle
             groups: BTreeMap::from([("filesystem.read".to_owned(), ApprovalDecision::Allow)]),
         },
         budgets: ExecutionBudgets {
-            max_iterations: 32,
+            max_iterations: parts.max_iterations,
             max_steps: 1_000,
             max_tokens: 1_000_000,
             max_cost_micros: 100_000_000,
@@ -101,6 +101,7 @@ fn manifest_from_parts(style: BuiltInStyle, parts: BuiltInParts) -> SessionStyle
 struct BuiltInParts {
     id: &'static str,
     version: &'static str,
+    max_iterations: u32,
     graph: &'static str,
     capabilities: Vec<&'static str>,
     tool_groups: Vec<&'static str>,
@@ -115,6 +116,7 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
         BuiltInStyle::PersistentChat => (
             "persistent-chat",
             "1.0.0",
+            32,
             PERSISTENT_CHAT_GRAPH,
             vec!["agents", "approval", "model", "tools"],
             vec!["filesystem"],
@@ -126,6 +128,7 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
         BuiltInStyle::EphemeralTurn => (
             "ephemeral-turn",
             "1.1.0",
+            32,
             EPHEMERAL_TURN_GRAPH,
             vec!["approval", "context", "model", "tools"],
             vec!["filesystem"],
@@ -136,13 +139,14 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
         ),
         BuiltInStyle::ResearchLoop => (
             "research-loop",
-            "1.0.0",
+            "1.1.0",
+            16,
             RESEARCH_LOOP_GRAPH,
-            vec!["agents", "approval", "artifacts", "model"],
-            Vec::new(),
+            vec!["approval", "artifacts", "context", "model", "tools"],
+            vec!["filesystem"],
             research_memory(),
-            artifact_compaction(),
-            bounded_children(4, 2, 1, 50_000),
+            no_compaction(),
+            no_children(),
             vec![
                 TerminationOutcome::CompleteSession,
                 TerminationOutcome::Fail,
@@ -151,6 +155,7 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
         BuiltInStyle::PlannerWorker => (
             "planner-worker",
             "1.0.0",
+            32,
             PLANNER_WORKER_GRAPH,
             vec!["agents", "approval", "model"],
             Vec::new(),
@@ -164,10 +169,11 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
         ),
         BuiltInStyle::DeclarativeGraph => (
             "declarative-graph",
-            "1.0.0",
+            "1.1.0",
+            3,
             DECLARATIVE_GRAPH,
-            vec!["approval", "events"],
-            Vec::new(),
+            vec!["approval", "tools"],
+            vec!["filesystem"],
             no_memory(),
             no_compaction(),
             no_children(),
@@ -180,13 +186,14 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
     BuiltInParts {
         id: tuple.0,
         version: tuple.1,
-        graph: tuple.2,
-        capabilities: tuple.3,
-        tool_groups: tuple.4,
-        memory: tuple.5,
-        compaction: tuple.6,
-        children: tuple.7,
-        outcomes: tuple.8,
+        max_iterations: tuple.2,
+        graph: tuple.3,
+        capabilities: tuple.4,
+        tool_groups: tuple.5,
+        memory: tuple.6,
+        compaction: tuple.7,
+        children: tuple.8,
+        outcomes: tuple.9,
     }
 }
 
@@ -313,18 +320,6 @@ fn no_memory() -> MemorySelection {
 fn summary_compaction() -> CompactionSelection {
     CompactionSelection {
         strategy: CompactionStrategy::Summary,
-        trigger_tokens: Some(750_000),
-        reserved_context_tokens: 32_000,
-        max_provider_projection_tokens: 250_000,
-        preserve_unresolved_tasks: true,
-        preserve_active_processes: true,
-        preservation_requirements: required_projection_records(),
-    }
-}
-
-fn artifact_compaction() -> CompactionSelection {
-    CompactionSelection {
-        strategy: CompactionStrategy::ArtifactHandoff,
         trigger_tokens: Some(750_000),
         reserved_context_tokens: 32_000,
         max_provider_projection_tokens: 250_000,
@@ -471,7 +466,7 @@ to = "done"
 
 const RESEARCH_LOOP_GRAPH: &str = r#"
 format_version = 1
-entry = "research"
+entry = "fresh-context"
 
 [budget]
 max_steps = 500
@@ -480,14 +475,25 @@ max_cost_micros = 75000000
 max_duration_ms = 2700000
 
 [declarations]
-capabilities = ["artifacts", "model"]
+capabilities = ["artifacts", "context", "model", "tools"]
+tools = ["filesystem.read"]
 providers = ["mock"]
+
+[[nodes]]
+id = "fresh-context"
+kind = "context_transform"
 
 [[nodes]]
 id = "research"
 kind = "model_call"
 provider = "mock"
 retry_limit = 2
+
+[[nodes]]
+id = "tool"
+kind = "tool_execution_gate"
+tool = "filesystem.read"
+read_scopes = ["workspace"]
 
 [[nodes]]
 id = "persist"
@@ -503,7 +509,15 @@ id = "done"
 kind = "complete_session"
 
 [[edges]]
+from = "fresh-context"
+to = "research"
+
+[[edges]]
 from = "research"
+to = "tool"
+
+[[edges]]
+from = "tool"
 to = "persist"
 
 [[edges]]
@@ -512,13 +526,15 @@ to = "repeat"
 
 [[edges]]
 from = "repeat"
-to = "research"
-condition = "iteration.remaining == true"
+to = "fresh-context"
+condition = "completion.criteria_met == false"
+label = "continue"
 
 [[edges]]
 from = "repeat"
 to = "done"
-condition = "iteration.remaining == false"
+condition = "completion.criteria_met == true"
+label = "complete"
 "#;
 
 const PLANNER_WORKER_GRAPH: &str = r#"
@@ -603,26 +619,70 @@ condition = "review.approved == true"
 
 const DECLARATIVE_GRAPH: &str = r#"
 format_version = 1
-entry = "emit"
+entry = "branch"
 
 [budget]
-max_steps = 10
+max_steps = 64
 max_tokens = 1000
 max_cost_micros = 1000
 max_duration_ms = 10000
 
 [declarations]
-capabilities = ["events"]
+capabilities = ["approval", "tools"]
+tools = ["filesystem.read"]
 
 [[nodes]]
-id = "emit"
-kind = "emit_event"
+id = "branch"
+kind = "conditional_branch"
+
+[[nodes]]
+id = "approval"
+kind = "user_approval"
+
+[[nodes]]
+id = "tool"
+kind = "tool_execution_gate"
+tool = "filesystem.read"
+read_scopes = ["workspace"]
+
+[[nodes]]
+id = "repeat"
+kind = "loop"
+max_iterations = 3
 
 [[nodes]]
 id = "done"
 kind = "complete_session"
 
 [[edges]]
-from = "emit"
+from = "branch"
+to = "approval"
+condition = "request.requires_approval == true"
+label = "require-approval"
+
+[[edges]]
+from = "branch"
+to = "tool"
+condition = "request.requires_approval == false"
+label = "skip-approval"
+
+[[edges]]
+from = "approval"
+to = "tool"
+
+[[edges]]
+from = "tool"
+to = "repeat"
+
+[[edges]]
+from = "repeat"
+to = "tool"
+condition = "iteration.remaining == true"
+label = "continue"
+
+[[edges]]
+from = "repeat"
 to = "done"
+condition = "iteration.remaining == false"
+label = "complete"
 "#;

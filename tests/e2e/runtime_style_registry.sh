@@ -81,13 +81,15 @@ persistent_before_sequence=$(printf '%s' "$persistent_before" |
 persistent_journal="$run_root/sessions/$persistent_id/events.jsonl"
 test -n "$persistent_before_sequence"
 test "$persistent_before_sequence" -eq "$(wc -l <"$persistent_journal" | tr -d ' ')"
-if "$cli" run "ephemeral before restart" --session "$ephemeral_id" \
+ephemeral_before=$("$cli" run "ephemeral before restart" --session "$ephemeral_id" \
     --option 'mock_scenario="streaming_text"' \
-    --option 'mock_text="ephemeral-before"' --json >/dev/null 2>&1; then
-    echo "unimplemented ephemeral graph silently used the legacy turn path" >&2
-    exit 1
-fi
-test "$(wc -l < "$run_root/sessions/$ephemeral_id/events.jsonl")" -eq 1
+    --option 'mock_text="ephemeral-before"' --json)
+ephemeral_before_sequence=$(printf '%s' "$ephemeral_before" |
+    sed -n 's/.*"last_committed_sequence":\([0-9][0-9]*\).*/\1/p')
+ephemeral_journal="$run_root/sessions/$ephemeral_id/events.jsonl"
+test -n "$ephemeral_before_sequence"
+test "$ephemeral_before_sequence" -eq \
+    "$(wc -l <"$ephemeral_journal" | tr -d ' ')"
 
 stop_runtime
 start_runtime
@@ -103,13 +105,15 @@ persistent_after_sequence=$(printf '%s' "$persistent_after" |
 test -n "$persistent_after_sequence"
 test "$persistent_after_sequence" -gt "$persistent_before_sequence"
 test "$persistent_after_sequence" -eq "$(wc -l <"$persistent_journal" | tr -d ' ')"
-if "$cli" run "ephemeral after restart" --session "$ephemeral_id" \
+ephemeral_after=$("$cli" run "ephemeral after restart" --session "$ephemeral_id" \
     --option 'mock_scenario="streaming_text"' \
-    --option 'mock_text="ephemeral-after"' --json >/dev/null 2>&1; then
-    echo "unsupported style changed behavior after restart" >&2
-    exit 1
-fi
-test "$(wc -l < "$run_root/sessions/$ephemeral_id/events.jsonl")" -eq 1
+    --option 'mock_text="ephemeral-after"' --json)
+ephemeral_after_sequence=$(printf '%s' "$ephemeral_after" |
+    sed -n 's/.*"last_committed_sequence":\([0-9][0-9]*\).*/\1/p')
+test -n "$ephemeral_after_sequence"
+test "$ephemeral_after_sequence" -gt "$ephemeral_before_sequence"
+test "$ephemeral_after_sequence" -eq \
+    "$(wc -l <"$ephemeral_journal" | tr -d ' ')"
 
 branch=$("$cli" session branch "$persistent_id" --at "$persistent_before_sequence" \
     --style ephemeral-turn --json)
@@ -117,6 +121,17 @@ branch_id=$(printf '%s' "$branch" |
     sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
 "$cli" session inspect "$branch_id" --json |
     grep -F '"id":"ephemeral-turn"' >/dev/null
+"$cli" run "parent continues persistently" --session "$persistent_id" \
+    --option 'mock_scenario="streaming_text"' \
+    --option 'mock_text="parent-continuation"' --json >/dev/null
+"$cli" run "branch continues ephemerally" --session "$branch_id" \
+    --option 'mock_scenario="streaming_text"' \
+    --option 'mock_text="branch-continuation"' --json >/dev/null
+"$cli" session inspect "$persistent_id" --json |
+    grep -F '"id":"persistent-chat"' >/dev/null
+branch_after=$("$cli" session inspect "$branch_id" --json)
+printf '%s' "$branch_after" | grep -F '"id":"ephemeral-turn"' >/dev/null
+printf '%s' "$branch_after" | grep -F '"provider_projection":[]' >/dev/null
 
 mkdir -p "$run_root/styles/user"
 printf disabled >"$run_root/styles/user/persistent-chat.disabled"

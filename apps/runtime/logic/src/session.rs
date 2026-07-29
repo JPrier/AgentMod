@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use agentmod_event_model::{EventClassification, EventEnvelope, EventModelError, EventScope};
 use agentmod_graph_engine::{ExecutableGraph, GRAPH_FORMAT_VERSION, NodeKind};
-use agentmod_primitives::{ContentHash, ContinuationId, Sequence, SessionId};
+use agentmod_primitives::{ContentHash, ContinuationId, EventId, Sequence, SessionId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -12,6 +12,8 @@ use crate::{
     conversation::{ConversationEntry, ConversationError, ConversationState, ProjectionProvenance},
     projection::measure_projection,
 };
+
+const MAX_REPLAY_VISIBLE_MODEL_BYTES: usize = 16 * 1024 * 1024;
 
 /// Durable session lifecycle reconstructed by replay.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -863,6 +865,12 @@ pub struct StyleExecutionState {
     /// Node currently executing, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_node: Option<StyleNodeEnteredEvent>,
+    /// Canonical sequence at which the active node was entered.
+    ///
+    /// Recovery uses this exact journal cut to distinguish a node that has not
+    /// begun its adapter work from one whose effect evidence is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_node_entered_at: Option<Sequence>,
     /// Completed node outcomes in committed order.
     #[serde(default)]
     pub completed_nodes: Vec<StyleNodeCompletedEvent>,
@@ -887,6 +895,30 @@ pub struct StyleExecutionState {
     /// Recoverable context boundaries retained in canonical execution order.
     #[serde(default)]
     pub context_boundaries: Vec<ContextBoundaryExecutionState>,
+    /// Latest provider exchange reconstructed from bounded canonical deltas.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_model_execution: Option<ModelExecutionEvidence>,
+}
+
+/// Bounded replay evidence for the latest started provider exchange.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelExecutionEvidence {
+    /// Exact turn cancellation/run identity.
+    pub cancellation_id: String,
+    /// Latest canonical user input owning this exchange chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_sequence: Option<Sequence>,
+    /// Canonical model-start sequence.
+    pub started_at: Sequence,
+    /// Concatenated visible deltas for the current turn across provider exchanges.
+    pub visible_text: String,
+    /// Matching successful terminal completion sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Sequence>,
+    /// Whether terminal evidence was a normal model response rather than a
+    /// tool-call handoff.
+    #[serde(default)]
+    pub response_completed: bool,
 }
 
 /// Replay-derived progress for one context-composition boundary.
@@ -910,6 +942,9 @@ pub struct ContextBoundaryExecutionState {
     /// Final exact serialized bytes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub serialized_bytes: Option<u64>,
+    /// Exact projection replacement event that completed a phase, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_replacement_event: Option<EventId>,
 }
 
 /// Exact replay-derived control position for a compiled style graph.
@@ -1144,6 +1179,12 @@ fn apply_payload(
             }
             if let Some(phase) = &replaced.context_phase {
                 apply_context_phase_completed(state, phase, event.metadata.sequence)?;
+                let boundary = style_execution_mut(state)?
+                    .context_boundaries
+                    .last_mut()
+                    .filter(|boundary| boundary.identity == phase.boundary)
+                    .ok_or(SessionReducerError::InvalidContextBoundaryTransition)?;
+                boundary.phase_replacement_event = Some(event.metadata.event_id);
             }
             Ok(())
         }
@@ -1161,18 +1202,105 @@ fn apply_payload(
         }
         RuntimeCommittedEvent::ModelRequestProposed(_)
         | RuntimeCommittedEvent::ModelRequestApproved(_)
-        | RuntimeCommittedEvent::ModelRequestStarted(_)
-        | RuntimeCommittedEvent::ModelOutputDeltaObserved(_)
         | RuntimeCommittedEvent::ModelToolCallDeltaObserved(_)
-        | RuntimeCommittedEvent::ModelToolCallProposed(_)
-        | RuntimeCommittedEvent::ModelRequestCancelled(_)
-        | RuntimeCommittedEvent::ModelRequestFailed(_)
         | RuntimeCommittedEvent::ToolCallProposed(_)
         | RuntimeCommittedEvent::ToolCallApproved(_)
         | RuntimeCommittedEvent::SchedulerFired(_)
         | RuntimeCommittedEvent::SchedulerDeliveryReconciled(_) => Ok(()),
+        RuntimeCommittedEvent::ModelRequestStarted(started) => {
+            let user_sequence =
+                state
+                    .conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        ConversationEntry::UserMessage(user) => Some(user.source_sequence),
+                        _ => None,
+                    });
+            if let Some(execution) = state.style_execution.as_mut() {
+                if let Some(evidence) = execution.latest_model_execution.as_mut() {
+                    if evidence.completed_at.is_none()
+                        || evidence.cancellation_id != started.cancellation_id
+                        || evidence.user_sequence != user_sequence
+                    {
+                        return Err(SessionReducerError::InvalidModelExecutionEvidence);
+                    }
+                    evidence.started_at = event.metadata.sequence;
+                    evidence.completed_at = None;
+                    evidence.response_completed = false;
+                } else {
+                    execution.latest_model_execution = Some(ModelExecutionEvidence {
+                        cancellation_id: started.cancellation_id.clone(),
+                        user_sequence,
+                        started_at: event.metadata.sequence,
+                        visible_text: String::new(),
+                        completed_at: None,
+                        response_completed: false,
+                    });
+                }
+            }
+            Ok(())
+        }
+        RuntimeCommittedEvent::ModelOutputDeltaObserved(observed) => {
+            if let Some(execution) = state.style_execution.as_mut() {
+                let Some(evidence) = execution.latest_model_execution.as_mut() else {
+                    return Ok(());
+                };
+                if evidence.cancellation_id != observed.cancellation_id
+                    || evidence.completed_at.is_some()
+                {
+                    return Err(SessionReducerError::InvalidModelExecutionEvidence);
+                }
+                let next_len = evidence
+                    .visible_text
+                    .len()
+                    .checked_add(observed.text.len())
+                    .ok_or(SessionReducerError::ModelOutputEvidenceOverflow)?;
+                if next_len > MAX_REPLAY_VISIBLE_MODEL_BYTES {
+                    return Err(SessionReducerError::ModelOutputEvidenceOverflow);
+                }
+                evidence.visible_text.push_str(&observed.text);
+            }
+            Ok(())
+        }
+        RuntimeCommittedEvent::ModelRequestCancelled(cancelled) => {
+            if let Some(execution) = state.style_execution.as_mut()
+                && execution
+                    .latest_model_execution
+                    .as_ref()
+                    .is_some_and(|evidence| evidence.cancellation_id == cancelled.cancellation_id)
+            {
+                execution.latest_model_execution = None;
+            }
+            Ok(())
+        }
+        RuntimeCommittedEvent::ModelRequestFailed(_) => {
+            if let Some(execution) = state.style_execution.as_mut() {
+                execution.latest_model_execution = None;
+            }
+            Ok(())
+        }
+        RuntimeCommittedEvent::ModelToolCallProposed(_) => {
+            if let Some(execution) = state.style_execution.as_mut()
+                && let Some(evidence) = execution.latest_model_execution.as_mut()
+                && evidence.completed_at.is_none()
+            {
+                evidence.completed_at = Some(event.metadata.sequence);
+            }
+            Ok(())
+        }
         RuntimeCommittedEvent::ModelResponseCompleted(completed) => {
             if let Some(execution) = state.style_execution.as_mut() {
+                if let Some(evidence) = execution.latest_model_execution.as_mut() {
+                    if evidence.cancellation_id != completed.cancellation_id
+                        || evidence.response_completed
+                    {
+                        return Err(SessionReducerError::InvalidModelExecutionEvidence);
+                    }
+                    evidence.completed_at = Some(event.metadata.sequence);
+                    evidence.response_completed = true;
+                }
                 execution.input_tokens = execution
                     .input_tokens
                     .checked_add(completed.input_tokens)
@@ -1188,7 +1316,7 @@ fn apply_payload(
             apply_style_execution_initialized(state, initialized)
         }
         RuntimeCommittedEvent::StyleNodeEntered(entered) => {
-            apply_style_node_entered(state, entered)
+            apply_style_node_entered(state, entered, event.metadata.sequence)
         }
         RuntimeCommittedEvent::StyleNodeCompleted(completed) => {
             apply_style_node_completed(state, completed)
@@ -1320,7 +1448,7 @@ fn apply_context_boundary_started(
         || started.identity.run_id.trim().is_empty()
         || !matches!(
             started.identity.boundary.as_str(),
-            "turn_start" | "before_model_request"
+            "turn_start" | "before_model_request" | "before_turn_completion"
         )
         || started
             .identity
@@ -1345,10 +1473,21 @@ fn apply_context_boundary_started(
             let Some(previous) = execution.context_boundaries.last() else {
                 return Err(SessionReducerError::InvalidContextBoundaryTransition);
             };
+            let same_node = previous.identity.node_id == started.identity.node_id;
+            let exact_context_to_model_edge =
+                graph_node_kind(&execution.graph, &previous.identity.node_id)
+                    == Some(NodeKind::ContextTransform)
+                    && graph_node_kind(&execution.graph, &started.identity.node_id)
+                        == Some(NodeKind::ModelCall)
+                    && graph_has_transition(
+                        &execution.graph,
+                        &previous.identity.node_id,
+                        &started.identity.node_id,
+                    );
             if previous.completed_at.is_none()
                 || previous.identity.boundary != "turn_start"
-                || previous.identity.origin != ContextBoundaryOrigin::UserTurn
-                || previous.identity.node_id != started.identity.node_id
+                || previous.identity.origin != started.identity.origin
+                || (!same_node && !exact_context_to_model_edge)
                 || previous.identity.run_id != started.identity.run_id
                 || previous.identity.request_hash != started.identity.request_hash
             {
@@ -1367,6 +1506,16 @@ fn apply_context_boundary_started(
                 return Err(SessionReducerError::InvalidContextBoundaryTransition);
             }
         }
+        ("before_turn_completion", ContextBoundaryOrigin::UserTurn) => {
+            let is_complete_turn = execution
+                .graph
+                .nodes
+                .iter()
+                .any(|node| node.id == active.node_id && node.kind == NodeKind::CompleteTurn);
+            if !is_complete_turn {
+                return Err(SessionReducerError::InvalidContextBoundaryTransition);
+            }
+        }
         _ => return Err(SessionReducerError::InvalidContextBoundaryTransition),
     }
     execution
@@ -1379,6 +1528,7 @@ fn apply_context_boundary_started(
             completed_at: None,
             estimated_tokens: None,
             serialized_bytes: None,
+            phase_replacement_event: None,
         });
     Ok(())
 }
@@ -1388,7 +1538,7 @@ fn apply_context_phase_completed(
     phase: &ContextPhaseIdentity,
     sequence: Sequence,
 ) -> Result<(), SessionReducerError> {
-    if !matches!(phase.phase.as_str(), "memory" | "compaction") {
+    if !matches!(phase.phase.as_str(), "memory" | "compaction" | "discard") {
         return Err(SessionReducerError::InvalidContextBoundaryTransition);
     }
     let execution = style_execution_mut(state)?;
@@ -1405,6 +1555,11 @@ fn apply_context_phase_completed(
             boundary.identity.boundary == "before_model_request"
                 && boundary.started_phases.as_slice() == ["memory", "compaction"]
                 && boundary.completed_phases.as_slice() == ["memory"]
+        }
+        "discard" => {
+            boundary.identity.boundary == "before_turn_completion"
+                && boundary.started_phases.as_slice() == ["discard"]
+                && boundary.completed_phases.is_empty()
         }
         _ => false,
     };
@@ -1428,7 +1583,7 @@ fn apply_context_phase_started(
     phase: &ContextPhaseIdentity,
     sequence: Sequence,
 ) -> Result<(), SessionReducerError> {
-    if !matches!(phase.phase.as_str(), "memory" | "compaction") {
+    if !matches!(phase.phase.as_str(), "memory" | "compaction" | "discard") {
         return Err(SessionReducerError::InvalidContextBoundaryTransition);
     }
     let execution = style_execution_mut(state)?;
@@ -1443,6 +1598,11 @@ fn apply_context_phase_started(
             boundary.identity.boundary == "before_model_request"
                 && boundary.started_phases.as_slice() == ["memory"]
                 && boundary.completed_phases.as_slice() == ["memory"]
+        }
+        "discard" => {
+            boundary.identity.boundary == "before_turn_completion"
+                && boundary.started_phases.is_empty()
+                && boundary.completed_phases.is_empty()
         }
         _ => false,
     };
@@ -1489,6 +1649,10 @@ fn apply_context_boundary_completed(
             boundary.started_phases.as_slice() == ["memory", "compaction"]
                 && boundary.completed_phases.as_slice() == ["memory", "compaction"]
         }
+        "before_turn_completion" => {
+            boundary.started_phases.as_slice() == ["discard"]
+                && boundary.completed_phases.as_slice() == ["discard"]
+        }
         _ => false,
     };
     if boundary.completed_at.is_some()
@@ -1529,6 +1693,7 @@ fn apply_style_execution_initialized(
             step: 1,
         }),
         active_node: None,
+        active_node_entered_at: None,
         completed_nodes: Vec::new(),
         failed_nodes: Vec::new(),
         transitions: Vec::new(),
@@ -1537,6 +1702,7 @@ fn apply_style_execution_initialized(
         output_tokens: 0,
         tokens_at_last_compaction: 0,
         context_boundaries: Vec::new(),
+        latest_model_execution: None,
     });
     Ok(())
 }
@@ -1544,6 +1710,7 @@ fn apply_style_execution_initialized(
 fn apply_style_node_entered(
     state: &mut SessionState,
     entered: &StyleNodeEnteredEvent,
+    sequence: Sequence,
 ) -> Result<(), SessionReducerError> {
     let execution = style_execution_mut(state)?;
     let expected = match &execution.control {
@@ -1570,6 +1737,10 @@ fn apply_style_node_entered(
         return Err(SessionReducerError::InvalidStyleExecutionTransition);
     }
     execution.active_node = Some(entered.clone());
+    execution.active_node_entered_at = Some(sequence);
+    if graph_node_kind(&execution.graph, &entered.node_id) == Some(NodeKind::ModelCall) {
+        execution.latest_model_execution = None;
+    }
     execution.control = StyleExecutionControlState::Active(entered.clone());
     Ok(())
 }
@@ -1578,6 +1749,18 @@ fn apply_style_node_completed(
     state: &mut SessionState,
     completed: &StyleNodeCompletedEvent,
 ) -> Result<(), SessionReducerError> {
+    if !style_node_effect_evidence_complete(
+        state
+            .style_execution
+            .as_ref()
+            .ok_or(SessionReducerError::StyleExecutionNotInitialized)?,
+        &state.conversation,
+        state.style_binding.as_ref(),
+        completed,
+        state.last_sequence,
+    ) {
+        return Err(SessionReducerError::InvalidStyleExecutionTransition);
+    }
     let execution = style_execution_mut(state)?;
     if !valid_style_counters(completed.attempt, completed.step)
         || !active_node_matches(
@@ -1602,6 +1785,7 @@ fn apply_style_node_completed(
         return Err(SessionReducerError::InvalidStyleExecutionTransition);
     }
     execution.active_node = None;
+    execution.active_node_entered_at = None;
     execution.completed_nodes.push(completed.clone());
     execution.control = match graph_node_kind(&execution.graph, &completed.node_id) {
         Some(NodeKind::CompleteTurn) => {
@@ -1659,6 +1843,7 @@ fn apply_style_node_failed(
         return Err(SessionReducerError::InvalidStyleExecutionTransition);
     }
     execution.active_node = None;
+    execution.active_node_entered_at = None;
     execution
         .termination_reason
         .clone_from(&failed.termination_reason);
@@ -1811,6 +1996,138 @@ fn graph_has_transition(graph: &ExecutableGraph, from_node_id: &str, to_node_id:
     graph.edges.iter().any(|edge| {
         graph.nodes[edge.from].id == from_node_id && graph.nodes[edge.to].id == to_node_id
     })
+}
+
+fn style_node_effect_evidence_complete(
+    execution: &StyleExecutionState,
+    conversation: &ConversationState,
+    binding: Option<&SessionStyleBinding>,
+    completed: &StyleNodeCompletedEvent,
+    journal_head: Sequence,
+) -> bool {
+    if !is_ephemeral_turn_graph(&execution.graph) {
+        return true;
+    }
+    match graph_node_kind(&execution.graph, &completed.node_id) {
+        Some(NodeKind::ContextTransform) => {
+            let Some(boundary) = execution.context_boundaries.last() else {
+                return false;
+            };
+            let Some(provenance) = conversation.projection_provenance() else {
+                return false;
+            };
+            let users = conversation
+                .provider_projection()
+                .iter()
+                .filter_map(|entry| match entry {
+                    ConversationEntry::UserMessage(user) => Some(user),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let [user] = users.as_slice() else {
+                return false;
+            };
+            let Some(canonical_user) =
+                conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        ConversationEntry::UserMessage(candidate)
+                            if candidate.source_sequence <= boundary.identity.source_head =>
+                        {
+                            Some(candidate)
+                        }
+                        _ => None,
+                    })
+            else {
+                return false;
+            };
+            let Some(replacement_event) = boundary.phase_replacement_event else {
+                return false;
+            };
+            let Some(selected_memory_provider) =
+                binding.map(|binding| binding.memory.provider.as_str())
+            else {
+                return false;
+            };
+            if conversation.provider_projection().iter().any(|entry| {
+                !matches!(entry, ConversationEntry::UserMessage(_))
+                    && !matches!(
+                        entry,
+                        ConversationEntry::RetrievedMemory(memory)
+                            if memory.injection_sequence == provenance.committed_at
+                                && memory.injection_event == Some(replacement_event)
+                                && memory.provider == selected_memory_provider
+                                && selected_memory_provider != "none"
+                    )
+            }) {
+                return false;
+            }
+            boundary.identity.node_id == completed.node_id
+                && boundary.identity.boundary == "turn_start"
+                && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+                && boundary.completed_phases.as_slice() == ["memory"]
+                && boundary.completed_at == Some(journal_head)
+                && provenance.method == "ephemeral_fresh_context"
+                && provenance.committed_at.checked_next().ok() == Some(journal_head)
+                && provenance.source_range == Some((user.source_sequence, user.source_sequence))
+                && *user == canonical_user
+                && user.id.0.strip_prefix("user:").is_some_and(|suffix| {
+                    suffix.ends_with(&format!(":{}", boundary.identity.run_id))
+                })
+        }
+        Some(NodeKind::CompleteTurn) => {
+            let Some(boundary) = execution.context_boundaries.last() else {
+                return false;
+            };
+            let Some(provenance) = conversation.projection_provenance() else {
+                return false;
+            };
+            boundary.identity.node_id == completed.node_id
+                && boundary.identity.boundary == "before_turn_completion"
+                && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+                && boundary.completed_phases.as_slice() == ["discard"]
+                && boundary.completed_at == Some(journal_head)
+                && provenance.method == "ephemeral_discard"
+                && provenance.committed_at.checked_next().ok() == Some(journal_head)
+                && conversation.provider_projection().is_empty()
+        }
+        _ => true,
+    }
+}
+
+fn is_ephemeral_turn_graph(graph: &ExecutableGraph) -> bool {
+    if graph.nodes.len() != 4 || graph.edges.len() != 3 {
+        return false;
+    }
+    let Some(entry) = graph.nodes.get(graph.entry_index) else {
+        return false;
+    };
+    let kinds = [
+        NodeKind::ContextTransform,
+        NodeKind::ModelCall,
+        NodeKind::ToolExecutionGate,
+        NodeKind::CompleteTurn,
+    ];
+    let mut index = entry.index;
+    for (offset, kind) in kinds.into_iter().enumerate() {
+        if graph.nodes.get(index).map(|node| node.kind) != Some(kind) {
+            return false;
+        }
+        if offset + 1 == kinds.len() {
+            return !graph.edges.iter().any(|edge| edge.from == index);
+        }
+        let mut outgoing = graph.edges.iter().filter(|edge| edge.from == index);
+        let Some(edge) = outgoing.next() else {
+            return false;
+        };
+        if outgoing.next().is_some() {
+            return false;
+        }
+        index = edge.to;
+    }
+    false
 }
 
 const fn valid_style_counters(attempt: u32, step: u64) -> bool {
@@ -2087,6 +2404,12 @@ pub enum SessionReducerError {
     /// Context completion did not describe the exact replayed projection.
     #[error("context boundary projection measurement is invalid")]
     InvalidContextBoundaryMeasurement,
+    /// Provider lifecycle evidence did not match the latest canonical start.
+    #[error("model execution evidence is invalid")]
+    InvalidModelExecutionEvidence,
+    /// Bounded visible model evidence exceeded the protocol frame ceiling.
+    #[error("model output replay evidence exceeded its byte limit")]
+    ModelOutputEvidenceOverflow,
     /// Provider-reported usage exceeded the replay-safe integer bound.
     #[error("style provider token usage overflowed")]
     StyleTokenUsageOverflow,
@@ -2143,9 +2466,11 @@ mod tests {
     use agentmod_event_model::{EventMetadata, EventOrigin};
     use agentmod_graph_engine::{CompilerLimits, GraphCacheInputs, compile as compile_graph};
     use agentmod_primitives::{CausationId, CorrelationId, EventId, TimestampMillis, Version};
+    use agentmod_session_style_sdk::{BuiltInStyle, CompiledSessionStyle};
     use uuid::Uuid;
 
     use crate::conversation::{ContextSummaryEntry, ConversationEntryId, TextEntry};
+    use crate::style_executor::tests::binding;
 
     use super::*;
 
@@ -2267,6 +2592,46 @@ to = "done"
         .expect("context graph")
     }
 
+    fn ephemeral_context_graph() -> ExecutableGraph {
+        compile_graph(
+            r#"
+format_version = 1
+entry = "fresh-context"
+[budget]
+max_steps = 10
+max_tokens = 100
+max_cost_micros = 100
+max_duration_ms = 1000
+[declarations]
+capabilities = ["context", "model"]
+providers = ["mock"]
+[[nodes]]
+id = "fresh-context"
+kind = "context_transform"
+[[nodes]]
+id = "respond"
+kind = "model_call"
+provider = "mock"
+[[nodes]]
+id = "done"
+kind = "complete_turn"
+[[edges]]
+from = "fresh-context"
+to = "respond"
+[[edges]]
+from = "respond"
+to = "done"
+"#,
+            &GraphCacheInputs {
+                plugin_set_hash: ContentHash::digest(b"plugins"),
+                runtime_api_version: "1.0.0".into(),
+                capability_set: BTreeSet::from([String::from("context"), String::from("model")]),
+            },
+            CompilerLimits::default(),
+        )
+        .expect("ephemeral context graph")
+    }
+
     fn context_identity(
         boundary: &str,
         source_head: u64,
@@ -2304,6 +2669,47 @@ to = "done"
             ),
         ])
         .expect("active context state")
+    }
+
+    #[test]
+    fn model_execution_evidence_rejects_overwrite_and_mismatched_terminal() {
+        let started = reduce(
+            Some(active_context_state()),
+            &envelope(
+                4,
+                RuntimeCommittedEvent::ModelRequestStarted(ModelRequestStartedEvent {
+                    cancellation_id: String::from("run-1"),
+                }),
+            ),
+        )
+        .expect("first model start");
+        assert!(matches!(
+            reduce(
+                Some(started.clone()),
+                &envelope(
+                    5,
+                    RuntimeCommittedEvent::ModelRequestStarted(ModelRequestStartedEvent {
+                        cancellation_id: String::from("run-2"),
+                    }),
+                ),
+            ),
+            Err(SessionReducerError::InvalidModelExecutionEvidence)
+        ));
+        assert!(matches!(
+            reduce(
+                Some(started),
+                &envelope(
+                    5,
+                    RuntimeCommittedEvent::ModelResponseCompleted(ModelResponseCompletedEvent {
+                        cancellation_id: String::from("run-2"),
+                        finish_reason: String::from("stop"),
+                        input_tokens: 1,
+                        output_tokens: 1,
+                    },),
+                ),
+            ),
+            Err(SessionReducerError::InvalidModelExecutionEvidence)
+        ));
     }
 
     #[test]
@@ -2529,6 +2935,366 @@ to = "done"
             ),
             Err(SessionReducerError::InvalidContextBoundaryTransition)
         ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the replay fixture spells out the exact cross-node boundary journal"
+    )]
+    fn context_reducer_allows_only_exact_context_to_model_boundary_identity() {
+        let request_hash = ContentHash::digest(b"ephemeral-request");
+        let turn = ContextBoundaryIdentity {
+            node_id: String::from("fresh-context"),
+            boundary: String::from("turn_start"),
+            run_id: String::from("run-ephemeral"),
+            origin: ContextBoundaryOrigin::UserTurn,
+            request_hash,
+            source_head: Sequence::new(3).expect("source head"),
+        };
+        let phase = ContextPhaseIdentity {
+            boundary: turn.clone(),
+            phase: String::from("memory"),
+        };
+        let empty = measure_projection(&[]).expect("empty measurement");
+        let state = replay(&[
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(ephemeral_context_graph()),
+                    },
+                )),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("fresh-context"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                    identity: turn.clone(),
+                }),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::ContextPhaseStarted(ContextPhaseStartedEvent {
+                    identity: phase.clone(),
+                }),
+            ),
+            envelope(
+                6,
+                RuntimeCommittedEvent::ContextPhaseCompleted(ContextPhaseCompletedEvent {
+                    identity: phase,
+                }),
+            ),
+            envelope(
+                7,
+                RuntimeCommittedEvent::ContextBoundaryCompleted(ContextBoundaryCompletedEvent {
+                    identity: turn,
+                    projection_hash: empty.projection_hash,
+                    estimated_tokens: empty.estimated_tokens,
+                    serialized_bytes: empty.serialized_bytes,
+                }),
+            ),
+            envelope(
+                8,
+                RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                    node_id: String::from("fresh-context"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                    result_reference: None,
+                    artifact_reference: None,
+                }),
+            ),
+            envelope(
+                9,
+                RuntimeCommittedEvent::StyleTransitionSelected(StyleTransitionSelectedEvent {
+                    from_node_id: String::from("fresh-context"),
+                    to_node_id: String::from("respond"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+            envelope(
+                10,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("respond"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 2,
+                }),
+            ),
+        ])
+        .expect("context-to-model state");
+        let before = ContextBoundaryIdentity {
+            node_id: String::from("respond"),
+            boundary: String::from("before_model_request"),
+            run_id: String::from("run-ephemeral"),
+            origin: ContextBoundaryOrigin::UserTurn,
+            request_hash,
+            source_head: Sequence::new(10).expect("source head"),
+        };
+        reduce(
+            Some(state.clone()),
+            &envelope(
+                11,
+                RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                    identity: before.clone(),
+                }),
+            ),
+        )
+        .expect("exact compiled context-to-model edge");
+
+        for invalid in [
+            ContextBoundaryIdentity {
+                run_id: String::from("other-run"),
+                ..before.clone()
+            },
+            ContextBoundaryIdentity {
+                request_hash: ContentHash::digest(b"other-request"),
+                ..before.clone()
+            },
+            ContextBoundaryIdentity {
+                origin: ContextBoundaryOrigin::ApprovalContinuation,
+                ..before
+            },
+        ] {
+            assert!(matches!(
+                reduce(
+                    Some(state.clone()),
+                    &envelope(
+                        11,
+                        RuntimeCommittedEvent::ContextBoundaryStarted(
+                            ContextBoundaryStartedEvent { identity: invalid }
+                        ),
+                    ),
+                ),
+                Err(SessionReducerError::InvalidContextBoundaryTransition)
+            ));
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the reducer fixture spells out the exact fresh-context journal evidence"
+    )]
+    fn ephemeral_fresh_completion_state(
+        replacement: Vec<ConversationEntry>,
+        source_sequence: Sequence,
+    ) -> SessionState {
+        let mut style_binding = binding(BuiltInStyle::EphemeralTurn);
+        style_binding.memory.provider = String::from("file");
+        let compiled: CompiledSessionStyle =
+            serde_json::from_str(&style_binding.compiled_style_json).expect("compiled style");
+        let request_hash = ContentHash::digest(b"fresh-request");
+        let boundary = ContextBoundaryIdentity {
+            node_id: String::from("fresh-context"),
+            boundary: String::from("turn_start"),
+            run_id: String::from("run-current"),
+            origin: ContextBoundaryOrigin::UserTurn,
+            request_hash,
+            source_head: Sequence::new(5).expect("source head"),
+        };
+        let phase = ContextPhaseIdentity {
+            boundary: boundary.clone(),
+            phase: String::from("memory"),
+        };
+        let measurement = measure_projection(&replacement).expect("replacement measurement");
+        replay(&[
+            envelope(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture"),
+                    style: style_binding.id.clone(),
+                    style_binding: Some(Box::new(style_binding)),
+                }),
+            ),
+            envelope(
+                2,
+                RuntimeCommittedEvent::ConversationEntryCommitted(
+                    ConversationEntryCommittedEvent {
+                        entry: ConversationEntry::UserMessage(TextEntry {
+                            id: ConversationEntryId(String::from("user:2:run-old")),
+                            text: String::from("old"),
+                            source_sequence: Sequence::new(2).expect("sequence"),
+                        }),
+                    },
+                ),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::ConversationEntryCommitted(
+                    ConversationEntryCommittedEvent {
+                        entry: ConversationEntry::UserMessage(TextEntry {
+                            id: ConversationEntryId(String::from("user:3:run-current")),
+                            text: String::from("current"),
+                            source_sequence: Sequence::new(3).expect("sequence"),
+                        }),
+                    },
+                ),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(compiled.graph),
+                    },
+                )),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("fresh-context"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+            envelope(
+                6,
+                RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                    identity: boundary.clone(),
+                }),
+            ),
+            envelope(
+                7,
+                RuntimeCommittedEvent::ContextPhaseStarted(ContextPhaseStartedEvent {
+                    identity: phase.clone(),
+                }),
+            ),
+            envelope(
+                8,
+                RuntimeCommittedEvent::ContextProjectionReplaced(ContextProjectionReplacedEvent {
+                    replacement,
+                    provenance: ProjectionProvenance {
+                        projection_id: String::from("fresh"),
+                        source_range: Some((source_sequence, source_sequence)),
+                        method: String::from("ephemeral_fresh_context"),
+                        committed_at: Sequence::new(8).expect("sequence"),
+                        artifact_id: None,
+                    },
+                    context_phase: Some(phase),
+                }),
+            ),
+            envelope(
+                9,
+                RuntimeCommittedEvent::ContextBoundaryCompleted(ContextBoundaryCompletedEvent {
+                    identity: boundary,
+                    projection_hash: measurement.projection_hash,
+                    estimated_tokens: measurement.estimated_tokens,
+                    serialized_bytes: measurement.serialized_bytes,
+                }),
+            ),
+        ])
+        .expect("fresh completion state")
+    }
+
+    fn fresh_memory(
+        provider: &str,
+        injection_sequence: u64,
+        injection_event: EventId,
+    ) -> ConversationEntry {
+        ConversationEntry::RetrievedMemory(crate::conversation::RetrievedMemoryEntry {
+            id: ConversationEntryId(String::from("memory:fresh")),
+            provider: provider.to_owned(),
+            query: String::from("current"),
+            scope: String::from("session:fixture"),
+            source: String::from("fixture"),
+            reference: String::from("memory-1"),
+            score: Some(1.0),
+            content: String::from("selected memory"),
+            injection_sequence: Sequence::new(injection_sequence).expect("sequence"),
+            injection_event: Some(injection_event),
+            created_at_millis: 1,
+            size_bytes: 15,
+        })
+    }
+
+    #[test]
+    fn ephemeral_context_completion_rejects_stale_user_and_memory_provenance() {
+        let old = ConversationEntry::UserMessage(TextEntry {
+            id: ConversationEntryId(String::from("user:2:run-old")),
+            text: String::from("old"),
+            source_sequence: Sequence::new(2).expect("sequence"),
+        });
+        let current = ConversationEntry::UserMessage(TextEntry {
+            id: ConversationEntryId(String::from("user:3:run-current")),
+            text: String::from("current"),
+            source_sequence: Sequence::new(3).expect("sequence"),
+        });
+        let replacement_event = EventId::from_uuid(Uuid::from_u128(108));
+        let wrong_event = EventId::from_uuid(Uuid::from_u128(999));
+        let fabricated = ConversationEntry::UserMessage(TextEntry {
+            id: ConversationEntryId(String::from("user:3:run-current")),
+            text: String::from("fabricated"),
+            source_sequence: Sequence::new(3).expect("sequence"),
+        });
+        let cases = [
+            ephemeral_fresh_completion_state(vec![old], Sequence::new(2).expect("sequence")),
+            ephemeral_fresh_completion_state(vec![fabricated], Sequence::new(3).expect("sequence")),
+            ephemeral_fresh_completion_state(
+                vec![fresh_memory("file", 7, replacement_event), current.clone()],
+                Sequence::new(3).expect("sequence"),
+            ),
+            ephemeral_fresh_completion_state(
+                vec![fresh_memory("file", 8, wrong_event), current.clone()],
+                Sequence::new(3).expect("sequence"),
+            ),
+            ephemeral_fresh_completion_state(
+                vec![
+                    fresh_memory("sqlite-fts", 8, replacement_event),
+                    current.clone(),
+                ],
+                Sequence::new(3).expect("sequence"),
+            ),
+        ];
+        for state in cases {
+            assert!(matches!(
+                reduce(
+                    Some(state),
+                    &envelope(
+                        10,
+                        RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                            node_id: String::from("fresh-context"),
+                            attempt: 1,
+                            loop_iteration: 0,
+                            step: 1,
+                            result_reference: None,
+                            artifact_reference: None,
+                        }),
+                    ),
+                ),
+                Err(SessionReducerError::InvalidStyleExecutionTransition)
+            ));
+        }
+
+        reduce(
+            Some(ephemeral_fresh_completion_state(
+                vec![fresh_memory("file", 8, replacement_event), current],
+                Sequence::new(3).expect("sequence"),
+            )),
+            &envelope(
+                10,
+                RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                    node_id: String::from("fresh-context"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                    result_reference: None,
+                    artifact_reference: None,
+                }),
+            ),
+        )
+        .expect("current selected memory remains supported");
     }
 
     #[test]

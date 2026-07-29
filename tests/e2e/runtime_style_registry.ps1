@@ -86,21 +86,10 @@ try {
             --session $persistent.session_id `
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="persistent-before"' --json | ConvertFrom-Json
-        $savedErrorPreference = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try {
-            & $cli run "ephemeral before restart" `
-                --session $ephemeral.session_id `
-                --option 'mock_scenario="streaming_text"' `
-                --option 'mock_text="ephemeral-before"' --json 2>$null | Out-Null
-            $ephemeralBeforeExit = $LASTEXITCODE
-        }
-        finally {
-            $ErrorActionPreference = $savedErrorPreference
-        }
-        if ($ephemeralBeforeExit -eq 0) {
-            throw "unimplemented ephemeral graph silently used the legacy turn path"
-        }
+        $ephemeralTurn = & $cli run "ephemeral before restart" `
+            --session $ephemeral.session_id `
+            --option 'mock_scenario="streaming_text"' `
+            --option 'mock_text="ephemeral-before"' --json | ConvertFrom-Json
         $ephemeralJournal = Join-Path $runRoot (
             "sessions\" + $ephemeral.session_id + "\events.jsonl"
         )
@@ -109,7 +98,8 @@ try {
         )
         if ($persistentTurn.last_committed_sequence -ne
                 @(Get-Content $persistentJournal).Count -or
-            @(Get-Content $ephemeralJournal).Count -ne 1) {
+            $ephemeralTurn.last_committed_sequence -ne
+                @(Get-Content $ephemeralJournal).Count) {
             throw "pre-restart style execution state was incorrect"
         }
 
@@ -126,26 +116,18 @@ try {
             --session $persistent.session_id `
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="persistent-after"' --json | ConvertFrom-Json
-        $savedErrorPreference = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        try {
-            & $cli run "ephemeral after restart" `
-                --session $ephemeral.session_id `
-                --option 'mock_scenario="streaming_text"' `
-                --option 'mock_text="ephemeral-after"' --json 2>$null | Out-Null
-            $ephemeralAfterExit = $LASTEXITCODE
-        }
-        finally {
-            $ErrorActionPreference = $savedErrorPreference
-        }
-        if ($ephemeralAfterExit -eq 0) {
-            throw "unsupported style changed behavior after restart"
-        }
+        $ephemeralAfter = & $cli run "ephemeral after restart" `
+            --session $ephemeral.session_id `
+            --option 'mock_scenario="streaming_text"' `
+            --option 'mock_text="ephemeral-after"' --json | ConvertFrom-Json
         if ($persistentAfter.last_committed_sequence -le
                 $persistentTurn.last_committed_sequence -or
             $persistentAfter.last_committed_sequence -ne
                 @(Get-Content $persistentJournal).Count -or
-            @(Get-Content $ephemeralJournal).Count -ne 1) {
+            $ephemeralAfter.last_committed_sequence -le
+                $ephemeralTurn.last_committed_sequence -or
+            $ephemeralAfter.last_committed_sequence -ne
+                @(Get-Content $ephemeralJournal).Count) {
             throw "post-restart style execution state was incorrect"
         }
 
@@ -156,6 +138,24 @@ try {
             ConvertFrom-Json
         if ($branchInspection.state.style_binding.id -ne "ephemeral-turn") {
             throw "branch did not receive its explicitly selected style"
+        }
+        & $cli run "parent continues persistently" `
+            --session $persistent.session_id `
+            --option 'mock_scenario="streaming_text"' `
+            --option 'mock_text="parent-continuation"' --json | Out-Null
+        & $cli run "branch continues ephemerally" `
+            --session $branch.session_id `
+            --option 'mock_scenario="streaming_text"' `
+            --option 'mock_text="branch-continuation"' --json | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "branch continuation failed" }
+        $parentAfterBranch = & $cli session inspect $persistent.session_id --json |
+            ConvertFrom-Json
+        $branchAfter = & $cli session inspect $branch.session_id --json |
+            ConvertFrom-Json
+        if ($parentAfterBranch.state.style_binding.id -ne "persistent-chat" -or
+            $branchAfter.state.style_binding.id -ne "ephemeral-turn" -or
+            @($branchAfter.state.conversation.provider_projection).Count -ne 0) {
+            throw "branch style execution changed parent or retained ephemeral projection"
         }
 
         $userStyleRoot = Join-Path $runRoot "styles\user"

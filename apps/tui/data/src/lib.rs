@@ -10,8 +10,9 @@
 
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use agentmod_tui_dependency::{
-    DependencyStyleAvailability, DependencyStyleSourceKind, DependencyTurnEvent,
-    DependencyTurnStream, DependencyTurnStreamItem, TuiDependencyError, TuiRuntimeDependencyPort,
+    DependencyBranchSessionRequest, DependencyStyleAvailability, DependencyStyleSourceKind,
+    DependencyTurnEvent, DependencyTurnStream, DependencyTurnStreamItem, TuiDependencyError,
+    TuiRuntimeDependencyPort,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -71,6 +72,23 @@ pub struct SessionDataRecord {
     pub style: String,
     pub sequence: Sequence,
     pub state: String,
+}
+
+/// Data-owned atomic branch request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchSessionDataRequest {
+    pub parent_session_id: SessionId,
+    pub at: Sequence,
+    pub style: Option<String>,
+}
+
+/// Data-owned atomic branch record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchSessionDataRecord {
+    pub session_id: SessionId,
+    pub parent_session_id: SessionId,
+    pub fork_sequence: Sequence,
+    pub child_head_sequence: Sequence,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -164,6 +182,10 @@ pub trait TuiDataPort {
         let _ = harness;
         self.create_session(workspace, style)
     }
+    fn branch_session(
+        &self,
+        request: BranchSessionDataRequest,
+    ) -> Result<BranchSessionDataRecord, TuiDataError>;
     fn session_events(
         &self,
         session_id: SessionId,
@@ -307,6 +329,25 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
     ) -> Result<SessionId, TuiDataError> {
         self.dependency
             .create_session_with_harness(workspace, style, harness)
+            .map_err(map_error)
+    }
+
+    fn branch_session(
+        &self,
+        request: BranchSessionDataRequest,
+    ) -> Result<BranchSessionDataRecord, TuiDataError> {
+        self.dependency
+            .branch_session(DependencyBranchSessionRequest {
+                parent_session_id: request.parent_session_id,
+                at: request.at,
+                style: request.style,
+            })
+            .map(|response| BranchSessionDataRecord {
+                session_id: response.session_id,
+                parent_session_id: response.parent_session_id,
+                fork_sequence: response.fork_sequence,
+                child_head_sequence: response.child_head_sequence,
+            })
             .map_err(map_error)
     }
 

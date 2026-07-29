@@ -68,7 +68,25 @@ try {
     }).Count -lt 2) {
         throw "TUI turn did not commit canonical conversation entries"
     }
-    Write-Output "runtime TUI smoke E2E passed"
+    $parentBeforeBranch = & $cli session inspect $created.session_id --json |
+        ConvertFrom-Json
+    $branchSmoke = & $tui --smoke-command "/branch 1 ephemeral-turn"
+    if ($LASTEXITCODE -ne 0 -or
+        $branchSmoke -notmatch "branched ([0-9a-f-]+) from") {
+        throw "TUI branch command failed: $branchSmoke"
+    }
+    $branchId = $Matches[1]
+    $branchInspection = & $cli session inspect $branchId --json | ConvertFrom-Json
+    $parentAfterBranch = & $cli session inspect $created.session_id --json |
+        ConvertFrom-Json
+    if ($branchInspection.state.style_binding.id -ne "ephemeral-turn" -or
+        $branchInspection.state.ancestry.parent_session_id -ne
+            $created.session_id -or
+        $parentAfterBranch.head_sequence -ne $parentBeforeBranch.head_sequence -or
+        $parentAfterBranch.state.style_binding.id -ne "persistent-chat") {
+        throw "TUI branch did not preserve the parent and select the child style"
+    }
+    Write-Output "runtime TUI smoke/branch E2E passed"
 }
 finally {
     if ($null -ne $daemon -and -not $daemon.HasExited) {

@@ -45,6 +45,16 @@ fn main() -> ExitCode {
                 .smoke_turn(&prompt)
                 .map(|output| println!("{output}"))
         }
+        Some("--smoke-command") => {
+            let command = arguments.collect::<Vec<_>>().join(" ");
+            if command.trim().is_empty() {
+                eprintln!("--smoke-command requires a command");
+                return ExitCode::from(2);
+            }
+            service
+                .smoke_command(&command)
+                .map(|output| println!("{output}"))
+        }
         Some(argument) => {
             eprintln!("unknown TUI option `{argument}`");
             return ExitCode::from(2);

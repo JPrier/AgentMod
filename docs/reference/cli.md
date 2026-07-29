@@ -34,7 +34,7 @@ agentmod schedule remove <schedule-id> [--json]
 agentmod schedule claim [--limit <count>] [--json]
 agentmod schedule complete <execution-id> [--failed] [--json]
 agentmod schedule run [--limit <count>] [--json]
-agentmod-tui [--smoke | --smoke-turn <prompt>]
+agentmod-tui [--smoke | --smoke-turn <prompt> | --smoke-command "<slash-command>"]
 agentmod-acp
 ```
 
@@ -44,6 +44,11 @@ workspace, `persistent-chat`, and the style-selected `native` harness. Use
 `harness list` and `harness inspect` to view adapter versions, availability,
 capabilities, and the exact capability-set hash. An explicit `--harness`
 override is accepted only when it satisfies the selected style.
+
+The TUI command palette supports `/branch <sequence> [style]`. Omitting the
+style preserves the parent binding; providing one resolves and validates that
+style through the runtime registry, atomically creates the child, and selects
+it without modifying the parent.
 
 `run` executes one durable turn in an existing session. Provider options are
 repeatable and accept JSON scalars/objects or plain strings. The bundled offline

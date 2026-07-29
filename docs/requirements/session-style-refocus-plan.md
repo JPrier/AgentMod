@@ -214,7 +214,12 @@ continuation resumes; unavailable or changed styles fail closed and are never
 replaced. CLI style commands and the TUI Styles view operate through protocol
 boundaries. `tests/e2e/runtime_style_registry.ps1` passed with two styles,
 restart continuation, branch restyling, disablement, and durable-file checks.
-The matching Unix script is implemented but is not execution evidence.
+The TUI `/branch <sequence> [style]` command maps layer-owned requests and
+results through dependency, data, logic, and service, selects the child after
+atomic creation, and refuses to run during an active stream.
+`runtime_tui_smoke.ps1` proves deliberate ephemeral restyling and an unchanged
+parent through a real Windows runtime. Matching Unix scripts are implemented
+and syntax-checked but are not execution evidence.
 
 Full workspace tests, strict Clippy, formatting, and the 88-package architecture
 check pass. One process-host cancellation test timed out during the first

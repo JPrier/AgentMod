@@ -54,6 +54,28 @@ impl<L: TuiLogicPort> TuiService<L> {
         ))
     }
 
+    /// Executes one command-palette action without entering raw-terminal mode.
+    ///
+    /// This diagnostic uses the same service, logic, data, dependency, and
+    /// authenticated runtime path as the fullscreen command palette.
+    pub fn smoke_command(mut self, command: &str) -> Result<String, TuiServiceError> {
+        if !command.trim_start().starts_with('/') {
+            return Err(TuiServiceError::InvalidSmokeCommand);
+        }
+        self.logic.bootstrap().map_err(map_logic)?;
+        self.logic.insert_text(command);
+        self.logic.submit_editor().map_err(map_logic)?;
+        let state = self.logic.state();
+        Ok(format!(
+            "status={} selected={} sessions={}",
+            state.status,
+            state
+                .selected()
+                .map_or_else(|| String::from("none"), |session| session.id.to_string()),
+            state.sessions.len()
+        ))
+    }
+
     /// Executes one normal runtime turn without entering raw-terminal mode.
     ///
     /// This diagnostic traverses the same logic, data, dependency, streaming,
@@ -625,7 +647,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Line::from(
                 "/new [workspace] [style] [harness]  /sessions  /styles  /style <id[@version]>",
             ),
-            Line::from("/harnesses  /harness <id>"),
+            Line::from("/harnesses  /harness <id>  /branch <sequence> [style]"),
             Line::from(
                 "/model <id>  /provider <id>  /chat  /events  /context  /graph  /help  /cancel",
             ),
@@ -785,6 +807,9 @@ pub enum TuiServiceError {
     /// A noninteractive diagnostic turn exceeded its fixed safety bound.
     #[error("TUI diagnostic turn timed out")]
     TurnTimeout,
+    /// The command diagnostic accepts only command-palette input.
+    #[error("TUI command diagnostic requires a slash command")]
+    InvalidSmokeCommand,
 }
 
 #[cfg(test)]

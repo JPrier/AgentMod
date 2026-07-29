@@ -43,4 +43,21 @@ grep -q "turn committed" <<<"$turn"
 journal="$run_root/sessions/$session_id/events.jsonl"
 test "$(grep -c '"event_type":"model.response_completed"' "$journal")" -eq 1
 test "$(grep -c '"event_type":"conversation.entry_committed"' "$journal")" -ge 2
-echo "runtime TUI smoke E2E passed"
+parent_before="$("$repository/target/debug/agentmod" session inspect \
+  "$session_id" --json)"
+parent_head="$(printf '%s' "$parent_before" |
+  sed -n 's/.*"head_sequence":\([0-9][0-9]*\).*/\1/p')"
+branch_smoke="$("$repository/target/debug/agentmod-tui" --smoke-command \
+  "/branch 1 ephemeral-turn")"
+branch_id="$(printf '%s' "$branch_smoke" |
+  sed -n 's/.*branched \([0-9a-f-]*\) from.*/\1/p')"
+test -n "$branch_id"
+branch_inspection="$("$repository/target/debug/agentmod" session inspect \
+  "$branch_id" --json)"
+parent_after="$("$repository/target/debug/agentmod" session inspect \
+  "$session_id" --json)"
+grep -q '"id":"ephemeral-turn"' <<<"$branch_inspection"
+grep -q "\"parent_session_id\":\"$session_id\"" <<<"$branch_inspection"
+grep -q "\"head_sequence\":$parent_head" <<<"$parent_after"
+grep -q '"id":"persistent-chat"' <<<"$parent_after"
+echo "runtime TUI smoke/branch E2E passed"

@@ -7,9 +7,9 @@ internals. Its enforced call direction is `service → logic → data → depend
 | Layer | Responsibility and owned types |
 |---|---|
 | service | Ratatui rendering, Crossterm input, terminal lifecycle/restoration, permission modal, and key-to-logic mapping |
-| logic | Session/style/harness selection, canonical-history and replay-derived style-introspection projection, streaming transcript state, editor/history behavior, slash commands, approval and cancellation use cases |
-| data | Runtime-health, style/harness/session, session-inspection, event-page, turn-stream, approval, and cancellation datasets with explicit normalization |
-| dependency | Authenticated local socket/named-pipe transport, runtime style/harness/session inspection requests, protocol negotiation, bounded framing, credit-window acknowledgement, request identity and sequence validation |
+| logic | Session/style/harness selection, deliberate branch-with-style use case, canonical-history and replay-derived style-introspection projection, streaming transcript state, editor/history behavior, slash commands, approval and cancellation use cases |
+| data | Runtime-health, style/harness/session, atomic branch, session-inspection, event-page, turn-stream, approval, and cancellation datasets with explicit normalization |
+| dependency | Authenticated local socket/named-pipe transport, runtime style/harness/session/branch requests, protocol negotiation, bounded framing, credit-window acknowledgement, request identity and sequence validation |
 | bin | Environment bootstrap and concrete dependency/data/logic/service assembly |
 
 The frontend loads dormant session summaries without loading all histories,
@@ -33,8 +33,10 @@ each bounded frame is accepted.
 
 `agentmod-tui --smoke` performs the same authenticated bootstrap and session
 listing without entering raw-terminal mode. `--smoke-turn <prompt>` additionally
-proves committed streaming and credit-window handling. Both exist for
-installation and CI transport diagnostics.
+proves committed streaming and credit-window handling.
+`--smoke-command "/branch <sequence> [style]"` traverses the same command
+palette and atomic branch path. These modes exist for installation and CI
+transport diagnostics.
 
 Current limitations:
 

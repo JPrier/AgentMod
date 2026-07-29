@@ -10,9 +10,9 @@
 
 use agentmod_primitives::{CancellationId, Sequence};
 use agentmod_tui_data::{
-    HarnessDataRecord, SessionDataRecord, SessionEventDataRecord, StyleDataAvailability,
-    StyleDataRecord, StyleDataSourceKind, TuiDataError, TuiDataPort, TurnDataEvent, TurnDataStream,
-    TurnDataStreamItem,
+    BranchSessionDataRecord, BranchSessionDataRequest, HarnessDataRecord, SessionDataRecord,
+    SessionEventDataRecord, StyleDataAvailability, StyleDataRecord, StyleDataSourceKind,
+    TuiDataError, TuiDataPort, TurnDataEvent, TurnDataStream, TurnDataStreamItem,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -107,6 +107,22 @@ pub struct ApprovalPrompt {
     pub call_id: String,
     pub tool: String,
     pub arguments: Value,
+}
+
+/// Logic-owned deliberate branch request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchSessionCommand {
+    pub at: Sequence,
+    pub style: Option<String>,
+}
+
+/// Logic-owned deliberate branch result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BranchSessionResult {
+    pub session_id: agentmod_primitives::SessionId,
+    pub parent_session_id: agentmod_primitives::SessionId,
+    pub fork_sequence: Sequence,
+    pub child_head_sequence: Sequence,
 }
 
 pub struct TuiState {
@@ -535,6 +551,82 @@ impl<D: TuiDataPort> TuiLogicPort for TuiLogic<D> {
 }
 
 impl<D: TuiDataPort> TuiLogic<D> {
+    fn resolve_style_selector(&self, selector: &str) -> Result<String, TuiLogicError> {
+        let style = self
+            .state
+            .styles
+            .iter()
+            .find(|style| style.selector() == selector || style.id == selector)
+            .ok_or_else(|| TuiLogicError::UnknownStyle(selector.to_owned()))?;
+        if style.availability != StyleAvailability::Available {
+            return Err(TuiLogicError::UnavailableStyle(style.selector()));
+        }
+        Ok(style.selector())
+    }
+
+    fn branch_selected(
+        &mut self,
+        command: BranchSessionCommand,
+    ) -> Result<BranchSessionResult, TuiLogicError> {
+        if self.state.stream.is_some() {
+            return Err(TuiLogicError::Busy);
+        }
+        let parent_session_id = self
+            .state
+            .selected()
+            .map(|session| session.id)
+            .ok_or(TuiLogicError::NoSession)?;
+        let result = self
+            .data
+            .branch_session(BranchSessionDataRequest {
+                parent_session_id,
+                at: command.at,
+                style: command.style,
+            })
+            .map_err(map_error)?;
+        self.select_branched_session(&result)?;
+        Ok(map_branch_result(&result))
+    }
+
+    fn select_branched_session(
+        &mut self,
+        result: &BranchSessionDataRecord,
+    ) -> Result<(), TuiLogicError> {
+        self.refresh_sessions()?;
+        let selected = self
+            .state
+            .sessions
+            .iter()
+            .position(|session| session.id == result.session_id)
+            .ok_or(TuiLogicError::BranchedSessionMissing(result.session_id))?;
+        self.state.selected_session = Some(selected);
+        self.reload_selected_history()
+    }
+
+    fn execute_branch_command(
+        &mut self,
+        parts: &mut std::str::SplitWhitespace<'_>,
+    ) -> Result<(), TuiLogicError> {
+        let at = required_sequence(parts.next(), "/branch <sequence> [style]")?;
+        let style = parts.next().map(ToOwned::to_owned);
+        if parts.next().is_some() {
+            return Err(TuiLogicError::InvalidCommand(String::from(
+                "/branch <sequence> [style]",
+            )));
+        }
+        if let Some(selector) = style.as_deref() {
+            let _ = self.resolve_style_selector(selector)?;
+        }
+        let result = self.branch_selected(BranchSessionCommand { at, style })?;
+        self.state.status = format!(
+            "branched {} from {} at {}",
+            result.session_id,
+            result.parent_session_id,
+            result.fork_sequence.get()
+        );
+        Ok(())
+    }
+
     fn execute_command(&mut self, input: &str) -> Result<(), TuiLogicError> {
         let mut parts = input.split_whitespace();
         match parts.next().unwrap_or_default() {
@@ -601,18 +693,10 @@ impl<D: TuiDataPort> TuiLogic<D> {
                         "/style <id[@version]>",
                     )));
                 }
-                let style = self
-                    .state
-                    .styles
-                    .iter()
-                    .find(|style| style.selector() == selector || style.id == selector)
-                    .ok_or_else(|| TuiLogicError::UnknownStyle(selector.clone()))?;
-                if style.availability != StyleAvailability::Available {
-                    return Err(TuiLogicError::UnavailableStyle(style.selector()));
-                }
-                self.state.selected_style = Some(style.selector());
+                self.state.selected_style = Some(self.resolve_style_selector(&selector)?);
                 self.state.status = format!("style: {}", self.state.active_style());
             }
+            "/branch" => self.execute_branch_command(&mut parts)?,
             "/model" => {
                 self.state.model = required_argument(parts.next(), "/model <id>")?;
                 self.state.status = format!("model: {}", self.state.model);
@@ -780,6 +864,22 @@ fn required_argument(value: Option<&str>, usage: &str) -> Result<String, TuiLogi
         .ok_or_else(|| TuiLogicError::InvalidCommand(usage.to_owned()))
 }
 
+fn required_sequence(value: Option<&str>, usage: &str) -> Result<Sequence, TuiLogicError> {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| Sequence::new(value).ok())
+        .ok_or_else(|| TuiLogicError::InvalidCommand(usage.to_owned()))
+}
+
+fn map_branch_result(record: &BranchSessionDataRecord) -> BranchSessionResult {
+    BranchSessionResult {
+        session_id: record.session_id,
+        parent_session_id: record.parent_session_id,
+        fork_sequence: record.fork_sequence,
+        child_head_sequence: record.child_head_sequence,
+    }
+}
+
 fn summarize_payload(value: &Value) -> String {
     let rendered = value.to_string();
     if rendered.chars().count() > 96 {
@@ -851,6 +951,8 @@ pub enum TuiLogicError {
     UnknownStyle(String),
     #[error("style `{0}` is not available")]
     UnavailableStyle(String),
+    #[error("branched session `{0}` is absent from the runtime catalog")]
+    BranchedSessionMissing(agentmod_primitives::SessionId),
 }
 
 #[cfg(test)]
@@ -859,7 +961,8 @@ mod tests {
 
     use agentmod_primitives::{CancellationId, SessionId};
     use agentmod_tui_data::{
-        HarnessDataRecord, RuntimeHealthDataRecord, SessionDataRecord, SessionEventDataRecord,
+        BranchSessionDataRecord, BranchSessionDataRequest, HarnessDataRecord,
+        RuntimeHealthDataRecord, SessionDataRecord, SessionEventDataRecord,
         SessionEventPageDataRecord, TurnDataEvent, TurnDataStream,
     };
     use serde_json::json;
@@ -870,6 +973,7 @@ mod tests {
     #[derive(Default)]
     struct FixtureData {
         created: RefCell<Vec<(String, String, Option<String>)>>,
+        branched: RefCell<Vec<BranchSessionDataRequest>>,
     }
 
     impl TuiDataPort for FixtureData {
@@ -881,15 +985,18 @@ mod tests {
         }
 
         fn list_styles(&self) -> Result<Vec<StyleDataRecord>, TuiDataError> {
-            Ok(vec![StyleDataRecord {
-                id: String::from("focused"),
-                version: String::from("1.0.0"),
-                source: StyleDataSourceKind::Project,
-                availability: StyleDataAvailability::Available,
-                style_content_hash: String::from("hash"),
-                compiled_cache_key: String::from("cache"),
-                required_capabilities: vec![],
-            }])
+            Ok(["focused", "ephemeral-turn"]
+                .into_iter()
+                .map(|id| StyleDataRecord {
+                    id: id.to_owned(),
+                    version: String::from("1.0.0"),
+                    source: StyleDataSourceKind::Project,
+                    availability: StyleDataAvailability::Available,
+                    style_content_hash: format!("{id}-hash"),
+                    compiled_cache_key: format!("{id}-cache"),
+                    required_capabilities: vec![],
+                })
+                .collect())
         }
 
         fn list_harnesses(&self) -> Result<Vec<HarnessDataRecord>, TuiDataError> {
@@ -903,13 +1010,23 @@ mod tests {
         }
 
         fn list_sessions(&self, _limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError> {
-            Ok(vec![SessionDataRecord {
+            let mut sessions = vec![SessionDataRecord {
                 id: SessionId::from_uuid(Uuid::nil()),
                 workspace: String::from("workspace"),
                 style: String::from("persistent-chat"),
                 sequence: Sequence::new(2).expect("valid sequence"),
                 state: String::from("active"),
-            }])
+            }];
+            if !self.branched.borrow().is_empty() {
+                sessions.push(SessionDataRecord {
+                    id: SessionId::from_uuid(Uuid::from_u128(3)),
+                    workspace: String::from("workspace"),
+                    style: String::from("ephemeral-turn"),
+                    sequence: Sequence::new(2).expect("valid sequence"),
+                    state: String::from("active"),
+                });
+            }
+            Ok(sessions)
         }
 
         fn create_session(
@@ -929,6 +1046,21 @@ mod tests {
         ) -> Result<SessionId, TuiDataError> {
             self.created.borrow_mut().push((workspace, style, harness));
             Ok(SessionId::from_uuid(Uuid::from_u128(2)))
+        }
+
+        fn branch_session(
+            &self,
+            request: BranchSessionDataRequest,
+        ) -> Result<BranchSessionDataRecord, TuiDataError> {
+            let parent_session_id = request.parent_session_id;
+            let fork_sequence = request.at;
+            self.branched.borrow_mut().push(request);
+            Ok(BranchSessionDataRecord {
+                session_id: SessionId::from_uuid(Uuid::from_u128(3)),
+                parent_session_id,
+                fork_sequence,
+                child_head_sequence: Sequence::new(2).expect("valid sequence"),
+            })
         }
 
         fn session_events(
@@ -1042,6 +1174,27 @@ mod tests {
                 String::from("focused@1.0.0"),
                 Some(String::from("fixture"))
             )]
+        );
+    }
+
+    #[test]
+    fn branch_command_selects_a_deliberately_restyled_child() {
+        let mut logic = TuiLogic::new(FixtureData::default());
+        logic.bootstrap().expect("bootstrap");
+        logic.insert_text("/branch 1 ephemeral-turn");
+        logic.submit_editor().expect("branch");
+
+        assert_eq!(
+            logic.state().selected().map(|session| session.id),
+            Some(SessionId::from_uuid(Uuid::from_u128(3)))
+        );
+        assert_eq!(
+            logic.data.branched.into_inner(),
+            vec![BranchSessionDataRequest {
+                parent_session_id: SessionId::from_uuid(Uuid::nil()),
+                at: Sequence::FIRST,
+                style: Some(String::from("ephemeral-turn")),
+            }]
         );
     }
 }

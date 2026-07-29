@@ -221,6 +221,16 @@ status = "partial"
 limitation = "The Windows research-loop process E2E proves replay-derived graph progress, budgets, context history, termination, daemon restart, and pure replay; the Windows TUI smoke remains green and rendering has a focused test. Unix scripts are syntax-checked but not process-executed. Cost/duration accounting and conditional-edge eligibility are explicitly unknown when canonical state cannot prove them."
 
 [[requirement]]
+id = "E2E-22"
+capability = "tui-branch-with-style"
+owner = "tui/runtime"
+tests = ["branch_command_selects_a_deliberately_restyled_child", "runtime_tui_smoke"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/tui/dependency/src/lib.rs", "apps/tui/data/src/lib.rs", "apps/tui/logic/src/lib.rs", "apps/tui/service/src/lib.rs", "apps/tui/bin/src/main.rs", "tests/e2e/runtime_tui_smoke.ps1", "tests/e2e/runtime_tui_smoke.sh"]
+status = "partial"
+limitation = "The Windows process E2E proves the four-layer TUI command path creates and selects an ephemeral child at an explicit sequence while the persistent parent head and style remain unchanged. The Unix script is syntax-checked but has not been process-executed."
+
+[[requirement]]
 id = "SCHED-01"
 capability = "durable-scheduling"
 owner = "scheduler/runtime"

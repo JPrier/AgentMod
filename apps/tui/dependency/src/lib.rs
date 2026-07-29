@@ -89,6 +89,23 @@ pub struct DependencySessionSummary {
     pub state: String,
 }
 
+/// Dependency-owned atomic branch request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyBranchSessionRequest {
+    pub parent_session_id: SessionId,
+    pub at: Sequence,
+    pub style: Option<String>,
+}
+
+/// Dependency-owned atomic branch result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyBranchSessionResponse {
+    pub session_id: SessionId,
+    pub parent_session_id: SessionId,
+    pub fork_sequence: Sequence,
+    pub child_head_sequence: Sequence,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct DependencySessionEvent {
     pub sequence: Sequence,
@@ -186,6 +203,10 @@ pub trait TuiRuntimeDependencyPort: Send + Sync {
     ) -> Result<SessionId, TuiDependencyError> {
         self.create_session(workspace, style)
     }
+    fn branch_session(
+        &self,
+        request: DependencyBranchSessionRequest,
+    ) -> Result<DependencyBranchSessionResponse, TuiDependencyError>;
     fn session_events(
         &self,
         session_id: SessionId,
@@ -617,6 +638,31 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
             return Err(TuiDependencyError::UnexpectedResponse);
         };
         Ok(session_id)
+    }
+
+    fn branch_session(
+        &self,
+        request: DependencyBranchSessionRequest,
+    ) -> Result<DependencyBranchSessionResponse, TuiDependencyError> {
+        let RuntimeResponse::SessionBranched {
+            session_id,
+            parent_session_id,
+            fork_sequence,
+            child_head_sequence,
+        } = self.send(RuntimeRequest::BranchSession {
+            session_id: request.parent_session_id,
+            at: request.at,
+            style: request.style,
+        })?
+        else {
+            return Err(TuiDependencyError::UnexpectedResponse);
+        };
+        Ok(DependencyBranchSessionResponse {
+            session_id,
+            parent_session_id,
+            fork_sequence,
+            child_head_sequence,
+        })
     }
 
     fn session_events(

@@ -295,6 +295,8 @@ impl ProviderExecutionDependency for StaticProviderCatalogDependency {
             .unwrap_or_else(|| "deterministic response".to_owned());
         let events = if scenario == "process_action" {
             process_action_events(&options)?
+        } else if scenario == "planner_worker" {
+            planner_worker_events(&options, &request.entries)?
         } else {
             scenario_events(scenario, text)?
         };
@@ -386,6 +388,62 @@ fn validate_request(
         ));
     }
     Ok(())
+}
+
+fn planner_worker_events(
+    options: &BTreeMap<String, String>,
+    entries: &[DependencyConversationEntry],
+) -> Result<Vec<DependencyProviderEvent>, ProviderExecutionDependencyError> {
+    let phase = options.get("mock_planner_phase").map(String::as_str);
+    let iteration = options
+        .get("mock_planner_iteration")
+        .map_or(Ok(0_u32), |value| value.parse::<u32>())
+        .map_err(|_| {
+            ProviderExecutionDependencyError::InvalidRequest(String::from(
+                "mock_planner_iteration is invalid",
+            ))
+        })?;
+    let pending_task = entries.iter().find_map(|entry| match entry {
+        DependencyConversationEntry::Metadata { key, value_json } if key == "pending_task" => {
+            Some(value_json.as_str())
+        }
+        _ => None,
+    });
+    let text = match (phase, pending_task) {
+        (Some("plan"), _) => String::from(
+            r#"{"tasks":[{"task_id":"task-1","description":"inspect runtime child recovery"},{"task_id":"task-2","description":"inspect planner join evidence"}]}"#,
+        ),
+        (None, Some(task)) => format!(
+            r#"{{"worker_result":{task},"status":"completed","evidence":["canonical child journal"]}}"#
+        ),
+        (Some("integrate"), _) => format!(
+            r#"{{"integration":"combined runtime-owned child handoffs","iteration":{iteration},"tests":"deterministic fixture passed"}}"#
+        ),
+        (Some("review"), _) if iteration == 0 => String::from(
+            r#"{"approved":false,"rejected_task_ids":["task-2"],"findings":["task-2 requires one evidence-bound revision"]}"#,
+        ),
+        (Some("review"), _) => String::from(
+            r#"{"approved":true,"rejected_task_ids":[],"findings":["child revision and integration evidence approved"]}"#,
+        ),
+        _ => {
+            return Err(ProviderExecutionDependencyError::InvalidRequest(
+                String::from("planner_worker requires a supported phase or pending task"),
+            ));
+        }
+    };
+    Ok(vec![
+        DependencyProviderEvent::Started,
+        DependencyProviderEvent::TextDelta(text),
+        completed(
+            "stop",
+            DependencyUsage {
+                input_tokens: 24,
+                output_tokens: 16,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        ),
+    ])
 }
 
 #[allow(
@@ -936,6 +994,67 @@ mod tests {
             cancelled.events.last(),
             Some(&DependencyProviderEvent::Cancelled)
         );
+    }
+
+    #[test]
+    fn planner_worker_fixture_is_stateless_and_phase_driven() {
+        let dependency = StaticProviderCatalogDependency::built_in();
+        let mut plan = request("planner_worker");
+        plan.options.extend([
+            DependencyProviderOption {
+                key: String::from("mock_planner_phase"),
+                value: String::from("plan"),
+            },
+            DependencyProviderOption {
+                key: String::from("mock_planner_iteration"),
+                value: String::from("0"),
+            },
+        ]);
+        let plan = dependency.execute_provider(plan).expect("planner response");
+        assert!(plan.events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::TextDelta(text)
+                if text.contains("\"task_id\":\"task-1\"")
+                    && text.contains("\"task_id\":\"task-2\"")
+        )));
+
+        let mut worker = request("planner_worker");
+        worker.entries = vec![DependencyConversationEntry::Metadata {
+            key: String::from("pending_task"),
+            value_json: String::from(
+                r#"{"task_id":"task-2","description":"inspect joins","state":"assigned"}"#,
+            ),
+        }];
+        let worker = dependency
+            .execute_provider(worker)
+            .expect("worker response");
+        assert!(worker.events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::TextDelta(text)
+                if text.contains("\"status\":\"completed\"")
+                    && text.contains("\"task_id\":\"task-2\"")
+        )));
+
+        let mut rejected = request("planner_worker");
+        rejected.options.extend([
+            DependencyProviderOption {
+                key: String::from("mock_planner_phase"),
+                value: String::from("review"),
+            },
+            DependencyProviderOption {
+                key: String::from("mock_planner_iteration"),
+                value: String::from("0"),
+            },
+        ]);
+        let rejected = dependency
+            .execute_provider(rejected)
+            .expect("reject once response");
+        assert!(rejected.events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::TextDelta(text)
+                if text.contains("\"approved\":false")
+                    && text.contains("\"task-2\"")
+        )));
     }
 
     #[test]

@@ -134,21 +134,21 @@ limitation = "Windows daemon E2Es prove pure replay to an earlier sequence, exac
 id = "E2E-13"
 capability = "ephemeral-turn"
 owner = "runtime/harness"
-tests = ["acceptance::ephemeral_turn"]
+tests = ["runtime_ephemeral_turn"]
 platforms = ["windows", "linux", "macos"]
-evidence = []
-status = "planned"
-limitation = "No implementation exists yet."
+evidence = ["tests/e2e/runtime_ephemeral_turn.ps1", "tests/e2e/runtime_ephemeral_turn.sh", "apps/runtime/logic/src/turn.rs"]
+status = "partial"
+limitation = "The Windows process E2E proves two isolated provider projections, canonical history preservation, restart, and explicit projection discard. The Unix script is syntax-checked but has not been process-executed, and explicit artifact handoff selection remains incomplete."
 
 [[requirement]]
 id = "E2E-14"
 capability = "planner-worker-reviewer"
 owner = "runtime"
-tests = ["acceptance::planner_worker_reviewer"]
+tests = ["runtime_planner_worker"]
 platforms = ["windows", "linux", "macos"]
-evidence = []
-status = "planned"
-limitation = "No implementation exists yet."
+evidence = ["tests/e2e/runtime_planner_worker.ps1", "tests/e2e/runtime_planner_worker.sh", "apps/runtime/logic/src/child_session.rs", "apps/runtime/logic/src/turn.rs"]
+status = "partial"
+limitation = "The deterministic Windows process E2E proves two initial runtime-managed workers, exact joins, reviewer rejection, one revision worker, approval, daemon restart, and replayed inspection. Workers remain sequential; workspace isolation, immutable result/diff/test artifacts, durable child-creation approval, crash-while-child-active coverage, and Unix process execution remain incomplete."
 
 [[requirement]]
 id = "E2E-15"

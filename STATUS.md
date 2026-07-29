@@ -14,10 +14,13 @@ none/sliding-window/tool-output-eviction compaction run through recoverable
 canonical lifecycle boundaries before provider requests. Research loops run
 bounded fresh-context iterations with immutable findings, and the compiled
 declarative fixture executes branch, approval, native-tool, loop, and terminal
-nodes. Planner-worker-reviewer now has a typed, atomically created child-session
-substrate but its plan/spawn/join/review graph adapter is not live.
+nodes. Planner-worker-reviewer now runs its compiled plan, spawn, wait, join,
+integrate, review, reject, revision, and terminal graph through runtime-managed
+child sessions with canonical replay state.
 Summary/artifact compaction, automatic memory
-writes, plugin composition, and harness selection remain incomplete.
+writes, plugin composition, harness selection, concurrent child dispatch,
+workspace isolation enforcement, and artifact-backed planner results remain
+incomplete.
 
 ## Completed capabilities
 
@@ -61,7 +64,7 @@ writes, plugin composition, and harness selection remain incomplete.
 | Ephemeral-turn style execution | End-to-end validated on Windows | The SDK-compiled `fresh-context → respond → tool → done` graph executes through the generic style executor. Each turn authorizes and canonically records one current-turn-only provider projection, retains typed canonical user/assistant history without fabricated handoff messages, and authorizes a phase-bound empty projection before completing the turn. Exact graph-edge, run, request, provider, model, options, and input identities govern recovery; journal-cut tests cover fresh replacement, context-to-model transition, assistant commit, discard phase, and discard boundary without duplicate user commits or provider redispatch. `runtime_ephemeral_turn.ps1` proves two isolated turns across restart, empty dormant projection, complete canonical history, and no turn-one input/output in turn two's fresh provider projection; the Unix equivalent has been syntax-checked but not process-executed |
 | Research-loop style execution | End-to-end validated on Windows | The SDK-compiled `fresh-context → research → tool → persist → repeat` graph executes through the generic style executor with a deterministic, style-bounded completion criterion. Every iteration receives a fresh provider projection, can execute native tools and resume approvals, commits visible output, persists a policy-approved immutable JSON finding through a canonical proposal/approval/dispatch/completion outbox, and records loop transitions and terminal lifecycle state. Replay retains structured provider tool proposals so restart cannot change finding bytes; exact request hashes reject changed provider/model/options/criteria. Unit crash matrices cover assistant, policy, dispatch, receipt, node, loop, transition, terminal lifecycle, tool, and approval cuts without ambiguous redispatch. `runtime_research_loop.ps1` proves three findings, three inspectable iterations, daemon restart, and pure replay; the Unix equivalent is syntax-checked but has not been process-executed |
 | Declarative-graph style execution | End-to-end validated for the built-in fixture on Windows | The generic executor recognizes the compiled five-node graph semantically rather than by style ID, binds caller-controlled inputs canonically before entry, selects both branch outcomes from compiled expressions, creates cursor/cache/request-bound style approval continuations, executes the declared `filesystem.read` through the normal proposal/policy/grant/host/receipt path, enforces the compiled loop bound, and terminalizes the session. Reducer evidence binds approval completion to its exact continuation and tool completion to a terminal call receipt. Runtime rejects secondary tool-policy approval and interceptor replacement for this minimal adapter until their exact style-owned resume data can be retained, rather than inventing a harness continuation. `runtime_declarative_graph.ps1` proves three loop iterations, native tool calls, daemon restart at approval, resume-once approval, duplicate-resolution idempotency, inspection, and pure replay; its Unix equivalent is syntax-checked but not process-executed |
-| Runtime-managed child-session substrate | Integration tested | Runtime logic owns exact parent proposal, graph node, task, revision, depth, style, and token-budget identity. Runtime data/dependency atomically create a fresh worker journal containing `session.created` plus `child_session.linked`; worker metadata is catalogued under distinct child-parent fields rather than branch ancestry. Recovery scans the parent proposal key and then replays the candidate journal to verify every typed field before accepting it. Child execution projects a canonical `PendingTask` into an ephemeral fresh context and does not commit a fabricated user message. Parent-side child creation events enforce Proposed → Approved → Created ordering. The runtime recognizes the exact compiled planner/worker/reviewer graph and replay now owns bounded task plans, exact completed-child joins, and structured reviewer decisions; node completion validates these records instead of trusting counts or result strings alone. Focused reducer, dependency atomic-tree, typed-projection, and existing ephemeral recovery tests pass. The live plan/spawn/wait/integrate/review/revision adapter, result artifacts, and durable child-creation approval remain incomplete. |
+| Runtime-managed planner/worker/reviewer and child sessions | End-to-end validated on Windows for the deterministic adapter | Runtime logic owns exact parent proposal, graph node, task, revision, depth, style, context/token limits, selected tools, memory access, and workspace-mode identity. Runtime data/dependency atomically create a fresh worker journal containing `session.created` plus `child_session.linked`; worker metadata is catalogued under distinct child-parent fields rather than branch ancestry. Creation and recovery resolve the exact child style again, apply the same restricted binding, and compare the complete immutable binding before accepting an existing child. Child execution projects a canonical `PendingTask` into an ephemeral fresh context and does not commit a fabricated user message. Parent events enforce Proposed → Approved → Created → Completed ordering; replay owns bounded task plans, exact completed-child joins, structured reviewer decisions, and loop transitions. The live adapter executes plan, two initial workers, exact join, integration, rejection, one task-scoped revision worker, second join, reintegration, approval, and session termination. Typed phase/child cancellation IDs remain valid across the harness protocol, and review nodes reset model evidence independently. `runtime_planner_worker.ps1` proves the process path plus daemon restart and replayed inspection. Workers are currently dispatched sequentially; handoffs are typed canonical entries rather than immutable result artifacts; workspace modes are selected but not yet enforced by separate workspace dependencies; reviewer inputs do not yet include real diff/test artifacts; durable child-creation approval continuations and Unix process execution remain incomplete. |
 | Style-selected context, memory, and compaction | End-to-end validated for no/file/SQLite memory and none/sliding compaction on Windows | The SDK compiles retrieval timing, query construction, write policy, injection location, reserved context tokens, projection limits, and typed preservation requirements with fail-safe schema-v1 defaults. Runtime data routes no-memory, checksum-protected file memory, and SQLite FTS through distinct selected dependencies with session isolation plus item, query-byte, contribution-byte, projection-token, and hard serialized-byte bounds. Context construction, replacement, and compaction proposals traverse the existing style/plugin/user/mandatory pipeline; canonical boundary/phase events enforce exact memory-before-compaction ordering, bind retries to provider/model/options/current-input identity, recompute projection measurements during replay, recover completed phases exactly once, and fail closed after an ambiguous interceptor start. Canonical replacements preserve full conversation history and complete provenance. `runtime_style_context.ps1` proves no/file/SQLite selection, isolation, restart retrieval, branch-to-no-memory cleanup, limits, first-turn pressure, reserved budgets, and none-vs-sliding projection differences while preserving canonical history. Summary/artifact handoff and automatic writes remain incomplete; the Unix process script has only been syntax-checked |
 | Runtime local RPC transport | Integration tested | Bounded framed negotiation, mandatory bootstrap-token authentication, concurrent local socket/named-pipe connections, request dispatch, ordered `StreamItem`/`StreamEnd` frames, committed-sequence binding, and bounded channel backpressure tests. A terminal-only style turn is explicitly framed as `StreamEnd` even when it emits zero provider events |
 | Runtime↔harness durable turn | End-to-end validated | CLI create/run traverses authenticated named pipe, runtime replay/commit, ordered interception and policy, short-lived keyed grant, supervised harness, deterministic provider, canonical proposal/approval/started/delta/completion events, and assistant commit; Windows E2E passes and Unix automation is present |
@@ -86,9 +89,10 @@ writes, plugin composition, and harness selection remain incomplete.
 ## In progress
 
 - Typed summary/artifact compaction and approved automatic memory-write flows.
-- Planner-worker-reviewer plan/spawn/join/review/revision execution on the
-  runtime-managed child-session substrate, plus general graph-node adapters
-  beyond the four live built-in semantics.
+- Planner-worker-reviewer result artifacts, concurrent child dispatch,
+  enforced workspace modes, real diff/test reviewer evidence, and durable
+  child-creation approval continuations; the deterministic sequential adapter
+  is live.
 - TUI management panels for schedules, plugins, MCP, processes, artifacts,
   child agents, and LSP; core interactive streaming is implemented.
 - MCP OAuth authorization-code flow.
@@ -96,12 +100,19 @@ writes, plugin composition, and harness selection remain incomplete.
 
 ## Failing tests
 
-None. `cargo test --workspace --all-targets --all-features --locked`,
+No test failures. `cargo test --workspace --all-targets --all-features --locked`,
 `cargo test --workspace --doc --all-features --locked`, strict workspace
 Clippy, formatting, and the 88-package architecture command and fixture tests
 pass locally on Windows for the current tree. The style-registry, ephemeral,
 research-loop, and declarative-graph process E2Es pass on Windows; their Unix
 scripts have been syntax-checked but not process-executed.
+`cargo audit` reports zero known vulnerabilities. `cargo deny check` does not
+yet pass with cargo-deny 0.20.2: the repository's publishable package manifests
+use unversioned internal path dependencies, `xtask` does not declare a license,
+and the current license policy has no scoped allowance for
+`webpki-roots`'s CDLA-Permissive-2.0 data license. Those pre-existing
+dependency-policy declarations must be reconciled without weakening registry
+wildcard checks before this phase can be declared complete.
 
 ## Blockers
 
@@ -109,7 +120,8 @@ None.
 
 ## Next tasks
 
-1. Implement planner-worker-reviewer as runtime-managed child sessions.
+1. Finish planner-worker result artifacts, workspace enforcement, concurrency,
+   and crash-cut recovery coverage.
 2. Finish summary/artifact/write context paths, then connect plugin composition
    and the harness capability registry.
 
@@ -177,6 +189,12 @@ continuation, but does not yet prove every declared node kind or a user-supplied
 graph through process-level execution.
 Scenario 7 and the deterministic none/file portion of Scenario 8 now pass on
 Windows through `runtime_style_context.ps1`; Unix scripts have not been executed.
+Scenario 5 now passes a deterministic Windows process path with two initial
+runtime-managed workers, one reviewer rejection, one revision worker, exact
+joins, approval, restart, and replayed inspection. It remains partial because
+workers are sequential, result/reviewer evidence is not yet artifact-backed
+with real diffs and test output, workspace isolation is descriptive, and the
+Unix script has only been syntax-checked.
 Scenario
 1 has a real model-driven read/edit/failing-test/fix/passing-test process E2E,
 but still lacks symbol search and multi-file edits. Scenarios 3 and 4 now pass

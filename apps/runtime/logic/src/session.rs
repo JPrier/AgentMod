@@ -2313,7 +2313,10 @@ fn apply_style_node_entered(
     }
     execution.active_node = Some(entered.clone());
     execution.active_node_entered_at = Some(sequence);
-    if graph_node_kind(&execution.graph, &entered.node_id) == Some(NodeKind::ModelCall) {
+    if matches!(
+        graph_node_kind(&execution.graph, &entered.node_id),
+        Some(NodeKind::ModelCall | NodeKind::Review)
+    ) {
         execution.latest_model_execution = None;
     }
     execution.control = StyleExecutionControlState::Active(entered.clone());

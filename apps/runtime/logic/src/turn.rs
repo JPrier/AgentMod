@@ -39,7 +39,7 @@ use crate::{
     artifact::{
         ArtifactPersistenceLogic, ArtifactRetention, ArtifactSecurity, PersistArtifactCommand,
     },
-    child_session::ChildSessionLogicPort,
+    child_session::{ChildSessionLogicPort, EnsureChildSessionCommand},
     compaction::{CompactionContext, CompactionError, CompactionStrategy, compact_projection},
     continuation::{
         ApprovalDisposition, ContinuationLogic, ContinuationLogicPort, ContinuationPayload,
@@ -49,8 +49,8 @@ use crate::{
         ToolApprovalContinuation, WakeContinuationCommand,
     },
     conversation::{
-        ConversationEntry, ConversationEntryId, PendingTaskEntry, ProjectionProvenance,
-        RetrievedMemoryEntry, TextEntry, ToolCallEntry, ToolResultEntry,
+        ChildHandoffEntry, ConversationEntry, ConversationEntryId, PendingTaskEntry,
+        ProjectionProvenance, RetrievedMemoryEntry, TextEntry, ToolCallEntry, ToolResultEntry,
     },
     harness::{
         AuthorizedProviderRequest, ExecuteProviderCommand, ProviderEvent, ProviderEventStream,
@@ -72,20 +72,24 @@ use crate::{
         ArtifactPersistenceApprovedEvent, ArtifactPersistenceCompletedEvent,
         ArtifactPersistenceDispatchedEvent, ArtifactPersistenceIdentity,
         ArtifactPersistenceProposedEvent, ArtifactPersistenceResumeAction,
-        ContextBoundaryCompletedEvent, ContextBoundaryIdentity, ContextBoundaryOrigin,
-        ContextBoundaryStartedEvent, ContextPhaseCompletedEvent, ContextPhaseIdentity,
-        ContextPhaseStartedEvent, ContextProjectionReplacedEvent, ConversationEntryCommittedEvent,
-        ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent, ModelRequestCancelledEvent,
-        ModelRequestFailedEvent, ModelRequestProposedEvent, ModelRequestStartedEvent,
-        ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent, ModelToolCallProposedEvent,
-        ProcessReconciliationCompletedEvent, ProcessReconciliationStartedEvent,
-        ProcessReconciliationStatus, RuntimeCommittedEvent, SchedulerDeliveryReconciledEvent,
+        ChildAgentCompletedEvent, ChildAgentCreatedEvent, ChildAgentCreationApprovedEvent,
+        ChildAgentCreationProposedEvent, ChildAgentExecutionIdentity, ChildAgentState,
+        ChildJoinCompletedEvent, ContextBoundaryCompletedEvent, ContextBoundaryIdentity,
+        ContextBoundaryOrigin, ContextBoundaryStartedEvent, ContextPhaseCompletedEvent,
+        ContextPhaseIdentity, ContextPhaseStartedEvent, ContextProjectionReplacedEvent,
+        ConversationEntryCommittedEvent, ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent,
+        ModelRequestCancelledEvent, ModelRequestFailedEvent, ModelRequestProposedEvent,
+        ModelRequestStartedEvent, ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent,
+        ModelToolCallProposedEvent, PlannedTask, ProcessReconciliationCompletedEvent,
+        ProcessReconciliationStartedEvent, ProcessReconciliationStatus,
+        ReviewerFindingsCommittedEvent, RuntimeCommittedEvent, SchedulerDeliveryReconciledEvent,
         SchedulerFiredEvent, SessionReducerError, StyleExecutionControlState,
         StyleExecutionInitializedEvent, StyleExecutionTerminatedEvent, StyleNodeCompletedEvent,
         StyleNodeEnteredEvent, StyleNodeFailedEvent, StyleTransitionSelectedEvent,
-        ToolCallApprovedEvent, ToolCallProposedEvent, ToolExecutionCompletedEvent,
-        ToolExecutionDispatchedEvent, ToolExecutionFailedEvent, ToolExecutionStartedEvent,
-        ToolExecutionState, ToolExecutionTerminalOutcome, ToolOutputObservedEvent, reduce,
+        TaskPlanCommittedEvent, ToolCallApprovedEvent, ToolCallProposedEvent,
+        ToolExecutionCompletedEvent, ToolExecutionDispatchedEvent, ToolExecutionFailedEvent,
+        ToolExecutionStartedEvent, ToolExecutionState, ToolExecutionTerminalOutcome,
+        ToolOutputObservedEvent, reduce,
     },
     style_executor::{
         CompiledStyleExecutor, StyleAdapterKind, StyleExecutorError, StyleNodeCursor,
@@ -428,7 +432,20 @@ pub struct TurnLogic<D> {
     child_sessions: Option<Arc<dyn ChildSessionLogicPort>>,
 }
 
-impl<D: Clone> TurnLogic<D> {
+impl<D> TurnLogic<D>
+where
+    D: Clone
+        + Send
+        + Sync
+        + EventIdentityDataPort
+        + JournalEventDataPort
+        + HarnessDataPort
+        + ContinuationDataPort
+        + MemoryDataPort
+        + ArtifactDataPort
+        + agentmod_runtime_data::tool::ToolDataPort
+        + 'static,
+{
     #[must_use]
     pub fn new(data: D, policy: ProviderExecutionPolicy) -> Self {
         let tool_policy = ToolExecutionPolicy {
@@ -448,6 +465,835 @@ impl<D: Clone> TurnLogic<D> {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the planner adapter keeps graph control adjacent to canonical plan, child, join, and review effects"
+    )]
+    async fn run_planner_worker_reviewer(
+        &self,
+        command: RunTurnCommand,
+        sink: Option<&mpsc::Sender<Result<RunTurnStreamItem, RunTurnError>>>,
+        scheduled: Option<ScheduledTurnPrelude>,
+        session_id: SessionId,
+        session_directory: PathBuf,
+        persistence: SessionPersistenceLogic<D>,
+        preflight: LoadSessionResult,
+    ) -> Result<RunTurnResult, RunTurnError> {
+        let (user_sequence, mut execution) =
+            if let Some(canonical) = preflight.state.style_execution.as_ref() {
+                if let Some(reason) = canonical.termination_reason.as_ref() {
+                    if reason == "complete_session"
+                        && preflight.state.lifecycle == crate::session::SessionLifecycle::Active
+                    {
+                        let user_sequence = current_run_user_sequence(&preflight.state, &command)?;
+                        let (sequence, _) = self.commit_next(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            preflight.state.last_sequence,
+                            preflight.last_event_id,
+                            RuntimeCommittedEvent::SessionLifecycleChanged(
+                                crate::session::SessionLifecycleChangedEvent {
+                                    lifecycle: crate::session::SessionLifecycle::Completed,
+                                    reason: Some(String::from("planner-worker-reviewer approved")),
+                                },
+                            ),
+                        )?;
+                        return Ok(RunTurnResult {
+                            events: Vec::new(),
+                            first_committed_sequence: user_sequence,
+                            last_committed_sequence: sequence,
+                            awaiting_continuation: None,
+                        });
+                    }
+                    return Err(RunTurnError::StyleExecutionTerminalReason(reason.clone()));
+                }
+                let user_sequence = current_run_user_sequence(&preflight.state, &command)?;
+                let execution = Self::resume_active_style_turn(
+                    &preflight.state,
+                    JournalPosition {
+                        sequence: preflight.state.last_sequence,
+                        event_id: preflight.last_event_id,
+                    },
+                )?
+                .ok_or(RunTurnError::StyleGraphMismatch)?;
+                (user_sequence, execution)
+            } else {
+                if let Some(scheduled) = scheduled {
+                    self.commit_scheduler_fired(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        scheduled,
+                    )?;
+                }
+                let (state, user_sequence, user_event) =
+                    self.commit_user(&persistence, session_id, &session_directory, &command)?;
+                let execution = self.begin_style_turn(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &state,
+                    JournalPosition {
+                        sequence: user_sequence,
+                        event_id: user_event.metadata.event_id,
+                    },
+                )?;
+                (user_sequence, execution)
+            };
+        if execution.executor.adapter_kind() != Some(StyleAdapterKind::PlannerWorkerReviewer) {
+            return Err(RunTurnError::StyleGraphMismatch);
+        }
+        validate_planner_child_policy(execution.executor.compiled())?;
+        let mut visible_events = Vec::new();
+
+        loop {
+            match execution.current.directive {
+                StyleNodeDirective::ModelCall if execution.current.id == "plan" => {
+                    let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                    if state.planner_worker.plan_committed_at.is_none() {
+                        let phase_command =
+                            planner_phase_command(&command, "plan", execution.loop_iteration);
+                        let events = self
+                            .execute_planner_model_node(
+                                &persistence,
+                                session_id,
+                                &session_directory,
+                                &mut execution,
+                                &command,
+                                &phase_command,
+                                sink,
+                            )
+                            .await?;
+                        let tasks = parse_planner_tasks(
+                            &events,
+                            execution.executor.compiled().child_agents.max_children,
+                        )?;
+                        let loaded =
+                            Self::load_state(&persistence, session_id, &session_directory)?;
+                        let model_response_sequence = loaded
+                            .style_execution
+                            .as_ref()
+                            .and_then(|state| state.latest_model_execution.as_ref())
+                            .and_then(|evidence| evidence.completed_at)
+                            .ok_or(RunTurnError::PlannerOutputInvalid)?;
+                        (execution.position.sequence, execution.position.event_id) = self
+                            .commit_next(
+                                &persistence,
+                                session_id,
+                                &session_directory,
+                                execution.position.sequence,
+                                execution.position.event_id,
+                                RuntimeCommittedEvent::TaskPlanCommitted(TaskPlanCommittedEvent {
+                                    node_id: execution.current.id.clone(),
+                                    attempt: execution.attempt,
+                                    loop_iteration: execution.loop_iteration,
+                                    step: execution.step,
+                                    model_response_sequence,
+                                    tasks,
+                                }),
+                            )?;
+                    }
+                    self.complete_and_enter_next(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(String::from("planner:task-plan")),
+                    )?;
+                }
+                StyleNodeDirective::SpawnChildAgent => {
+                    self.spawn_planner_children(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &command,
+                        &mut execution,
+                    )
+                    .await?;
+                    let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                    let child_count = state
+                        .child_agents
+                        .values()
+                        .filter(|record| {
+                            record.identity.loop_iteration == execution.loop_iteration
+                                && matches!(
+                                    record.state,
+                                    ChildAgentState::Active | ChildAgentState::Completed
+                                )
+                        })
+                        .count();
+                    self.complete_and_enter_next(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(format!("children:{child_count}")),
+                    )?;
+                }
+                StyleNodeDirective::WaitForAgents => {
+                    let child_events = self
+                        .wait_for_planner_children(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            &command,
+                            &mut execution,
+                        )
+                        .await?;
+                    visible_events.extend(child_events);
+                    let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                    let child_count = state
+                        .child_agents
+                        .values()
+                        .filter(|record| {
+                            record.identity.loop_iteration == execution.loop_iteration
+                                && record.state == ChildAgentState::Completed
+                        })
+                        .count();
+                    self.complete_and_enter_next(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(format!("children-completed:{child_count}")),
+                    )?;
+                }
+                StyleNodeDirective::ModelCall if execution.current.id == "integrate" => {
+                    self.commit_planner_handoffs(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                    )?;
+                    let phase_command =
+                        planner_phase_command(&command, "integrate", execution.loop_iteration);
+                    let events = self
+                        .execute_planner_model_node(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            &mut execution,
+                            &phase_command,
+                            &phase_command,
+                            sink,
+                        )
+                        .await?;
+                    if !assistant_already_committed(
+                        &Self::load_state(&persistence, session_id, &session_directory)?,
+                        &phase_command.cancellation_id,
+                        &events,
+                    ) {
+                        execution.position = self.commit_visible_assistant(
+                            &persistence,
+                            session_id,
+                            session_directory.clone(),
+                            execution.position.sequence,
+                            execution.position.event_id,
+                            &phase_command.cancellation_id,
+                            &events,
+                        )?;
+                    }
+                    visible_events.extend(events);
+                    let loop_iteration = execution.loop_iteration;
+                    self.complete_and_enter_next(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(format!("integration:iteration:{loop_iteration}")),
+                    )?;
+                }
+                StyleNodeDirective::Review => {
+                    let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                    let existing = state
+                        .planner_worker
+                        .reviews
+                        .iter()
+                        .find(|review| review.loop_iteration == execution.loop_iteration)
+                        .cloned();
+                    let review = if let Some(review) = existing {
+                        (review.approved, review.rejected_task_ids, review.findings)
+                    } else {
+                        let phase_command =
+                            planner_phase_command(&command, "review", execution.loop_iteration);
+                        let events = self
+                            .execute_planner_model_node(
+                                &persistence,
+                                session_id,
+                                &session_directory,
+                                &mut execution,
+                                &phase_command,
+                                &phase_command,
+                                sink,
+                            )
+                            .await?;
+                        let review = parse_reviewer_findings(
+                            &events,
+                            &Self::load_state(&persistence, session_id, &session_directory)?
+                                .planner_worker
+                                .tasks,
+                        )?;
+                        (execution.position.sequence, execution.position.event_id) = self
+                            .commit_next(
+                                &persistence,
+                                session_id,
+                                &session_directory,
+                                execution.position.sequence,
+                                execution.position.event_id,
+                                RuntimeCommittedEvent::ReviewerFindingsCommitted(
+                                    ReviewerFindingsCommittedEvent {
+                                        node_id: execution.current.id.clone(),
+                                        attempt: execution.attempt,
+                                        loop_iteration: execution.loop_iteration,
+                                        step: execution.step,
+                                        approved: review.0,
+                                        rejected_task_ids: review.1.clone(),
+                                        findings: review.2.clone(),
+                                    },
+                                ),
+                            )?;
+                        review
+                    };
+                    self.complete_and_enter_next(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(format!("review:approved:{}", review.0)),
+                    )?;
+                }
+                StyleNodeDirective::Loop => {
+                    let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                    let review = state
+                        .planner_worker
+                        .reviews
+                        .last()
+                        .filter(|review| review.loop_iteration == execution.loop_iteration)
+                        .ok_or(RunTurnError::PlannerOutputInvalid)?;
+                    let approved = review.approved;
+                    self.complete_and_enter_next_with(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(format!("review:approved:{approved}")),
+                        None,
+                        &json!({"review":{"approved":approved}}),
+                        !approved,
+                    )?;
+                }
+                StyleNodeDirective::CompleteSession => {
+                    let completed_iteration = execution.loop_iteration;
+                    self.complete_terminal_style_node(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(format!(
+                            "planner-worker-reviewer:approved:{completed_iteration}"
+                        )),
+                    )?;
+                    (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        execution.position.sequence,
+                        execution.position.event_id,
+                        RuntimeCommittedEvent::SessionLifecycleChanged(
+                            crate::session::SessionLifecycleChangedEvent {
+                                lifecycle: crate::session::SessionLifecycle::Completed,
+                                reason: Some(String::from("planner-worker-reviewer approved")),
+                            },
+                        ),
+                    )?;
+                    return Ok(RunTurnResult {
+                        events: visible_events,
+                        first_committed_sequence: user_sequence,
+                        last_committed_sequence: execution.position.sequence,
+                        awaiting_continuation: None,
+                    });
+                }
+                _ => {
+                    return Err(RunTurnError::UnexpectedStyleNode {
+                        expected: "planner-worker-reviewer node",
+                        actual: execution.current.id.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "model execution binds the exact graph cursor, context boundary, provider request, and stream sink"
+    )]
+    async fn execute_planner_model_node(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+        context_command: &RunTurnCommand,
+        provider_command: &RunTurnCommand,
+        sink: Option<&mpsc::Sender<Result<RunTurnStreamItem, RunTurnError>>>,
+    ) -> Result<Vec<ProviderEvent>, RunTurnError> {
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        if let Some(events) = recoverable_research_model_events(&state, provider_command) {
+            return Ok(events);
+        }
+        let context_request_hash = current_context_request_hash(&state, context_command)?;
+        let needs_turn_start = state.style_execution.as_ref().is_none_or(|style| {
+            style.context_boundaries.iter().rev().all(|boundary| {
+                boundary.identity.node_id != execution.current.id
+                    || boundary.identity.boundary != "turn_start"
+                    || boundary.identity.run_id != context_command.cancellation_id
+                    || boundary.identity.request_hash != context_request_hash
+                    || boundary.completed_at.is_none()
+            })
+        });
+        if !needs_turn_start && !recoverable_context_retry(&state, context_command) {
+            return Err(RunTurnError::StyleRecoveryRequired(
+                execution.current.id.clone(),
+            ));
+        }
+        let (state, position) = if needs_turn_start {
+            self.compose_style_context(
+                persistence,
+                session_id,
+                session_directory,
+                state,
+                execution.position,
+                context_command,
+                ContextCompositionBoundary::TurnStart,
+                ContextCompositionOrigin::UserTurn,
+            )
+            .await?
+        } else {
+            (state, execution.position)
+        };
+        let (state, position) = self
+            .compose_style_context(
+                persistence,
+                session_id,
+                session_directory,
+                state,
+                position,
+                context_command,
+                ContextCompositionBoundary::BeforeModelRequest,
+                ContextCompositionOrigin::UserTurn,
+            )
+            .await?;
+        let authorized = self
+            .authorize_and_commit(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                state,
+                provider_command,
+            )
+            .await?;
+        let (events, observed) = self
+            .execute_and_commit(
+                persistence,
+                session_id,
+                session_directory,
+                authorized,
+                &provider_command.cancellation_id,
+                sink,
+            )
+            .await?;
+        execution.position = observed;
+        if let Some(reason) = provider_node_failure(&events) {
+            execution.position = self.fail_style_node_at_head(
+                persistence,
+                session_id,
+                session_directory,
+                execution,
+                reason,
+                Some("planner_model_failed"),
+            )?;
+            return Err(RunTurnError::PlannerModelFailed);
+        }
+        if events
+            .iter()
+            .any(|event| matches!(event, ProviderEvent::ToolProposed { .. }))
+        {
+            return Err(RunTurnError::PlannerOutputInvalid);
+        }
+        Ok(events)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "child creation keeps proposal, policy, exact recovery, binding restriction, and atomic receipt adjacent"
+    )]
+    async fn spawn_planner_children(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        command: &RunTurnCommand,
+        execution: &mut ActiveStyleTurn,
+    ) -> Result<(), RunTurnError> {
+        let policy = execution.executor.compiled().child_agents.clone();
+        let child_style = policy
+            .child_style
+            .clone()
+            .ok_or(RunTurnError::InvalidChildPolicy)?;
+        let workspace_mode = policy
+            .workspace_mode
+            .map(child_workspace_mode)
+            .ok_or(RunTurnError::InvalidChildPolicy)?;
+        let context_budget_tokens = policy
+            .context_budget_tokens
+            .ok_or(RunTurnError::InvalidChildPolicy)?;
+        let memory_access = policy
+            .memory_access
+            .ok_or(RunTurnError::InvalidChildPolicy)?;
+        loop {
+            let state = Self::load_state(persistence, session_id, session_directory)?;
+            let tasks = planner_tasks_for_iteration(&state, execution.loop_iteration)?;
+            let pending = tasks.into_iter().find(|task| {
+                !state.child_agents.values().any(|record| {
+                    record.identity.loop_iteration == execution.loop_iteration
+                        && record.identity.task_id == task.task_id
+                        && matches!(
+                            record.state,
+                            ChildAgentState::Active | ChildAgentState::Completed
+                        )
+                })
+            });
+            let Some(task) = pending else {
+                return Ok(());
+            };
+            let identity = ChildAgentExecutionIdentity {
+                execution_id: format!(
+                    "child:{}:{}:{}:{}",
+                    execution.current.id, execution.loop_iteration, task.task_id, execution.step
+                ),
+                node_id: execution.current.id.clone(),
+                attempt: execution.attempt,
+                loop_iteration: execution.loop_iteration,
+                step: execution.step,
+                task_id: task.task_id.clone(),
+            };
+            let existing = state.child_agents.get(&identity.execution_id).cloned();
+            let proposed_at = if let Some(record) = existing.as_ref() {
+                record.proposed_at
+            } else {
+                let next = execution
+                    .position
+                    .sequence
+                    .checked_next()
+                    .map_err(|_| RunTurnError::SequenceOverflow)?;
+                (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    execution.position.sequence,
+                    execution.position.event_id,
+                    RuntimeCommittedEvent::ChildAgentCreationProposed(
+                        ChildAgentCreationProposedEvent {
+                            identity: identity.clone(),
+                            task: task.description.clone(),
+                            child_style: child_style.clone(),
+                            workspace_mode: workspace_mode.clone(),
+                            token_budget: policy.per_child_token_budget,
+                        },
+                    ),
+                )?;
+                next
+            };
+            let state = Self::load_state(persistence, session_id, session_directory)?;
+            let record = state
+                .child_agents
+                .get(&identity.execution_id)
+                .ok_or(RunTurnError::InvalidChildPolicy)?;
+            if record.state == ChildAgentState::Proposed {
+                if existing.is_some() {
+                    return Err(RunTurnError::StyleControlRecoveryRequired {
+                        node: execution.current.id.clone(),
+                        phase: "child_creation_policy",
+                    });
+                }
+                let proposal = ActionProposal {
+                    id: ProposalId(identity.execution_id.clone()),
+                    action: ConsequentialAction::ChildAgentCreation {
+                        style: child_style.clone(),
+                        workspace_mode: workspace_mode.clone(),
+                        token_budget: policy.per_child_token_budget,
+                    },
+                    style: state.style.clone(),
+                    workspace: state.workspace.clone(),
+                    origin: String::from("runtime"),
+                };
+                self.authorize_style_action(proposal.clone(), "child session creation")
+                    .await?;
+                let action_digest = proposal.digest().map_err(|_| RunTurnError::Event)?;
+                (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    execution.position.sequence,
+                    execution.position.event_id,
+                    RuntimeCommittedEvent::ChildAgentCreationApproved(
+                        ChildAgentCreationApprovedEvent {
+                            identity: identity.clone(),
+                            action_digest,
+                        },
+                    ),
+                )?;
+            }
+            let state = Self::load_state(persistence, session_id, session_directory)?;
+            let record = state
+                .child_agents
+                .get(&identity.execution_id)
+                .ok_or(RunTurnError::InvalidChildPolicy)?;
+            if record.state == ChildAgentState::Approved {
+                let depth = state
+                    .child_origin
+                    .as_ref()
+                    .map_or(1, |origin| origin.depth.saturating_add(1));
+                if depth > u32::from(policy.max_depth) {
+                    return Err(RunTurnError::ChildDepthExceeded);
+                }
+                let child_sessions = self
+                    .child_sessions
+                    .as_ref()
+                    .ok_or(RunTurnError::ChildSessionsUnavailable)?;
+                let child = child_sessions
+                    .ensure_child_session(EnsureChildSessionCommand {
+                        sessions_root: command.sessions_root.clone(),
+                        parent_session_id: session_id,
+                        parent_action_sequence: proposed_at,
+                        parent_graph_node_id: execution.current.id.clone(),
+                        workspace: state.workspace.clone(),
+                        style_selector: child_style.clone(),
+                        task_id: task.task_id.clone(),
+                        revision: execution.loop_iteration,
+                        depth,
+                        task: task.description,
+                        token_budget: policy.per_child_token_budget,
+                        context_budget_tokens,
+                        tool_groups: policy.tool_groups.clone(),
+                        memory_access,
+                    })
+                    .map_err(RunTurnError::ChildSession)?;
+                (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    execution.position.sequence,
+                    execution.position.event_id,
+                    RuntimeCommittedEvent::ChildAgentCreated(ChildAgentCreatedEvent {
+                        identity,
+                        child_session_id: child.session_id,
+                        parent_action_sequence: proposed_at,
+                        child_style: child_style.clone(),
+                    }),
+                )?;
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "child wait binds the parent cursor, each child journal, typed task command, and terminal parent receipt"
+    )]
+    async fn wait_for_planner_children(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        command: &RunTurnCommand,
+        execution: &mut ActiveStyleTurn,
+    ) -> Result<Vec<ProviderEvent>, RunTurnError> {
+        let mut visible = Vec::new();
+        loop {
+            let state = Self::load_state(persistence, session_id, session_directory)?;
+            let active = state
+                .child_agents
+                .values()
+                .find(|record| {
+                    record.identity.loop_iteration == execution.loop_iteration
+                        && record.state == ChildAgentState::Active
+                })
+                .cloned();
+            let Some(record) = active else {
+                break;
+            };
+            let child_session_id = record
+                .child_session_id
+                .ok_or(RunTurnError::InvalidChildPolicy)?;
+            let child_directory = command.sessions_root.join(child_session_id.to_string());
+            let child_persistence = SessionPersistenceLogic::new(self.data.clone());
+            let before = child_persistence
+                .load_session(LoadSessionCommand {
+                    session_directory: child_directory.clone(),
+                    expected_session_id: child_session_id,
+                })
+                .map_err(RunTurnError::Persistence)?;
+            let child_events =
+                if before.state.lifecycle == crate::session::SessionLifecycle::Completed {
+                    Vec::new()
+                } else {
+                    Box::pin(self.run_child_task(RunTurnCommand {
+                        sessions_root: command.sessions_root.clone(),
+                        session_id: child_session_id.to_string(),
+                        prompt: record.task.clone(),
+                        provider: command.provider.clone(),
+                        model: command.model.clone(),
+                        options: command.options.clone(),
+                        cancellation_id: planner_child_cancellation_id(
+                            &command.cancellation_id,
+                            &record.identity.task_id,
+                            record.identity.loop_iteration,
+                        ),
+                    }))
+                    .await?
+                    .events
+                };
+            visible.extend(child_events.clone());
+            let mut loaded = child_persistence
+                .load_session(LoadSessionCommand {
+                    session_directory: child_directory.clone(),
+                    expected_session_id: child_session_id,
+                })
+                .map_err(RunTurnError::Persistence)?;
+            if loaded.state.lifecycle == crate::session::SessionLifecycle::Active {
+                self.commit_next(
+                    &child_persistence,
+                    child_session_id,
+                    &child_directory,
+                    loaded.state.last_sequence,
+                    loaded.last_event_id,
+                    RuntimeCommittedEvent::SessionLifecycleChanged(
+                        crate::session::SessionLifecycleChangedEvent {
+                            lifecycle: crate::session::SessionLifecycle::Completed,
+                            reason: Some(String::from("child task completed")),
+                        },
+                    ),
+                )?;
+                loaded = child_persistence
+                    .load_session(LoadSessionCommand {
+                        session_directory: child_directory,
+                        expected_session_id: child_session_id,
+                    })
+                    .map_err(RunTurnError::Persistence)?;
+            }
+            let summary = latest_assistant_summary(&loaded.state, &child_events);
+            (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                execution.position.sequence,
+                execution.position.event_id,
+                RuntimeCommittedEvent::ChildAgentCompleted(ChildAgentCompletedEvent {
+                    identity: record.identity,
+                    child_session_id,
+                    child_head_sequence: loaded.state.last_sequence,
+                    summary,
+                }),
+            )?;
+        }
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        if !state
+            .planner_worker
+            .joins
+            .iter()
+            .any(|join| join.loop_iteration == execution.loop_iteration)
+        {
+            let mut child_execution_ids = state
+                .child_agents
+                .values()
+                .filter(|record| {
+                    record.identity.loop_iteration == execution.loop_iteration
+                        && record.state == ChildAgentState::Completed
+                })
+                .map(|record| record.identity.execution_id.clone())
+                .collect::<Vec<_>>();
+            child_execution_ids.sort();
+            (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                execution.position.sequence,
+                execution.position.event_id,
+                RuntimeCommittedEvent::ChildJoinCompleted(ChildJoinCompletedEvent {
+                    node_id: execution.current.id.clone(),
+                    loop_iteration: execution.loop_iteration,
+                    child_execution_ids,
+                }),
+            )?;
+        }
+        Ok(visible)
+    }
+
+    fn commit_planner_handoffs(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+    ) -> Result<(), RunTurnError> {
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        let records = state
+            .child_agents
+            .values()
+            .filter(|record| {
+                record.identity.loop_iteration == execution.loop_iteration
+                    && record.state == ChildAgentState::Completed
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for record in records {
+            let child_session_id = record
+                .child_session_id
+                .ok_or(RunTurnError::InvalidChildPolicy)?;
+            let entry_id = ConversationEntryId(format!(
+                "child-handoff:{}:{}",
+                record.identity.execution_id, child_session_id
+            ));
+            let loaded = Self::load_state(persistence, session_id, session_directory)?;
+            if loaded
+                .conversation
+                .history()
+                .iter()
+                .any(|entry| entry.id() == &entry_id)
+            {
+                continue;
+            }
+            let sequence = execution
+                .position
+                .sequence
+                .checked_next()
+                .map_err(|_| RunTurnError::SequenceOverflow)?;
+            (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                execution.position.sequence,
+                execution.position.event_id,
+                RuntimeCommittedEvent::ConversationEntryCommitted(
+                    ConversationEntryCommittedEvent {
+                        entry: ConversationEntry::ChildAgentHandoff(ChildHandoffEntry {
+                            id: entry_id,
+                            child_session: child_session_id.to_string(),
+                            summary: record.summary.unwrap_or_default(),
+                            artifact_id: None,
+                            source_sequence: sequence,
+                        }),
+                    },
+                ),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Enables runtime-managed child sessions for styles that declare them.
     #[must_use]
     pub fn with_child_sessions(
@@ -457,7 +1303,9 @@ impl<D: Clone> TurnLogic<D> {
         self.child_sessions = Some(Arc::new(child_sessions));
         self
     }
+}
 
+impl<D> TurnLogic<D> {
     async fn session_gate(&self, session: &str) -> Arc<Mutex<()>> {
         let mut gates = self.session_gates.lock().await;
         gates.retain(|_, gate| gate.strong_count() > 0);
@@ -721,9 +1569,17 @@ where
             .and_then(|executor| executor.adapter_kind())
             == Some(StyleAdapterKind::PlannerWorkerReviewer)
         {
-            return Err(RunTurnError::UnsupportedStyleExecution(String::from(
-                "planner-worker-reviewer",
-            )));
+            return self
+                .run_planner_worker_reviewer(
+                    command,
+                    sink,
+                    scheduled,
+                    session_id,
+                    session_directory,
+                    persistence,
+                    preflight,
+                )
+                .await;
         }
         if preflight
             .state
@@ -5408,9 +6264,6 @@ where
             // adapter exists.
             return Ok(loaded);
         };
-        if adapter_kind == StyleAdapterKind::PlannerWorkerReviewer {
-            return Ok(loaded);
-        }
         let max_steps = binding
             .budgets
             .max_steps
@@ -5476,7 +6329,9 @@ where
                 .is_ok_and(|source| source.directive == StyleNodeDirective::ContextTransform);
         let recoverable_research_entry = matches!(
             adapter_kind,
-            StyleAdapterKind::ResearchLoop | StyleAdapterKind::DeclarativeGraph
+            StyleAdapterKind::ResearchLoop
+                | StyleAdapterKind::PlannerWorkerReviewer
+                | StyleAdapterKind::DeclarativeGraph
         );
         if destination.directive.requires_effect_evidence()
             && !recoverable_fresh_model_entry
@@ -6203,10 +7058,14 @@ fn recoverable_context_retry(
         .find(|node| node.id == active.node_id)
         .map(|node| node.kind);
     match (adapter_kind, active_kind) {
-        (StyleAdapterKind::PersistentTurn, Some(agentmod_graph_engine::NodeKind::ModelCall)) => {
-            pristine_entry || boundary_at_head
-        }
         (
+            StyleAdapterKind::PersistentTurn | StyleAdapterKind::PlannerWorkerReviewer,
+            Some(
+                agentmod_graph_engine::NodeKind::ModelCall
+                | agentmod_graph_engine::NodeKind::Review,
+            ),
+        )
+        | (
             StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop,
             Some(agentmod_graph_engine::NodeKind::ContextTransform),
         ) => pristine_entry || boundary_at_head,
@@ -6651,7 +7510,9 @@ fn current_run_user<'a>(
         return exact.ok_or(RunTurnError::ContextRecoveryIdentityMismatch);
     }
     let base_run_id = research_base_run_id(&command.cancellation_id)
+        .or_else(|| planner_base_run_id(&command.cancellation_id))
         .or_else(|| research_base_run_id_from_state(state))
+        .or_else(|| planner_base_run_id_from_state(state))
         .ok_or(RunTurnError::ContextRecoveryIdentityMismatch)?;
     state
         .conversation
@@ -7230,6 +8091,231 @@ fn provider_node_failure(events: &[ProviderEvent]) -> Option<&'static str> {
     })
 }
 
+fn validate_planner_child_policy(
+    compiled: &agentmod_session_style_sdk::CompiledSessionStyle,
+) -> Result<(), RunTurnError> {
+    let children = &compiled.child_agents;
+    if children.max_children < 2
+        || children.max_concurrent == 0
+        || children.max_depth == 0
+        || children.per_child_token_budget == 0
+        || children.child_style.is_none()
+        || children.workspace_mode
+            != Some(agentmod_session_style_sdk::ChildWorkspaceMode::SharedReadOnly)
+        || children.inherit_provider != Some(true)
+        || children.inherit_model != Some(true)
+        || children.context_budget_tokens.is_none()
+        || children.memory_access.is_none()
+        || children.join_behavior != Some(agentmod_session_style_sdk::ChildJoinBehavior::All)
+        || children.cancellation_behavior
+            != Some(agentmod_session_style_sdk::ChildCancellationBehavior::Cascade)
+        || children.reviewer_max_attempts.is_none()
+    {
+        return Err(RunTurnError::InvalidChildPolicy);
+    }
+    Ok(())
+}
+
+fn child_workspace_mode(mode: agentmod_session_style_sdk::ChildWorkspaceMode) -> String {
+    match mode {
+        agentmod_session_style_sdk::ChildWorkspaceMode::SharedReadOnly => {
+            String::from("shared_read_only")
+        }
+        agentmod_session_style_sdk::ChildWorkspaceMode::SharedSerializedWrites => {
+            String::from("shared_serialized_writes")
+        }
+        agentmod_session_style_sdk::ChildWorkspaceMode::IndependentGitWorktree => {
+            String::from("independent_git_worktree")
+        }
+        agentmod_session_style_sdk::ChildWorkspaceMode::TemporaryCopy => {
+            String::from("temporary_copy")
+        }
+        agentmod_session_style_sdk::ChildWorkspaceMode::ExplicitCustomWorkspace => {
+            String::from("explicit_custom_workspace")
+        }
+    }
+}
+
+fn planner_phase_command(
+    command: &RunTurnCommand,
+    phase: &str,
+    loop_iteration: u32,
+) -> RunTurnCommand {
+    let mut command = command.clone();
+    command.cancellation_id =
+        planner_phase_cancellation_id(&command.cancellation_id, phase, loop_iteration);
+    if command.options.get("mock_scenario").and_then(Value::as_str) == Some("planner_worker")
+        && let Some(options) = command.options.as_object_mut()
+    {
+        options.insert(
+            String::from("mock_planner_phase"),
+            Value::String(phase.to_owned()),
+        );
+        options.insert(
+            String::from("mock_planner_iteration"),
+            Value::String(loop_iteration.to_string()),
+        );
+    }
+    command
+}
+
+fn provider_visible_text(events: &[ProviderEvent]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_planner_tasks(
+    events: &[ProviderEvent],
+    max_children: u32,
+) -> Result<Vec<PlannedTask>, RunTurnError> {
+    let value: Value = serde_json::from_str(&provider_visible_text(events))
+        .map_err(|_| RunTurnError::PlannerOutputInvalid)?;
+    let tasks = value
+        .get("tasks")
+        .and_then(Value::as_array)
+        .ok_or(RunTurnError::PlannerOutputInvalid)?;
+    if tasks.len() < 2 || u32::try_from(tasks.len()).map_or(true, |count| count > max_children) {
+        return Err(RunTurnError::PlannerOutputInvalid);
+    }
+    let mut ids = BTreeSet::new();
+    tasks
+        .iter()
+        .map(|task| {
+            let task_id = task
+                .get("task_id")
+                .or_else(|| task.get("id"))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+                .ok_or(RunTurnError::PlannerOutputInvalid)?;
+            let description = task
+                .get("description")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty() && value.len() <= 64 * 1024)
+                .ok_or(RunTurnError::PlannerOutputInvalid)?;
+            if !ids.insert(task_id.to_owned()) {
+                return Err(RunTurnError::PlannerOutputInvalid);
+            }
+            Ok(PlannedTask {
+                task_id: task_id.to_owned(),
+                description: description.to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn parse_reviewer_findings(
+    events: &[ProviderEvent],
+    tasks: &BTreeMap<String, PlannedTask>,
+) -> Result<(bool, Vec<String>, Vec<String>), RunTurnError> {
+    let value: Value = serde_json::from_str(&provider_visible_text(events))
+        .map_err(|_| RunTurnError::ReviewerOutputInvalid)?;
+    let approved = value
+        .get("approved")
+        .and_then(Value::as_bool)
+        .ok_or(RunTurnError::ReviewerOutputInvalid)?;
+    let rejected_task_ids = value
+        .get("rejected_task_ids")
+        .and_then(Value::as_array)
+        .ok_or(RunTurnError::ReviewerOutputInvalid)?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|task_id| tasks.contains_key(*task_id))
+                .map(str::to_owned)
+                .ok_or(RunTurnError::ReviewerOutputInvalid)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let findings = value
+        .get("findings")
+        .and_then(Value::as_array)
+        .ok_or(RunTurnError::ReviewerOutputInvalid)?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|finding| !finding.trim().is_empty() && finding.len() <= 64 * 1024)
+                .map(str::to_owned)
+                .ok_or(RunTurnError::ReviewerOutputInvalid)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut unique = rejected_task_ids.clone();
+    unique.sort();
+    unique.dedup();
+    if approved != rejected_task_ids.is_empty()
+        || unique.len() != rejected_task_ids.len()
+        || findings.is_empty()
+    {
+        return Err(RunTurnError::ReviewerOutputInvalid);
+    }
+    Ok((approved, rejected_task_ids, findings))
+}
+
+fn planner_tasks_for_iteration(
+    state: &crate::session::SessionState,
+    loop_iteration: u32,
+) -> Result<Vec<PlannedTask>, RunTurnError> {
+    if loop_iteration == 0 {
+        return Ok(state.planner_worker.tasks.values().cloned().collect());
+    }
+    let review = state
+        .planner_worker
+        .reviews
+        .iter()
+        .find(|review| review.loop_iteration.checked_add(1) == Some(loop_iteration))
+        .ok_or(RunTurnError::PlannerOutputInvalid)?;
+    review
+        .rejected_task_ids
+        .iter()
+        .map(|task_id| {
+            state
+                .planner_worker
+                .tasks
+                .get(task_id)
+                .cloned()
+                .ok_or(RunTurnError::PlannerOutputInvalid)
+        })
+        .collect()
+}
+
+fn assistant_already_committed(
+    state: &crate::session::SessionState,
+    cancellation_id: &str,
+    events: &[ProviderEvent],
+) -> bool {
+    let expected = provider_visible_text(events);
+    state.conversation.history().iter().any(|entry| {
+        matches!(
+            entry,
+            ConversationEntry::AssistantMessage(message)
+                if message.id.0.ends_with(&format!(":{cancellation_id}"))
+                    && message.text == expected
+        )
+    })
+}
+
+fn latest_assistant_summary(
+    state: &crate::session::SessionState,
+    events: &[ProviderEvent],
+) -> String {
+    let summary = state
+        .conversation
+        .history()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            ConversationEntry::AssistantMessage(message) => Some(message.text.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| provider_visible_text(events));
+    summary.chars().take(256 * 1024).collect()
+}
+
 fn research_completion_after(options: &Value, limit: u32) -> Result<u32, RunTurnError> {
     let selected = options
         .get("research_complete_after")
@@ -7460,6 +8546,67 @@ fn research_base_run_id(cancellation_id: &str) -> Option<&str> {
     .then_some(base)
 }
 
+fn planner_base_run_id(cancellation_id: &str) -> Option<&str> {
+    let (base_and_phase, iteration) = cancellation_id.rsplit_once('-')?;
+    let (base, phase) = base_and_phase.rsplit_once("-planner-")?;
+    (!base.is_empty()
+        && matches!(phase, "plan" | "integrate" | "review")
+        && iteration.parse::<u32>().is_ok())
+    .then_some(base)
+}
+
+fn planner_base_run_id_from_state(state: &crate::session::SessionState) -> Option<&str> {
+    let binding = state.style_binding.as_ref()?;
+    let executor = CompiledStyleExecutor::from_binding(binding).ok()?;
+    if executor.adapter_kind() != Some(StyleAdapterKind::PlannerWorkerReviewer) {
+        return None;
+    }
+    state
+        .style_execution
+        .as_ref()?
+        .context_boundaries
+        .iter()
+        .find(|boundary| {
+            boundary.identity.boundary == "turn_start"
+                && boundary.identity.origin == expected_initial_context_origin(state)
+        })
+        .map(|boundary| boundary.identity.run_id.as_str())
+}
+
+fn planner_phase_cancellation_id(base: &str, phase: &str, iteration: u32) -> String {
+    let phase_discriminator = match phase {
+        "plan" => 1_u128,
+        "integrate" => 2_u128,
+        "review" => 3_u128,
+        _ => 4_u128,
+    };
+    uuid::Uuid::parse_str(base).map_or_else(
+        |_| format!("{base}-planner-{phase}-{iteration}"),
+        |base| {
+            let discriminator = (phase_discriminator << 64) | u128::from(iteration);
+            uuid::Uuid::from_u128(base.as_u128() ^ discriminator)
+                .hyphenated()
+                .to_string()
+        },
+    )
+}
+
+fn planner_child_cancellation_id(base: &str, task_id: &str, iteration: u32) -> String {
+    uuid::Uuid::parse_str(base).map_or_else(
+        |_| format!("{base}-child-{task_id}-{iteration}"),
+        |base| {
+            let digest = ContentHash::digest(format!("{task_id}:{iteration}").as_bytes());
+            let mut discriminator = [0_u8; 16];
+            discriminator.copy_from_slice(&digest.as_bytes()[..16]);
+            uuid::Uuid::from_u128(
+                base.as_u128() ^ u128::from_le_bytes(discriminator) ^ u128::from(iteration),
+            )
+            .hyphenated()
+            .to_string()
+        },
+    )
+}
+
 fn research_base_run_id_from_state(state: &crate::session::SessionState) -> Option<&str> {
     let binding = state.style_binding.as_ref()?;
     let executor = CompiledStyleExecutor::from_binding(binding).ok()?;
@@ -7651,6 +8798,20 @@ pub enum RunTurnError {
     ChildTaskRequired,
     #[error("runtime-managed child task input does not match its canonical assignment")]
     ChildTaskMismatch,
+    #[error("planner-worker child policy is invalid or unsupported")]
+    InvalidChildPolicy,
+    #[error("runtime-managed child sessions are not configured")]
+    ChildSessionsUnavailable,
+    #[error("child-agent depth exceeds the selected style bound")]
+    ChildDepthExceeded,
+    #[error("runtime-managed child session failed: {0}")]
+    ChildSession(crate::child_session::ChildSessionLogicError),
+    #[error("planner model output is not a valid bounded task plan")]
+    PlannerOutputInvalid,
+    #[error("reviewer model output is not a valid bounded decision")]
+    ReviewerOutputInvalid,
+    #[error("planner/reviewer model execution failed")]
+    PlannerModelFailed,
     #[error("style-owned tool approval is not supported by this graph adapter")]
     StyleOwnedToolApprovalUnsupported,
     #[error("style-owned tool replacement is not supported by this graph adapter")]
@@ -11537,5 +12698,103 @@ mod tests {
                 "model.request_failed",
             ]
         );
+    }
+
+    #[test]
+    fn planner_phase_cancellation_ids_are_typed_deterministic_and_distinct() {
+        let base = Uuid::from_u128(42).hyphenated().to_string();
+        let plan = planner_phase_cancellation_id(&base, "plan", 0);
+        let repeated_plan = planner_phase_cancellation_id(&base, "plan", 0);
+        let integration = planner_phase_cancellation_id(&base, "integrate", 0);
+        let next_review = planner_phase_cancellation_id(&base, "review", 1);
+
+        assert!(Uuid::parse_str(&plan).is_ok());
+        assert_eq!(plan, repeated_plan);
+        assert_ne!(plan, integration);
+        assert_ne!(integration, next_review);
+        assert_ne!(plan, base);
+    }
+
+    #[test]
+    fn planner_child_cancellation_ids_are_typed_and_task_scoped() {
+        let base = Uuid::from_u128(42).hyphenated().to_string();
+        let first = planner_child_cancellation_id(&base, "task-1", 0);
+        let repeated = planner_child_cancellation_id(&base, "task-1", 0);
+        let second = planner_child_cancellation_id(&base, "task-2", 0);
+        let revision = planner_child_cancellation_id(&base, "task-1", 1);
+
+        assert!(Uuid::parse_str(&first).is_ok());
+        assert_eq!(first, repeated);
+        assert_ne!(first, second);
+        assert_ne!(first, revision);
+    }
+
+    #[test]
+    fn planner_task_output_is_bounded_and_rejects_duplicate_ids() {
+        let valid = vec![ProviderEvent::Text(String::from(
+            r#"{"tasks":[{"task_id":"one","description":"first"},{"task_id":"two","description":"second"}]}"#,
+        ))];
+        let tasks = parse_planner_tasks(&valid, 2).expect("valid task plan");
+        assert_eq!(
+            tasks
+                .iter()
+                .map(|task| task.task_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["one", "two"]
+        );
+
+        let duplicate = vec![ProviderEvent::Text(String::from(
+            r#"{"tasks":[{"task_id":"one","description":"first"},{"task_id":"one","description":"second"}]}"#,
+        ))];
+        assert!(matches!(
+            parse_planner_tasks(&duplicate, 2),
+            Err(RunTurnError::PlannerOutputInvalid)
+        ));
+        assert!(matches!(
+            parse_planner_tasks(&valid, 1),
+            Err(RunTurnError::PlannerOutputInvalid)
+        ));
+    }
+
+    #[test]
+    fn reviewer_output_requires_consistent_known_rejections() {
+        let tasks = BTreeMap::from([
+            (
+                String::from("one"),
+                PlannedTask {
+                    task_id: String::from("one"),
+                    description: String::from("first"),
+                },
+            ),
+            (
+                String::from("two"),
+                PlannedTask {
+                    task_id: String::from("two"),
+                    description: String::from("second"),
+                },
+            ),
+        ]);
+        let rejected = vec![ProviderEvent::Text(String::from(
+            r#"{"approved":false,"rejected_task_ids":["two"],"findings":["revise two"]}"#,
+        ))];
+        assert_eq!(
+            parse_reviewer_findings(&rejected, &tasks).expect("valid rejection"),
+            (
+                false,
+                vec![String::from("two")],
+                vec![String::from("revise two")]
+            )
+        );
+
+        for invalid in [
+            r#"{"approved":true,"rejected_task_ids":["two"],"findings":["conflict"]}"#,
+            r#"{"approved":false,"rejected_task_ids":["missing"],"findings":["unknown"]}"#,
+            r#"{"approved":false,"rejected_task_ids":["two","two"],"findings":["duplicate"]}"#,
+        ] {
+            assert!(matches!(
+                parse_reviewer_findings(&[ProviderEvent::Text(String::from(invalid))], &tasks),
+                Err(RunTurnError::ReviewerOutputInvalid)
+            ));
+        }
     }
 }

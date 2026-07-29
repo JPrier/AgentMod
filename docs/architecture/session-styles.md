@@ -19,8 +19,8 @@ and `agentmod-graph-engine`.
 The generic style executor consumes the compiled SDK graph. It records
 initialization, node entry, node completion or failure, and selected transitions
 as canonical events and reconstructs its active node from replay.
-Persistent-chat, ephemeral-turn, research-loop, and the bounded declarative
-fixture execute through this path while provider calls, tool proposals,
+Persistent-chat, ephemeral-turn, research-loop, planner-worker-reviewer, and
+the bounded declarative fixture execute through this path while provider calls, tool proposals,
 permission checks, receipts, continuations, artifacts, and recovery remain in
 their existing runtime components.
 
@@ -34,12 +34,20 @@ canonical history. Exact context and graph events make restart recovery
 fail-closed around both replacement boundaries. Unsupported graph shapes fail
 before a turn mutates the journal.
 
-The planner-worker-reviewer manifest is discoverable and inspectable, and its
-typed child-session substrate is live, but its plan/spawn/join/review adapter is
-not yet complete. Arbitrary declarative graphs are limited to graph shapes whose
-runtime node adapters are implemented; compilation success alone does not make
-an unsupported node combination executable. Plugin-selected pipelines remain
-planned integration work.
+The planner-worker-reviewer adapter executes its compiled plan, spawn, wait,
+integrate, review, revision, and terminal nodes. Plans become bounded
+runtime-owned task records. Each worker is an atomically created child session
+with a typed parent/task link and a restricted immutable style binding. Exact
+joins and structured reviewer decisions are canonical replay state; a rejection
+selects only the rejected tasks for the next bounded loop iteration. Current
+workers execute sequentially, workspace mode is selected but not yet enforced
+by a dedicated isolation dependency, and child results are typed handoff entries
+rather than immutable result/diff/test artifacts. Those limits keep the
+deterministic adapter short of the complete product scenario. Arbitrary
+declarative graphs are limited to graph shapes whose runtime node adapters are
+implemented; compilation success alone does not make an unsupported node
+combination executable. Plugin-selected pipelines remain planned integration
+work.
 
 Enabled child-agent policies are complete execution contracts rather than only
 numeric limits. They select an exact `style-id@semver`, workspace mode,

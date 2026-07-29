@@ -10,8 +10,9 @@
 
 use agentmod_primitives::{CancellationId, Sequence};
 use agentmod_tui_data::{
-    SessionDataRecord, SessionEventDataRecord, TuiDataError, TuiDataPort, TurnDataEvent,
-    TurnDataStream, TurnDataStreamItem,
+    SessionDataRecord, SessionEventDataRecord, StyleDataAvailability, StyleDataRecord,
+    StyleDataSourceKind, TuiDataError, TuiDataPort, TurnDataEvent, TurnDataStream,
+    TurnDataStreamItem,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -22,7 +23,47 @@ pub enum View {
     Chat,
     Events,
     Context,
+    Styles,
     Help,
+}
+
+/// Logic-owned style provenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StyleSourceKind {
+    BuiltIn,
+    User,
+    Project,
+    Plugin,
+    Inline,
+}
+
+/// Logic-owned style selection availability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StyleAvailability {
+    Available,
+    Disabled,
+    Invalid,
+    Incompatible,
+    Conflict,
+}
+
+/// Logic-owned bounded style catalog row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleSummary {
+    pub id: String,
+    pub version: String,
+    pub source: StyleSourceKind,
+    pub availability: StyleAvailability,
+    pub style_content_hash: String,
+    pub compiled_cache_key: String,
+    pub required_capabilities: Vec<String>,
+}
+
+impl StyleSummary {
+    #[must_use]
+    pub fn selector(&self) -> String {
+        format!("{}@{}", self.id, self.version)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -60,6 +101,9 @@ pub struct TuiState {
     pub runtime_ready: bool,
     pub runtime_version: String,
     pub sessions: Vec<SessionDataRecord>,
+    pub styles: Vec<StyleSummary>,
+    pub selected_style: Option<String>,
+    pub default_style: String,
     pub selected_session: Option<usize>,
     pub transcript: Vec<TranscriptEntry>,
     pub timeline: Vec<EventTimelineEntry>,
@@ -85,6 +129,9 @@ impl Default for TuiState {
             runtime_ready: false,
             runtime_version: String::new(),
             sessions: Vec::new(),
+            styles: Vec::new(),
+            selected_style: None,
+            default_style: String::from("persistent-chat"),
             selected_session: None,
             transcript: Vec::new(),
             timeline: Vec::new(),
@@ -117,12 +164,20 @@ impl TuiState {
     pub const fn is_streaming(&self) -> bool {
         self.stream.is_some()
     }
+
+    #[must_use]
+    pub fn active_style(&self) -> &str {
+        self.selected_style
+            .as_deref()
+            .unwrap_or(self.default_style.as_str())
+    }
 }
 
 pub trait TuiLogicPort {
     fn state(&self) -> &TuiState;
     fn bootstrap(&mut self) -> Result<(), TuiLogicError>;
     fn refresh_sessions(&mut self) -> Result<(), TuiLogicError>;
+    fn refresh_styles(&mut self) -> Result<(), TuiLogicError>;
     fn select_relative(&mut self, delta: i32) -> Result<(), TuiLogicError>;
     fn submit_editor(&mut self) -> Result<(), TuiLogicError>;
     fn poll_runtime(&mut self) -> Result<(), TuiLogicError>;
@@ -168,6 +223,7 @@ impl<D: TuiDataPort> TuiLogicPort for TuiLogic<D> {
         } else {
             String::from("runtime degraded")
         };
+        self.refresh_styles()?;
         self.refresh_sessions()
     }
 
@@ -178,6 +234,26 @@ impl<D: TuiDataPort> TuiLogicPort for TuiLogic<D> {
             .and_then(|id| self.state.sessions.iter().position(|value| value.id == id))
             .or_else(|| (!self.state.sessions.is_empty()).then_some(0));
         self.reload_selected_history()
+    }
+
+    fn refresh_styles(&mut self) -> Result<(), TuiLogicError> {
+        self.state.styles = self
+            .data
+            .list_styles()
+            .map_err(map_error)?
+            .into_iter()
+            .map(map_style)
+            .collect();
+        if let Some(selected) = &self.state.selected_style
+            && !self
+                .state
+                .styles
+                .iter()
+                .any(|style| style.selector() == *selected)
+        {
+            self.state.selected_style = None;
+        }
+        Ok(())
     }
 
     fn select_relative(&mut self, delta: i32) -> Result<(), TuiLogicError> {
@@ -410,17 +486,49 @@ impl<D: TuiDataPort> TuiLogic<D> {
         match parts.next().unwrap_or_default() {
             "/new" => {
                 let workspace = parts.next().unwrap_or(".").to_owned();
+                let style = parts
+                    .next()
+                    .map_or_else(|| self.state.active_style().to_owned(), ToOwned::to_owned);
+                if parts.next().is_some() {
+                    return Err(TuiLogicError::InvalidCommand(String::from(
+                        "/new [workspace] [style]",
+                    )));
+                }
                 let id = self
                     .data
-                    .create_session(workspace, String::from("persistent-chat"))
+                    .create_session(workspace, style.clone())
                     .map_err(map_error)?;
                 self.refresh_sessions()?;
                 self.state.selected_session =
                     self.state.sessions.iter().position(|value| value.id == id);
                 self.reload_selected_history()?;
-                self.state.status = format!("created session {id}");
+                self.state.status = format!("created session {id} with {style}");
             }
             "/sessions" => self.refresh_sessions()?,
+            "/styles" => {
+                self.refresh_styles()?;
+                self.state.view = View::Styles;
+                self.state.status = format!("{} styles available", self.state.styles.len());
+            }
+            "/style" => {
+                let selector = required_argument(parts.next(), "/style <id[@version]>")?;
+                if parts.next().is_some() {
+                    return Err(TuiLogicError::InvalidCommand(String::from(
+                        "/style <id[@version]>",
+                    )));
+                }
+                let style = self
+                    .state
+                    .styles
+                    .iter()
+                    .find(|style| style.selector() == selector || style.id == selector)
+                    .ok_or_else(|| TuiLogicError::UnknownStyle(selector.clone()))?;
+                if style.availability != StyleAvailability::Available {
+                    return Err(TuiLogicError::UnavailableStyle(style.selector()));
+                }
+                self.state.selected_style = Some(style.selector());
+                self.state.status = format!("style: {}", self.state.active_style());
+            }
             "/model" => {
                 self.state.model = required_argument(parts.next(), "/model <id>")?;
                 self.state.status = format!("model: {}", self.state.model);
@@ -592,6 +700,30 @@ fn map_error(error: TuiDataError) -> TuiLogicError {
     TuiLogicError::Data(error.to_string())
 }
 
+fn map_style(style: StyleDataRecord) -> StyleSummary {
+    StyleSummary {
+        id: style.id,
+        version: style.version,
+        source: match style.source {
+            StyleDataSourceKind::BuiltIn => StyleSourceKind::BuiltIn,
+            StyleDataSourceKind::User => StyleSourceKind::User,
+            StyleDataSourceKind::Project => StyleSourceKind::Project,
+            StyleDataSourceKind::Plugin => StyleSourceKind::Plugin,
+            StyleDataSourceKind::Inline => StyleSourceKind::Inline,
+        },
+        availability: match style.availability {
+            StyleDataAvailability::Available => StyleAvailability::Available,
+            StyleDataAvailability::Disabled => StyleAvailability::Disabled,
+            StyleDataAvailability::Invalid => StyleAvailability::Invalid,
+            StyleDataAvailability::Incompatible => StyleAvailability::Incompatible,
+            StyleDataAvailability::Conflict => StyleAvailability::Conflict,
+        },
+        style_content_hash: style.style_content_hash,
+        compiled_cache_key: style.compiled_cache_key,
+        required_capabilities: style.required_capabilities,
+    }
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum TuiLogicError {
     #[error("TUI runtime data failed: {0}")]
@@ -608,10 +740,16 @@ pub enum TuiLogicError {
     UnknownCommand(String),
     #[error("invalid command; usage: {0}")]
     InvalidCommand(String),
+    #[error("unknown style `{0}`")]
+    UnknownStyle(String),
+    #[error("style `{0}` is not available")]
+    UnavailableStyle(String),
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use agentmod_primitives::{CancellationId, SessionId};
     use agentmod_tui_data::{
         RuntimeHealthDataRecord, SessionDataRecord, SessionEventDataRecord,
@@ -622,7 +760,10 @@ mod tests {
 
     use super::*;
 
-    struct FixtureData;
+    #[derive(Default)]
+    struct FixtureData {
+        created: RefCell<Vec<(String, String)>>,
+    }
 
     impl TuiDataPort for FixtureData {
         fn runtime_health(&self) -> Result<RuntimeHealthDataRecord, TuiDataError> {
@@ -630,6 +771,18 @@ mod tests {
                 ready: true,
                 version: String::from("2.1"),
             })
+        }
+
+        fn list_styles(&self) -> Result<Vec<StyleDataRecord>, TuiDataError> {
+            Ok(vec![StyleDataRecord {
+                id: String::from("focused"),
+                version: String::from("1.0.0"),
+                source: StyleDataSourceKind::Project,
+                availability: StyleDataAvailability::Available,
+                style_content_hash: String::from("hash"),
+                compiled_cache_key: String::from("cache"),
+                required_capabilities: vec![],
+            }])
         }
 
         fn list_sessions(&self, _limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError> {
@@ -644,10 +797,11 @@ mod tests {
 
         fn create_session(
             &self,
-            _workspace: String,
-            _style: String,
+            workspace: String,
+            style: String,
         ) -> Result<SessionId, TuiDataError> {
-            unreachable!("not used by this fixture")
+            self.created.borrow_mut().push((workspace, style));
+            Ok(SessionId::from_uuid(Uuid::from_u128(2)))
         }
 
         fn session_events(
@@ -707,7 +861,7 @@ mod tests {
 
     #[test]
     fn bootstrap_reconstructs_visible_state_from_canonical_events() {
-        let mut logic = TuiLogic::new(FixtureData);
+        let mut logic = TuiLogic::new(FixtureData::default());
 
         logic.bootstrap().expect("bootstrap");
 
@@ -719,7 +873,7 @@ mod tests {
 
     #[test]
     fn editor_operations_preserve_utf8_boundaries() {
-        let mut logic = TuiLogic::new(FixtureData);
+        let mut logic = TuiLogic::new(FixtureData::default());
 
         logic.insert_text("a🦀b");
         logic.move_cursor(-1);
@@ -737,5 +891,24 @@ mod tests {
 
         assert!(summary.ends_with('…'));
         assert!(summary.chars().count() <= 96);
+    }
+
+    #[test]
+    fn selected_non_default_style_reaches_create_session() {
+        let mut logic = TuiLogic::new(FixtureData::default());
+        logic.bootstrap().expect("bootstrap");
+        logic.insert_text("/style focused@1.0.0");
+        logic.submit_editor().expect("select style");
+        logic.insert_text("/new workspace");
+        logic.submit_editor().expect("create session");
+
+        assert_eq!(
+            logic.state().selected_style.as_deref(),
+            Some("focused@1.0.0")
+        );
+        assert_eq!(
+            logic.data.created.into_inner(),
+            vec![(String::from("workspace"), String::from("focused@1.0.0"))]
+        );
     }
 }

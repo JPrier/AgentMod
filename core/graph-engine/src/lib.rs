@@ -263,9 +263,11 @@ pub struct EdgeDefinition {
 }
 
 /// Deterministic executable graph.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutableGraph {
     /// Source format version.
+    #[serde(deserialize_with = "deserialize_supported_format_version")]
     pub format_version: u16,
     /// Index of the entry node.
     pub entry_index: usize,
@@ -279,6 +281,19 @@ pub struct ExecutableGraph {
     pub edges: Vec<ExecutableEdge>,
     /// Complete deterministic cache identity.
     pub cache_key: GraphCacheKey,
+}
+
+fn deserialize_supported_format_version<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let format_version = u16::deserialize(deserializer)?;
+    if format_version != GRAPH_FORMAT_VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "unsupported graph format version {format_version}; supported version is {GRAPH_FORMAT_VERSION}"
+        )));
+    }
+    Ok(format_version)
 }
 
 impl ExecutableGraph {
@@ -296,7 +311,8 @@ impl ExecutableGraph {
 }
 
 /// Compiled generic node.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutableNode {
     /// Deterministic node index.
     pub index: usize,
@@ -323,7 +339,8 @@ pub struct ExecutableNode {
 }
 
 /// Compiled directed transition.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutableEdge {
     /// Source node index.
     pub from: usize,
@@ -336,7 +353,8 @@ pub struct ExecutableEdge {
 }
 
 /// Cache identity with inspectable constituent hashes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct GraphCacheKey {
     /// Exact graph source hash.
     pub graph_content_hash: ContentHash,

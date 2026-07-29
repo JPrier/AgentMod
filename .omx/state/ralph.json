@@ -1,9 +1,12 @@
 {
   "active": true,
-  "iteration": 2,
+  "iteration": 4,
   "max_iterations": 0,
-  "current_phase": "event-kernel",
+  "current_phase": "generic-session-style-executor",
   "started_at": "2026-07-27T00:21:09.3711258-04:00",
   "completed_at": null,
-  "note": "Ralph skill package was not installed; lifecycle is tracked with the documented OMX state schema."
+  "state": {
+    "context_snapshot_path": ".omx/context/session-style-refocus-20260728T235053Z.md"
+  },
+  "note": "Ralph is loaded from the installed oh-my-codex package because the user-level skill path is absent."
 }

@@ -56,6 +56,123 @@ pub struct ApprovalRecord {
     pub resolved_at: Option<Sequence>,
 }
 
+/// Provenance class for the immutable style selected by a session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionStyleSource {
+    /// Shipped with the runtime.
+    BuiltIn,
+    /// Loaded from the configured user style directory.
+    User,
+    /// Loaded from the configured project style directory.
+    Project,
+    /// Supplied by a validated plugin package.
+    Plugin,
+    /// Supplied directly by a calling client.
+    Inline,
+}
+
+/// Session-owned memory selection copied from the compiled style.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionMemoryConfiguration {
+    /// Stable provider ID, including `none`.
+    pub provider: String,
+    /// Allowed memory scopes in deterministic order.
+    pub scopes: Vec<String>,
+    /// Maximum records injected into one context.
+    pub max_items: u32,
+    /// Maximum injected bytes.
+    pub max_injected_bytes: u64,
+}
+
+/// Session-owned compaction selection copied from the compiled style.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionCompactionConfiguration {
+    /// Stable strategy ID.
+    pub strategy: String,
+    /// Automatic trigger threshold.
+    pub trigger_tokens: Option<u64>,
+    /// Whether unresolved tasks must survive compaction.
+    pub preserve_unresolved_tasks: bool,
+    /// Whether active process state must survive compaction.
+    pub preserve_active_processes: bool,
+}
+
+/// Immutable style execution budgets bound at session creation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionStyleBudgets {
+    /// Maximum style iterations.
+    pub max_iterations: u32,
+    /// Maximum graph transitions.
+    pub max_steps: u64,
+    /// Maximum provider tokens.
+    pub max_tokens: u64,
+    /// Maximum cost in configured currency micros.
+    pub max_cost_micros: u64,
+    /// Maximum wall-clock duration.
+    pub max_duration_ms: u64,
+}
+
+/// Immutable permission defaults bound at session creation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionPermissionDefaults {
+    /// Fallback decision.
+    pub default: String,
+    /// Deterministically ordered action/tool-group overrides.
+    pub groups: BTreeMap<String, String>,
+}
+
+/// Complete immutable identity and selected components for one session style.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionStyleBinding {
+    /// Stable style ID.
+    pub id: String,
+    /// Semantic style version.
+    pub version: String,
+    /// Canonical manifest content hash.
+    pub content_hash: ContentHash,
+    /// Compatibility-bound compiled cache key.
+    pub compiled_cache_key: ContentHash,
+    /// Hash of the exact compiled descriptor retained in the style lock.
+    pub compiled_style_hash: ContentHash,
+    /// Source class.
+    pub source: SessionStyleSource,
+    /// Safe source locator used for diagnostics and migration.
+    pub source_locator: String,
+    /// Validated plugin-set hash used during compilation.
+    pub plugin_set_hash: ContentHash,
+    /// Runtime capability-set hash used during compilation.
+    pub capability_set_hash: ContentHash,
+    /// Runtime API version used during compilation.
+    pub runtime_api_version: String,
+    /// Canonical style-specific manifest configuration.
+    pub configuration_json: String,
+    /// Canonical compiled descriptor used by the generic executor.
+    pub compiled_style_json: String,
+    /// Selected memory configuration.
+    pub memory: SessionMemoryConfiguration,
+    /// Selected compaction configuration.
+    pub compaction: SessionCompactionConfiguration,
+    /// Tool groups exposed to this session.
+    pub tool_groups: Vec<String>,
+    /// Harness selected for this session.
+    pub harness: String,
+    /// Runtime capabilities required by the style.
+    pub required_capabilities: Vec<String>,
+    /// Ordered blocking interceptor IDs.
+    pub interceptor_order: Vec<String>,
+    /// Hard execution budgets.
+    pub budgets: SessionStyleBudgets,
+    /// Permission defaults applied before mandatory policy.
+    pub permission_defaults: SessionPermissionDefaults,
+    /// Canonical child-agent policy copied from the compiled style.
+    pub child_agent_policy_json: String,
+    /// Canonical retry policy copied from the compiled style.
+    pub retry_policy_json: String,
+    /// Canonical termination policy copied from the compiled style.
+    pub termination_policy_json: String,
+}
+
 /// Session creation payload.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionCreatedEvent {
@@ -63,6 +180,12 @@ pub struct SessionCreatedEvent {
     pub workspace: String,
     /// Explicit top-level session style.
     pub style: String,
+    /// Immutable compiled-style binding for style-driven sessions.
+    ///
+    /// Legacy journals remain replayable, but execution must explicitly
+    /// migrate them before another style-driven turn may start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_binding: Option<Box<SessionStyleBinding>>,
 }
 
 /// Immutable ancestry recorded when a session is branched.
@@ -471,6 +594,9 @@ pub struct SessionState {
     pub workspace: String,
     /// Explicit top-level style.
     pub style: String,
+    /// Immutable style identity and selected component configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub style_binding: Option<SessionStyleBinding>,
     /// Parent session and fork point for a branch.
     #[serde(default)]
     pub ancestry: Option<SessionAncestry>,
@@ -621,6 +747,7 @@ fn initialize(
         id: session_id,
         workspace: created.workspace.clone(),
         style: created.style.clone(),
+        style_binding: created.style_binding.as_deref().cloned(),
         ancestry: None,
         lifecycle: SessionLifecycle::Active,
         conversation: ConversationState::new(),
@@ -1070,6 +1197,7 @@ mod tests {
             RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
                 workspace: "fixture".into(),
                 style: "persistent-chat".into(),
+                style_binding: None,
             }),
         )
     }
@@ -1318,6 +1446,7 @@ mod tests {
         let payload = RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
             workspace: "fixture".into(),
             style: "persistent-chat".into(),
+            style_binding: None,
         });
         let mut metadata = created().metadata;
         metadata.event_type = "tool.execution.completed".into();

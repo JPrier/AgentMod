@@ -12,6 +12,7 @@ pub mod receipt;
 pub mod registry;
 pub mod scheduler;
 pub mod snapshot;
+pub mod style;
 pub mod supervised;
 pub mod tool;
 

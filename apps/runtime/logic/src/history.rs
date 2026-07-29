@@ -21,7 +21,8 @@ use crate::{
     conversation::{ArtifactEntry, ConversationEntry, ConversationEntryId, ProjectionProvenance},
     session::{
         ContextProjectionReplacedEvent, ConversationEntryCommittedEvent, RuntimeCommittedEvent,
-        SessionBranchedEvent, SessionCreatedEvent, SessionReducerError, SessionState, replay_to,
+        SessionBranchedEvent, SessionCreatedEvent, SessionReducerError, SessionState,
+        SessionStyleBinding, replay_to,
     },
 };
 
@@ -103,8 +104,8 @@ pub struct BranchSessionCommand {
     pub parent_session_id: SessionId,
     /// Inclusive parent fork point.
     pub at: Sequence,
-    /// Optional explicit style replacement.
-    pub style: Option<String>,
+    /// Optional explicitly resolved style replacement.
+    pub style_binding: Option<SessionStyleBinding>,
 }
 
 /// Atomic branch result.
@@ -284,10 +285,12 @@ where
             session_id: command.parent_session_id,
             at: Some(command.at),
         })?;
-        let style = command
-            .style
-            .unwrap_or_else(|| inspection.state.style.clone());
-        validate_style(&style)?;
+        let style_binding = command
+            .style_binding
+            .or_else(|| inspection.state.style_binding.clone())
+            .ok_or(SessionHistoryLogicError::MissingStyleBinding)?;
+        validate_style_binding(&style_binding)?;
+        let style = style_binding.id.clone();
         let prepared = self
             .data
             .prepare(PrepareSessionDataRequest {
@@ -315,6 +318,7 @@ where
             RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
                 workspace: inspection.state.workspace.clone(),
                 style: style.clone(),
+                style_binding: Some(Box::new(style_binding.clone())),
             }),
         )
         .map_err(|error| SessionHistoryLogicError::EventMapping(error.to_string()))?;
@@ -386,6 +390,10 @@ where
                 sessions_root: command.sessions_root,
                 prepared,
                 style,
+                style_binding_json: serde_json::to_string(&style_binding)
+                    .map_err(|error| SessionHistoryLogicError::EventMapping(error.to_string()))?,
+                style_manifest_json: style_binding.configuration_json.clone(),
+                compiled_style_json: style_binding.compiled_style_json.clone(),
                 parent_session_id: command.parent_session_id,
                 fork_sequence: command.at.get(),
                 events,
@@ -630,12 +638,15 @@ fn validate_root(root: &std::path::Path) -> Result<(), SessionHistoryLogicError>
     }
 }
 
-fn validate_style(style: &str) -> Result<(), SessionHistoryLogicError> {
-    if style.is_empty()
-        || style.len() > 128
+fn validate_style_binding(style: &SessionStyleBinding) -> Result<(), SessionHistoryLogicError> {
+    if style.id.is_empty()
+        || style.id.len() > 128
         || !style
+            .id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || style.content_hash != ContentHash::digest(style.configuration_json.as_bytes())
+        || style.compiled_style_hash != ContentHash::digest(style.compiled_style_json.as_bytes())
     {
         Err(SessionHistoryLogicError::InvalidStyle)
     } else {
@@ -659,6 +670,9 @@ pub enum SessionHistoryLogicError {
     /// Requested style is unsafe.
     #[error("session style identifier is invalid")]
     InvalidStyle,
+    /// Session predates immutable style binding and needs explicit migration.
+    #[error("session has no immutable style binding; select a replacement style explicitly")]
+    MissingStyleBinding,
     /// Subscription page bound is zero or excessive.
     #[error("session subscription limit is invalid")]
     InvalidSubscriptionLimit,

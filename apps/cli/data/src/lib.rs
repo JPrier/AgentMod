@@ -8,16 +8,88 @@
 use agentmod_cli_dependency::{
     CliDependencyPort, DependencyBranchSessionRequest, DependencyCancelTurnRequest,
     DependencyCreateDeferredTurnRequest, DependencyCreateSessionRequest,
-    DependencyInspectSessionRequest, DependencyListSessionsRequest,
+    DependencyInspectSessionRequest, DependencyInspectStyleRequest, DependencyListSessionsRequest,
     DependencyResolveApprovalRequest, DependencyRunTurnRequest, DependencyRunTurnStream,
     DependencyRunTurnStreamItem, DependencyRuntimeAvailability, DependencyRuntimeHealthRequest,
     DependencySchedule, DependencySchedulePayload, DependencyScheduleTrigger,
-    DependencyScheduledExecution, DependencyScheduledRun, DependencySubscribeSessionRequest,
+    DependencyScheduledExecution, DependencyScheduledRun, DependencyStyleAvailability,
+    DependencyStyleDiagnostic, DependencyStyleFileRequest, DependencyStyleInspection,
+    DependencyStyleSourceKind, DependencyStyleSummary, DependencySubscribeSessionRequest,
     DependencyTurnEvent,
 };
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use serde_json::Value;
 use thiserror::Error;
+
+/// Data-owned source kind for a session style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StyleDataSourceKind {
+    BuiltIn,
+    User,
+    Project,
+    Plugin,
+    Inline,
+}
+
+/// Data-owned selection availability for a session style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StyleDataAvailability {
+    Available,
+    Disabled,
+    Invalid,
+    Incompatible,
+    Conflict,
+}
+
+/// Data-owned validation diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleDiagnosticDataRecord {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+    pub help: String,
+}
+
+/// Data-owned style registry summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleSummaryDataRecord {
+    pub id: String,
+    pub version: String,
+    pub source: StyleDataSourceKind,
+    pub availability: StyleDataAvailability,
+    pub style_content_hash: String,
+    pub compiled_cache_key: String,
+    pub required_capabilities: Vec<String>,
+}
+
+/// Data-owned detailed style inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleInspectionDataRecord {
+    pub summary: StyleSummaryDataRecord,
+    pub source_locator: String,
+    pub manifest: Value,
+    pub compiled: Option<Value>,
+    pub diagnostics: Vec<StyleDiagnosticDataRecord>,
+}
+
+/// Data-owned request for a registry selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectStyleDataRequest {
+    pub selector: String,
+}
+
+/// Data-owned request for a manifest file; reading remains in dependency.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleFileDataRequest {
+    pub file: String,
+}
+
+/// Data-owned validation result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleValidationDataRecord {
+    pub valid: bool,
+    pub diagnostics: Vec<StyleDiagnosticDataRecord>,
+}
 
 /// Data-owned request for the runtime portion of a doctor report.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -431,6 +503,31 @@ pub trait CliDataPort {
         request: ResolveApprovalDataRequest,
     ) -> Result<ResolveApprovalDataRecord, DataError>;
 
+    fn list_styles(&self) -> Result<Vec<StyleSummaryDataRecord>, DataError> {
+        Err(style_unavailable())
+    }
+
+    fn inspect_style(
+        &self,
+        _request: InspectStyleDataRequest,
+    ) -> Result<StyleInspectionDataRecord, DataError> {
+        Err(style_unavailable())
+    }
+
+    fn validate_style(
+        &self,
+        _request: StyleFileDataRequest,
+    ) -> Result<StyleValidationDataRecord, DataError> {
+        Err(style_unavailable())
+    }
+
+    fn compile_style(
+        &self,
+        _request: StyleFileDataRequest,
+    ) -> Result<StyleInspectionDataRecord, DataError> {
+        Err(style_unavailable())
+    }
+
     fn upsert_schedule(
         &self,
         _schedule: ScheduleDataRecord,
@@ -516,6 +613,52 @@ where
             },
             version: response.runtime_version,
         })
+    }
+
+    fn list_styles(&self) -> Result<Vec<StyleSummaryDataRecord>, DataError> {
+        self.dependency
+            .list_styles()
+            .map(|styles| styles.into_iter().map(map_style_summary).collect())
+            .map_err(|_| style_unavailable())
+    }
+
+    fn inspect_style(
+        &self,
+        request: InspectStyleDataRequest,
+    ) -> Result<StyleInspectionDataRecord, DataError> {
+        self.dependency
+            .inspect_style(DependencyInspectStyleRequest {
+                selector: request.selector,
+            })
+            .map(map_style_inspection)
+            .map_err(|_| style_unavailable())
+    }
+
+    fn validate_style(
+        &self,
+        request: StyleFileDataRequest,
+    ) -> Result<StyleValidationDataRecord, DataError> {
+        self.dependency
+            .validate_style(DependencyStyleFileRequest { file: request.file })
+            .map(|result| StyleValidationDataRecord {
+                valid: result.valid,
+                diagnostics: result
+                    .diagnostics
+                    .into_iter()
+                    .map(map_style_diagnostic)
+                    .collect(),
+            })
+            .map_err(|_| style_unavailable())
+    }
+
+    fn compile_style(
+        &self,
+        request: StyleFileDataRequest,
+    ) -> Result<StyleInspectionDataRecord, DataError> {
+        self.dependency
+            .compile_style(DependencyStyleFileRequest { file: request.file })
+            .map(map_style_inspection)
+            .map_err(|_| style_unavailable())
     }
 
     fn create_session(
@@ -783,6 +926,59 @@ fn schedule_unavailable() -> DataError {
     }
 }
 
+fn style_unavailable() -> DataError {
+    DataError::RuntimeClient {
+        detail: String::from("style data unavailable"),
+    }
+}
+
+fn map_style_summary(summary: DependencyStyleSummary) -> StyleSummaryDataRecord {
+    StyleSummaryDataRecord {
+        id: summary.id,
+        version: summary.version,
+        source: match summary.source {
+            DependencyStyleSourceKind::BuiltIn => StyleDataSourceKind::BuiltIn,
+            DependencyStyleSourceKind::User => StyleDataSourceKind::User,
+            DependencyStyleSourceKind::Project => StyleDataSourceKind::Project,
+            DependencyStyleSourceKind::Plugin => StyleDataSourceKind::Plugin,
+            DependencyStyleSourceKind::Inline => StyleDataSourceKind::Inline,
+        },
+        availability: match summary.availability {
+            DependencyStyleAvailability::Available => StyleDataAvailability::Available,
+            DependencyStyleAvailability::Disabled => StyleDataAvailability::Disabled,
+            DependencyStyleAvailability::Invalid => StyleDataAvailability::Invalid,
+            DependencyStyleAvailability::Incompatible => StyleDataAvailability::Incompatible,
+            DependencyStyleAvailability::Conflict => StyleDataAvailability::Conflict,
+        },
+        style_content_hash: summary.style_content_hash,
+        compiled_cache_key: summary.compiled_cache_key,
+        required_capabilities: summary.required_capabilities,
+    }
+}
+
+fn map_style_diagnostic(diagnostic: DependencyStyleDiagnostic) -> StyleDiagnosticDataRecord {
+    StyleDiagnosticDataRecord {
+        code: diagnostic.code,
+        path: diagnostic.path,
+        message: diagnostic.message,
+        help: diagnostic.help,
+    }
+}
+
+fn map_style_inspection(inspection: DependencyStyleInspection) -> StyleInspectionDataRecord {
+    StyleInspectionDataRecord {
+        summary: map_style_summary(inspection.summary),
+        source_locator: inspection.source_locator,
+        manifest: inspection.manifest,
+        compiled: inspection.compiled,
+        diagnostics: inspection
+            .diagnostics
+            .into_iter()
+            .map(map_style_diagnostic)
+            .collect(),
+    }
+}
+
 fn runtime_error(error: &agentmod_cli_dependency::DependencyError) -> DataError {
     DataError::RuntimeClient {
         detail: error.to_string(),
@@ -989,6 +1185,18 @@ mod tests {
             })
         }
 
+        fn list_styles(&self) -> Result<Vec<DependencyStyleSummary>, DependencyError> {
+            Ok(vec![DependencyStyleSummary {
+                id: String::from("calm"),
+                version: String::from("1.0.0"),
+                source: DependencyStyleSourceKind::Project,
+                availability: DependencyStyleAvailability::Available,
+                style_content_hash: String::from("hash"),
+                compiled_cache_key: String::from("cache"),
+                required_capabilities: vec![String::from("tools")],
+            }])
+        }
+
         fn create_session(
             &self,
             _request: DependencyCreateSessionRequest,
@@ -1112,5 +1320,15 @@ mod tests {
             Err(DataError::InvalidEndpointLabel)
         );
         assert!(data.dependency.observed.into_inner().is_empty());
+    }
+
+    #[test]
+    fn style_summary_is_mapped_into_data_owned_record() {
+        let styles = CliData::new(MockDependency::default())
+            .list_styles()
+            .expect("styles");
+        assert_eq!(styles[0].id, "calm");
+        assert_eq!(styles[0].source, StyleDataSourceKind::Project);
+        assert_eq!(styles[0].availability, StyleDataAvailability::Available);
     }
 }

@@ -87,7 +87,12 @@ impl RuntimeEndpointStream {
 #[async_trait]
 impl<L> RuntimeWireEndpoint for RuntimeService<L>
 where
-    L: RuntimeLogicPort + SessionRegistryLogicPort + SessionHistoryLogicPort + Send + Sync,
+    L: RuntimeLogicPort
+        + SessionRegistryLogicPort
+        + SessionHistoryLogicPort
+        + agentmod_runtime_logic::style::SessionStyleLogicPort
+        + Send
+        + Sync,
 {
     async fn handle_runtime_request(
         &self,
@@ -620,6 +625,55 @@ mod tests {
         }
     }
 
+    impl agentmod_runtime_logic::style::SessionStyleLogicPort for MockLogic {
+        fn list_styles(
+            &self,
+            _command: agentmod_runtime_logic::style::ListStylesCommand,
+        ) -> Result<
+            Vec<agentmod_runtime_logic::style::StyleSummary>,
+            agentmod_runtime_logic::style::SessionStyleLogicError,
+        > {
+            Ok(Vec::new())
+        }
+
+        fn inspect_style(
+            &self,
+            _command: agentmod_runtime_logic::style::InspectStyleCommand,
+        ) -> Result<
+            agentmod_runtime_logic::style::StyleInspection,
+            agentmod_runtime_logic::style::SessionStyleLogicError,
+        > {
+            Err(agentmod_runtime_logic::style::SessionStyleLogicError::InvalidSelector)
+        }
+
+        fn validate_style(
+            &self,
+            _command: agentmod_runtime_logic::style::ValidateStyleCommand,
+        ) -> Result<
+            agentmod_runtime_logic::style::StyleInspection,
+            agentmod_runtime_logic::style::SessionStyleLogicError,
+        > {
+            Err(agentmod_runtime_logic::style::SessionStyleLogicError::EmptyManifest)
+        }
+
+        fn resolve_style(
+            &self,
+            _command: agentmod_runtime_logic::style::InspectStyleCommand,
+        ) -> Result<
+            agentmod_runtime_logic::style::ResolvedStyle,
+            agentmod_runtime_logic::style::SessionStyleLogicError,
+        > {
+            Err(agentmod_runtime_logic::style::SessionStyleLogicError::InvalidSelector)
+        }
+
+        fn validate_style_binding(
+            &self,
+            _command: agentmod_runtime_logic::style::ValidateStyleBindingCommand,
+        ) -> Result<(), agentmod_runtime_logic::style::SessionStyleLogicError> {
+            Err(agentmod_runtime_logic::style::SessionStyleLogicError::InvalidSelector)
+        }
+    }
+
     fn config(token: &str) -> LocalRpcConfig {
         LocalRpcConfig {
             endpoint: String::from("fixture"),
@@ -648,6 +702,7 @@ mod tests {
             RuntimeServiceConfig {
                 session_root: PathBuf::from("sessions"),
                 version: String::from("test"),
+                styles: crate::RuntimeStyleServiceConfig::native(std::path::Path::new("sessions")),
             },
         )
     }

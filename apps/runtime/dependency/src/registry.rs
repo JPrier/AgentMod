@@ -7,7 +7,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use agentmod_primitives::{CausationId, CorrelationId, EventId, SessionId, TimestampMillis};
+use agentmod_primitives::{
+    CausationId, ContentHash, CorrelationId, EventId, SessionId, TimestampMillis,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -17,9 +19,10 @@ use crate::journal::{
     JsonlJournalDependency,
 };
 
-const METADATA_LIMIT: u64 = 64 * 1024;
+const METADATA_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+const METADATA_LIMIT_U64: u64 = 2 * 1024 * 1024;
 const BRANCH_ARTIFACT_LIMIT: usize = 16 * 1024 * 1024;
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
 /// IDs and normalized workspace obtained from external system dependencies.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +57,12 @@ pub struct DependencyCreateSessionRequest {
     pub prepared: DependencyPreparedSession,
     /// Explicit validated style.
     pub style: String,
+    /// Canonical immutable binding JSON.
+    pub style_binding_json: String,
+    /// Canonical selected manifest JSON.
+    pub style_manifest_json: String,
+    /// Canonical compiled descriptor JSON.
+    pub compiled_style_json: String,
     /// Canonical initial event JSON.
     pub initial_event_json: Vec<u8>,
 }
@@ -100,6 +109,12 @@ pub struct DependencyCreateBranchRequest {
     pub prepared: DependencyPreparedSession,
     /// Explicit validated child style.
     pub style: String,
+    /// Canonical immutable binding JSON.
+    pub style_binding_json: String,
+    /// Canonical selected manifest JSON.
+    pub style_manifest_json: String,
+    /// Canonical compiled descriptor JSON.
+    pub compiled_style_json: String,
     /// Immutable parent session identifier.
     pub parent_session_id: String,
     /// Inclusive parent sequence used to construct the child.
@@ -345,19 +360,26 @@ fn populate_directory(
     request: &DependencyCreateSessionRequest,
 ) -> Result<(), SessionCatalogDependencyError> {
     create_session_subdirectories(temporary)?;
+    let descriptors = parse_style_descriptors(
+        &request.style,
+        &request.style_binding_json,
+        &request.style_manifest_json,
+        &request.compiled_style_json,
+    )?;
     let workspace = request.prepared.normalized_workspace.to_string_lossy();
     let metadata = StoredMetadata {
         schema_version: SCHEMA_VERSION,
         session_id: request.prepared.session_id.to_string(),
         workspace: workspace.as_ref(),
         style: &request.style,
+        style_binding: Some(&descriptors.binding),
         sequence: 1,
         state: "active",
         created_at_millis: request.prepared.timestamp.get(),
         parent_session_id: None,
         fork_sequence: None,
     };
-    write_session_descriptors(temporary, &metadata, workspace.as_ref(), &request.style)?;
+    write_session_descriptors(temporary, &metadata, workspace.as_ref(), &descriptors)?;
     JsonlJournalDependency
         .append(DependencyAppendJournalRequest {
             session_directory: temporary.to_owned(),
@@ -387,7 +409,7 @@ fn write_session_descriptors(
     temporary: &Path,
     metadata: &StoredMetadata<'_>,
     workspace: &str,
-    style: &str,
+    style: &ParsedStyleDescriptors,
 ) -> Result<(), SessionCatalogDependencyError> {
     atomic_json(temporary.join("metadata.json"), &metadata)?;
     atomic_json(
@@ -396,11 +418,19 @@ fn write_session_descriptors(
     )?;
     atomic_json(
         temporary.join("style.json"),
-        &serde_json::json!({"schema_version": SCHEMA_VERSION, "id": style}),
+        &serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "binding": style.binding,
+            "manifest": style.manifest
+        }),
     )?;
     atomic_json(
         temporary.join("style.lock"),
-        &serde_json::json!({"schema_version": SCHEMA_VERSION, "id": style}),
+        &serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "binding": style.binding,
+            "compiled": style.compiled
+        }),
     )?;
     Ok(())
 }
@@ -410,12 +440,19 @@ fn populate_branch_directory(
     request: &DependencyCreateBranchRequest,
 ) -> Result<(), SessionCatalogDependencyError> {
     create_session_subdirectories(temporary)?;
+    let descriptors = parse_style_descriptors(
+        &request.style,
+        &request.style_binding_json,
+        &request.style_manifest_json,
+        &request.compiled_style_json,
+    )?;
     let workspace = request.prepared.normalized_workspace.to_string_lossy();
     let metadata = StoredMetadata {
         schema_version: SCHEMA_VERSION,
         session_id: request.prepared.session_id.to_string(),
         workspace: workspace.as_ref(),
         style: &request.style,
+        style_binding: Some(&descriptors.binding),
         sequence: u64::try_from(request.events.len())
             .map_err(|_| SessionCatalogDependencyError::SequenceOverflow)?,
         state: "active",
@@ -423,7 +460,7 @@ fn populate_branch_directory(
         parent_session_id: Some(&request.parent_session_id),
         fork_sequence: Some(request.fork_sequence),
     };
-    write_session_descriptors(temporary, &metadata, workspace.as_ref(), &request.style)?;
+    write_session_descriptors(temporary, &metadata, workspace.as_ref(), &descriptors)?;
     for artifact in &request.artifacts {
         let artifact_directory = temporary.join("artifacts");
         let path = artifact_directory.join(format!("{}.json", artifact.artifact_id));
@@ -496,6 +533,56 @@ fn validate_branch(
     Ok(())
 }
 
+struct ParsedStyleDescriptors {
+    binding: serde_json::Value,
+    manifest: serde_json::Value,
+    compiled: serde_json::Value,
+}
+
+fn parse_style_descriptors(
+    style_id: &str,
+    binding_json: &str,
+    manifest_json: &str,
+    compiled_json: &str,
+) -> Result<ParsedStyleDescriptors, SessionCatalogDependencyError> {
+    if style_id.is_empty()
+        || binding_json.len() > METADATA_LIMIT_BYTES
+        || manifest_json.len() > METADATA_LIMIT_BYTES
+        || compiled_json.len() > METADATA_LIMIT_BYTES
+    {
+        return Err(SessionCatalogDependencyError::InvalidStyleBinding);
+    }
+    let binding: serde_json::Value = serde_json::from_str(binding_json)
+        .map_err(|_| SessionCatalogDependencyError::InvalidStyleBinding)?;
+    let manifest: serde_json::Value = serde_json::from_str(manifest_json)
+        .map_err(|_| SessionCatalogDependencyError::InvalidStyleBinding)?;
+    let compiled: serde_json::Value = serde_json::from_str(compiled_json)
+        .map_err(|_| SessionCatalogDependencyError::InvalidStyleBinding)?;
+    let bound_id = binding
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(SessionCatalogDependencyError::InvalidStyleBinding)?;
+    let manifest_hash = binding
+        .get("content_hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(SessionCatalogDependencyError::InvalidStyleBinding)?;
+    let compiled_hash = binding
+        .get("compiled_style_hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(SessionCatalogDependencyError::InvalidStyleBinding)?;
+    if bound_id != style_id
+        || ContentHash::digest(manifest_json.as_bytes()).to_string() != manifest_hash
+        || ContentHash::digest(compiled_json.as_bytes()).to_string() != compiled_hash
+    {
+        return Err(SessionCatalogDependencyError::InvalidStyleBinding);
+    }
+    Ok(ParsedStyleDescriptors {
+        binding,
+        manifest,
+        compiled,
+    })
+}
+
 fn atomic_json(path: PathBuf, value: &impl Serialize) -> Result<(), SessionCatalogDependencyError> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| SessionCatalogDependencyError::Serialization(error.to_string()))?;
@@ -512,20 +599,23 @@ fn atomic_json(path: PathBuf, value: &impl Serialize) -> Result<(), SessionCatal
 
 fn read_metadata(path: &Path) -> Result<StoredMetadataOwned, SessionCatalogDependencyError> {
     let file = File::open(path).map_err(map_io)?;
-    if file.metadata().map_err(map_io)?.len() > METADATA_LIMIT {
+    if file.metadata().map_err(map_io)?.len() > METADATA_LIMIT_U64 {
         return Err(SessionCatalogDependencyError::MetadataTooLarge);
     }
     let mut bytes = Vec::new();
-    file.take(METADATA_LIMIT + 1)
+    file.take(METADATA_LIMIT_U64 + 1)
         .read_to_end(&mut bytes)
         .map_err(map_io)?;
-    if bytes.len() as u64 > METADATA_LIMIT {
+    if bytes.len() > METADATA_LIMIT_BYTES {
         return Err(SessionCatalogDependencyError::MetadataTooLarge);
     }
     let metadata: StoredMetadataOwned = serde_json::from_slice(&bytes)
         .map_err(|error| SessionCatalogDependencyError::Serialization(error.to_string()))?;
-    if metadata.schema_version != SCHEMA_VERSION {
+    if !matches!(metadata.schema_version, 1 | SCHEMA_VERSION) {
         return Err(SessionCatalogDependencyError::UnsupportedSchema);
+    }
+    if metadata.schema_version == SCHEMA_VERSION && metadata.style_binding.is_none() {
+        return Err(SessionCatalogDependencyError::InvalidStyleBinding);
     }
     Ok(metadata)
 }
@@ -563,6 +653,8 @@ struct StoredMetadata<'a> {
     session_id: String,
     workspace: &'a str,
     style: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    style_binding: Option<&'a serde_json::Value>,
     sequence: u64,
     state: &'a str,
     created_at_millis: i64,
@@ -578,6 +670,8 @@ struct StoredMetadataOwned {
     session_id: String,
     workspace: String,
     style: String,
+    #[serde(default)]
+    style_binding: Option<serde_json::Value>,
     sequence: u64,
     state: String,
     created_at_millis: i64,
@@ -650,6 +744,9 @@ pub enum SessionCatalogDependencyError {
     /// Branch event count could not be represented.
     #[error("session branch sequence overflow")]
     SequenceOverflow,
+    /// Style binding, manifest, or compiled descriptor was inconsistent.
+    #[error("session style binding is invalid")]
+    InvalidStyleBinding,
 }
 
 #[cfg(test)]
@@ -667,16 +764,32 @@ mod tests {
         }
     }
 
+    fn style_documents() -> (String, String, String) {
+        let manifest = String::from(r#"{"id":"persistent-chat"}"#);
+        let compiled = String::from(r#"{"id":"persistent-chat","entry":"respond"}"#);
+        let binding = serde_json::json!({
+            "id": "persistent-chat",
+            "content_hash": ContentHash::digest(manifest.as_bytes()),
+            "compiled_style_hash": ContentHash::digest(compiled.as_bytes())
+        })
+        .to_string();
+        (binding, manifest, compiled)
+    }
+
     #[test]
     fn creates_required_tree_and_lists_without_loading_history() {
         let root = tempfile::tempdir().expect("root");
         let workspace = tempfile::tempdir().expect("workspace");
         let adapter = FileSessionCatalogDependency;
+        let (style_binding_json, style_manifest_json, compiled_style_json) = style_documents();
         let created = adapter
             .create_session(DependencyCreateSessionRequest {
                 sessions_root: root.path().join("sessions"),
                 prepared: prepared(workspace.path()),
                 style: String::from("persistent-chat"),
+                style_binding_json,
+                style_manifest_json,
+                compiled_style_json,
                 initial_event_json: br#"{"fixture":true}"#.to_vec(),
             })
             .expect("create");
@@ -714,11 +827,15 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let sessions = root.path().join("sessions");
         let adapter = FileSessionCatalogDependency;
+        let (style_binding_json, style_manifest_json, compiled_style_json) = style_documents();
         let created = adapter
             .create_session(DependencyCreateSessionRequest {
                 sessions_root: sessions.clone(),
                 prepared: prepared(workspace.path()),
                 style: String::from("persistent-chat"),
+                style_binding_json,
+                style_manifest_json,
+                compiled_style_json,
                 initial_event_json: br#"{"fixture":true}"#.to_vec(),
             })
             .expect("create");
@@ -763,10 +880,14 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let bytes = br#"{"schema_version":1,"history":["complete"]}"#.to_vec();
         let artifact_id = Uuid::from_u128(9).to_string();
+        let (style_binding_json, style_manifest_json, compiled_style_json) = style_documents();
         let request = DependencyCreateBranchRequest {
             sessions_root: root.path().join("sessions"),
             prepared: prepared(workspace.path()),
             style: String::from("persistent-chat"),
+            style_binding_json,
+            style_manifest_json,
+            compiled_style_json,
             parent_session_id: Uuid::from_u128(8).to_string(),
             fork_sequence: 7,
             events: vec![

@@ -41,6 +41,11 @@ use crate::{
         ProcessSchedulerDependency, RuntimeSchedulerDependencyError,
         RuntimeSchedulerDependencyPort,
     },
+    style::{
+        DependencyStyleCacheLoadRequest, DependencyStyleCacheRecord,
+        DependencyStyleCacheStoreRequest, DependencyStyleDiscovery,
+        DependencyStyleDiscoveryRequest, SessionStyleDependencyError, SessionStyleDependencyPort,
+    },
     tool::{
         DependencyCancelToolRequest, DependencyToolCommand, DependencyToolEvent,
         ProcessToolHostDependency, ToolHostDependencyError, ToolHostDependencyPort,
@@ -249,6 +254,29 @@ impl RuntimeDependencyPort for SupervisedRuntimeDependencies {
         request: DependencyStorageHealthRequest,
     ) -> Result<DependencyStorageHealthResponse, DependencyError> {
         LocalRuntimeDependencies.check_storage(request)
+    }
+}
+
+impl SessionStyleDependencyPort for SupervisedRuntimeDependencies {
+    fn discover_session_styles(
+        &self,
+        request: DependencyStyleDiscoveryRequest,
+    ) -> Result<DependencyStyleDiscovery, SessionStyleDependencyError> {
+        LocalRuntimeDependencies.discover_session_styles(request)
+    }
+
+    fn load_session_style_cache(
+        &self,
+        request: DependencyStyleCacheLoadRequest,
+    ) -> Result<Option<DependencyStyleCacheRecord>, SessionStyleDependencyError> {
+        LocalRuntimeDependencies.load_session_style_cache(request)
+    }
+
+    fn store_session_style_cache(
+        &self,
+        request: DependencyStyleCacheStoreRequest,
+    ) -> Result<(), SessionStyleDependencyError> {
+        LocalRuntimeDependencies.store_session_style_cache(request)
     }
 }
 

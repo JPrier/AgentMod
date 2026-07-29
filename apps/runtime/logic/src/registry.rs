@@ -5,14 +5,14 @@ use std::path::PathBuf;
 use agentmod_event_model::{
     EventClassification, EventEnvelope, EventMetadata, EventOrigin, EventScope,
 };
-use agentmod_primitives::{Sequence, SessionId, Version};
+use agentmod_primitives::{ContentHash, Sequence, SessionId, Version};
 use agentmod_runtime_data::registry::{
     CreateSessionDataRequest, ListSessionsDataRequest, PrepareSessionDataRequest,
     PreparedSessionDataRecord, SessionRegistryDataError, SessionRegistryDataPort,
 };
 use thiserror::Error;
 
-use crate::session::{RuntimeCommittedEvent, SessionCreatedEvent};
+use crate::session::{RuntimeCommittedEvent, SessionCreatedEvent, SessionStyleBinding};
 
 const MAX_SESSION_LIST: usize = 1_000;
 const MAX_STYLE_LENGTH: usize = 128;
@@ -24,8 +24,8 @@ pub struct CreateSessionCommand {
     pub sessions_root: PathBuf,
     /// User-selected workspace path.
     pub workspace: PathBuf,
-    /// Explicit top-level style ID.
-    pub style: String,
+    /// Immutable selected and compiled style.
+    pub style_binding: SessionStyleBinding,
 }
 
 /// Logic-owned create result.
@@ -100,8 +100,10 @@ where
                 workspace: command.workspace,
             })
             .map_err(SessionRegistryLogicError::Data)?;
-        let event = initial_event(&prepared, &command.style)?;
+        let event = initial_event(&prepared, &command.style_binding)?;
         let event_json = serde_json::to_vec(&event)
+            .map_err(|_| SessionRegistryLogicError::InitialEventSerialization)?;
+        let style_binding_json = serde_json::to_string(&command.style_binding)
             .map_err(|_| SessionRegistryLogicError::InitialEventSerialization)?;
         let session_id = prepared.session_id;
         let created = self
@@ -109,7 +111,10 @@ where
             .create(CreateSessionDataRequest {
                 sessions_root: command.sessions_root,
                 prepared,
-                style: command.style,
+                style: command.style_binding.id.clone(),
+                style_binding_json,
+                style_manifest_json: command.style_binding.configuration_json,
+                compiled_style_json: command.style_binding.compiled_style_json,
                 initial_event_json: event_json,
             })
             .map_err(SessionRegistryLogicError::Data)?;
@@ -155,21 +160,34 @@ fn validate_create(command: &CreateSessionCommand) -> Result<(), SessionRegistry
     if command.workspace.as_os_str().is_empty() {
         return Err(SessionRegistryLogicError::InvalidWorkspace);
     }
-    if command.style.is_empty()
-        || command.style.len() > MAX_STYLE_LENGTH
+    if command.style_binding.id.is_empty()
+        || command.style_binding.id.len() > MAX_STYLE_LENGTH
         || !command
-            .style
+            .style_binding
+            .id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(SessionRegistryLogicError::InvalidStyle);
+    }
+    if command.style_binding.version.trim().is_empty()
+        || command.style_binding.runtime_api_version.trim().is_empty()
+        || command.style_binding.source_locator.trim().is_empty()
+        || command.style_binding.configuration_json.is_empty()
+        || command.style_binding.compiled_style_json.is_empty()
+        || command.style_binding.content_hash
+            != ContentHash::digest(command.style_binding.configuration_json.as_bytes())
+        || command.style_binding.compiled_style_hash
+            != ContentHash::digest(command.style_binding.compiled_style_json.as_bytes())
+    {
+        return Err(SessionRegistryLogicError::InvalidStyleBinding);
     }
     Ok(())
 }
 
 fn initial_event(
     prepared: &PreparedSessionDataRecord,
-    style: &str,
+    style: &SessionStyleBinding,
 ) -> Result<EventEnvelope<RuntimeCommittedEvent>, SessionRegistryLogicError> {
     EventEnvelope::seal(
         EventMetadata {
@@ -192,7 +210,8 @@ fn initial_event(
         },
         RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
             workspace: prepared.normalized_workspace.to_string_lossy().into_owned(),
-            style: style.to_owned(),
+            style: style.id.clone(),
+            style_binding: Some(Box::new(style.clone())),
         }),
     )
     .map_err(|_| SessionRegistryLogicError::InitialEventSerialization)
@@ -210,6 +229,9 @@ pub enum SessionRegistryLogicError {
     /// Style ID has unsafe syntax or length.
     #[error("session style identifier is invalid")]
     InvalidStyle,
+    /// Selected style binding is incomplete or inconsistent.
+    #[error("session style binding is invalid")]
+    InvalidStyleBinding,
     /// Data operation failed.
     #[error("session registry data failed: {0}")]
     Data(SessionRegistryDataError),

@@ -2,10 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use agentmod_graph_engine::GRAPH_FORMAT_VERSION;
 use agentmod_primitives::ContentHash;
 use agentmod_session_style_sdk::{
-    BuiltInStyle, CompileContext, DecisionCapability, GraphSource, StyleCompilerLimits,
-    built_in_manifest, compile_style, compile_style_set, parse_json, parse_toml, to_json, to_toml,
+    BuiltInStyle, CompileContext, CompiledSessionStyle, DecisionCapability, GraphSource,
+    StyleCompilerLimits, built_in_manifest, compile_style, compile_style_set, parse_json,
+    parse_toml, to_json, to_toml,
 };
 use proptest::prelude::*;
 
@@ -121,6 +123,38 @@ fn all_five_built_ins_compile_with_hard_limits_and_explicit_completion() {
                 .contains("cache_key")
         );
     }
+}
+
+#[test]
+fn compiled_built_in_style_json_round_trips_and_rejects_invalid_cache_data() {
+    let manifest = built_in_manifest(BuiltInStyle::PersistentChat);
+    let compiled = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("built-in style compiles");
+    let encoded = serde_json::to_string(&compiled).expect("compiled style serializes");
+    let reloaded: CompiledSessionStyle =
+        serde_json::from_str(&encoded).expect("compiled style cache reloads");
+
+    assert_eq!(reloaded, compiled);
+    assert_eq!(
+        serde_json::to_string(&reloaded).expect("reloaded style serializes"),
+        encoded
+    );
+
+    let cached: serde_json::Value = serde_json::from_str(&encoded).expect("compiled cache is JSON");
+    let mut unsupported_version = cached.clone();
+    unsupported_version["graph"]["format_version"] =
+        serde_json::Value::from(GRAPH_FORMAT_VERSION + 1);
+    assert!(
+        serde_json::from_value::<CompiledSessionStyle>(unsupported_version).is_err(),
+        "compiled cache data with an unsupported graph version must be rejected"
+    );
+
+    let mut invalid = cached;
+    invalid["graph"]["unexpected_cache_field"] = serde_json::Value::Null;
+    assert!(
+        serde_json::from_value::<CompiledSessionStyle>(invalid).is_err(),
+        "compiled cache data with unknown graph fields must be rejected"
+    );
 }
 
 #[test]

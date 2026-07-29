@@ -10,6 +10,7 @@
 
 use std::{
     collections::BTreeSet,
+    path::Path,
     sync::{Arc, mpsc},
 };
 
@@ -23,7 +24,9 @@ use agentmod_protocol_support::{
 };
 use agentmod_runtime_protocol::{
     RuntimeProviderEvent, RuntimeRequest, RuntimeResponse, RuntimeSchedulePayload,
-    RuntimeScheduleSpec, RuntimeScheduleTrigger, RuntimeSessionEvent,
+    RuntimeScheduleSpec, RuntimeScheduleTrigger, RuntimeSessionEvent, RuntimeStyleAvailability,
+    RuntimeStyleDiagnostic, RuntimeStyleInspection, RuntimeStyleManifestFormat,
+    RuntimeStyleSourceKind, RuntimeStyleSummary,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -31,6 +34,84 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
 const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 1);
+const MAX_STYLE_MANIFEST_BYTES: u64 = 1_048_576;
+
+/// Dependency-owned style manifest format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyStyleManifestFormat {
+    Toml,
+    Json,
+}
+
+/// Dependency-owned style source kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyStyleSourceKind {
+    BuiltIn,
+    User,
+    Project,
+    Plugin,
+    Inline,
+}
+
+/// Dependency-owned style availability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyStyleAvailability {
+    Available,
+    Disabled,
+    Invalid,
+    Incompatible,
+    Conflict,
+}
+
+/// Dependency-owned style diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyStyleDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+    pub help: String,
+}
+
+/// Dependency-owned style summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyStyleSummary {
+    pub id: String,
+    pub version: String,
+    pub source: DependencyStyleSourceKind,
+    pub availability: DependencyStyleAvailability,
+    pub style_content_hash: String,
+    pub compiled_cache_key: String,
+    pub required_capabilities: Vec<String>,
+}
+
+/// Dependency-owned detailed style inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DependencyStyleInspection {
+    pub summary: DependencyStyleSummary,
+    pub source_locator: String,
+    pub manifest: Value,
+    pub compiled: Option<Value>,
+    pub diagnostics: Vec<DependencyStyleDiagnostic>,
+}
+
+/// Dependency-owned selector for a registry entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyInspectStyleRequest {
+    pub selector: String,
+}
+
+/// Dependency-owned style manifest file request. Reading is contained here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyStyleFileRequest {
+    pub file: String,
+}
+
+/// Dependency-owned validation result; invalid manifests are normal results.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyStyleValidationResult {
+    pub valid: bool,
+    pub diagnostics: Vec<DependencyStyleDiagnostic>,
+}
 
 /// Dependency-owned runtime health request.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -439,6 +520,31 @@ pub trait CliDependencyPort {
         &self,
         request: DependencyResolveApprovalRequest,
     ) -> Result<DependencyResolveApprovalResponse, DependencyError>;
+
+    fn list_styles(&self) -> Result<Vec<DependencyStyleSummary>, DependencyError> {
+        Err(DependencyError::UnsupportedRuntimeRequest)
+    }
+
+    fn inspect_style(
+        &self,
+        _request: DependencyInspectStyleRequest,
+    ) -> Result<DependencyStyleInspection, DependencyError> {
+        Err(DependencyError::UnsupportedRuntimeRequest)
+    }
+
+    fn validate_style(
+        &self,
+        _request: DependencyStyleFileRequest,
+    ) -> Result<DependencyStyleValidationResult, DependencyError> {
+        Err(DependencyError::UnsupportedRuntimeRequest)
+    }
+
+    fn compile_style(
+        &self,
+        _request: DependencyStyleFileRequest,
+    ) -> Result<DependencyStyleInspection, DependencyError> {
+        Err(DependencyError::UnsupportedRuntimeRequest)
+    }
 
     fn upsert_schedule(
         &self,
@@ -976,6 +1082,57 @@ impl CliDependencyPort for LocalRuntimeClient {
         })
     }
 
+    fn list_styles(&self) -> Result<Vec<DependencyStyleSummary>, DependencyError> {
+        let RuntimeResponse::Styles { styles } = self.send_local(RuntimeRequest::ListStyles)?
+        else {
+            return Err(DependencyError::UnexpectedRuntimeResponse);
+        };
+        Ok(styles.into_iter().map(map_style_summary).collect())
+    }
+
+    fn inspect_style(
+        &self,
+        request: DependencyInspectStyleRequest,
+    ) -> Result<DependencyStyleInspection, DependencyError> {
+        let RuntimeResponse::StyleInspected { inspection } =
+            self.send_local(RuntimeRequest::InspectStyle {
+                selector: request.selector,
+            })?
+        else {
+            return Err(DependencyError::UnexpectedRuntimeResponse);
+        };
+        Ok(map_style_inspection(inspection))
+    }
+
+    fn validate_style(
+        &self,
+        request: DependencyStyleFileRequest,
+    ) -> Result<DependencyStyleValidationResult, DependencyError> {
+        let (manifest, format) = read_style_manifest(&request.file)?;
+        let RuntimeResponse::StyleValidated { valid, diagnostics } =
+            self.send_local(RuntimeRequest::ValidateStyle { manifest, format })?
+        else {
+            return Err(DependencyError::UnexpectedRuntimeResponse);
+        };
+        Ok(DependencyStyleValidationResult {
+            valid,
+            diagnostics: diagnostics.into_iter().map(map_style_diagnostic).collect(),
+        })
+    }
+
+    fn compile_style(
+        &self,
+        request: DependencyStyleFileRequest,
+    ) -> Result<DependencyStyleInspection, DependencyError> {
+        let (manifest, format) = read_style_manifest(&request.file)?;
+        let RuntimeResponse::StyleCompiled { inspection } =
+            self.send_local(RuntimeRequest::CompileStyle { manifest, format })?
+        else {
+            return Err(DependencyError::UnexpectedRuntimeResponse);
+        };
+        Ok(map_style_inspection(inspection))
+    }
+
     fn create_session(
         &self,
         request: DependencyCreateSessionRequest,
@@ -1473,6 +1630,74 @@ fn map_turn_event(event: RuntimeProviderEvent) -> DependencyTurnEvent {
     }
 }
 
+fn read_style_manifest(
+    file: &str,
+) -> Result<(String, RuntimeStyleManifestFormat), DependencyError> {
+    let path = Path::new(file);
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
+    let format = match extension.as_deref() {
+        Some("toml") => RuntimeStyleManifestFormat::Toml,
+        Some("json") => RuntimeStyleManifestFormat::Json,
+        _ => return Err(DependencyError::UnsupportedStyleManifestExtension),
+    };
+    let metadata = std::fs::metadata(path).map_err(|_| DependencyError::StyleManifestFile)?;
+    if metadata.len() > MAX_STYLE_MANIFEST_BYTES {
+        return Err(DependencyError::StyleManifestTooLarge);
+    }
+    let manifest = std::fs::read_to_string(path).map_err(|_| DependencyError::StyleManifestFile)?;
+    Ok((manifest, format))
+}
+
+fn map_style_summary(summary: RuntimeStyleSummary) -> DependencyStyleSummary {
+    DependencyStyleSummary {
+        id: summary.id,
+        version: summary.version,
+        source: match summary.source {
+            RuntimeStyleSourceKind::BuiltIn => DependencyStyleSourceKind::BuiltIn,
+            RuntimeStyleSourceKind::User => DependencyStyleSourceKind::User,
+            RuntimeStyleSourceKind::Project => DependencyStyleSourceKind::Project,
+            RuntimeStyleSourceKind::Plugin => DependencyStyleSourceKind::Plugin,
+            RuntimeStyleSourceKind::Inline => DependencyStyleSourceKind::Inline,
+        },
+        availability: match summary.availability {
+            RuntimeStyleAvailability::Available => DependencyStyleAvailability::Available,
+            RuntimeStyleAvailability::Disabled => DependencyStyleAvailability::Disabled,
+            RuntimeStyleAvailability::Invalid => DependencyStyleAvailability::Invalid,
+            RuntimeStyleAvailability::Incompatible => DependencyStyleAvailability::Incompatible,
+            RuntimeStyleAvailability::Conflict => DependencyStyleAvailability::Conflict,
+        },
+        style_content_hash: summary.style_content_hash,
+        compiled_cache_key: summary.compiled_cache_key,
+        required_capabilities: summary.required_capabilities,
+    }
+}
+
+fn map_style_diagnostic(diagnostic: RuntimeStyleDiagnostic) -> DependencyStyleDiagnostic {
+    DependencyStyleDiagnostic {
+        code: diagnostic.code,
+        path: diagnostic.path,
+        message: diagnostic.message,
+        help: diagnostic.help,
+    }
+}
+
+fn map_style_inspection(inspection: RuntimeStyleInspection) -> DependencyStyleInspection {
+    DependencyStyleInspection {
+        summary: map_style_summary(inspection.summary),
+        source_locator: inspection.source_locator,
+        manifest: inspection.manifest,
+        compiled: inspection.compiled,
+        diagnostics: inspection
+            .diagnostics
+            .into_iter()
+            .map(map_style_diagnostic)
+            .collect(),
+    }
+}
+
 fn new_header(kind: FrameKind) -> FrameHeader {
     FrameHeader {
         family: String::from("runtime"),
@@ -1570,6 +1795,15 @@ pub enum DependencyError {
     /// Bootstrap configuration is unsafe.
     #[error("runtime client configuration is invalid: {0}")]
     InvalidConfiguration(&'static str),
+    /// The manifest path could not be read as UTF-8 text.
+    #[error("style manifest file could not be read")]
+    StyleManifestFile,
+    /// Only TOML and JSON manifest files are accepted by the CLI boundary.
+    #[error("style manifest file must use a .toml or .json extension")]
+    UnsupportedStyleManifestExtension,
+    /// Manifest size exceeds the bounded local input limit.
+    #[error("style manifest file exceeds the 1 MiB limit")]
+    StyleManifestTooLarge,
     /// Local transport was unavailable or malformed.
     #[error("runtime transport is unavailable")]
     Transport,
@@ -1693,6 +1927,63 @@ mod tests {
                 version: String::from("test")
             }
         );
+        server_task.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn local_exchange_round_trips_style_list_fixture() {
+        let client = LocalRuntimeClient::new(
+            String::from("fixture"),
+            String::from("0123456789abcdef0123456789abcdef"),
+            4096,
+        )
+        .expect("client");
+        let (mut caller, mut server) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            let handshake: WireFrame<Handshake> =
+                read_frame(&mut server, 4096).await.expect("handshake");
+            write_frame(
+                &mut server,
+                &WireFrame {
+                    header: response_for(&handshake.header),
+                    payload: Negotiated {
+                        version: RUNTIME_PROTOCOL_VERSION,
+                        capabilities: BTreeSet::from([String::from("request_response")]),
+                    },
+                },
+                4096,
+            )
+            .await
+            .expect("negotiated");
+            let request: WireFrame<RuntimeRequest> =
+                read_frame(&mut server, 4096).await.expect("request");
+            assert_eq!(request.payload, RuntimeRequest::ListStyles);
+            write_frame(
+                &mut server,
+                &WireFrame {
+                    header: response_for(&request.header),
+                    payload: RuntimeResponse::Styles {
+                        styles: vec![RuntimeStyleSummary {
+                            id: String::from("calm"),
+                            version: String::from("1.0.0"),
+                            source: RuntimeStyleSourceKind::BuiltIn,
+                            availability: RuntimeStyleAvailability::Available,
+                            style_content_hash: String::from("hash"),
+                            compiled_cache_key: String::from("cache"),
+                            required_capabilities: vec![],
+                        }],
+                    },
+                },
+                4096,
+            )
+            .await
+            .expect("response");
+        });
+        let response = client
+            .exchange(&mut caller, RuntimeRequest::ListStyles)
+            .await
+            .expect("exchange");
+        assert!(matches!(response, RuntimeResponse::Styles { styles } if styles[0].id == "calm"));
         server_task.await.expect("server");
     }
 

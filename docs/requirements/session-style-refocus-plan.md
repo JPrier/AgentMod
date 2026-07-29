@@ -1,0 +1,187 @@
+# Session-Style Refocus Implementation Map
+
+Status: Phase 1 complete; Phase 2 active  
+Branch: `feature/session-style-registry`  
+Baseline commit: `e99e9e1bf02f10475ada0a48fcb746f9fa1ead6b`  
+Verified: 2026-07-28 on Windows
+
+## Verified current state
+
+AgentMod already has the low-level kernels and process boundaries this phase must
+preserve. The session-style SDK owns five built-in manifests, strict TOML/JSON
+parsing, compatibility validation, graph and interceptor compilation, and
+compatibility-bound cache keys. The graph engine, event pipeline, conversation
+projection, compaction strategies, memory providers, plugin SDK/host, runtime
+proposal and permission path, harness supervision, canonical journal, artifacts,
+continuations, receipts, replay, branching, scheduling, and first-party tool
+hosts are live and tested.
+
+No production runtime crate currently consumes `agentmod-session-style-sdk`.
+Session creation accepts a syntax-checked style string, writes that string to the
+initial event, `metadata.json`, `style.json`, and `style.lock`, and then runs the
+same hard-coded turn loop for every value. The TUI `/new` command always selects
+`persistent-chat`. Branching can replace the string, but it does not resolve or
+compile the replacement.
+
+The following documents contradict the implementation and require reconciliation:
+
+- `docs/architecture/n-tier.md` and `docs/architecture/overview.md` describe a
+  health-only runtime, harness, and CLI.
+- `docs/architecture/plugin-system.md` and `docs/reference/plugin-sdk.md` say the
+  plugin SDK and isolated plugin host do not exist.
+- `docs/architecture/session-styles.md`,
+  `docs/reference/session-style-format.md`, and
+  `docs/guides/creating-a-session-style.md` say the style manifest SDK and
+  built-ins do not exist.
+- `docs/architecture/event-pipeline.md` understates the live runtime
+  interception path, although style/plugin pipeline assembly is still empty.
+
+There is no `core/conversation-projection` crate. The live equivalent is
+`apps/runtime/logic/src/conversation.rs`.
+
+## Baseline evidence
+
+| Command | Result |
+|---|---|
+| `cargo fmt --all -- --check` | passed |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
+| `cargo test --workspace --all-targets --all-features --locked` | passed; 351 tests enumerated |
+| `cargo test --workspace --doc --all-features --locked` | passed; no doctests |
+| `cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml` | passed; 88 packages, no violations |
+| `cargo test --locked -p xtask --test architecture` | passed; 2 tests |
+| `cargo deny check` | pending; command not installed |
+| `cargo audit` | pending; command not installed |
+
+This is Windows evidence only. Existing Unix scripts are not execution evidence.
+
+## N-tier implementation map
+
+### Runtime dependency
+
+- Add bounded style-manifest discovery for configured user, project, and plugin
+  roots.
+- Read TOML/JSON bytes and disable markers without interpreting business rules.
+- Read and atomically write compiled-cache bytes.
+- Persist complete immutable session style descriptors and locks.
+- Preserve atomic session/branch directory creation and journal ordering.
+
+### Runtime data
+
+- Own built-in, configured, and plugin-provided catalog records.
+- Parse and compile manifests through `agentmod-session-style-sdk`.
+- Build the runtime compile context from explicit capabilities, providers, tool
+  groups, plugins, memory providers, and compaction strategies.
+- Normalize sources, diagnostics, availability, and cache records into
+  data-owned types.
+- Maintain an injected, bounded compiled-style cache; do not use a global
+  mutable locator.
+
+### Runtime logic
+
+- Own selector parsing, ID/version resolution, precedence, compatibility,
+  activation, immutable binding identity, restart validation, and branch style
+  semantics.
+- Reject unavailable, disabled, ambiguous, missing, or incompatible styles.
+- Map data records into logic-owned descriptors and session bindings.
+- Keep dynamic session and capability decisions here while reusing SDK
+  diagnostics instead of duplicating compiler rules.
+
+### Runtime service
+
+- Add list, inspect, validate, and compile style endpoints.
+- Map runtime wire DTOs only at the service boundary.
+- Resolve and bind a selected style during session creation.
+- Surface style compatibility and complete binding details during session
+  inspection.
+
+### Frontends
+
+- CLI: add `style list`, `style inspect`, `style validate`, and `style compile`;
+  keep `session create --style`, add style-file/selection overrides as the
+  runtime contracts become available, and render full session binding details.
+- TUI: replace hard-coded `/new` behavior with explicit style selection and
+  expose catalog/details/compatibility in the initial style-focused flow.
+- ACP remains protocol-driven and must not import runtime internals.
+
+## Durable binding
+
+Every newly created or deliberately restyled branch will persist:
+
+- style ID and semantic version;
+- canonical manifest content hash;
+- compiled-style cache key;
+- source and relevant plugin-set hash;
+- capability-set hash and runtime API version;
+- style-specific configuration;
+- memory and compaction selections;
+- selected tool groups and harness requirement;
+- execution budgets and permission defaults.
+
+The binding is committed in canonical creation history and written atomically to
+session metadata/style descriptors. Existing ID-only sessions remain readable
+for replay, but continuation of a legacy or incompatible binding must fail with
+an explicit migration/replacement diagnostic rather than silently substituting
+another style.
+
+## Delivery sequence
+
+1. Registry and immutable session binding, including protocol, CLI, TUI,
+   restart validation, branch semantics, and focused process E2E.
+2. Generic graph executor state and transitions; route persistent chat through
+   it before adding more styles.
+3. Style-selected context, memory, compaction, provenance, and context
+   pipelines.
+4. Ephemeral turn, research loop, declarative graph, then planner-worker-reviewer
+   and runtime-managed child sessions.
+5. Live plugin composition for interceptors, observers, styles, and context
+   components.
+6. Harness registry, capability negotiation, native descriptor, and
+   deterministic secondary fixture.
+7. Complete frontend and introspection surfaces.
+8. Recovery matrix, benchmarks, traceability, documentation, and Windows/Unix
+   process-level acceptance evidence.
+
+## Phase 1 proof obligations
+
+- Five built-ins list and inspect through the live daemon.
+- Invalid and incompatible manifests return stable SDK-derived diagnostics.
+- User, project, and plugin manifest fixtures are discovered with explicit
+  source and availability.
+- Two style selections produce distinct immutable bindings.
+- Restart retains and validates each binding.
+- Branch inheritance preserves the exact parent binding; an explicit branch
+  style resolves and binds the requested replacement.
+- CLI and TUI select styles without bypassing the runtime.
+- Existing replay, branch, turn, tool, approval, receipt, scheduler, and
+  architecture tests remain green.
+
+## Phase 1 verified result
+
+Completed 2026-07-28 on Windows. The runtime registry now owns five built-ins
+plus bounded user, project, and plugin sources, explicit disablement, SDK-derived
+diagnostics, content-addressed compiled caching, exact semantic-version
+selection, and immutable activation bindings. New sessions and deliberately
+restyled branches persist schema-v2 metadata plus full style and compiled locks.
+Canonical `session.created` history contains the binding, so replay and restart
+reconstruct it without opening a separate mutable catalog record.
+
+Inspection reports `compatible`, `incompatible`, or `migration_required`.
+Execution validates the exact persisted binding lazily before a turn or
+continuation resumes; unavailable or changed styles fail closed and are never
+replaced. CLI style commands and the TUI Styles view operate through protocol
+boundaries. `tests/e2e/runtime_style_registry.ps1` passed with two styles,
+restart continuation, branch restyling, disablement, and durable-file checks.
+The matching Unix script is implemented but is not execution evidence.
+
+Full workspace tests, strict Clippy, formatting, and the 88-package architecture
+check pass. One process-host cancellation test timed out during the first
+workspace run, passed immediately in isolation, and the complete workspace run
+then passed.
+
+## Later acceptance accounting
+
+The twelve orchestration scenarios in the phase request are release-blocking for
+this refocus. Manifests, mocks, Unix scripts, or a parallel hard-coded chat loop
+do not satisfy them. Each scenario requires canonical event/artifact assertions,
+process-level restart evidence where specified, and verified Windows and Unix
+execution before this phase may be reported complete.

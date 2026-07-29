@@ -10,6 +10,27 @@ use serde_json::Value;
 pub enum RuntimeRequest {
     /// Report process health and negotiated API version.
     Health,
+    /// List the bounded registry of available session styles.
+    ListStyles,
+    /// Inspect one style selected by ID or `id@version`.
+    InspectStyle {
+        /// Stable style selector.
+        selector: String,
+    },
+    /// Validate a manifest supplied by a frontend without persisting it.
+    ValidateStyle {
+        /// Complete style manifest document.
+        manifest: String,
+        /// Serialization format of `manifest`.
+        format: RuntimeStyleManifestFormat,
+    },
+    /// Compile a manifest supplied by a frontend without persisting it.
+    CompileStyle {
+        /// Complete style manifest document.
+        manifest: String,
+        /// Serialization format of `manifest`.
+        format: RuntimeStyleManifestFormat,
+    },
     /// Create a durable session.
     CreateSession {
         /// User-supplied workspace text, validated by service and logic.
@@ -182,6 +203,28 @@ pub enum RuntimeResponse {
         /// Runtime application version.
         version: String,
     },
+    /// Bounded style-registry summary rows.
+    Styles {
+        /// Ordered registry entries.
+        styles: Vec<RuntimeStyleSummary>,
+    },
+    /// Complete inspection of one registry entry.
+    StyleInspected {
+        /// Frontend-safe style inspection.
+        inspection: RuntimeStyleInspection,
+    },
+    /// Result of manifest validation. Diagnostics do not make RPC fail.
+    StyleValidated {
+        /// Whether the supplied manifest is valid.
+        valid: bool,
+        /// Stable validation diagnostics.
+        diagnostics: Vec<RuntimeStyleDiagnostic>,
+    },
+    /// Complete inspection generated from a compiled manifest.
+    StyleCompiled {
+        /// Frontend-safe compiled style inspection.
+        inspection: RuntimeStyleInspection,
+    },
     /// Session was durably created.
     SessionCreated {
         /// Canonical session ID.
@@ -325,6 +368,95 @@ pub enum RuntimeResponse {
     },
     /// Operation cancellation was accepted.
     Cancelled,
+}
+
+/// Serialization format supplied for a style manifest.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStyleManifestFormat {
+    /// TOML style manifest.
+    Toml,
+    /// JSON style manifest.
+    Json,
+}
+
+/// Provenance of a style registry entry.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStyleSourceKind {
+    /// Bundled with the runtime.
+    BuiltIn,
+    /// Installed for the current user.
+    User,
+    /// Defined by the selected project.
+    Project,
+    /// Contributed by a plugin.
+    Plugin,
+    /// Supplied directly by a caller.
+    Inline,
+}
+
+/// Runtime usability of a style registry entry.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuntimeStyleAvailability {
+    /// Style can be selected now.
+    Available,
+    /// Style is intentionally disabled.
+    Disabled,
+    /// Style manifest is malformed.
+    Invalid,
+    /// Runtime lacks a required capability.
+    Incompatible,
+    /// Multiple sources provide conflicting definitions.
+    Conflict,
+}
+
+/// Stable diagnostic emitted while validating or compiling a style.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeStyleDiagnostic {
+    /// Stable machine-readable diagnostic code.
+    pub code: String,
+    /// Manifest path associated with the diagnostic.
+    pub path: String,
+    /// Safe human-readable explanation.
+    pub message: String,
+    /// Optional remediation guidance.
+    pub help: String,
+}
+
+/// Lightweight style-registry entry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeStyleSummary {
+    /// Stable style identifier.
+    pub id: String,
+    /// Manifest version.
+    pub version: String,
+    /// Source provenance.
+    pub source: RuntimeStyleSourceKind,
+    /// Availability for selection.
+    pub availability: RuntimeStyleAvailability,
+    /// Hash of the style content.
+    pub style_content_hash: String,
+    /// Cache key for the compiled descriptor.
+    pub compiled_cache_key: String,
+    /// Capabilities required by this style.
+    pub required_capabilities: Vec<String>,
+}
+
+/// Detailed, frontend-safe style inspection.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RuntimeStyleInspection {
+    /// Registry summary.
+    pub summary: RuntimeStyleSummary,
+    /// Safe source location or provenance label.
+    pub source_locator: String,
+    /// Parsed manifest representation.
+    pub manifest: Value,
+    /// Compiled descriptor when compilation succeeded.
+    pub compiled: Option<Value>,
+    /// Validation or compilation diagnostics.
+    pub diagnostics: Vec<RuntimeStyleDiagnostic>,
 }
 
 /// Runtime frontend schedule trigger.
@@ -587,6 +719,37 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<RuntimeRequest>(&encoded).expect("decode"),
             request
+        );
+    }
+
+    #[test]
+    fn style_requests_and_responses_round_trip_with_stable_tags() {
+        let request = RuntimeRequest::ValidateStyle {
+            manifest: String::from("id = 'calm'"),
+            format: RuntimeStyleManifestFormat::Toml,
+        };
+        let encoded = serde_json::to_value(&request).expect("encode request");
+        assert_eq!(encoded["operation"], "validate_style");
+        assert_eq!(encoded["arguments"]["format"], "toml");
+        assert_eq!(
+            serde_json::from_value::<RuntimeRequest>(encoded).expect("decode request"),
+            request
+        );
+
+        let response = RuntimeResponse::StyleValidated {
+            valid: false,
+            diagnostics: vec![RuntimeStyleDiagnostic {
+                code: String::from("style.id.required"),
+                path: String::from("id"),
+                message: String::from("style id is required"),
+                help: String::from("set id"),
+            }],
+        };
+        let encoded = serde_json::to_value(&response).expect("encode response");
+        assert_eq!(encoded["result"], "style_validated");
+        assert_eq!(
+            serde_json::from_value::<RuntimeResponse>(encoded).expect("decode response"),
+            response
         );
     }
 }

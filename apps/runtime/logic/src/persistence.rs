@@ -421,6 +421,7 @@ mod tests {
             RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
                 workspace: "fixture".into(),
                 style: "persistent-chat".into(),
+                style_binding: None,
             }),
         )
         .expect("seal")

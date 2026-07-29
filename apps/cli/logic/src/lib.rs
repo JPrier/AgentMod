@@ -10,15 +10,87 @@
 
 use agentmod_cli_data::{
     BranchSessionDataRequest, CancelTurnDataRequest, CliDataPort, CreateDeferredTurnDataRequest,
-    CreateSessionDataRequest, InspectSessionDataRequest, ListSessionsDataRequest,
-    ResolveApprovalDataRequest, RunTurnDataRequest, RunTurnDataStream, RunTurnDataStreamItem,
-    RuntimeHealthDataAvailability, RuntimeHealthDataRequest, ScheduleDataPayload,
-    ScheduleDataRecord, ScheduleDataTrigger, ScheduledExecutionDataRecord, ScheduledRunDataRecord,
+    CreateSessionDataRequest, InspectSessionDataRequest, InspectStyleDataRequest,
+    ListSessionsDataRequest, ResolveApprovalDataRequest, RunTurnDataRequest, RunTurnDataStream,
+    RunTurnDataStreamItem, RuntimeHealthDataAvailability, RuntimeHealthDataRequest,
+    ScheduleDataPayload, ScheduleDataRecord, ScheduleDataTrigger, ScheduledExecutionDataRecord,
+    ScheduledRunDataRecord, StyleDataAvailability, StyleDataSourceKind, StyleDiagnosticDataRecord,
+    StyleFileDataRequest, StyleInspectionDataRecord, StyleSummaryDataRecord,
     SubscribeSessionDataRequest, TurnDataEvent,
 };
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use serde_json::Value;
 use thiserror::Error;
+
+/// Logic-owned source kind for a session style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StyleSourceKind {
+    BuiltIn,
+    User,
+    Project,
+    Plugin,
+    Inline,
+}
+
+/// Logic-owned availability of a session style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StyleAvailability {
+    Available,
+    Disabled,
+    Invalid,
+    Incompatible,
+    Conflict,
+}
+
+/// Logic-owned style diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+    pub help: String,
+}
+
+/// Logic-owned style summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleSummaryResult {
+    pub id: String,
+    pub version: String,
+    pub source: StyleSourceKind,
+    pub availability: StyleAvailability,
+    pub style_content_hash: String,
+    pub compiled_cache_key: String,
+    pub required_capabilities: Vec<String>,
+}
+
+/// Logic-owned detailed style inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleInspectionResult {
+    pub summary: StyleSummaryResult,
+    pub source_locator: String,
+    pub manifest: Value,
+    pub compiled: Option<Value>,
+    pub diagnostics: Vec<StyleDiagnostic>,
+}
+
+/// Logic-owned registry selector.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InspectStyleCommand {
+    pub selector: String,
+}
+
+/// Logic-owned style file command. Files are resolved only by dependency.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleFileCommand {
+    pub file: String,
+}
+
+/// Logic-owned validation result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleValidationResult {
+    pub valid: bool,
+    pub diagnostics: Vec<StyleDiagnostic>,
+}
 
 /// Logic-owned doctor command.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -452,6 +524,31 @@ pub trait CliLogicPort {
         command: ResolveApprovalCommand,
     ) -> Result<ResolveApprovalResult, LogicError>;
 
+    fn list_styles(&self) -> Result<Vec<StyleSummaryResult>, LogicError> {
+        Err(LogicError::StyleData)
+    }
+
+    fn inspect_style(
+        &self,
+        _command: InspectStyleCommand,
+    ) -> Result<StyleInspectionResult, LogicError> {
+        Err(LogicError::StyleData)
+    }
+
+    fn validate_style(
+        &self,
+        _command: StyleFileCommand,
+    ) -> Result<StyleValidationResult, LogicError> {
+        Err(LogicError::StyleData)
+    }
+
+    fn compile_style(
+        &self,
+        _command: StyleFileCommand,
+    ) -> Result<StyleInspectionResult, LogicError> {
+        Err(LogicError::StyleData)
+    }
+
     fn upsert_schedule(
         &self,
         _schedule: ScheduleCommand,
@@ -540,6 +637,61 @@ where
                 detail: format!("runtime version {}", record.version),
             }],
         })
+    }
+
+    fn list_styles(&self) -> Result<Vec<StyleSummaryResult>, LogicError> {
+        self.data
+            .list_styles()
+            .map(|styles| styles.into_iter().map(map_style_summary).collect())
+            .map_err(|_| LogicError::StyleData)
+    }
+
+    fn inspect_style(
+        &self,
+        command: InspectStyleCommand,
+    ) -> Result<StyleInspectionResult, LogicError> {
+        if command.selector.trim().is_empty() {
+            return Err(LogicError::InvalidStyleSelector);
+        }
+        self.data
+            .inspect_style(InspectStyleDataRequest {
+                selector: command.selector,
+            })
+            .map(map_style_inspection)
+            .map_err(|_| LogicError::StyleData)
+    }
+
+    fn validate_style(
+        &self,
+        command: StyleFileCommand,
+    ) -> Result<StyleValidationResult, LogicError> {
+        if command.file.trim().is_empty() {
+            return Err(LogicError::InvalidStyleFile);
+        }
+        self.data
+            .validate_style(StyleFileDataRequest { file: command.file })
+            .map(|result| StyleValidationResult {
+                valid: result.valid,
+                diagnostics: result
+                    .diagnostics
+                    .into_iter()
+                    .map(map_style_diagnostic)
+                    .collect(),
+            })
+            .map_err(|_| LogicError::StyleData)
+    }
+
+    fn compile_style(
+        &self,
+        command: StyleFileCommand,
+    ) -> Result<StyleInspectionResult, LogicError> {
+        if command.file.trim().is_empty() {
+            return Err(LogicError::InvalidStyleFile);
+        }
+        self.data
+            .compile_style(StyleFileDataRequest { file: command.file })
+            .map(map_style_inspection)
+            .map_err(|_| LogicError::StyleData)
     }
 
     fn create_session(
@@ -1059,12 +1211,68 @@ fn map_turn_event(event: TurnDataEvent) -> TurnEvent {
     }
 }
 
+fn map_style_summary(summary: StyleSummaryDataRecord) -> StyleSummaryResult {
+    StyleSummaryResult {
+        id: summary.id,
+        version: summary.version,
+        source: match summary.source {
+            StyleDataSourceKind::BuiltIn => StyleSourceKind::BuiltIn,
+            StyleDataSourceKind::User => StyleSourceKind::User,
+            StyleDataSourceKind::Project => StyleSourceKind::Project,
+            StyleDataSourceKind::Plugin => StyleSourceKind::Plugin,
+            StyleDataSourceKind::Inline => StyleSourceKind::Inline,
+        },
+        availability: match summary.availability {
+            StyleDataAvailability::Available => StyleAvailability::Available,
+            StyleDataAvailability::Disabled => StyleAvailability::Disabled,
+            StyleDataAvailability::Invalid => StyleAvailability::Invalid,
+            StyleDataAvailability::Incompatible => StyleAvailability::Incompatible,
+            StyleDataAvailability::Conflict => StyleAvailability::Conflict,
+        },
+        style_content_hash: summary.style_content_hash,
+        compiled_cache_key: summary.compiled_cache_key,
+        required_capabilities: summary.required_capabilities,
+    }
+}
+
+fn map_style_diagnostic(diagnostic: StyleDiagnosticDataRecord) -> StyleDiagnostic {
+    StyleDiagnostic {
+        code: diagnostic.code,
+        path: diagnostic.path,
+        message: diagnostic.message,
+        help: diagnostic.help,
+    }
+}
+
+fn map_style_inspection(inspection: StyleInspectionDataRecord) -> StyleInspectionResult {
+    StyleInspectionResult {
+        summary: map_style_summary(inspection.summary),
+        source_locator: inspection.source_locator,
+        manifest: inspection.manifest,
+        compiled: inspection.compiled,
+        diagnostics: inspection
+            .diagnostics
+            .into_iter()
+            .map(map_style_diagnostic)
+            .collect(),
+    }
+}
+
 /// CLI business failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum LogicError {
     /// The service supplied no selected runtime endpoint.
     #[error("runtime endpoint is empty")]
     InvalidRuntimeEndpoint,
+    /// A style selector is blank.
+    #[error("style selector is empty")]
+    InvalidStyleSelector,
+    /// A style file path is blank.
+    #[error("style file is empty")]
+    InvalidStyleFile,
+    /// Style runtime data is unavailable.
+    #[error("style runtime data is unavailable")]
+    StyleData,
     /// Doctor data could not be constructed.
     #[error("doctor data unavailable: {detail}")]
     DoctorData {
@@ -1133,6 +1341,18 @@ mod tests {
                 availability: self.availability,
                 version: "1.2.3".into(),
             })
+        }
+
+        fn list_styles(&self) -> Result<Vec<agentmod_cli_data::StyleSummaryDataRecord>, DataError> {
+            Ok(vec![agentmod_cli_data::StyleSummaryDataRecord {
+                id: String::from("calm"),
+                version: String::from("1.0.0"),
+                source: StyleDataSourceKind::BuiltIn,
+                availability: StyleDataAvailability::Available,
+                style_content_hash: String::from("hash"),
+                compiled_cache_key: String::from("cache"),
+                required_capabilities: vec![],
+            }])
         }
 
         fn create_session(
@@ -1302,6 +1522,20 @@ mod tests {
             .expect("doctor result");
         assert_eq!(result.state, DoctorState::Unavailable);
         assert!(!result.successful);
+    }
+
+    #[test]
+    fn style_summary_is_mapped_into_logic_owned_result() {
+        let logic = CliLogic::new(MockData {
+            availability: RuntimeHealthDataAvailability::Ready,
+            observed: RefCell::new(vec![]),
+            deferred: RefCell::new(vec![]),
+            schedules: RefCell::new(vec![]),
+        });
+        let styles = logic.list_styles().expect("styles");
+        assert_eq!(styles[0].id, "calm");
+        assert_eq!(styles[0].source, StyleSourceKind::BuiltIn);
+        assert_eq!(styles[0].availability, StyleAvailability::Available);
     }
 
     #[test]

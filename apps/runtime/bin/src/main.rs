@@ -24,7 +24,7 @@ use agentmod_runtime_logic::{
 };
 use agentmod_runtime_protocol::RuntimeRequest;
 use agentmod_runtime_service::{
-    RuntimeService, RuntimeServiceConfig,
+    RuntimeService, RuntimeServiceConfig, RuntimeStyleServiceConfig,
     harness::{
         ProviderService, ProviderServicePort, ServiceExecuteProviderRequest, ServiceProviderEntry,
         ServiceProviderEvent,
@@ -223,6 +223,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             RuntimeServiceConfig {
                 session_root: sessions_root.clone(),
                 version: env!("CARGO_PKG_VERSION").into(),
+                styles: RuntimeStyleServiceConfig::native(&sessions_root),
             },
         );
         let turns = TurnService::new(TurnLogic::new(data, provider_policy()), sessions_root);
@@ -324,6 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         RuntimeServiceConfig {
             session_root: PathBuf::from("sessions"),
             version: env!("CARGO_PKG_VERSION").into(),
+            styles: RuntimeStyleServiceConfig::native(std::path::Path::new("sessions")),
         },
     );
     let response = service.handle_wire(&RuntimeRequest::Health)?;

@@ -7,11 +7,13 @@ implementation state; planned interfaces and scaffolds do not count as implement
 
 ## Current phase
 
-Phase 4 — daemon/frontends integration, with later capability slices already
-landed. The event kernel, supervised provider turns, isolated tool hosts,
-scheduling, headless CLI, and the first complete terminal-frontend vertical
-slice are live. ACP, remaining TUI management panels, multi-file symbol search,
-and cross-platform CI evidence remain outstanding.
+Session-style refocus, Phase 2 — generic style executor. Phase 1 is implemented:
+the runtime now discovers, validates, compiles, caches, selects, persists, and
+restart-validates immutable session-style bindings through all four runtime
+tiers. CLI and TUI selection surfaces are live. Session execution still uses the
+pre-existing turn controller, so built-in manifests other than persistent chat
+are selectable and durable but do not yet have their distinct orchestration
+semantics.
 
 ## Completed capabilities
 
@@ -50,6 +52,7 @@ and cross-platform CI evidence remain outstanding.
 | Native Git host | End-to-end validated | Discovery/status/diff, detached worktrees, commit-free integrity-checked checkpoints and guarded restore have 9 host tests; runtime routing uses keyed grants and `tests/e2e/runtime_git_loop.ps1` validates a real repository status round trip |
 | Native LSP host | End-to-end validated | Separate five-crate host implements LSP 3.17 lifecycle, all required query/edit-proposal operations, cancellation, timeout, restart, workspace containment, keyed authorization and deterministic fixture coverage; runtime project-root routing passes a process E2E |
 | Session-style SDK | Implemented and unit tested | Five built-ins, strict owned TOML/JSON manifests, STYLE001–STYLE029 validation, graph/pipeline compilation, availability/budget checks, inspectable descriptors and compatibility-bound cache keys; 10 tests |
+| Runtime session-style registry and binding | End-to-end validated on Windows | Runtime dependency discovers bounded user/project/plugin TOML/JSON sources and disable markers and persists compiled cache records; data compiles through the SDK and owns catalog/cache records; logic owns exact ID/version selection, compatibility, immutable binding, and fail-closed restart validation; service exposes list/inspect/validate/compile and binds creation/branch operations. Complete identity, manifest, compiled descriptor, memory/compaction/tool/harness/budget/permission selections are canonical and atomic in schema-v2 session metadata, `style.json`, and `style.lock`. CLI commands and the TUI Styles view select live styles. `runtime_style_registry.ps1` proves two distinct styles, restart continuation, explicit branch restyling, and no fallback after disablement; the Unix equivalent exists but has not yet been executed |
 | Runtime local RPC transport | Integration tested | Bounded framed negotiation, mandatory bootstrap-token authentication, concurrent local socket/named-pipe connections, request dispatch, ordered `StreamItem`/`StreamEnd` frames, committed-sequence binding, and bounded channel backpressure tests |
 | Runtime↔harness durable turn | End-to-end validated | CLI create/run traverses authenticated named pipe, runtime replay/commit, ordered interception and policy, short-lived keyed grant, supervised harness, deterministic provider, canonical proposal/approval/started/delta/completion events, and assistant commit; Windows E2E passes and Unix automation is present |
 | Runtime provider stream cancellation | End-to-end validated | Harness lifecycle events cross the process boundary as individual bounded frames, are committed one at a time, and cross runtime RPC as ordered bounded stream frames; caller-selected cancellation IDs travel through four-layer CLI/runtime mappings, active cancellation interrupts and drops the harness child, partial visible output and cancellation are committed without completion, and a fresh request reconnects in `runtime_stream_cancel.ps1`; Unix automation is present |
@@ -72,6 +75,8 @@ and cross-platform CI evidence remain outstanding.
 
 ## In progress
 
+- Generic compiled-style executor with canonical active-node/transition state;
+  persistent chat must move through it before additional styles gain semantics.
 - TUI management panels for schedules, plugins, MCP, processes, artifacts,
   child agents, and LSP; core interactive streaming is implemented.
 - MCP OAuth authorization-code flow.
@@ -79,20 +84,22 @@ and cross-platform CI evidence remain outstanding.
 
 ## Failing tests
 
-None. `cargo test --workspace --all-features`, `cargo fmt --all -- --check`, strict
+None. `cargo test --workspace --all-targets --all-features --locked` passed on
+the second complete run after one isolated process-cancellation timing failure;
+that test passed immediately in isolation. `cargo fmt --all -- --check`, strict
 workspace Clippy, and the 88-package architecture check pass locally on Windows.
 
 ## Blockers
 
-None. The optional OMX Ralph/Ralplan skill package and role prompt files referenced by
-the user-level AGENTS.md are not installed, so the documented workflow is being
-followed directly with explicit planner/architect/critic assignments.
+None.
 
 ## Next tasks
 
-1. Complete MCP OAuth authorization-code flow.
-2. Complete remaining TUI management panels, including schedules.
-3. Complete ACP rich content and per-session MCP declarations.
+1. Route persistent chat through the generic compiled-style executor and persist
+   active graph state.
+2. Activate style-selected context, memory, compaction, and pipelines.
+3. Implement ephemeral turn, research loop, declarative graph, then
+   planner-worker-reviewer child sessions.
 
 ## Performance results
 
@@ -150,7 +157,10 @@ mandatory permission precedence, and plugin authority validation have tests.
 
 ## Acceptance scenario status
 
-All acceptance scenarios remain short of cross-platform full-suite completion. Scenario
+All acceptance scenarios remain short of cross-platform full-suite completion. The
+session-style refocus Scenario 1 passes its Windows process path and Scenario 12
+passes explicit branch restyling; their Unix scripts have not been executed.
+Scenario
 1 has a real model-driven read/edit/failing-test/fix/passing-test process E2E,
 but still lacks symbol search and multi-file edits. Scenarios 3 and 4 now pass
 their functional paths on Windows, including denial projection and daemon

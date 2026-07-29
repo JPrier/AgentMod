@@ -550,6 +550,7 @@ where
     C: agentmod_runtime_logic::RuntimeLogicPort
         + agentmod_runtime_logic::registry::SessionRegistryLogicPort
         + agentmod_runtime_logic::history::SessionHistoryLogicPort
+        + agentmod_runtime_logic::style::SessionStyleLogicPort
         + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort,
     T: TurnLogicPort + DeferredTurnLogicPort + ScheduledRecoveryLogicPort,
 {
@@ -1080,6 +1081,7 @@ where
     C: agentmod_runtime_logic::RuntimeLogicPort
         + agentmod_runtime_logic::registry::SessionRegistryLogicPort
         + agentmod_runtime_logic::history::SessionHistoryLogicPort
+        + agentmod_runtime_logic::style::SessionStyleLogicPort
         + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort
         + Clone
         + Send
@@ -1108,6 +1110,9 @@ where
             resume_after_resolution,
         } = request
         {
+            self.core
+                .validate_session_style_compatibility(*session_id)
+                .map_err(|error| error.to_string())?;
             let (transitioned, events, last_sequence, awaiting_continuation) = self
                 .turns
                 .resolve_approval(
@@ -1151,6 +1156,9 @@ where
             expires_at_ms,
         } = request
         {
+            self.core
+                .validate_session_style_compatibility(*session_id)
+                .map_err(|error| error.to_string())?;
             let wake_condition = wake_condition_from_wire(trigger)
                 .ok_or_else(|| String::from("interval deferred continuations are unsupported"))?;
             self.turns
@@ -1223,6 +1231,9 @@ where
                 .handle_wire(request)
                 .map_err(|error| error.to_string());
         };
+        self.core
+            .validate_session_style_compatibility(*session_id)
+            .map_err(|error| error.to_string())?;
         let response = self
             .turns
             .run_turn(ServiceRunTurnRequest {
@@ -1329,6 +1340,9 @@ where
                 .await
                 .map(crate::local_rpc::RuntimeEndpointStream::single);
         };
+        self.core
+            .validate_session_style_compatibility(*session_id)
+            .map_err(|error| error.to_string())?;
         let mut turn = self
             .turns
             .run_turn_stream(ServiceRunTurnRequest {

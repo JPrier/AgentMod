@@ -5,7 +5,10 @@ pub mod harness;
 pub mod local_rpc;
 pub mod turn;
 
-use std::path::PathBuf;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+};
 
 use agentmod_runtime_logic::{
     GetRuntimeHealthCommand, LogicError, RuntimeHealthState, RuntimeLogicPort,
@@ -22,10 +25,18 @@ use agentmod_runtime_logic::{
         RuntimeScheduleLogicError, RuntimeScheduleLogicPort, SchedulePayload, ScheduleTrigger,
         ScheduledExecution, UpsertScheduleCommand,
     },
+    style::{
+        InspectStyleCommand, ListStylesCommand, SessionStyleLogicError, SessionStyleLogicPort,
+        StyleAvailability, StyleDecisionCapability, StyleEnvironment, StyleInspection,
+        StyleManifestFormat, StyleSource, StyleSummary, ValidateStyleBindingCommand,
+        ValidateStyleCommand,
+    },
 };
 use agentmod_runtime_protocol::{
     RuntimeRequest, RuntimeResponse, RuntimeSchedulePayload, RuntimeScheduleSpec,
-    RuntimeScheduleTrigger, RuntimeScheduledExecution, SessionSummary,
+    RuntimeScheduleTrigger, RuntimeScheduledExecution, RuntimeStyleAvailability,
+    RuntimeStyleDiagnostic, RuntimeStyleInspection, RuntimeStyleManifestFormat,
+    RuntimeStyleSourceKind, RuntimeStyleSummary, SessionSummary,
 };
 use thiserror::Error;
 
@@ -61,6 +72,119 @@ pub struct RuntimeServiceConfig {
     pub session_root: PathBuf,
     /// Build version.
     pub version: String,
+    /// Explicit style registry sources and advertised runtime capabilities.
+    pub styles: RuntimeStyleServiceConfig,
+}
+
+/// Service bootstrap configuration for the runtime style registry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeStyleServiceConfig {
+    /// Runtime style API semantic version.
+    pub runtime_api_version: String,
+    /// Validated activated-plugin set hash.
+    pub plugin_set_hash: String,
+    /// Optional user style root.
+    pub user_style_root: Option<PathBuf>,
+    /// Optional default project style root used outside session creation.
+    pub project_style_root: Option<PathBuf>,
+    /// Activated plugin style roots.
+    pub plugin_style_roots: Vec<PathBuf>,
+    /// Optional persistent compiled-cache root.
+    pub cache_root: Option<PathBuf>,
+    /// Advertised runtime capabilities.
+    pub capabilities: BTreeSet<String>,
+    /// Advertised tool groups.
+    pub tool_groups: BTreeMap<String, BTreeSet<String>>,
+    /// Advertised providers.
+    pub providers: BTreeSet<String>,
+    /// Activated plugins.
+    pub plugins: BTreeSet<String>,
+    /// Available memory providers.
+    pub memory_providers: BTreeSet<String>,
+    /// Available compaction strategies.
+    pub compaction_strategies: BTreeSet<String>,
+    /// Supported interceptor decisions.
+    pub supported_decisions: BTreeSet<ServiceStyleDecisionCapability>,
+    /// Resolved graph references.
+    pub graph_references: BTreeMap<String, String>,
+}
+
+/// Service-owned advertised interceptor decision.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ServiceStyleDecisionCapability {
+    /// Continue.
+    Continue,
+    /// Replace.
+    Replace,
+    /// Reject.
+    Reject,
+    /// Require approval.
+    RequireApproval,
+    /// Defer.
+    Defer,
+    /// Cancel.
+    Cancel,
+    /// Fork.
+    Fork,
+}
+
+impl RuntimeStyleServiceConfig {
+    /// Builds the native runtime's explicit first-party capability registry.
+    #[must_use]
+    pub fn native(session_root: &std::path::Path) -> Self {
+        let parent = session_root.parent().unwrap_or(session_root);
+        Self {
+            runtime_api_version: String::from("1.0.0"),
+            plugin_set_hash: agentmod_primitives::ContentHash::digest(b"runtime.security@1")
+                .to_string(),
+            user_style_root: Some(parent.join("styles").join("user")),
+            project_style_root: Some(PathBuf::from(".agentmod").join("styles")),
+            plugin_style_roots: vec![parent.join("styles").join("plugins")],
+            cache_root: Some(parent.join("style-cache")),
+            capabilities: [
+                "agents",
+                "approval",
+                "artifacts",
+                "context",
+                "events",
+                "model",
+                "tools",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            tool_groups: BTreeMap::from([(
+                String::from("filesystem"),
+                BTreeSet::from([String::from("filesystem.read")]),
+            )]),
+            providers: BTreeSet::from([String::from("mock")]),
+            plugins: BTreeSet::from([String::from("runtime.security")]),
+            memory_providers: ["none", "file", "sqlite-fts"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            compaction_strategies: [
+                "none",
+                "sliding_window",
+                "summary",
+                "artifact_handoff",
+                "tool_output_eviction",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            supported_decisions: BTreeSet::from([
+                ServiceStyleDecisionCapability::Continue,
+                ServiceStyleDecisionCapability::Replace,
+                ServiceStyleDecisionCapability::Reject,
+                ServiceStyleDecisionCapability::RequireApproval,
+                ServiceStyleDecisionCapability::Defer,
+                ServiceStyleDecisionCapability::Cancel,
+                ServiceStyleDecisionCapability::Fork,
+            ]),
+            graph_references: BTreeMap::new(),
+        }
+    }
 }
 
 /// Endpoint-facing runtime service.
@@ -80,7 +204,10 @@ impl<L> RuntimeService<L> {
 
 impl<L> RuntimeService<L>
 where
-    L: RuntimeLogicPort + SessionRegistryLogicPort + SessionHistoryLogicPort,
+    L: RuntimeLogicPort
+        + SessionRegistryLogicPort
+        + SessionHistoryLogicPort
+        + SessionStyleLogicPort,
 {
     /// Handles the currently implemented runtime wire endpoints.
     ///
@@ -88,6 +215,10 @@ where
     ///
     /// Returns [`ServiceError`] for unsupported endpoints, invalid service
     /// configuration, or translated business failures.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the service exhaustively maps each runtime wire route into service-owned records"
+    )]
     pub fn handle_wire(&self, request: &RuntimeRequest) -> Result<RuntimeResponse, ServiceError> {
         match request {
             RuntimeRequest::Health => {
@@ -102,6 +233,47 @@ where
                     }
                     .into(),
                     version: service_response.version,
+                })
+            }
+            RuntimeRequest::ListStyles => Ok(RuntimeResponse::Styles {
+                styles: self
+                    .list_styles(ServiceListStylesRequest)?
+                    .styles
+                    .into_iter()
+                    .map(to_wire_style_summary)
+                    .collect(),
+            }),
+            RuntimeRequest::InspectStyle { selector } => Ok(RuntimeResponse::StyleInspected {
+                inspection: to_wire_style_inspection(
+                    self.inspect_style(ServiceInspectStyleRequest {
+                        selector: selector.clone(),
+                    })?
+                    .inspection,
+                ),
+            }),
+            RuntimeRequest::ValidateStyle { manifest, format } => {
+                let response = self.validate_style(ServiceValidateStyleRequest {
+                    manifest: manifest.clone(),
+                    format: from_wire_manifest_format(*format),
+                })?;
+                Ok(RuntimeResponse::StyleValidated {
+                    valid: response.valid,
+                    diagnostics: response
+                        .diagnostics
+                        .into_iter()
+                        .map(to_wire_style_diagnostic)
+                        .collect(),
+                })
+            }
+            RuntimeRequest::CompileStyle { manifest, format } => {
+                Ok(RuntimeResponse::StyleCompiled {
+                    inspection: to_wire_style_inspection(
+                        self.compile_style(ServiceValidateStyleRequest {
+                            manifest: manifest.clone(),
+                            format: from_wire_manifest_format(*format),
+                        })?
+                        .inspection,
+                    ),
                 })
             }
             RuntimeRequest::CreateSession { workspace, style } => {
@@ -165,6 +337,160 @@ where
         }
     }
 
+    /// Lists the live style registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a translated style-catalog error when discovery fails.
+    pub fn list_styles(
+        &self,
+        _request: ServiceListStylesRequest,
+    ) -> Result<ServiceListStylesResponse, ServiceError> {
+        self.logic
+            .list_styles(ListStylesCommand {
+                environment: self.style_environment(None),
+            })
+            .map(|styles| ServiceListStylesResponse {
+                styles: styles.into_iter().map(from_logic_style_summary).collect(),
+            })
+            .map_err(ServiceError::SessionStyle)
+    }
+
+    /// Inspects one registry entry selected by ID or exact ID/version.
+    ///
+    /// # Errors
+    ///
+    /// Returns an endpoint validation or translated style-selection error.
+    pub fn inspect_style(
+        &self,
+        request: ServiceInspectStyleRequest,
+    ) -> Result<ServiceInspectStyleResponse, ServiceError> {
+        if request.selector.trim().is_empty() {
+            return Err(ServiceError::InvalidStyleRequest);
+        }
+        self.logic
+            .inspect_style(InspectStyleCommand {
+                selector: request.selector,
+                environment: self.style_environment(None),
+            })
+            .map(from_logic_style_inspection)
+            .map(|inspection| ServiceInspectStyleResponse { inspection })
+            .map_err(ServiceError::SessionStyle)
+    }
+
+    /// Validates one transient manifest with structured diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an endpoint or style-compilation error when validation cannot run.
+    pub fn validate_style(
+        &self,
+        request: ServiceValidateStyleRequest,
+    ) -> Result<ServiceValidateStyleResponse, ServiceError> {
+        let inspection = self.validate_or_compile_style(request)?;
+        Ok(ServiceValidateStyleResponse {
+            valid: inspection.summary.availability == ServiceStyleAvailability::Available,
+            diagnostics: inspection.diagnostics,
+        })
+    }
+
+    /// Compiles one transient manifest for inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an endpoint or style-compilation error when compilation cannot run.
+    pub fn compile_style(
+        &self,
+        request: ServiceValidateStyleRequest,
+    ) -> Result<ServiceCompileStyleResponse, ServiceError> {
+        self.validate_or_compile_style(request)
+            .map(|inspection| ServiceCompileStyleResponse { inspection })
+    }
+
+    fn validate_or_compile_style(
+        &self,
+        request: ServiceValidateStyleRequest,
+    ) -> Result<ServiceStyleInspection, ServiceError> {
+        if request.manifest.is_empty() {
+            return Err(ServiceError::InvalidStyleRequest);
+        }
+        self.logic
+            .validate_style(ValidateStyleCommand {
+                manifest: request.manifest,
+                format: match request.format {
+                    ServiceStyleManifestFormat::Toml => StyleManifestFormat::Toml,
+                    ServiceStyleManifestFormat::Json => StyleManifestFormat::Json,
+                },
+                environment: self.style_environment(None),
+            })
+            .map(from_logic_style_inspection)
+            .map_err(ServiceError::SessionStyle)
+    }
+
+    fn style_environment(&self, workspace: Option<&str>) -> StyleEnvironment {
+        StyleEnvironment {
+            runtime_api_version: self.config.styles.runtime_api_version.clone(),
+            plugin_set_hash: self.config.styles.plugin_set_hash.clone(),
+            user_style_root: self.config.styles.user_style_root.clone(),
+            project_style_root: workspace.map_or_else(
+                || self.config.styles.project_style_root.clone(),
+                |workspace| Some(PathBuf::from(workspace).join(".agentmod").join("styles")),
+            ),
+            plugin_style_roots: self.config.styles.plugin_style_roots.clone(),
+            cache_root: self.config.styles.cache_root.clone(),
+            capabilities: self.config.styles.capabilities.clone(),
+            tool_groups: self.config.styles.tool_groups.clone(),
+            providers: self.config.styles.providers.clone(),
+            plugins: self.config.styles.plugins.clone(),
+            memory_providers: self.config.styles.memory_providers.clone(),
+            compaction_strategies: self.config.styles.compaction_strategies.clone(),
+            supported_decisions: self
+                .config
+                .styles
+                .supported_decisions
+                .iter()
+                .copied()
+                .map(to_logic_style_decision)
+                .collect(),
+            graph_references: self.config.styles.graph_references.clone(),
+        }
+    }
+
+    /// Validates the immutable style binding reconstructed from a session's
+    /// canonical history against the current runtime catalog.
+    ///
+    /// This is intentionally lazy so dormant sessions do not acquire tasks,
+    /// processes, or loaded transcripts merely because the daemon restarted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a migration-required error for legacy unbound sessions and a
+    /// precise style error when the exact persisted style is unavailable or
+    /// incompatible. No replacement style is selected automatically.
+    pub fn validate_session_style_compatibility(
+        &self,
+        session_id: agentmod_primitives::SessionId,
+    ) -> Result<(), ServiceError> {
+        let result = self
+            .logic
+            .inspect_session(InspectSessionCommand {
+                sessions_root: self.config.session_root.clone(),
+                session_id,
+                at: None,
+            })
+            .map_err(|error| ServiceError::SessionHistory(error.to_string()))?;
+        let binding = result
+            .state
+            .style_binding
+            .ok_or(ServiceError::StyleMigrationRequired)?;
+        self.logic
+            .validate_style_binding(ValidateStyleBindingCommand {
+                binding,
+                environment: self.style_environment(Some(&result.state.workspace)),
+            })
+            .map_err(ServiceError::SessionStyle)
+    }
+
     /// Purely reconstructs endpoint-safe structured state.
     ///
     /// # Errors
@@ -182,8 +508,33 @@ where
                 at: request.at,
             })
             .map_err(|error| ServiceError::SessionHistory(error.to_string()))?;
-        let state =
+        let compatibility = match result.state.style_binding.clone() {
+            Some(binding) => self
+                .logic
+                .validate_style_binding(ValidateStyleBindingCommand {
+                    binding,
+                    environment: self.style_environment(Some(&result.state.workspace)),
+                })
+                .map_or_else(
+                    |error| {
+                        serde_json::json!({
+                            "status": "incompatible",
+                            "reason": error.to_string(),
+                        })
+                    },
+                    |()| serde_json::json!({ "status": "compatible" }),
+                ),
+            None => serde_json::json!({
+                "status": "migration_required",
+                "reason": "the session predates immutable session-style bindings",
+            }),
+        };
+        let mut state =
             serde_json::to_value(&result.state).map_err(|_| ServiceError::StateSerialization)?;
+        state
+            .as_object_mut()
+            .ok_or(ServiceError::StateSerialization)?
+            .insert(String::from("style_compatibility"), compatibility);
         Ok(ServiceInspectSessionResponse {
             session_id: result.state.id,
             head_sequence: result.head_sequence,
@@ -237,13 +588,30 @@ where
         &self,
         request: ServiceBranchSessionRequest,
     ) -> Result<ServiceBranchSessionResponse, ServiceError> {
+        let ServiceBranchSessionRequest {
+            parent_session_id,
+            at,
+            style,
+        } = request;
+        let style_binding = style
+            .as_ref()
+            .map(|selector| {
+                self.logic
+                    .resolve_style(InspectStyleCommand {
+                        selector: selector.clone(),
+                        environment: self.style_environment(None),
+                    })
+                    .map(|resolved| resolved.binding)
+                    .map_err(ServiceError::SessionStyle)
+            })
+            .transpose()?;
         let result = self
             .logic
             .branch_session(BranchSessionCommand {
                 sessions_root: self.config.session_root.clone(),
-                parent_session_id: request.parent_session_id,
-                at: request.at,
-                style: request.style,
+                parent_session_id,
+                at,
+                style_binding,
             })
             .map_err(|error| ServiceError::SessionHistory(error.to_string()))?;
         Ok(ServiceBranchSessionResponse {
@@ -266,12 +634,19 @@ where
         if request.workspace.trim().is_empty() || request.style.trim().is_empty() {
             return Err(ServiceError::InvalidSessionRequest);
         }
+        let resolved = self
+            .logic
+            .resolve_style(InspectStyleCommand {
+                selector: request.style,
+                environment: self.style_environment(Some(&request.workspace)),
+            })
+            .map_err(ServiceError::SessionStyle)?;
         let result = self
             .logic
             .create_session(CreateSessionCommand {
                 sessions_root: self.config.session_root.clone(),
                 workspace: PathBuf::from(request.workspace),
-                style: request.style,
+                style_binding: resolved.binding,
             })
             .map_err(ServiceError::SessionRegistry)?;
         Ok(ServiceCreateSessionResponse {
@@ -476,6 +851,142 @@ impl<L: RuntimeScheduleLogicPort> RuntimeService<L> {
             .map(|values| values.into_iter().map(from_logic_execution).collect())
             .map_err(ServiceError::Schedule)
     }
+}
+
+/// Service-owned style list request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceListStylesRequest;
+
+/// Service-owned style list response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceListStylesResponse {
+    /// Bounded catalog rows.
+    pub styles: Vec<ServiceStyleSummary>,
+}
+
+/// Service-owned style inspection request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceInspectStyleRequest {
+    /// ID or exact `id@version`.
+    pub selector: String,
+}
+
+/// Service-owned style inspection response.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServiceInspectStyleResponse {
+    /// Complete inspection.
+    pub inspection: ServiceStyleInspection,
+}
+
+/// Service-owned manifest format.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceStyleManifestFormat {
+    /// TOML.
+    Toml,
+    /// JSON.
+    Json,
+}
+
+/// Service-owned transient validation request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceValidateStyleRequest {
+    /// Complete source.
+    pub manifest: String,
+    /// Encoding.
+    pub format: ServiceStyleManifestFormat,
+}
+
+/// Service-owned validation response.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceValidateStyleResponse {
+    /// Whether the manifest compiled in the current environment.
+    pub valid: bool,
+    /// Structured diagnostics.
+    pub diagnostics: Vec<ServiceStyleDiagnostic>,
+}
+
+/// Service-owned compilation response.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServiceCompileStyleResponse {
+    /// Complete compiled inspection.
+    pub inspection: ServiceStyleInspection,
+}
+
+/// Service-owned style source.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceStyleSource {
+    /// Built in.
+    BuiltIn,
+    /// User file.
+    User,
+    /// Project file.
+    Project,
+    /// Plugin package.
+    Plugin,
+    /// Inline.
+    Inline,
+}
+
+/// Service-owned style availability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceStyleAvailability {
+    /// Available.
+    Available,
+    /// Disabled.
+    Disabled,
+    /// Invalid.
+    Invalid,
+    /// Incompatible.
+    Incompatible,
+    /// Conflicting exact identity.
+    Conflict,
+}
+
+/// Service-owned style diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceStyleDiagnostic {
+    /// Stable code.
+    pub code: String,
+    /// Manifest path.
+    pub path: String,
+    /// Safe explanation.
+    pub message: String,
+    /// Remediation.
+    pub help: String,
+}
+
+/// Service-owned style summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceStyleSummary {
+    /// Stable ID.
+    pub id: String,
+    /// Semantic version.
+    pub version: String,
+    /// Source.
+    pub source: ServiceStyleSource,
+    /// Availability.
+    pub availability: ServiceStyleAvailability,
+    /// Manifest content hash.
+    pub style_content_hash: String,
+    /// Compiled cache key.
+    pub compiled_cache_key: String,
+    /// Required runtime capabilities.
+    pub required_capabilities: Vec<String>,
+}
+
+/// Service-owned complete style inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServiceStyleInspection {
+    /// Summary.
+    pub summary: ServiceStyleSummary,
+    /// Safe source locator.
+    pub source_locator: String,
+    /// Parsed manifest.
+    pub manifest: serde_json::Value,
+    /// Compiled descriptor.
+    pub compiled: Option<serde_json::Value>,
+    /// Diagnostics.
+    pub diagnostics: Vec<ServiceStyleDiagnostic>,
 }
 
 /// Service-owned create-session request.
@@ -777,6 +1288,117 @@ fn from_logic_schedule(value: RuntimeSchedule) -> ServiceSchedule {
     }
 }
 
+const fn to_logic_style_decision(value: ServiceStyleDecisionCapability) -> StyleDecisionCapability {
+    match value {
+        ServiceStyleDecisionCapability::Continue => StyleDecisionCapability::Continue,
+        ServiceStyleDecisionCapability::Replace => StyleDecisionCapability::Replace,
+        ServiceStyleDecisionCapability::Reject => StyleDecisionCapability::Reject,
+        ServiceStyleDecisionCapability::RequireApproval => StyleDecisionCapability::RequireApproval,
+        ServiceStyleDecisionCapability::Defer => StyleDecisionCapability::Defer,
+        ServiceStyleDecisionCapability::Cancel => StyleDecisionCapability::Cancel,
+        ServiceStyleDecisionCapability::Fork => StyleDecisionCapability::Fork,
+    }
+}
+
+const fn from_wire_manifest_format(
+    value: RuntimeStyleManifestFormat,
+) -> ServiceStyleManifestFormat {
+    match value {
+        RuntimeStyleManifestFormat::Toml => ServiceStyleManifestFormat::Toml,
+        RuntimeStyleManifestFormat::Json => ServiceStyleManifestFormat::Json,
+    }
+}
+
+fn from_logic_style_summary(value: StyleSummary) -> ServiceStyleSummary {
+    ServiceStyleSummary {
+        id: value.id,
+        version: value.version,
+        source: match value.source {
+            StyleSource::BuiltIn => ServiceStyleSource::BuiltIn,
+            StyleSource::User => ServiceStyleSource::User,
+            StyleSource::Project => ServiceStyleSource::Project,
+            StyleSource::Plugin => ServiceStyleSource::Plugin,
+            StyleSource::Inline => ServiceStyleSource::Inline,
+        },
+        availability: match value.availability {
+            StyleAvailability::Available => ServiceStyleAvailability::Available,
+            StyleAvailability::Disabled => ServiceStyleAvailability::Disabled,
+            StyleAvailability::Invalid => ServiceStyleAvailability::Invalid,
+            StyleAvailability::Incompatible => ServiceStyleAvailability::Incompatible,
+            StyleAvailability::Conflict => ServiceStyleAvailability::Conflict,
+        },
+        style_content_hash: value.content_hash.unwrap_or_default(),
+        compiled_cache_key: value.compiled_cache_key.unwrap_or_default(),
+        required_capabilities: value.required_capabilities,
+    }
+}
+
+fn from_logic_style_inspection(value: StyleInspection) -> ServiceStyleInspection {
+    ServiceStyleInspection {
+        summary: from_logic_style_summary(value.summary),
+        source_locator: value.source_locator,
+        manifest: value.manifest,
+        compiled: value.compiled,
+        diagnostics: value
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| ServiceStyleDiagnostic {
+                code: diagnostic.code,
+                path: diagnostic.path,
+                message: diagnostic.message,
+                help: diagnostic.help,
+            })
+            .collect(),
+    }
+}
+
+fn to_wire_style_summary(value: ServiceStyleSummary) -> RuntimeStyleSummary {
+    RuntimeStyleSummary {
+        id: value.id,
+        version: value.version,
+        source: match value.source {
+            ServiceStyleSource::BuiltIn => RuntimeStyleSourceKind::BuiltIn,
+            ServiceStyleSource::User => RuntimeStyleSourceKind::User,
+            ServiceStyleSource::Project => RuntimeStyleSourceKind::Project,
+            ServiceStyleSource::Plugin => RuntimeStyleSourceKind::Plugin,
+            ServiceStyleSource::Inline => RuntimeStyleSourceKind::Inline,
+        },
+        availability: match value.availability {
+            ServiceStyleAvailability::Available => RuntimeStyleAvailability::Available,
+            ServiceStyleAvailability::Disabled => RuntimeStyleAvailability::Disabled,
+            ServiceStyleAvailability::Invalid => RuntimeStyleAvailability::Invalid,
+            ServiceStyleAvailability::Incompatible => RuntimeStyleAvailability::Incompatible,
+            ServiceStyleAvailability::Conflict => RuntimeStyleAvailability::Conflict,
+        },
+        style_content_hash: value.style_content_hash,
+        compiled_cache_key: value.compiled_cache_key,
+        required_capabilities: value.required_capabilities,
+    }
+}
+
+fn to_wire_style_diagnostic(value: ServiceStyleDiagnostic) -> RuntimeStyleDiagnostic {
+    RuntimeStyleDiagnostic {
+        code: value.code,
+        path: value.path,
+        message: value.message,
+        help: value.help,
+    }
+}
+
+fn to_wire_style_inspection(value: ServiceStyleInspection) -> RuntimeStyleInspection {
+    RuntimeStyleInspection {
+        summary: to_wire_style_summary(value.summary),
+        source_locator: value.source_locator,
+        manifest: value.manifest,
+        compiled: value.compiled,
+        diagnostics: value
+            .diagnostics
+            .into_iter()
+            .map(to_wire_style_diagnostic)
+            .collect(),
+    }
+}
+
 fn from_logic_execution(value: ScheduledExecution) -> ServiceScheduledExecution {
     ServiceScheduledExecution {
         execution_id: value.execution_id,
@@ -849,6 +1471,15 @@ pub enum ServiceError {
     /// Session registry business use case failed.
     #[error("session registry operation failed: {0}")]
     SessionRegistry(SessionRegistryLogicError),
+    /// Session style discovery, validation, or selection failed.
+    #[error("session style operation failed: {0}")]
+    SessionStyle(SessionStyleLogicError),
+    /// Style endpoint request failed validation.
+    #[error("session style request is invalid")]
+    InvalidStyleRequest,
+    /// A legacy session must be explicitly migrated before style execution.
+    #[error("session style migration is required before execution can resume")]
+    StyleMigrationRequired,
     /// Point-in-time replay or branching failed.
     #[error("session history operation failed: {0}")]
     SessionHistory(String),
@@ -938,6 +1569,43 @@ mod tests {
         }
     }
 
+    impl SessionStyleLogicPort for MockLogic {
+        fn list_styles(
+            &self,
+            _command: ListStylesCommand,
+        ) -> Result<Vec<StyleSummary>, SessionStyleLogicError> {
+            Ok(Vec::new())
+        }
+
+        fn inspect_style(
+            &self,
+            _command: InspectStyleCommand,
+        ) -> Result<StyleInspection, SessionStyleLogicError> {
+            Err(SessionStyleLogicError::InvalidSelector)
+        }
+
+        fn validate_style(
+            &self,
+            _command: ValidateStyleCommand,
+        ) -> Result<StyleInspection, SessionStyleLogicError> {
+            Err(SessionStyleLogicError::EmptyManifest)
+        }
+
+        fn resolve_style(
+            &self,
+            _command: InspectStyleCommand,
+        ) -> Result<agentmod_runtime_logic::style::ResolvedStyle, SessionStyleLogicError> {
+            Err(SessionStyleLogicError::InvalidSelector)
+        }
+
+        fn validate_style_binding(
+            &self,
+            _command: agentmod_runtime_logic::style::ValidateStyleBindingCommand,
+        ) -> Result<(), SessionStyleLogicError> {
+            Err(SessionStyleLogicError::InvalidSelector)
+        }
+    }
+
     fn service(state: RuntimeHealthState) -> RuntimeService<MockLogic> {
         RuntimeService::new(
             MockLogic {
@@ -947,6 +1615,7 @@ mod tests {
             RuntimeServiceConfig {
                 session_root: PathBuf::from("sessions"),
                 version: "0.1.0-test".into(),
+                styles: RuntimeStyleServiceConfig::native(std::path::Path::new("sessions")),
             },
         )
     }

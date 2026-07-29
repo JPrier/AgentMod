@@ -9,7 +9,7 @@ use agentmod_graph_engine::{
 };
 use agentmod_primitives::ContentHash;
 use semver::{Version, VersionReq};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     ApprovalDefaults, BuiltInStyle, ChildAgentLimits, CompactionSelection, CompactionStrategy,
@@ -162,7 +162,8 @@ impl fmt::Display for StyleCompileError {
 impl std::error::Error for StyleCompileError {}
 
 /// Complete cache identity for a compiled style.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StyleCacheKey {
     /// Canonical manifest content hash.
     pub style_content_hash: ContentHash,
@@ -177,7 +178,8 @@ pub struct StyleCacheKey {
 }
 
 /// Inspectable compiled style descriptor; runtime logic interprets it.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CompiledSessionStyle {
     /// Stable style ID.
     pub style_id: String,

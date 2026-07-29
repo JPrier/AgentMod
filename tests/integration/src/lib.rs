@@ -57,6 +57,9 @@ mod tests {
             RuntimeServiceConfig {
                 session_root: storage.path().join("sessions"),
                 version: String::from("test"),
+                styles: agentmod_runtime_service::RuntimeStyleServiceConfig::native(
+                    &storage.path().join("sessions"),
+                ),
             },
         );
         let RuntimeResponse::SessionCreated { session_id } = service
@@ -96,6 +99,110 @@ mod tests {
     }
 
     #[test]
+    fn session_style_registry_binds_exact_styles_and_fails_closed_when_disabled() {
+        let storage = tempfile::tempdir().expect("storage");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions_root = storage.path().join("sessions");
+        let service = RuntimeService::new(
+            RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
+            RuntimeServiceConfig {
+                session_root: sessions_root.clone(),
+                version: String::from("test"),
+                styles: agentmod_runtime_service::RuntimeStyleServiceConfig::native(&sessions_root),
+            },
+        );
+
+        let RuntimeResponse::Styles { styles } = service
+            .handle_wire(&RuntimeRequest::ListStyles)
+            .expect("list built-in styles")
+        else {
+            panic!("styles response")
+        };
+        assert_eq!(styles.len(), 5);
+        assert!(styles.iter().all(|style| {
+            style.availability == agentmod_runtime_protocol::RuntimeStyleAvailability::Available
+        }));
+
+        let create = |style: &str| {
+            let RuntimeResponse::SessionCreated { session_id } = service
+                .handle_wire(&RuntimeRequest::CreateSession {
+                    workspace: workspace.path().display().to_string(),
+                    style: style.to_owned(),
+                })
+                .expect("create style-bound session")
+            else {
+                panic!("created response")
+            };
+            session_id
+        };
+        let persistent = create("persistent-chat");
+        let ephemeral = create("ephemeral-turn@1.0.0");
+
+        for (session_id, expected_style) in [
+            (persistent, "persistent-chat"),
+            (ephemeral, "ephemeral-turn"),
+        ] {
+            let RuntimeResponse::SessionInspected { state, .. } = service
+                .handle_wire(&RuntimeRequest::InspectSession {
+                    session_id,
+                    at: None,
+                })
+                .expect("inspect style-bound session")
+            else {
+                panic!("inspection response")
+            };
+            assert_eq!(state["style_binding"]["id"], expected_style);
+            assert_eq!(state["style_binding"]["version"], "1.0.0");
+            assert_eq!(state["style_binding"]["harness"], "native");
+            assert_eq!(state["style_compatibility"]["status"], "compatible");
+            for key in [
+                "content_hash",
+                "compiled_cache_key",
+                "compiled_style_hash",
+                "plugin_set_hash",
+                "capability_set_hash",
+            ] {
+                assert!(
+                    state["style_binding"][key]
+                        .as_str()
+                        .is_some_and(|value| value.len() == 64),
+                    "{key}"
+                );
+            }
+        }
+
+        let disabled_root = storage.path().join("styles").join("user");
+        std::fs::create_dir_all(&disabled_root).expect("create user style root");
+        std::fs::write(disabled_root.join("persistent-chat.disabled"), b"disabled")
+            .expect("disable exact style");
+
+        let error = service
+            .validate_session_style_compatibility(persistent)
+            .expect_err("disabled persisted style must fail closed");
+        assert!(error.to_string().contains("disabled"));
+        service
+            .validate_session_style_compatibility(ephemeral)
+            .expect("unrelated persisted style remains compatible");
+
+        let RuntimeResponse::SessionInspected { state, .. } = service
+            .handle_wire(&RuntimeRequest::InspectSession {
+                session_id: persistent,
+                at: None,
+            })
+            .expect("incompatible inspection remains available")
+        else {
+            panic!("inspection response")
+        };
+        assert_eq!(state["style_binding"]["id"], "persistent-chat");
+        assert_eq!(state["style_compatibility"]["status"], "incompatible");
+        assert!(
+            state["style_compatibility"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("disabled"))
+        );
+    }
+
+    #[test]
     fn runtime_replay_and_branch_use_fresh_child_history() {
         let storage = tempfile::tempdir().expect("storage");
         let workspace = tempfile::tempdir().expect("workspace");
@@ -104,6 +211,9 @@ mod tests {
             RuntimeServiceConfig {
                 session_root: storage.path().join("sessions"),
                 version: String::from("test"),
+                styles: agentmod_runtime_service::RuntimeStyleServiceConfig::native(
+                    &storage.path().join("sessions"),
+                ),
             },
         );
         let RuntimeResponse::SessionCreated { session_id } = service

@@ -136,6 +136,10 @@ impl<L: TuiLogicPort> TuiService<L> {
                     Ok(())
                 }
                 KeyCode::Char('4') => {
+                    self.logic.set_view(View::Styles);
+                    Ok(())
+                }
+                KeyCode::Char('5') => {
                     self.logic.set_view(View::Help);
                     Ok(())
                 }
@@ -222,6 +226,7 @@ fn render(frame: &mut Frame<'_>, state: &TuiState) {
         View::Chat => render_chat(frame, state, content),
         View::Events => render_events(frame, state, content),
         View::Context => render_context(frame, state, content),
+        View::Styles => render_styles(frame, state, content),
         View::Help => render_help(frame, content),
     }
     render_editor(frame, state, editor);
@@ -239,12 +244,13 @@ fn render(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn render_header(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
-    let tabs = Tabs::new(["Chat", "Events", "Context", "Help"])
+    let tabs = Tabs::new(["Chat", "Events", "Context", "Styles", "Help"])
         .select(match state.view {
             View::Chat => 0,
             View::Events => 1,
             View::Context => 2,
-            View::Help => 3,
+            View::Styles => 3,
+            View::Help => 4,
         })
         .block(
             Block::new()
@@ -368,7 +374,7 @@ fn render_context(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("Style     ", Style::new().fg(Color::DarkGray)),
-            Span::raw(session.map(|value| value.style.clone()).unwrap_or_default()),
+            Span::raw(state.active_style()),
         ]),
         Line::from(vec![
             Span::styled("Events    ", Style::new().fg(Color::DarkGray)),
@@ -381,15 +387,63 @@ fn render_context(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
     );
 }
 
+fn render_styles(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+    let selected = state.active_style();
+    let lines = if state.styles.is_empty() {
+        vec![Line::from("No styles returned by the runtime.")]
+    } else {
+        state
+            .styles
+            .iter()
+            .flat_map(|style| {
+                let selector = style.selector();
+                let marker = if selector == selected { "●" } else { " " };
+                vec![
+                    Line::from(Span::styled(
+                        format!(
+                            "{marker} {selector} · {:?} · {:?}",
+                            style.availability, style.source
+                        ),
+                        if selector == selected {
+                            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::new()
+                        },
+                    )),
+                    Line::from(Span::styled(
+                        format!(
+                            "  hash={} cache={} capabilities={}",
+                            style.style_content_hash,
+                            style.compiled_cache_key,
+                            if style.required_capabilities.is_empty() {
+                                String::from("none")
+                            } else {
+                                style.required_capabilities.join(",")
+                            }
+                        ),
+                        Style::new().fg(Color::DarkGray),
+                    )),
+                ]
+            })
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" Style catalog · /style <id[@version]> "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from("Ctrl+1…4 views · Tab cycle · Alt+↑/↓ sessions · Ctrl+R refresh"),
+            Line::from("Ctrl+1…5 views · Tab cycle · Alt+↑/↓ sessions · Ctrl+R refresh"),
             Line::from("Enter send · Shift+Enter newline · ↑/↓ prompt history"),
             Line::from("Ctrl+C cancel active generation · Ctrl+Q or Esc quit"),
             Line::default(),
-            Line::from("/new [workspace]  /sessions  /model <id>  /provider <id>"),
-            Line::from("/chat  /events  /context  /help  /cancel"),
+            Line::from("/new [workspace] [style]  /sessions  /styles  /style <id[@version]>"),
+            Line::from("/model <id>  /provider <id>  /chat  /events  /context  /help  /cancel"),
             Line::from("/approve  /deny  /quit"),
             Line::default(),
             Line::from("Permission dialog: Y/Enter approve · N/Esc deny"),
@@ -494,7 +548,8 @@ const fn next_view(view: View) -> View {
     match view {
         View::Chat => View::Events,
         View::Events => View::Context,
-        View::Context => View::Help,
+        View::Context => View::Styles,
+        View::Styles => View::Help,
         View::Help => View::Chat,
     }
 }
@@ -504,7 +559,8 @@ const fn previous_view(view: View) -> View {
         View::Chat => View::Help,
         View::Events => View::Chat,
         View::Context => View::Events,
-        View::Help => View::Context,
+        View::Styles => View::Context,
+        View::Help => View::Styles,
     }
 }
 
@@ -544,7 +600,10 @@ pub enum TuiServiceError {
 
 #[cfg(test)]
 mod tests {
-    use agentmod_tui_logic::{TranscriptEntry, TranscriptRole, TuiState, View};
+    use agentmod_tui_logic::{
+        StyleAvailability, StyleSourceKind, StyleSummary, TranscriptEntry, TranscriptRole,
+        TuiState, View,
+    };
     use ratatui::{Terminal, backend::TestBackend};
 
     use super::render;
@@ -579,5 +638,37 @@ mod tests {
         assert!(screen.contains("Conversation"));
         assert!(screen.contains("streamed response"));
         assert!(screen.contains("Prompt"));
+    }
+
+    #[test]
+    fn style_catalog_renders_selected_style_and_hashes() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut state = TuiState::default();
+        state.view = View::Styles;
+        state.selected_style = Some(String::from("focused@1.0.0"));
+        state.styles.push(StyleSummary {
+            id: String::from("focused"),
+            version: String::from("1.0.0"),
+            source: StyleSourceKind::Project,
+            availability: StyleAvailability::Available,
+            style_content_hash: String::from("content-hash"),
+            compiled_cache_key: String::from("cache-key"),
+            required_capabilities: vec![String::from("tools")],
+        });
+
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("render");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("Style catalog"));
+        assert!(screen.contains("focused@1.0.0"));
+        assert!(screen.contains("content-hash"));
     }
 }

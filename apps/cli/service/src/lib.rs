@@ -8,8 +8,9 @@ use agentmod_cli_logic::{
     InspectSessionCommand, InspectSessionResult, ListSessionsCommand, ResolveApprovalCommand,
     ResolveApprovalResult, RunDoctorCommand, RunTurnCommand, RunTurnResult, RunTurnStream,
     RunTurnStreamItem, ScheduleCommand as LogicScheduleCommand, SchedulePayload, ScheduleResult,
-    ScheduleTrigger, SessionEventPageResult, SessionSummaryResult, SubscribeSessionCommand,
-    TurnEvent,
+    ScheduleTrigger, SessionEventPageResult, SessionSummaryResult, StyleAvailability,
+    StyleDiagnostic, StyleFileCommand, StyleInspectionResult, StyleSourceKind, StyleSummaryResult,
+    StyleValidationResult, SubscribeSessionCommand, TurnEvent,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use thiserror::Error;
@@ -82,6 +83,12 @@ pub enum CliCommand {
         /// Schedule operation.
         #[command(subcommand)]
         command: ScheduleCommand,
+    },
+    /// Inspect and validate session style manifests.
+    Style {
+        /// Style operation.
+        #[command(subcommand)]
+        command: StyleCommand,
     },
     /// Cancel one active provider request.
     Cancel {
@@ -210,6 +217,41 @@ pub enum ScheduleCommand {
     },
 }
 
+/// Session-style CLI operations.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum StyleCommand {
+    /// List the bounded style registry.
+    List {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one style by ID or `id@version`.
+    Inspect {
+        /// Style selector.
+        selector: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate a TOML or JSON style manifest file.
+    Validate {
+        /// Manifest file.
+        file: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compile a TOML or JSON style manifest file.
+    Compile {
+        /// Manifest file.
+        file: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Durable approval CLI operations.
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum ApprovalCommand {
@@ -330,6 +372,88 @@ pub enum ServiceOutputFormat {
     Text,
     /// Stable JSON object.
     Json,
+}
+
+/// Service-owned rendered source kind.
+#[allow(
+    missing_docs,
+    reason = "service-local rendering enum variants are self-describing"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceStyleSourceKind {
+    BuiltIn,
+    User,
+    Project,
+    Plugin,
+    Inline,
+}
+
+/// Service-owned rendered availability.
+#[allow(
+    missing_docs,
+    reason = "service-local rendering enum variants are self-describing"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceStyleAvailability {
+    Available,
+    Disabled,
+    Invalid,
+    Incompatible,
+    Conflict,
+}
+
+/// Service-owned rendered style diagnostic.
+#[allow(
+    missing_docs,
+    reason = "service-local rendering fields mirror stable output keys"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceStyleDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+    pub help: String,
+}
+
+/// Service-owned rendered style summary.
+#[allow(
+    missing_docs,
+    reason = "service-local rendering fields mirror stable output keys"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceStyleSummary {
+    pub id: String,
+    pub version: String,
+    pub source: ServiceStyleSourceKind,
+    pub availability: ServiceStyleAvailability,
+    pub style_content_hash: String,
+    pub compiled_cache_key: String,
+    pub required_capabilities: Vec<String>,
+}
+
+/// Service-owned rendered inspection result.
+#[allow(
+    missing_docs,
+    reason = "service-local rendering fields mirror stable output keys"
+)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServiceStyleInspection {
+    pub summary: ServiceStyleSummary,
+    pub source_locator: String,
+    pub manifest: serde_json::Value,
+    pub compiled: Option<serde_json::Value>,
+    pub diagnostics: Vec<ServiceStyleDiagnostic>,
+}
+
+/// Service-owned rendered validation result.
+#[allow(
+    missing_docs,
+    reason = "service-local rendering fields mirror stable output keys"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceStyleValidation {
+    pub valid: bool,
+    pub diagnostics: Vec<ServiceStyleDiagnostic>,
 }
 
 /// Service-owned command response.
@@ -593,6 +717,12 @@ where
                     failed,
                     json,
                 } => self.complete_scheduled_execution(&execution_id, !failed, json),
+            },
+            CliCommand::Style { command } => match command {
+                StyleCommand::List { json } => self.list_styles(json),
+                StyleCommand::Inspect { selector, json } => self.inspect_style(selector, json),
+                StyleCommand::Validate { file, json } => self.validate_style(file, json),
+                StyleCommand::Compile { file, json } => self.compile_style(file, json),
             },
             CliCommand::Cancel {
                 cancellation_id,
@@ -908,6 +1038,54 @@ where
         ))
     }
 
+    fn list_styles(&self, json: bool) -> Result<ServiceCommandResponse, ServiceError> {
+        let styles = self.logic.list_styles().map_err(logic_error)?;
+        let styles = styles
+            .into_iter()
+            .map(map_style_summary)
+            .collect::<Vec<_>>();
+        Ok(render_style_list(&styles, json))
+    }
+
+    fn inspect_style(
+        &self,
+        selector: String,
+        json: bool,
+    ) -> Result<ServiceCommandResponse, ServiceError> {
+        let inspection = self
+            .logic
+            .inspect_style(agentmod_cli_logic::InspectStyleCommand { selector })
+            .map_err(logic_error)?;
+        render_style_inspection(&map_style_inspection(inspection), "style_inspect", json)
+    }
+
+    fn validate_style(
+        &self,
+        file: String,
+        json: bool,
+    ) -> Result<ServiceCommandResponse, ServiceError> {
+        let validation = self
+            .logic
+            .validate_style(StyleFileCommand { file })
+            .map_err(logic_error)?;
+        Ok(render_style_validation(
+            &map_style_validation(validation),
+            json,
+        ))
+    }
+
+    fn compile_style(
+        &self,
+        file: String,
+        json: bool,
+    ) -> Result<ServiceCommandResponse, ServiceError> {
+        let inspection = self
+            .logic
+            .compile_style(StyleFileCommand { file })
+            .map_err(logic_error)?;
+        render_style_inspection(&map_style_inspection(inspection), "style_compile", json)
+    }
+
     fn inspect_session(
         &self,
         session: &str,
@@ -1190,6 +1368,220 @@ fn state_label(state: DoctorState) -> &'static str {
         DoctorState::Ready => "ready",
         DoctorState::Degraded => "degraded",
         DoctorState::Unavailable => "unavailable",
+    }
+}
+
+fn map_style_summary(summary: StyleSummaryResult) -> ServiceStyleSummary {
+    ServiceStyleSummary {
+        id: summary.id,
+        version: summary.version,
+        source: match summary.source {
+            StyleSourceKind::BuiltIn => ServiceStyleSourceKind::BuiltIn,
+            StyleSourceKind::User => ServiceStyleSourceKind::User,
+            StyleSourceKind::Project => ServiceStyleSourceKind::Project,
+            StyleSourceKind::Plugin => ServiceStyleSourceKind::Plugin,
+            StyleSourceKind::Inline => ServiceStyleSourceKind::Inline,
+        },
+        availability: match summary.availability {
+            StyleAvailability::Available => ServiceStyleAvailability::Available,
+            StyleAvailability::Disabled => ServiceStyleAvailability::Disabled,
+            StyleAvailability::Invalid => ServiceStyleAvailability::Invalid,
+            StyleAvailability::Incompatible => ServiceStyleAvailability::Incompatible,
+            StyleAvailability::Conflict => ServiceStyleAvailability::Conflict,
+        },
+        style_content_hash: summary.style_content_hash,
+        compiled_cache_key: summary.compiled_cache_key,
+        required_capabilities: summary.required_capabilities,
+    }
+}
+
+fn map_style_diagnostic(diagnostic: StyleDiagnostic) -> ServiceStyleDiagnostic {
+    ServiceStyleDiagnostic {
+        code: diagnostic.code,
+        path: diagnostic.path,
+        message: diagnostic.message,
+        help: diagnostic.help,
+    }
+}
+
+fn map_style_inspection(inspection: StyleInspectionResult) -> ServiceStyleInspection {
+    ServiceStyleInspection {
+        summary: map_style_summary(inspection.summary),
+        source_locator: inspection.source_locator,
+        manifest: inspection.manifest,
+        compiled: inspection.compiled,
+        diagnostics: inspection
+            .diagnostics
+            .into_iter()
+            .map(map_style_diagnostic)
+            .collect(),
+    }
+}
+
+fn map_style_validation(validation: StyleValidationResult) -> ServiceStyleValidation {
+    ServiceStyleValidation {
+        valid: validation.valid,
+        diagnostics: validation
+            .diagnostics
+            .into_iter()
+            .map(map_style_diagnostic)
+            .collect(),
+    }
+}
+
+fn style_source_label(source: ServiceStyleSourceKind) -> &'static str {
+    match source {
+        ServiceStyleSourceKind::BuiltIn => "built_in",
+        ServiceStyleSourceKind::User => "user",
+        ServiceStyleSourceKind::Project => "project",
+        ServiceStyleSourceKind::Plugin => "plugin",
+        ServiceStyleSourceKind::Inline => "inline",
+    }
+}
+
+fn style_availability_label(availability: ServiceStyleAvailability) -> &'static str {
+    match availability {
+        ServiceStyleAvailability::Available => "available",
+        ServiceStyleAvailability::Disabled => "disabled",
+        ServiceStyleAvailability::Invalid => "invalid",
+        ServiceStyleAvailability::Incompatible => "incompatible",
+        ServiceStyleAvailability::Conflict => "conflict",
+    }
+}
+
+fn render_style_diagnostic(diagnostic: &ServiceStyleDiagnostic) -> serde_json::Value {
+    serde_json::json!({
+        "code": diagnostic.code,
+        "path": diagnostic.path,
+        "message": diagnostic.message,
+        "help": diagnostic.help,
+    })
+}
+
+fn render_style_summary(summary: &ServiceStyleSummary) -> serde_json::Value {
+    serde_json::json!({
+        "id": summary.id,
+        "version": summary.version,
+        "source": style_source_label(summary.source),
+        "availability": style_availability_label(summary.availability),
+        "style_content_hash": summary.style_content_hash,
+        "compiled_cache_key": summary.compiled_cache_key,
+        "required_capabilities": summary.required_capabilities,
+    })
+}
+
+fn render_style_list(styles: &[ServiceStyleSummary], json: bool) -> ServiceCommandResponse {
+    let value = serde_json::json!({
+        "command": "style_list",
+        "styles": styles.iter().map(render_style_summary).collect::<Vec<_>>(),
+    });
+    let text = if styles.is_empty() {
+        String::from("no styles")
+    } else {
+        styles
+            .iter()
+            .map(|style| {
+                format!(
+                    "{}@{}\t{}\t{}\t{}\t{}",
+                    style.id,
+                    style.version,
+                    style_availability_label(style.availability),
+                    style_source_label(style.source),
+                    style.style_content_hash,
+                    style.compiled_cache_key,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    render_value(value, json, text)
+}
+
+fn render_style_inspection(
+    inspection: &ServiceStyleInspection,
+    command: &str,
+    json: bool,
+) -> Result<ServiceCommandResponse, ServiceError> {
+    let value = serde_json::json!({
+        "command": command,
+        "summary": render_style_summary(&inspection.summary),
+        "source_locator": inspection.source_locator,
+        "manifest": inspection.manifest,
+        "compiled": inspection.compiled,
+        "diagnostics": inspection.diagnostics.iter().map(render_style_diagnostic).collect::<Vec<_>>(),
+    });
+    let text = if json {
+        value.to_string()
+    } else {
+        let manifest = serde_json::to_string_pretty(&inspection.manifest).map_err(|error| {
+            ServiceError::Rendering {
+                detail: error.to_string(),
+            }
+        })?;
+        let compiled = inspection.compiled.as_ref().map_or_else(
+            || String::from("none"),
+            |value| {
+                serde_json::to_string_pretty(value)
+                    .unwrap_or_else(|_| String::from("<unrenderable>"))
+            },
+        );
+        format!(
+            "{}@{}\navailability: {}\nsource: {}\nsource_locator: {}\nstyle_content_hash: {}\ncompiled_cache_key: {}\nmanifest:\n{}\ncompiled:\n{}\ndiagnostics:\n{}",
+            inspection.summary.id,
+            inspection.summary.version,
+            style_availability_label(inspection.summary.availability),
+            style_source_label(inspection.summary.source),
+            inspection.source_locator,
+            inspection.summary.style_content_hash,
+            inspection.summary.compiled_cache_key,
+            manifest,
+            compiled,
+            inspection
+                .diagnostics
+                .iter()
+                .map(|diagnostic| format!(
+                    "{} {}: {}",
+                    diagnostic.code, diagnostic.path, diagnostic.message
+                ))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    };
+    Ok(ServiceCommandResponse {
+        output: text,
+        exit_code: 0,
+    })
+}
+
+fn render_style_validation(
+    validation: &ServiceStyleValidation,
+    json: bool,
+) -> ServiceCommandResponse {
+    let value = serde_json::json!({
+        "command": "style_validate",
+        "valid": validation.valid,
+        "diagnostics": validation.diagnostics.iter().map(render_style_diagnostic).collect::<Vec<_>>(),
+    });
+    let text = if json {
+        value.to_string()
+    } else if validation.diagnostics.is_empty() {
+        String::from("style manifest is valid")
+    } else {
+        validation
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                format!(
+                    "{} {}: {}",
+                    diagnostic.code, diagnostic.path, diagnostic.message
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    ServiceCommandResponse {
+        output: text,
+        exit_code: 0,
     }
 }
 
@@ -2035,5 +2427,34 @@ mod tests {
             ])
             .expect_err("missing trigger");
         assert!(matches!(error, ServiceError::Arguments { .. }));
+    }
+
+    #[test]
+    fn style_commands_parse_and_render_stable_json() {
+        let parsed = CliArguments::try_parse_from(["agentmod", "style", "inspect", "calm@1"])
+            .expect("style command");
+        assert!(matches!(
+            parsed.command,
+            CliCommand::Style {
+                command: StyleCommand::Inspect { selector, json: false }
+            } if selector == "calm@1"
+        ));
+        let response = render_style_validation(
+            &ServiceStyleValidation {
+                valid: false,
+                diagnostics: vec![ServiceStyleDiagnostic {
+                    code: String::from("style.id.required"),
+                    path: String::from("id"),
+                    message: String::from("style id is required"),
+                    help: String::from("set id"),
+                }],
+            },
+            true,
+        );
+        let value: serde_json::Value = serde_json::from_str(&response.output).expect("json");
+        assert_eq!(value["command"], "style_validate");
+        assert_eq!(value["valid"], false);
+        assert_eq!(value["diagnostics"][0]["code"], "style.id.required");
+        assert_eq!(response.exit_code, 0);
     }
 }

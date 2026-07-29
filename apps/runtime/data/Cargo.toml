@@ -11,6 +11,7 @@ repository.workspace = true
 agentmod-event-model = { path = "../../../core/event-model" }
 agentmod-primitives = { path = "../../../core/primitives" }
 agentmod-runtime-dependency = { path = "../dependency" }
+agentmod-session-style-sdk = { path = "../../../sdk/session-style-sdk" }
 async-trait.workspace = true
 blake3.workspace = true
 serde.workspace = true

@@ -44,6 +44,12 @@ pub struct CreateSessionDataRequest {
     pub prepared: PreparedSessionDataRecord,
     /// Explicit style.
     pub style: String,
+    /// Canonical logic-owned immutable binding JSON.
+    pub style_binding_json: String,
+    /// Canonical selected manifest JSON.
+    pub style_manifest_json: String,
+    /// Canonical compiled descriptor JSON.
+    pub compiled_style_json: String,
     /// Canonical initial event bytes.
     pub initial_event_json: Vec<u8>,
 }
@@ -90,6 +96,12 @@ pub struct CreateBranchDataRequest {
     pub prepared: PreparedSessionDataRecord,
     /// Explicit child style.
     pub style: String,
+    /// Canonical logic-owned immutable binding JSON.
+    pub style_binding_json: String,
+    /// Canonical selected manifest JSON.
+    pub style_manifest_json: String,
+    /// Canonical compiled descriptor JSON.
+    pub compiled_style_json: String,
     /// Immutable parent identifier.
     pub parent_session_id: SessionId,
     /// Inclusive source fork point.
@@ -211,6 +223,9 @@ where
                 sessions_root: request.sessions_root,
                 prepared: to_dependency_prepared(request.prepared),
                 style: request.style,
+                style_binding_json: request.style_binding_json,
+                style_manifest_json: request.style_manifest_json,
+                compiled_style_json: request.compiled_style_json,
                 initial_event_json: request.initial_event_json,
             })
             .map(|created| CreatedSessionDataRecord {
@@ -286,6 +301,9 @@ where
                 sessions_root: request.sessions_root,
                 prepared: to_dependency_prepared(request.prepared),
                 style: request.style,
+                style_binding_json: request.style_binding_json,
+                style_manifest_json: request.style_manifest_json,
+                compiled_style_json: request.compiled_style_json,
                 initial_event_json: request.initial_event_json,
             })
             .map(|created| CreatedSessionDataRecord {
@@ -352,6 +370,9 @@ fn to_dependency_branch(request: CreateBranchDataRequest) -> DependencyCreateBra
         sessions_root: request.sessions_root,
         prepared: to_dependency_prepared(request.prepared),
         style: request.style,
+        style_binding_json: request.style_binding_json,
+        style_manifest_json: request.style_manifest_json,
+        compiled_style_json: request.compiled_style_json,
         parent_session_id: request.parent_session_id.to_string(),
         fork_sequence: request.fork_sequence,
         events: request

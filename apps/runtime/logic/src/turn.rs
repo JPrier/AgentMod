@@ -2894,6 +2894,7 @@ mod tests {
         let payload = RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
             workspace: "fixture-workspace".into(),
             style: "persistent-chat".into(),
+            style_binding: None,
         });
         let typed = EventEnvelope::seal(
             EventMetadata {

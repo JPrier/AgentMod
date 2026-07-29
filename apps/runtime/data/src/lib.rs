@@ -8,9 +8,14 @@ pub mod memory;
 pub mod registry;
 pub mod scheduler;
 pub mod snapshot;
+pub mod style;
 pub mod tool;
 
-use std::path::PathBuf;
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use agentmod_runtime_dependency::{
     DependencyError, DependencyStorageHealthRequest, RuntimeDependencyPort,
@@ -50,13 +55,17 @@ pub trait RuntimeDataPort {
 #[derive(Clone, Debug)]
 pub struct RuntimeData<D> {
     dependency: D,
+    style_cache: Arc<Mutex<BTreeMap<String, style::CachedSessionStyle>>>,
 }
 
 impl<D> RuntimeData<D> {
     /// Creates runtime data with a concrete dependency implementation.
     #[must_use]
-    pub const fn new(dependency: D) -> Self {
-        Self { dependency }
+    pub fn new(dependency: D) -> Self {
+        Self {
+            dependency,
+            style_cache: Arc::new(Mutex::new(BTreeMap::new())),
+        }
     }
 }
 

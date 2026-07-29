@@ -23,6 +23,7 @@ use agentmod_protocol_support::{
 };
 use agentmod_runtime_protocol::{
     RuntimeProviderEvent, RuntimeRequest, RuntimeResponse, RuntimeSessionEvent,
+    RuntimeStyleAvailability, RuntimeStyleSourceKind,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -35,6 +36,38 @@ const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 1);
 pub struct DependencyRuntimeHealth {
     pub status: String,
     pub version: String,
+}
+
+/// Dependency-owned provenance for one registry style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyStyleSourceKind {
+    BuiltIn,
+    User,
+    Project,
+    Plugin,
+    Inline,
+}
+
+/// Dependency-owned availability for one registry style.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyStyleAvailability {
+    Available,
+    Disabled,
+    Invalid,
+    Incompatible,
+    Conflict,
+}
+
+/// Dependency-owned bounded style catalog row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyStyleSummary {
+    pub id: String,
+    pub version: String,
+    pub source: DependencyStyleSourceKind,
+    pub availability: DependencyStyleAvailability,
+    pub style_content_hash: String,
+    pub compiled_cache_key: String,
+    pub required_capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -119,6 +152,7 @@ impl DependencyTurnStream {
 
 pub trait TuiRuntimeDependencyPort: Send + Sync {
     fn health(&self) -> Result<DependencyRuntimeHealth, TuiDependencyError>;
+    fn list_styles(&self) -> Result<Vec<DependencyStyleSummary>, TuiDependencyError>;
     fn list_sessions(
         &self,
         limit: u32,
@@ -442,6 +476,38 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
             return Err(TuiDependencyError::UnexpectedResponse);
         };
         Ok(DependencyRuntimeHealth { status, version })
+    }
+
+    fn list_styles(&self) -> Result<Vec<DependencyStyleSummary>, TuiDependencyError> {
+        let RuntimeResponse::Styles { styles } = self.send(RuntimeRequest::ListStyles)? else {
+            return Err(TuiDependencyError::UnexpectedResponse);
+        };
+        Ok(styles
+            .into_iter()
+            .map(|style| DependencyStyleSummary {
+                id: style.id,
+                version: style.version,
+                source: match style.source {
+                    RuntimeStyleSourceKind::BuiltIn => DependencyStyleSourceKind::BuiltIn,
+                    RuntimeStyleSourceKind::User => DependencyStyleSourceKind::User,
+                    RuntimeStyleSourceKind::Project => DependencyStyleSourceKind::Project,
+                    RuntimeStyleSourceKind::Plugin => DependencyStyleSourceKind::Plugin,
+                    RuntimeStyleSourceKind::Inline => DependencyStyleSourceKind::Inline,
+                },
+                availability: match style.availability {
+                    RuntimeStyleAvailability::Available => DependencyStyleAvailability::Available,
+                    RuntimeStyleAvailability::Disabled => DependencyStyleAvailability::Disabled,
+                    RuntimeStyleAvailability::Invalid => DependencyStyleAvailability::Invalid,
+                    RuntimeStyleAvailability::Incompatible => {
+                        DependencyStyleAvailability::Incompatible
+                    }
+                    RuntimeStyleAvailability::Conflict => DependencyStyleAvailability::Conflict,
+                },
+                style_content_hash: style.style_content_hash,
+                compiled_cache_key: style.compiled_cache_key,
+                required_capabilities: style.required_capabilities,
+            })
+            .collect())
     }
 
     fn list_sessions(

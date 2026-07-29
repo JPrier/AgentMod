@@ -10,8 +10,8 @@
 
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use agentmod_tui_dependency::{
-    DependencyTurnEvent, DependencyTurnStream, DependencyTurnStreamItem, TuiDependencyError,
-    TuiRuntimeDependencyPort,
+    DependencyStyleAvailability, DependencyStyleSourceKind, DependencyTurnEvent,
+    DependencyTurnStream, DependencyTurnStreamItem, TuiDependencyError, TuiRuntimeDependencyPort,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -20,6 +20,38 @@ use thiserror::Error;
 pub struct RuntimeHealthDataRecord {
     pub ready: bool,
     pub version: String,
+}
+
+/// Data-owned style provenance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StyleDataSourceKind {
+    BuiltIn,
+    User,
+    Project,
+    Plugin,
+    Inline,
+}
+
+/// Data-owned style selection availability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StyleDataAvailability {
+    Available,
+    Disabled,
+    Invalid,
+    Incompatible,
+    Conflict,
+}
+
+/// Data-owned bounded style catalog row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleDataRecord {
+    pub id: String,
+    pub version: String,
+    pub source: StyleDataSourceKind,
+    pub availability: StyleDataAvailability,
+    pub style_content_hash: String,
+    pub compiled_cache_key: String,
+    pub required_capabilities: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -104,6 +136,7 @@ impl TurnDataStream {
 
 pub trait TuiDataPort {
     fn runtime_health(&self) -> Result<RuntimeHealthDataRecord, TuiDataError>;
+    fn list_styles(&self) -> Result<Vec<StyleDataRecord>, TuiDataError>;
     fn list_sessions(&self, limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError>;
     fn create_session(&self, workspace: String, style: String) -> Result<SessionId, TuiDataError>;
     fn session_events(
@@ -149,6 +182,46 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
             .map(|value| RuntimeHealthDataRecord {
                 ready: value.status == "ok",
                 version: value.version,
+            })
+            .map_err(map_error)
+    }
+
+    fn list_styles(&self) -> Result<Vec<StyleDataRecord>, TuiDataError> {
+        self.dependency
+            .list_styles()
+            .map(|styles| {
+                styles
+                    .into_iter()
+                    .map(|style| StyleDataRecord {
+                        id: style.id,
+                        version: style.version,
+                        source: match style.source {
+                            DependencyStyleSourceKind::BuiltIn => StyleDataSourceKind::BuiltIn,
+                            DependencyStyleSourceKind::User => StyleDataSourceKind::User,
+                            DependencyStyleSourceKind::Project => StyleDataSourceKind::Project,
+                            DependencyStyleSourceKind::Plugin => StyleDataSourceKind::Plugin,
+                            DependencyStyleSourceKind::Inline => StyleDataSourceKind::Inline,
+                        },
+                        availability: match style.availability {
+                            DependencyStyleAvailability::Available => {
+                                StyleDataAvailability::Available
+                            }
+                            DependencyStyleAvailability::Disabled => {
+                                StyleDataAvailability::Disabled
+                            }
+                            DependencyStyleAvailability::Invalid => StyleDataAvailability::Invalid,
+                            DependencyStyleAvailability::Incompatible => {
+                                StyleDataAvailability::Incompatible
+                            }
+                            DependencyStyleAvailability::Conflict => {
+                                StyleDataAvailability::Conflict
+                            }
+                        },
+                        style_content_hash: style.style_content_hash,
+                        compiled_cache_key: style.compiled_cache_key,
+                        required_capabilities: style.required_capabilities,
+                    })
+                    .collect()
             })
             .map_err(map_error)
     }

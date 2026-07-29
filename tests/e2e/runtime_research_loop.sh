@@ -53,6 +53,13 @@ assert_research_state() {
     printf '%s' "$inspection" | grep -F '"version":"1.1.0"' >/dev/null
     printf '%s' "$inspection" | grep -F '"lifecycle":"completed"' >/dev/null
     printf '%s' "$inspection" | grep -F '"termination_reason":"complete_session"' >/dev/null
+    printf '%s' "$inspection" | grep -F '"style_introspection":' >/dev/null
+    printf '%s' "$inspection" | grep -F '"loop_count":3' >/dev/null
+    printf '%s' "$inspection" | grep -F '"retry_count":0' >/dev/null
+    printf '%s' "$inspection" | grep -F '"next_eligible_transitions":[]' >/dev/null
+    printf '%s' "$inspection" | grep -F '"remaining_budgets":' >/dev/null
+    printf '%s' "$inspection" | grep -F '"retrieved_provenance":' >/dev/null
+    printf '%s' "$inspection" | grep -F '"reviewer_findings":' >/dev/null
     test "$(printf '%s' "$inspection" | grep -o '"node_id":"persist"' | wc -l | tr -d ' ')" -eq 3
     test "$(printf '%s' "$inspection" | grep -o '"node_id":"repeat"' | wc -l | tr -d ' ')" -eq 3
 }

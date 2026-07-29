@@ -170,6 +170,9 @@ pub trait TuiRuntimeDependencyPort: Send + Sync {
         &self,
         limit: u32,
     ) -> Result<Vec<DependencySessionSummary>, TuiDependencyError>;
+    fn inspect_session(&self, _session_id: SessionId) -> Result<Value, TuiDependencyError> {
+        Ok(Value::Null)
+    }
     fn create_session(
         &self,
         workspace: String,
@@ -567,6 +570,18 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
                 state: value.state,
             })
             .collect())
+    }
+
+    fn inspect_session(&self, session_id: SessionId) -> Result<Value, TuiDependencyError> {
+        let RuntimeResponse::SessionInspected { state, .. } =
+            self.send(RuntimeRequest::InspectSession {
+                session_id,
+                at: None,
+            })?
+        else {
+            return Err(TuiDependencyError::UnexpectedResponse);
+        };
+        Ok(state)
     }
 
     fn create_session(

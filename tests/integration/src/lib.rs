@@ -283,6 +283,7 @@ mod tests {
             state["style_binding"]["harness_capability_set_hash"],
             fixture.capability_set_hash
         );
+        assert_initial_style_introspection(&state);
 
         let error = service
             .handle_wire(&RuntimeRequest::CreateSession {
@@ -292,6 +293,33 @@ mod tests {
             })
             .expect_err("fixture cannot satisfy the style's image requirement");
         assert!(error.to_string().contains("images"), "{error}");
+    }
+
+    fn assert_initial_style_introspection(state: &serde_json::Value) {
+        let introspection = &state["style_introspection"];
+        assert_eq!(introspection["style"]["id"], "persistent-chat");
+        assert_eq!(introspection["harness"]["id"], "fixture");
+        assert_eq!(introspection["graph"]["entry_node"], "respond");
+        assert_eq!(
+            introspection["remaining_budgets"]["steps"],
+            state["style_binding"]["budgets"]["max_steps"]
+        );
+        assert_eq!(
+            introspection["pipeline"]["blocking_interceptor_order"],
+            state["style_binding"]["interceptor_order"]
+        );
+        assert_eq!(
+            introspection["memory"]["selection"]["provider"],
+            state["style_binding"]["memory"]["provider"]
+        );
+        for collection in ["nodes", "transitions"] {
+            assert!(
+                introspection["graph"][collection]
+                    .as_array()
+                    .is_some_and(|values| !values.is_empty()),
+                "{collection}"
+            );
+        }
     }
 
     #[test]

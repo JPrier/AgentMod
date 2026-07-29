@@ -114,41 +114,7 @@ impl<L: TuiLogicPort> TuiService<L> {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<(), TuiLogicError> {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return match key.code {
-                KeyCode::Char('q') => {
-                    self.logic.request_quit();
-                    Ok(())
-                }
-                KeyCode::Char('c') if self.logic.state().is_streaming() => {
-                    self.logic.cancel_active()
-                }
-                KeyCode::Char('r') => self.logic.refresh_sessions(),
-                KeyCode::Char('1') => {
-                    self.logic.set_view(View::Chat);
-                    Ok(())
-                }
-                KeyCode::Char('2') => {
-                    self.logic.set_view(View::Events);
-                    Ok(())
-                }
-                KeyCode::Char('3') => {
-                    self.logic.set_view(View::Context);
-                    Ok(())
-                }
-                KeyCode::Char('4') => {
-                    self.logic.set_view(View::Styles);
-                    Ok(())
-                }
-                KeyCode::Char('5') => {
-                    self.logic.set_view(View::Harnesses);
-                    Ok(())
-                }
-                KeyCode::Char('6') => {
-                    self.logic.set_view(View::Help);
-                    Ok(())
-                }
-                _ => Ok(()),
-            };
+            return self.handle_control_key(key.code);
         }
         if self.logic.state().approval.is_some() {
             return match key.code {
@@ -212,6 +178,35 @@ impl<L: TuiLogicPort> TuiService<L> {
             _ => Ok(()),
         }
     }
+
+    fn handle_control_key(&mut self, code: KeyCode) -> Result<(), TuiLogicError> {
+        if let Some(view) = control_view(code) {
+            self.logic.set_view(view);
+            return Ok(());
+        }
+        match code {
+            KeyCode::Char('q') => {
+                self.logic.request_quit();
+                Ok(())
+            }
+            KeyCode::Char('c') if self.logic.state().is_streaming() => self.logic.cancel_active(),
+            KeyCode::Char('r') => self.logic.refresh_sessions(),
+            _ => Ok(()),
+        }
+    }
+}
+
+fn control_view(code: KeyCode) -> Option<View> {
+    match code {
+        KeyCode::Char('1') => Some(View::Chat),
+        KeyCode::Char('2') => Some(View::Events),
+        KeyCode::Char('3') => Some(View::Context),
+        KeyCode::Char('4') => Some(View::Graph),
+        KeyCode::Char('5') => Some(View::Styles),
+        KeyCode::Char('6') => Some(View::Harnesses),
+        KeyCode::Char('7') => Some(View::Help),
+        _ => None,
+    }
 }
 
 fn render(frame: &mut Frame<'_>, state: &TuiState) {
@@ -230,6 +225,7 @@ fn render(frame: &mut Frame<'_>, state: &TuiState) {
         View::Chat => render_chat(frame, state, content),
         View::Events => render_events(frame, state, content),
         View::Context => render_context(frame, state, content),
+        View::Graph => render_graph(frame, state, content),
         View::Styles => render_styles(frame, state, content),
         View::Harnesses => render_harnesses(frame, state, content),
         View::Help => render_help(frame, content),
@@ -249,21 +245,30 @@ fn render(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn render_header(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
-    let tabs = Tabs::new(["Chat", "Events", "Context", "Styles", "Harnesses", "Help"])
-        .select(match state.view {
-            View::Chat => 0,
-            View::Events => 1,
-            View::Context => 2,
-            View::Styles => 3,
-            View::Harnesses => 4,
-            View::Help => 5,
-        })
-        .block(
-            Block::new()
-                .borders(Borders::BOTTOM)
-                .title(format!(" AgentMod {} ", state.runtime_version)),
-        )
-        .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
+    let tabs = Tabs::new([
+        "Chat",
+        "Events",
+        "Context",
+        "Graph",
+        "Styles",
+        "Harnesses",
+        "Help",
+    ])
+    .select(match state.view {
+        View::Chat => 0,
+        View::Events => 1,
+        View::Context => 2,
+        View::Graph => 3,
+        View::Styles => 4,
+        View::Harnesses => 5,
+        View::Help => 6,
+    })
+    .block(
+        Block::new()
+            .borders(Borders::BOTTOM)
+            .title(format!(" AgentMod {} ", state.runtime_version)),
+    )
+    .highlight_style(Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD));
     frame.render_widget(tabs, area);
 }
 
@@ -393,6 +398,131 @@ fn render_context(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
     );
 }
 
+fn render_graph(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+    let Some(inspection) = state.style_introspection.as_ref() else {
+        frame.render_widget(
+            Paragraph::new("No style execution inspection is available for this session.")
+                .block(Block::bordered().title(" Style graph and orchestration ")),
+            area,
+        );
+        return;
+    };
+    frame.render_widget(
+        Paragraph::new(graph_lines(inspection))
+            .block(Block::bordered().title(" Style graph and orchestration · /graph "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn graph_lines(inspection: &serde_json::Value) -> Vec<Line<'static>> {
+    let style = &inspection["style"];
+    let graph = &inspection["graph"];
+    let budgets = &inspection["remaining_budgets"];
+    let pipeline = &inspection["pipeline"];
+    let memory = &inspection["memory"];
+    let compaction = &inspection["compaction"];
+    let children = &inspection["child_agents"];
+    let active = graph["active_node"]["node_id"].as_str().unwrap_or("idle");
+    let control = graph["control"]["state"].as_str().unwrap_or("not_started");
+    let interceptors = pipeline["blocking_interceptor_order"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let retrieved = memory["retrieved_provenance"]
+        .as_array()
+        .map_or(0, Vec::len);
+    let compactions = compaction["history"].as_array().map_or(0, Vec::len);
+    let child_count = children["executions"]
+        .as_object()
+        .map_or(0, serde_json::Map::len);
+    let join_count = children["joins"].as_array().map_or(0, Vec::len);
+    let review_count = children["reviewer_findings"].as_array().map_or(0, Vec::len);
+    let next = graph["next_eligible_transitions"]
+        .as_array()
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value["to_node_id"].as_str())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| String::from("none"));
+    let termination = inspection["termination_reason"]
+        .as_str()
+        .unwrap_or("running");
+    vec![
+        graph_line(
+            "Style",
+            format!(
+                "{}@{} · {}",
+                style["id"].as_str().unwrap_or("unknown"),
+                style["version"].as_str().unwrap_or("unknown"),
+                style["source"].as_str().unwrap_or("unknown")
+            ),
+        ),
+        graph_line(
+            "Harness",
+            format!(
+                "{}@{}",
+                inspection["harness"]["id"].as_str().unwrap_or("unknown"),
+                inspection["harness"]["version"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            ),
+        ),
+        graph_line("Node", format!("{active} · {control} · next {next}")),
+        graph_line(
+            "Progress",
+            format!(
+                "{} loops · {} retries",
+                graph["loop_count"].as_u64().unwrap_or(0),
+                graph["retry_count"].as_u64().unwrap_or(0)
+            ),
+        ),
+        graph_line(
+            "Budgets",
+            format!(
+                "{} steps · {} tokens · {} iterations remaining",
+                budgets["steps"].as_u64().unwrap_or(0),
+                budgets["tokens"].as_u64().unwrap_or(0),
+                budgets["iterations"].as_u64().unwrap_or(0)
+            ),
+        ),
+        graph_line("Pipeline", format!("{interceptors} blocking interceptors")),
+        graph_line(
+            "Memory",
+            format!(
+                "{} · {retrieved} retrieved records",
+                memory["selection"]["provider"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            ),
+        ),
+        graph_line(
+            "Compaction",
+            format!(
+                "{} · {compactions} context boundaries",
+                compaction["selection"]["strategy"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            ),
+        ),
+        graph_line(
+            "Children",
+            format!("{child_count} executions · {join_count} joins · {review_count} reviews"),
+        ),
+        graph_line("Terminal", termination.to_owned()),
+    ]
+}
+
+fn graph_line(label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<11}"), Style::new().fg(Color::DarkGray)),
+        Span::raw(value),
+    ])
+}
+
 fn render_styles(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
     let selected = state.active_style();
     let lines = if state.styles.is_empty() {
@@ -488,7 +618,7 @@ fn render_harnesses(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from("Ctrl+1…6 views · Tab cycle · Alt+↑/↓ sessions · Ctrl+R refresh"),
+            Line::from("Ctrl+1…7 views · Tab cycle · Alt+↑/↓ sessions · Ctrl+R refresh"),
             Line::from("Enter send · Shift+Enter newline · ↑/↓ prompt history"),
             Line::from("Ctrl+C cancel active generation · Ctrl+Q or Esc quit"),
             Line::default(),
@@ -496,7 +626,9 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
                 "/new [workspace] [style] [harness]  /sessions  /styles  /style <id[@version]>",
             ),
             Line::from("/harnesses  /harness <id>"),
-            Line::from("/model <id>  /provider <id>  /chat  /events  /context  /help  /cancel"),
+            Line::from(
+                "/model <id>  /provider <id>  /chat  /events  /context  /graph  /help  /cancel",
+            ),
             Line::from("/approve  /deny  /quit"),
             Line::default(),
             Line::from("Permission dialog: Y/Enter approve · N/Esc deny"),
@@ -601,7 +733,8 @@ const fn next_view(view: View) -> View {
     match view {
         View::Chat => View::Events,
         View::Events => View::Context,
-        View::Context => View::Styles,
+        View::Context => View::Graph,
+        View::Graph => View::Styles,
         View::Styles => View::Harnesses,
         View::Harnesses => View::Help,
         View::Help => View::Chat,
@@ -613,7 +746,8 @@ const fn previous_view(view: View) -> View {
         View::Chat => View::Help,
         View::Events => View::Chat,
         View::Context => View::Events,
-        View::Styles => View::Context,
+        View::Graph => View::Context,
+        View::Styles => View::Graph,
         View::Harnesses => View::Styles,
         View::Help => View::Harnesses,
     }
@@ -754,5 +888,57 @@ mod tests {
         assert!(screen.contains("Harness catalog"));
         assert!(screen.contains("fixture@1.0.0"));
         assert!(screen.contains("streaming"));
+    }
+
+    #[test]
+    fn graph_view_renders_replay_derived_orchestration_state() {
+        let backend = TestBackend::new(140, 36);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut state = TuiState::default();
+        state.runtime_ready = true;
+        state.runtime_version = String::from("test");
+        state.view = View::Graph;
+        state.style_introspection = Some(serde_json::json!({
+            "style": {"id": "research-loop", "version": "1.1.0", "source": "built_in"},
+            "harness": {"id": "fixture", "version": "1.0.0"},
+            "graph": {
+                "active_node": {"node_id": "research"},
+                "control": {"state": "active"},
+                "next_eligible_transitions": [],
+                "loop_count": 2,
+                "retry_count": 1
+            },
+            "remaining_budgets": {"steps": 7, "tokens": 1024, "iterations": 1},
+            "pipeline": {"blocking_interceptor_order": ["policy"]},
+            "memory": {
+                "selection": {"provider": "file"},
+                "retrieved_provenance": [{"source": "memory.md"}]
+            },
+            "compaction": {
+                "selection": {"strategy": "sliding_window"},
+                "history": [{}, {}]
+            },
+            "child_agents": {
+                "executions": {"worker-1": {}},
+                "joins": [{}],
+                "reviewer_findings": [{}, {}]
+            },
+            "termination_reason": null
+        }));
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("render");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("Style graph and orchestration"));
+        assert!(screen.contains("research-loop@1.1.0"));
+        assert!(screen.contains("research · active"));
+        assert!(screen.contains("7 steps · 1024 tokens · 1 iterations remaining"));
+        assert!(screen.contains("1 executions · 1 joins · 2 reviews"));
     }
 }

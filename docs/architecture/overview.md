@@ -23,6 +23,8 @@ The workspace currently contains:
   generic compiled-graph executor used by the live built-in modes;
 - an N-tier harness registry with per-session adapter identity and capability
   negotiation;
+- replay-derived style/graph introspection consumed by CLI JSON and the TUI
+  Graph view without dispatching effects;
 - per-session memory retrieval and compaction with canonical projection
   provenance;
 - protocol-only CLI, TUI, and ACP frontends;

@@ -635,6 +635,15 @@ where
             .as_object_mut()
             .ok_or(ServiceError::StateSerialization)?
             .insert(String::from("style_compatibility"), compatibility);
+        if let Some(introspection) =
+            agentmod_runtime_logic::introspection::inspect_style_execution(&result.state)
+                .map_err(|_| ServiceError::StateSerialization)?
+        {
+            state
+                .as_object_mut()
+                .ok_or(ServiceError::StateSerialization)?
+                .insert(String::from("style_introspection"), introspection.value);
+        }
         Ok(ServiceInspectSessionResponse {
             session_id: result.state.id,
             head_sequence: result.head_sequence,

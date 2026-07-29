@@ -57,6 +57,27 @@ try {
                 "complete_session") {
             throw "research graph termination was not retained"
         }
+        $introspection = $inspection.state.style_introspection
+        if ($introspection.style.id -ne "research-loop" -or
+            $introspection.graph.active_node -ne $null -or
+            $introspection.graph.loop_count -ne 3 -or
+            $introspection.graph.retry_count -ne 0 -or
+            $introspection.graph.next_eligible_transitions.Count -ne 0 -or
+            $introspection.termination_reason -ne "complete_session") {
+            throw "research graph introspection mismatch"
+        }
+        if ($introspection.graph.completed_nodes.Count -lt 15 -or
+            $introspection.graph.previous_transitions.Count -lt 14 -or
+            $introspection.remaining_budgets.steps -lt 0 -or
+            $introspection.remaining_budgets.tokens -lt 0 -or
+            $introspection.pipeline.blocking_interceptor_order -eq $null -or
+            $introspection.memory.retrieved_provenance -eq $null -or
+            $introspection.compaction.history.Count -lt 3 -or
+            $introspection.child_agents.executions -eq $null -or
+            $introspection.child_agents.joins -eq $null -or
+            $introspection.child_agents.reviewer_findings -eq $null) {
+            throw "research orchestration inspection is incomplete"
+        }
         if (@($inspection.state.artifact_persistences.PSObject.Properties).Count -ne 3) {
             throw "expected three canonical research artifacts"
         }
@@ -111,7 +132,7 @@ try {
         }
         Assert-ResearchState $replayed
 
-        Write-Output "runtime research-loop iteration/artifact/restart/replay E2E passed"
+        Write-Output "runtime research-loop iteration/artifact/introspection/restart/replay E2E passed"
     }
     finally {
         Stop-TestRuntime $daemon

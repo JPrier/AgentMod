@@ -10,6 +10,7 @@ pub mod harness;
 pub mod harness_registry;
 pub mod history;
 pub mod interception;
+pub mod introspection;
 pub mod memory;
 pub mod permission;
 pub mod persistence;

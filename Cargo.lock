@@ -1064,6 +1064,7 @@ dependencies = [
  "agentmod-primitives",
  "agentmod-tui-logic",
  "ratatui",
+ "serde_json",
  "thiserror 2.0.19",
  "uuid",
 ]

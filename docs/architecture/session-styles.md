@@ -77,6 +77,17 @@ intentionally omits image support so negative negotiation is deterministic.
 This is the adapter seam for future harnesses, not a claim that third-party
 Pi, OpenCode, Claude Code, or Codex adapters are complete.
 
+Session inspection includes a logic-owned `style_introspection` projection
+derived only from the immutable binding and replay state. It presents the
+compiled graph, current control/active node, prior outcomes and transitions,
+known next transitions, conditional candidates, loop/retry counts, remaining
+canonical step/token/iteration budgets, pipeline activity, memory provenance,
+compaction boundaries, child/join/reviewer state, and termination. Inspection
+does not execute graph conditions or external components. If the variable
+environment for a conditional edge is not canonical, the edge is shown as a
+candidate rather than claimed eligible. Cost and elapsed-time remainder remain
+explicitly unknown until canonical accounting records those dimensions.
+
 Enabled child-agent policies are complete execution contracts rather than only
 numeric limits. They select an exact `style-id@semver`, workspace mode,
 provider/model inheritance, context/token/cost budgets, tool groups, memory

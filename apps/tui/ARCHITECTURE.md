@@ -7,9 +7,9 @@ internals. Its enforced call direction is `service → logic → data → depend
 | Layer | Responsibility and owned types |
 |---|---|
 | service | Ratatui rendering, Crossterm input, terminal lifecycle/restoration, permission modal, and key-to-logic mapping |
-| logic | Session selection, canonical-history projection, streaming transcript state, editor/history behavior, slash commands, approval and cancellation use cases |
-| data | Runtime-health, session, event-page, turn-stream, approval, and cancellation datasets with explicit normalization |
-| dependency | Authenticated local socket/named-pipe transport, protocol negotiation, bounded framing, credit-window acknowledgement, request identity and sequence validation |
+| logic | Session/style/harness selection, canonical-history and replay-derived style-introspection projection, streaming transcript state, editor/history behavior, slash commands, approval and cancellation use cases |
+| data | Runtime-health, style/harness/session, session-inspection, event-page, turn-stream, approval, and cancellation datasets with explicit normalization |
+| dependency | Authenticated local socket/named-pipe transport, runtime style/harness/session inspection requests, protocol negotiation, bounded framing, credit-window acknowledgement, request identity and sequence validation |
 | bin | Environment bootstrap and concrete dependency/data/logic/service assembly |
 
 The frontend loads dormant session summaries without loading all histories,
@@ -17,6 +17,14 @@ then pages the selected session's verified canonical events. Live provider
 events are rendered only after the runtime binds them to committed sequence
 numbers. Tool approval and cancellation call ordinary runtime endpoints; the
 TUI has no bypass around interception or mandatory policy.
+
+The Graph view reads the selected session's runtime-produced
+`style_introspection` projection. It displays style/harness identity,
+active/control node, known next transitions, loop/retry progress, remaining
+canonical budgets, pipeline, memory/compaction, child/join/reviewer state, and
+termination. Refreshes occur at selection and material turn lifecycle
+boundaries; the frontend never interprets the compiled graph or opens runtime
+storage itself.
 
 `ratatui::run` owns raw-mode setup and restoration. Crossterm polling and reads
 remain on the terminal thread. Runtime streaming uses a bounded worker channel

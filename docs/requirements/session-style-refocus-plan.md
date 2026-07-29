@@ -1,6 +1,6 @@
 # Session-Style Refocus Implementation Map
 
-Status: Phases 1-6 executable; Phase 7 product surfaces and introspection active
+Status: Phases 1-6 executable; Phase 7 introspection vertical slice live
 
 Branch: `feature/session-style-registry`
 
@@ -165,6 +165,24 @@ execution. The Unix script passes syntax validation but has not been
 process-executed. The fixture defaults to the same credential-free deterministic
 harness executable through a separate adapter/process configuration; complete
 third-party harness implementations are not claimed.
+
+## Phase 7 introspection vertical-slice result
+
+Completed 2026-07-28 on Windows. Runtime logic now derives a stable bounded
+`style_introspection` projection solely from immutable session binding and
+canonical replay state. CLI inspect/replay receive the projection through the
+existing runtime protocol, and the TUI retrieves it through its own
+dependency -> data -> logic -> service chain for a live Graph view. The
+projection covers compiled graph/control/progress, conservative next-transition
+visibility, remaining canonical budgets, pipelines, memory provenance,
+compaction, children/joins/reviews, and termination without dispatching an
+effect.
+
+The extended `runtime_research_loop.ps1` passed with three iterations, restart,
+and pure replay assertions, and `runtime_tui_smoke.ps1` remained green. Unix
+automation is syntax-checked only. Cost/duration accounting, observer-order
+receipts, and a canonical conditional-variable environment remain incomplete
+and are reported as unknown rather than inferred.
 
 ## Phase 1 proof obligations
 

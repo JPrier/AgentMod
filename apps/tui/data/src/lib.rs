@@ -151,6 +151,9 @@ pub trait TuiDataPort {
         Ok(Vec::new())
     }
     fn list_sessions(&self, limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError>;
+    fn inspect_session(&self, _session_id: SessionId) -> Result<Value, TuiDataError> {
+        Ok(Value::Null)
+    }
     fn create_session(&self, workspace: String, style: String) -> Result<SessionId, TuiDataError>;
     fn create_session_with_harness(
         &self,
@@ -281,6 +284,12 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
                     })
                     .collect()
             })
+            .map_err(map_error)
+    }
+
+    fn inspect_session(&self, session_id: SessionId) -> Result<Value, TuiDataError> {
+        self.dependency
+            .inspect_session(session_id)
             .map_err(map_error)
     }
 

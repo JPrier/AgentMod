@@ -191,6 +191,16 @@ status = "planned"
 limitation = "No implementation exists yet."
 
 [[requirement]]
+id = "E2E-19"
+capability = "process-isolation"
+owner = "runtime/supervision"
+tests = ["acceptance::process_isolation"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/runtime/dependency/src/harness.rs", "apps/runtime/dependency/src/tool.rs", "apps/runtime/dependency/src/process_tool.rs", "apps/harness/bin/src/main.rs", "apps/tools/browser/bin/src/main.rs", "apps/tools/filesystem/bin/src/main.rs", "apps/tools/process/bin/src/main.rs", "tests/e2e/runtime_harness.ps1", "tests/e2e/runtime_tool_loop.ps1", "tests/e2e/runtime_process_loop.ps1", "tests/e2e/runtime_git_loop.ps1", "tests/e2e/runtime_web_loop.ps1", "tests/e2e/runtime_browser_loop.ps1", "tests/e2e/runtime_lsp_loop.ps1", "tests/e2e/runtime_mcp_loop.ps1"]
+status = "partial"
+limitation = "The runtime supervises the harness plus per-session browser/filesystem/process/Git/Web/LSP/MCP children and drops desynchronized children without ambiguous retry; kill-injection and automatic recovery assertions for every required process type remain incomplete."
+
+[[requirement]]
 id = "E2E-20"
 capability = "per-session-harness-selection"
 owner = "runtime/harness/frontends"
@@ -201,14 +211,14 @@ status = "partial"
 limitation = "The Windows process E2E proves native and independently supervised deterministic fixture discovery, explicit per-session selection, incompatible capability rejection, canonical identity retention, restart validation, and post-restart execution. The Unix script is syntax-checked but has not been process-executed. The fixture defaults to the same deterministic harness executable through a separate adapter configuration; complete third-party adapters remain planned."
 
 [[requirement]]
-id = "E2E-19"
-capability = "process-isolation"
-owner = "runtime/supervision"
-tests = ["acceptance::process_isolation"]
+id = "E2E-21"
+capability = "style-graph-introspection"
+owner = "runtime/tui/cli"
+tests = ["harness_registry_selects_adapters_and_rejects_missing_capabilities", "graph_view_renders_replay_derived_orchestration_state", "runtime_research_loop", "runtime_tui_smoke"]
 platforms = ["windows", "linux", "macos"]
-evidence = ["apps/runtime/dependency/src/harness.rs", "apps/runtime/dependency/src/tool.rs", "apps/runtime/dependency/src/process_tool.rs", "apps/harness/bin/src/main.rs", "apps/tools/browser/bin/src/main.rs", "apps/tools/filesystem/bin/src/main.rs", "apps/tools/process/bin/src/main.rs", "tests/e2e/runtime_harness.ps1", "tests/e2e/runtime_tool_loop.ps1", "tests/e2e/runtime_process_loop.ps1", "tests/e2e/runtime_git_loop.ps1", "tests/e2e/runtime_web_loop.ps1", "tests/e2e/runtime_browser_loop.ps1", "tests/e2e/runtime_lsp_loop.ps1", "tests/e2e/runtime_mcp_loop.ps1"]
+evidence = ["apps/runtime/logic/src/introspection.rs", "apps/runtime/service/src/lib.rs", "apps/tui/dependency/src/lib.rs", "apps/tui/data/src/lib.rs", "apps/tui/logic/src/lib.rs", "apps/tui/service/src/lib.rs", "tests/integration/src/lib.rs", "tests/e2e/runtime_research_loop.ps1", "tests/e2e/runtime_research_loop.sh", "tests/e2e/runtime_tui_smoke.ps1", "tests/e2e/runtime_tui_smoke.sh"]
 status = "partial"
-limitation = "The runtime supervises the harness plus per-session browser/filesystem/process/Git/Web/LSP/MCP children and drops desynchronized children without ambiguous retry; kill-injection and automatic recovery assertions for every required process type remain incomplete."
+limitation = "The Windows research-loop process E2E proves replay-derived graph progress, budgets, context history, termination, daemon restart, and pure replay; the Windows TUI smoke remains green and rendering has a focused test. Unix scripts are syntax-checked but not process-executed. Cost/duration accounting and conditional-edge eligibility are explicitly unknown when canonical state cannot prove them."
 
 [[requirement]]
 id = "SCHED-01"

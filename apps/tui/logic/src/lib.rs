@@ -23,6 +23,7 @@ pub enum View {
     Chat,
     Events,
     Context,
+    Graph,
     Styles,
     Harnesses,
     Help,
@@ -120,6 +121,7 @@ pub struct TuiState {
     pub selected_session: Option<usize>,
     pub transcript: Vec<TranscriptEntry>,
     pub timeline: Vec<EventTimelineEntry>,
+    pub style_introspection: Option<Value>,
     pub editor: String,
     pub editor_cursor: usize,
     pub history: Vec<String>,
@@ -150,6 +152,7 @@ impl Default for TuiState {
             selected_session: None,
             transcript: Vec::new(),
             timeline: Vec::new(),
+            style_introspection: None,
             editor: String::new(),
             editor_cursor: 0,
             history: Vec::new(),
@@ -370,7 +373,20 @@ impl<D: TuiDataPort> TuiLogicPort for TuiLogic<D> {
                 TurnDataStreamItem::Event {
                     event,
                     committed_sequence,
-                } => self.apply_turn_event(event, committed_sequence),
+                } => {
+                    let refresh_introspection = matches!(
+                        &event,
+                        TurnDataEvent::Started
+                            | TurnDataEvent::ToolProposed { .. }
+                            | TurnDataEvent::Completed { .. }
+                            | TurnDataEvent::Cancelled
+                            | TurnDataEvent::Failed { .. }
+                    );
+                    self.apply_turn_event(event, committed_sequence);
+                    if refresh_introspection {
+                        self.refresh_selected_introspection()?;
+                    }
+                }
                 TurnDataStreamItem::Complete {
                     first_sequence,
                     last_sequence,
@@ -378,6 +394,7 @@ impl<D: TuiDataPort> TuiLogicPort for TuiLogic<D> {
                 } => {
                     self.state.stream = None;
                     self.state.active_cancellation = None;
+                    self.refresh_selected_introspection()?;
                     self.state.status = awaiting_continuation.as_ref().map_or_else(
                         || {
                             format!(
@@ -606,6 +623,7 @@ impl<D: TuiDataPort> TuiLogic<D> {
             }
             "/events" => self.state.view = View::Events,
             "/context" => self.state.view = View::Context,
+            "/graph" => self.state.view = View::Graph,
             "/help" => self.state.view = View::Help,
             "/chat" => self.state.view = View::Chat,
             "/cancel" => self.cancel_active()?,
@@ -620,10 +638,12 @@ impl<D: TuiDataPort> TuiLogic<D> {
     fn reload_selected_history(&mut self) -> Result<(), TuiLogicError> {
         self.state.transcript.clear();
         self.state.timeline.clear();
+        self.state.style_introspection = None;
         let Some(session_id) = self.state.selected().map(|value| value.id) else {
             self.state.status = String::from("no sessions — use /new");
             return Ok(());
         };
+        self.refresh_selected_introspection()?;
         let mut cursor = None;
         loop {
             let page = self
@@ -639,6 +659,16 @@ impl<D: TuiDataPort> TuiLogic<D> {
             }
         }
         self.state.status = format!("session {session_id}");
+        Ok(())
+    }
+
+    fn refresh_selected_introspection(&mut self) -> Result<(), TuiLogicError> {
+        let Some(session_id) = self.state.selected().map(|value| value.id) else {
+            self.state.style_introspection = None;
+            return Ok(());
+        };
+        let inspection = self.data.inspect_session(session_id).map_err(map_error)?;
+        self.state.style_introspection = inspection.get("style_introspection").cloned();
         Ok(())
     }
 

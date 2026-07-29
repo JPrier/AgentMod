@@ -123,6 +123,15 @@ a fresh child journal at the selected point, records parent/fork ancestry, and
 optionally replaces the explicit top-level style. Continuing the child does not
 append to the parent.
 
+For style-bound sessions, inspect/replay state includes
+`style_introspection`. This stable projection contains style/source/cache and
+harness identity, compiled graph nodes and edges, active/control/previous node
+state, known next transitions and conditional candidates, loop/retry counts,
+remaining step/token/iteration budgets, tool/permission/retry/termination
+configuration, pipeline activity, memory provenance, compaction history,
+child/join/reviewer state, and termination. Remaining cost and duration are
+`null` until those accounting dimensions are canonically retained.
+
 `session events` is the durable reconnect surface. It returns verified canonical
 events strictly after `--after` (or from sequence 1), bounded to `--limit`
 (default 256, maximum 1024). JSON output includes `head_sequence`,

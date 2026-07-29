@@ -719,6 +719,18 @@ where
             .as_ref()
             .and_then(|binding| CompiledStyleExecutor::from_binding(binding).ok())
             .and_then(|executor| executor.adapter_kind())
+            == Some(StyleAdapterKind::PlannerWorkerReviewer)
+        {
+            return Err(RunTurnError::UnsupportedStyleExecution(String::from(
+                "planner-worker-reviewer",
+            )));
+        }
+        if preflight
+            .state
+            .style_binding
+            .as_ref()
+            .and_then(|binding| CompiledStyleExecutor::from_binding(binding).ok())
+            .and_then(|executor| executor.adapter_kind())
             == Some(StyleAdapterKind::DeclarativeGraph)
         {
             return self
@@ -954,7 +966,8 @@ where
                         )
                         .await
                     }
-                    StyleAdapterKind::DeclarativeGraph => Err(RunTurnError::StyleGraphMismatch),
+                    StyleAdapterKind::PlannerWorkerReviewer
+                    | StyleAdapterKind::DeclarativeGraph => Err(RunTurnError::StyleGraphMismatch),
                 }
             }
             .await;
@@ -3364,7 +3377,9 @@ where
             StyleAdapterKind::ResearchLoop => {
                 Some(("research-fresh-context", "research_fresh_context"))
             }
-            StyleAdapterKind::PersistentTurn | StyleAdapterKind::DeclarativeGraph => None,
+            StyleAdapterKind::PersistentTurn
+            | StyleAdapterKind::PlannerWorkerReviewer
+            | StyleAdapterKind::DeclarativeGraph => None,
         };
         let fresh_isolated_context = fresh_context_kind.is_some()
             && boundary == ContextCompositionBoundary::TurnStart
@@ -5310,7 +5325,9 @@ where
         }
         let current = executor.entry().map_err(RunTurnError::StyleExecutor)?;
         let expected_entry = match executor.adapter_kind() {
-            Some(StyleAdapterKind::PersistentTurn) => StyleNodeDirective::ModelCall,
+            Some(StyleAdapterKind::PersistentTurn | StyleAdapterKind::PlannerWorkerReviewer) => {
+                StyleNodeDirective::ModelCall
+            }
             Some(StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop) => {
                 StyleNodeDirective::ContextTransform
             }
@@ -5391,6 +5408,9 @@ where
             // adapter exists.
             return Ok(loaded);
         };
+        if adapter_kind == StyleAdapterKind::PlannerWorkerReviewer {
+            return Ok(loaded);
+        }
         let max_steps = binding
             .budgets
             .max_steps
@@ -7255,6 +7275,8 @@ fn style_transition_variables(completed: &StyleNodeCompletedEvent) -> Result<Val
         }
         Some("iteration:remaining:true") => Ok(json!({"iteration":{"remaining":true}})),
         Some("iteration:remaining:false") => Ok(json!({"iteration":{"remaining":false}})),
+        Some("review:approved:true") => Ok(json!({"review":{"approved":true}})),
+        Some("review:approved:false") => Ok(json!({"review":{"approved":false}})),
         Some(value) if value.starts_with("completion:criteria_met:") => {
             Err(RunTurnError::StyleGraphMismatch)
         }
@@ -7262,6 +7284,9 @@ fn style_transition_variables(completed: &StyleNodeCompletedEvent) -> Result<Val
             if value.starts_with("declarative-request:")
                 || value.starts_with("iteration:remaining:") =>
         {
+            Err(RunTurnError::StyleGraphMismatch)
+        }
+        Some(value) if value.starts_with("review:approved:") => {
             Err(RunTurnError::StyleGraphMismatch)
         }
         _ => Ok(json!({})),

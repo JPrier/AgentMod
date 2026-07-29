@@ -42,6 +42,7 @@ pub(crate) enum StyleAdapterKind {
     PersistentTurn,
     EphemeralTurn,
     ResearchLoop,
+    PlannerWorkerReviewer,
     DeclarativeGraph,
 }
 
@@ -229,6 +230,9 @@ impl CompiledStyleExecutor {
         if self.supports_research_loop() {
             return Some(StyleAdapterKind::ResearchLoop);
         }
+        if self.supports_planner_worker_reviewer() {
+            return Some(StyleAdapterKind::PlannerWorkerReviewer);
+        }
         self.supports_declarative_graph()
             .then_some(StyleAdapterKind::DeclarativeGraph)
     }
@@ -382,6 +386,56 @@ impl CompiledStyleExecutor {
             return false;
         };
         repeat.to.index == tool.to.index
+            && done.to.directive == StyleNodeDirective::CompleteSession
+            && self
+                .transition(done.to.index, &serde_json::json!({}))
+                .is_ok_and(|transition| transition.is_none())
+    }
+
+    /// Returns whether this graph is the bounded planner/worker/reviewer
+    /// lifecycle supported by the runtime-owned child-session adapter.
+    fn supports_planner_worker_reviewer(&self) -> bool {
+        if self.compiled.graph.nodes.len() != 7 || self.compiled.graph.edges.len() != 7 {
+            return false;
+        }
+        let Ok(plan) = self.entry() else {
+            return false;
+        };
+        let Ok(Some(spawn)) = self.transition(plan.index, &serde_json::json!({})) else {
+            return false;
+        };
+        let Ok(Some(wait)) = self.transition(spawn.to.index, &serde_json::json!({})) else {
+            return false;
+        };
+        let Ok(Some(integrate)) = self.transition(wait.to.index, &serde_json::json!({})) else {
+            return false;
+        };
+        let Ok(Some(review)) = self.transition(integrate.to.index, &serde_json::json!({})) else {
+            return false;
+        };
+        let Ok(Some(revision)) = self.transition(review.to.index, &serde_json::json!({})) else {
+            return false;
+        };
+        let Ok(Some(retry)) = self.transition(
+            revision.to.index,
+            &serde_json::json!({"review":{"approved":false}}),
+        ) else {
+            return false;
+        };
+        let Ok(Some(done)) = self.transition(
+            revision.to.index,
+            &serde_json::json!({"review":{"approved":true}}),
+        ) else {
+            return false;
+        };
+        plan.directive == StyleNodeDirective::ModelCall
+            && spawn.to.directive == StyleNodeDirective::SpawnChildAgent
+            && wait.to.directive == StyleNodeDirective::WaitForAgents
+            && integrate.to.directive == StyleNodeDirective::ModelCall
+            && review.to.directive == StyleNodeDirective::Review
+            && revision.to.directive == StyleNodeDirective::Loop
+            && revision.to.max_iterations.is_some()
+            && retry.to.index == spawn.to.index
             && done.to.directive == StyleNodeDirective::CompleteSession
             && self
                 .transition(done.to.index, &serde_json::json!({}))
@@ -655,6 +709,33 @@ pub(crate) mod tests {
                 node: String::from("repeat")
             })
         );
+    }
+
+    #[test]
+    fn planner_worker_reviewer_uses_the_compiled_child_and_review_loop() {
+        let executor = CompiledStyleExecutor::from_binding(&binding(BuiltInStyle::PlannerWorker))
+            .expect("executor");
+        assert_eq!(
+            executor.adapter_kind(),
+            Some(super::StyleAdapterKind::PlannerWorkerReviewer)
+        );
+        let plan = executor.entry().expect("plan");
+        let spawn = executor
+            .transition(plan.index, &json!({}))
+            .expect("plan transition")
+            .expect("spawn");
+        assert_eq!(spawn.to.directive, StyleNodeDirective::SpawnChildAgent);
+        let revision = executor.node("revision").expect("revision");
+        let retry = executor
+            .transition(revision.index, &json!({"review":{"approved":false}}))
+            .expect("retry transition")
+            .expect("spawn retry");
+        assert_eq!(retry.to.id, "spawn-workers");
+        let done = executor
+            .transition(revision.index, &json!({"review":{"approved":true}}))
+            .expect("approved transition")
+            .expect("done");
+        assert_eq!(done.to.directive, StyleNodeDirective::CompleteSession);
     }
 
     #[test]

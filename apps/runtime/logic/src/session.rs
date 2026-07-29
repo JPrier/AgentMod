@@ -5,6 +5,7 @@ use std::{collections::BTreeMap, str::FromStr};
 use agentmod_event_model::{EventClassification, EventEnvelope, EventModelError, EventScope};
 use agentmod_graph_engine::{ExecutableGraph, GRAPH_FORMAT_VERSION, NodeKind};
 use agentmod_primitives::{ContentHash, ContinuationId, EventId, Sequence, SessionId};
+use agentmod_session_style_sdk::CompiledSessionStyle;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -848,6 +849,62 @@ pub struct ChildAgentCompletedEvent {
     pub summary: String,
 }
 
+/// Runtime-owned task emitted by a planner model response.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlannedTask {
+    /// Stable task identity within the parent session.
+    pub task_id: String,
+    /// Bounded typed worker assignment.
+    pub description: String,
+}
+
+/// Structured planner output committed before child creation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskPlanCommittedEvent {
+    /// Planner graph node.
+    pub node_id: String,
+    /// One-based node attempt.
+    pub attempt: u32,
+    /// Zero-based orchestration iteration.
+    pub loop_iteration: u32,
+    /// One-based graph step.
+    pub step: u64,
+    /// Exact model response containing the structured plan.
+    pub model_response_sequence: Sequence,
+    /// Runtime-validated task records.
+    pub tasks: Vec<PlannedTask>,
+}
+
+/// Exact completed child set used to release a parent join.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildJoinCompletedEvent {
+    /// Wait node that owns the join.
+    pub node_id: String,
+    /// Zero-based orchestration iteration.
+    pub loop_iteration: u32,
+    /// Deterministically ordered child execution IDs.
+    pub child_execution_ids: Vec<String>,
+}
+
+/// Structured reviewer decision committed before revision routing.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReviewerFindingsCommittedEvent {
+    /// Review graph node.
+    pub node_id: String,
+    /// One-based node attempt.
+    pub attempt: u32,
+    /// Zero-based orchestration iteration.
+    pub loop_iteration: u32,
+    /// One-based graph step.
+    pub step: u64,
+    /// Whether the current integration is accepted.
+    pub approved: bool,
+    /// Tasks that require another runtime-owned revision.
+    pub rejected_task_ids: Vec<String>,
+    /// Bounded structured findings.
+    pub findings: Vec<String>,
+}
+
 /// Typed committed events consumed by the pure session reducer.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "event", content = "payload", rename_all = "snake_case")]
@@ -944,6 +1001,12 @@ pub enum RuntimeCommittedEvent {
     ChildAgentCreated(ChildAgentCreatedEvent),
     /// Records a verified terminal child result.
     ChildAgentCompleted(ChildAgentCompletedEvent),
+    /// Records structured planner tasks before child creation.
+    TaskPlanCommitted(TaskPlanCommittedEvent),
+    /// Records the exact terminal child set used by a join.
+    ChildJoinCompleted(ChildJoinCompletedEvent),
+    /// Records a structured reviewer decision.
+    ReviewerFindingsCommitted(ReviewerFindingsCommittedEvent),
 }
 
 impl RuntimeCommittedEvent {
@@ -997,6 +1060,9 @@ impl RuntimeCommittedEvent {
             Self::ChildAgentCreationApproved(_) => "child_agent.creation_approved",
             Self::ChildAgentCreated(_) => "child_agent.created",
             Self::ChildAgentCompleted(_) => "child_agent.completed",
+            Self::TaskPlanCommitted(_) => "style.task_plan_committed",
+            Self::ChildJoinCompleted(_) => "child_agent.join_completed",
+            Self::ReviewerFindingsCommitted(_) => "style.reviewer_findings_committed",
         }
     }
 }
@@ -1062,6 +1128,45 @@ pub struct ChildAgentRecord {
     pub completed_at: Option<Sequence>,
     /// Bounded result summary.
     pub summary: Option<String>,
+}
+
+/// Replay-owned planner/worker/reviewer orchestration state.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PlannerWorkerState {
+    /// Latest validated plan tasks keyed by stable task ID.
+    pub tasks: BTreeMap<String, PlannedTask>,
+    /// Sequence that committed the plan.
+    pub plan_committed_at: Option<Sequence>,
+    /// Exact child execution IDs in each completed join.
+    pub joins: Vec<ChildJoinRecord>,
+    /// Structured reviewer decisions in canonical order.
+    pub reviews: Vec<ReviewerDecisionRecord>,
+}
+
+/// Replay-owned exact child set that released one wait node.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildJoinRecord {
+    /// Orchestration iteration joined.
+    pub loop_iteration: u32,
+    /// Deterministically ordered child execution IDs.
+    pub child_execution_ids: Vec<String>,
+    /// Canonical join commit sequence.
+    pub committed_at: Sequence,
+}
+
+/// Replay-owned structured reviewer decision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReviewerDecisionRecord {
+    /// Orchestration iteration reviewed.
+    pub loop_iteration: u32,
+    /// Whether the integration was accepted.
+    pub approved: bool,
+    /// Rejected task IDs.
+    pub rejected_task_ids: Vec<String>,
+    /// Bounded reviewer findings.
+    pub findings: Vec<String>,
+    /// Canonical commit sequence.
+    pub committed_at: Sequence,
 }
 
 /// Safe next action derived only from canonical artifact-persistence state.
@@ -1165,6 +1270,9 @@ pub struct SessionState {
     /// Runtime-managed child sessions keyed by deterministic execution ID.
     #[serde(default)]
     pub child_agents: BTreeMap<String, ChildAgentRecord>,
+    /// Planner/worker/reviewer task, join, and review projection.
+    #[serde(default)]
+    pub planner_worker: PlannerWorkerState,
     /// Restart/reconnect reconciliation state keyed by provider call ID.
     #[serde(default)]
     pub process_reconciliations: BTreeMap<String, ProcessReconciliationRecord>,
@@ -1497,6 +1605,7 @@ fn initialize(
         tool_executions: BTreeMap::new(),
         artifact_persistences: BTreeMap::new(),
         child_agents: BTreeMap::new(),
+        planner_worker: PlannerWorkerState::default(),
         process_reconciliations: BTreeMap::new(),
         last_sequence: event.metadata.sequence,
         last_event_checksum: event.integrity_checksum,
@@ -1732,6 +1841,15 @@ fn apply_payload(
         }
         RuntimeCommittedEvent::ChildAgentCompleted(completed) => {
             apply_child_agent_completed(state, completed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::TaskPlanCommitted(committed) => {
+            apply_task_plan_committed(state, committed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ChildJoinCompleted(completed) => {
+            apply_child_join_completed(state, completed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ReviewerFindingsCommitted(committed) => {
+            apply_reviewer_findings_committed(state, committed, event.metadata.sequence)
         }
         RuntimeCommittedEvent::ToolExecutionDispatched(dispatched) => {
             apply_tool_dispatch(state, dispatched, event.metadata.sequence)
@@ -2561,6 +2679,161 @@ fn apply_child_agent_completed(
     Ok(())
 }
 
+fn apply_task_plan_committed(
+    state: &mut SessionState,
+    committed: &TaskPlanCommittedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let execution = state
+        .style_execution
+        .as_ref()
+        .ok_or(SessionReducerError::StyleExecutionNotInitialized)?;
+    let model_completed = execution
+        .latest_model_execution
+        .as_ref()
+        .is_some_and(|evidence| {
+            evidence.response_completed
+                && evidence.completed_at == Some(committed.model_response_sequence)
+        });
+    let max_children = state
+        .style_binding
+        .as_ref()
+        .and_then(|binding| {
+            serde_json::from_str::<CompiledSessionStyle>(&binding.compiled_style_json).ok()
+        })
+        .map_or(0, |compiled| compiled.child_agents.max_children);
+    let active_matches = active_node_matches(
+        execution.active_node.as_ref(),
+        &committed.node_id,
+        committed.attempt,
+        committed.loop_iteration,
+        committed.step,
+    );
+    let mut tasks = BTreeMap::new();
+    let valid_tasks = committed.tasks.iter().all(|task| {
+        !task.task_id.trim().is_empty()
+            && !task.description.trim().is_empty()
+            && task.task_id.len() <= 256
+            && task.description.len() <= 64 * 1024
+            && tasks.insert(task.task_id.clone(), task.clone()).is_none()
+    });
+    if graph_node_kind(&execution.graph, &committed.node_id) != Some(NodeKind::ModelCall)
+        || !active_matches
+        || !model_completed
+        || committed.tasks.len() < 2
+        || u32::try_from(committed.tasks.len()).map_or(true, |count| count > max_children)
+        || !valid_tasks
+        || !state.planner_worker.tasks.is_empty()
+        || state.planner_worker.plan_committed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    state.planner_worker.tasks = tasks;
+    state.planner_worker.plan_committed_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_child_join_completed(
+    state: &mut SessionState,
+    completed: &ChildJoinCompletedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let execution = state
+        .style_execution
+        .as_ref()
+        .ok_or(SessionReducerError::StyleExecutionNotInitialized)?;
+    let mut expected = state
+        .child_agents
+        .values()
+        .filter(|record| {
+            record.identity.loop_iteration == completed.loop_iteration
+                && record.state == ChildAgentState::Completed
+        })
+        .map(|record| record.identity.execution_id.clone())
+        .collect::<Vec<_>>();
+    expected.sort();
+    let mut actual = completed.child_execution_ids.clone();
+    actual.sort();
+    actual.dedup();
+    if graph_node_kind(&execution.graph, &completed.node_id) != Some(NodeKind::WaitForAgents)
+        || execution.active_node.as_ref().is_none_or(|active| {
+            active.node_id != completed.node_id || active.loop_iteration != completed.loop_iteration
+        })
+        || actual.is_empty()
+        || actual != expected
+        || completed.child_execution_ids.len() != actual.len()
+        || state
+            .planner_worker
+            .joins
+            .iter()
+            .any(|join| join.loop_iteration == completed.loop_iteration)
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    state.planner_worker.joins.push(ChildJoinRecord {
+        loop_iteration: completed.loop_iteration,
+        child_execution_ids: actual,
+        committed_at: sequence,
+    });
+    Ok(())
+}
+
+fn apply_reviewer_findings_committed(
+    state: &mut SessionState,
+    committed: &ReviewerFindingsCommittedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let execution = state
+        .style_execution
+        .as_ref()
+        .ok_or(SessionReducerError::StyleExecutionNotInitialized)?;
+    let mut rejected = committed.rejected_task_ids.clone();
+    rejected.sort();
+    rejected.dedup();
+    let known_rejections = rejected
+        .iter()
+        .all(|task_id| state.planner_worker.tasks.contains_key(task_id));
+    let findings_bytes = committed
+        .findings
+        .iter()
+        .try_fold(0_usize, |total, finding| total.checked_add(finding.len()))
+        .unwrap_or(usize::MAX);
+    if graph_node_kind(&execution.graph, &committed.node_id) != Some(NodeKind::Review)
+        || !active_node_matches(
+            execution.active_node.as_ref(),
+            &committed.node_id,
+            committed.attempt,
+            committed.loop_iteration,
+            committed.step,
+        )
+        || committed.approved != committed.rejected_task_ids.is_empty()
+        || committed.rejected_task_ids.len() != rejected.len()
+        || !known_rejections
+        || committed.findings.is_empty()
+        || committed.findings.len() > 128
+        || committed
+            .findings
+            .iter()
+            .any(|finding| finding.trim().is_empty())
+        || findings_bytes > 256 * 1024
+        || state
+            .planner_worker
+            .reviews
+            .iter()
+            .any(|review| review.loop_iteration == committed.loop_iteration)
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    state.planner_worker.reviews.push(ReviewerDecisionRecord {
+        loop_iteration: committed.loop_iteration,
+        approved: committed.approved,
+        rejected_task_ids: rejected,
+        findings: committed.findings.clone(),
+        committed_at: sequence,
+    });
+    Ok(())
+}
+
 fn apply_style_node_completed(
     state: &mut SessionState,
     completed: &StyleNodeCompletedEvent,
@@ -2576,6 +2849,7 @@ fn apply_style_node_completed(
         &state.approvals,
         &state.tool_executions,
         &state.child_agents,
+        &state.planner_worker,
         state.child_origin.as_ref(),
         completed,
         state.last_sequence,
@@ -2851,6 +3125,7 @@ fn style_node_effect_evidence_complete(
     approvals: &BTreeMap<ContinuationId, ApprovalRecord>,
     tool_executions: &BTreeMap<String, ToolExecutionRecord>,
     child_agents: &BTreeMap<String, ChildAgentRecord>,
+    planner_worker: &PlannerWorkerState,
     child_origin: Option<&ChildSessionOrigin>,
     completed: &StyleNodeCompletedEvent,
     journal_head: Sequence,
@@ -2898,8 +3173,42 @@ fn style_node_effect_evidence_complete(
                         ChildAgentState::Active | ChildAgentState::Completed
                     )
             })
-            .count();
-        return expected > 0 && matching == expected;
+            .collect::<Vec<_>>();
+        let mut actual_task_ids = matching
+            .iter()
+            .map(|record| record.identity.task_id.clone())
+            .collect::<Vec<_>>();
+        actual_task_ids.sort();
+        let mut expected_task_ids = if completed.loop_iteration == 0 {
+            planner_worker.tasks.keys().cloned().collect::<Vec<_>>()
+        } else {
+            planner_worker
+                .reviews
+                .iter()
+                .rev()
+                .find(|review| {
+                    review.loop_iteration.checked_add(1) == Some(completed.loop_iteration)
+                })
+                .map_or_else(Vec::new, |review| review.rejected_task_ids.clone())
+        };
+        expected_task_ids.sort();
+        return expected > 0 && matching.len() == expected && actual_task_ids == expected_task_ids;
+    }
+    if is_planner_worker_graph(&execution.graph)
+        && graph_node_kind(&execution.graph, &completed.node_id) == Some(NodeKind::ModelCall)
+    {
+        if completed.node_id == "plan" {
+            return planner_worker.plan_committed_at == Some(journal_head);
+        }
+        return execution
+            .latest_model_execution
+            .as_ref()
+            .is_some_and(|evidence| {
+                evidence.response_completed
+                    && evidence
+                        .completed_at
+                        .is_some_and(|sequence| sequence <= journal_head)
+            });
     }
     if graph_node_kind(&execution.graph, &completed.node_id) == Some(NodeKind::WaitForAgents) {
         let Some(expected) = completed
@@ -2916,8 +3225,33 @@ fn style_node_effect_evidence_complete(
                 record.state == ChildAgentState::Completed
                     && record.identity.loop_iteration == completed.loop_iteration
             })
-            .count();
-        return expected > 0 && matching == expected;
+            .collect::<Vec<_>>();
+        let mut matching_ids = matching
+            .iter()
+            .map(|record| record.identity.execution_id.clone())
+            .collect::<Vec<_>>();
+        matching_ids.sort();
+        return expected > 0
+            && matching.len() == expected
+            && planner_worker.joins.last().is_some_and(|join| {
+                join.loop_iteration == completed.loop_iteration
+                    && join.committed_at == journal_head
+                    && join.child_execution_ids == matching_ids
+            });
+    }
+    if is_planner_worker_graph(&execution.graph)
+        && graph_node_kind(&execution.graph, &completed.node_id) == Some(NodeKind::Review)
+    {
+        return planner_worker.reviews.last().is_some_and(|review| {
+            review.loop_iteration == completed.loop_iteration
+                && review.committed_at == journal_head
+                && completed.result_reference.as_deref()
+                    == Some(if review.approved {
+                        "review:approved:true"
+                    } else {
+                        "review:approved:false"
+                    })
+        });
     }
     if is_declarative_graph(&execution.graph)
         && graph_node_kind(&execution.graph, &completed.node_id)
@@ -3172,6 +3506,39 @@ fn is_research_loop_graph(graph: &ExecutableGraph) -> bool {
         && graph_has_transition(graph, "persist", "repeat")
         && graph_has_transition(graph, "repeat", "fresh-context")
         && graph_has_transition(graph, "repeat", "done")
+}
+
+fn is_planner_worker_graph(graph: &ExecutableGraph) -> bool {
+    let expected = [
+        ("plan", NodeKind::ModelCall),
+        ("spawn-workers", NodeKind::SpawnChildAgent),
+        ("wait-workers", NodeKind::WaitForAgents),
+        ("integrate", NodeKind::ModelCall),
+        ("review", NodeKind::Review),
+        ("revision", NodeKind::Loop),
+        ("done", NodeKind::CompleteSession),
+    ];
+    graph.nodes.len() == expected.len()
+        && graph.edges.len() == 7
+        && expected.iter().all(|(id, kind)| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == *id)
+                .map(|node| node.kind)
+                == Some(*kind)
+        })
+        && graph
+            .nodes
+            .get(graph.entry_index)
+            .is_some_and(|node| node.id == "plan")
+        && graph_has_transition(graph, "plan", "spawn-workers")
+        && graph_has_transition(graph, "spawn-workers", "wait-workers")
+        && graph_has_transition(graph, "wait-workers", "integrate")
+        && graph_has_transition(graph, "integrate", "review")
+        && graph_has_transition(graph, "review", "revision")
+        && graph_has_transition(graph, "revision", "spawn-workers")
+        && graph_has_transition(graph, "revision", "done")
 }
 
 fn is_declarative_graph(graph: &ExecutableGraph) -> bool {
@@ -3484,6 +3851,9 @@ pub enum SessionReducerError {
     /// Child sessions did not follow proposal, atomic creation, and terminal ordering.
     #[error("child-agent state transition is invalid")]
     InvalidChildAgentTransition,
+    /// Planner tasks, joins, or reviewer findings violated canonical ordering.
+    #[error("planner-worker-reviewer state transition is invalid")]
+    InvalidPlannerWorkerTransition,
     /// Context composition did not follow start, phase, completion ordering.
     #[error("context boundary state transition is invalid")]
     InvalidContextBoundaryTransition,
@@ -3617,6 +3987,10 @@ mod tests {
         )
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture retains the complete canonical plan-to-child proposal sequence"
+    )]
     fn proposed_child_creation_fixture() -> (
         ChildAgentExecutionIdentity,
         ContentHash,
@@ -3682,6 +4056,48 @@ mod tests {
             ),
             envelope(
                 4,
+                RuntimeCommittedEvent::ModelRequestStarted(ModelRequestStartedEvent {
+                    cancellation_id: String::from("planner"),
+                }),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::ModelOutputDeltaObserved(ModelOutputDeltaObservedEvent {
+                    cancellation_id: String::from("planner"),
+                    text: String::from("structured plan"),
+                }),
+            ),
+            envelope(
+                6,
+                RuntimeCommittedEvent::ModelResponseCompleted(ModelResponseCompletedEvent {
+                    cancellation_id: String::from("planner"),
+                    finish_reason: String::from("stop"),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                }),
+            ),
+            envelope(
+                7,
+                RuntimeCommittedEvent::TaskPlanCommitted(TaskPlanCommittedEvent {
+                    node_id: String::from("plan"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                    model_response_sequence: Sequence::new(6).expect("response"),
+                    tasks: vec![
+                        PlannedTask {
+                            task_id: String::from("task-1"),
+                            description: String::from("inspect scheduler recovery"),
+                        },
+                        PlannedTask {
+                            task_id: String::from("task-2"),
+                            description: String::from("inspect tool recovery"),
+                        },
+                    ],
+                }),
+            ),
+            envelope(
+                8,
                 RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
                     node_id: String::from("plan"),
                     attempt: 1,
@@ -3692,7 +4108,7 @@ mod tests {
                 }),
             ),
             envelope(
-                5,
+                9,
                 RuntimeCommittedEvent::StyleTransitionSelected(StyleTransitionSelectedEvent {
                     from_node_id: String::from("plan"),
                     to_node_id: String::from("spawn-workers"),
@@ -3702,7 +4118,7 @@ mod tests {
                 }),
             ),
             envelope(
-                6,
+                10,
                 RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
                     node_id: String::from("spawn-workers"),
                     attempt: 1,
@@ -3711,7 +4127,7 @@ mod tests {
                 }),
             ),
             envelope(
-                7,
+                11,
                 RuntimeCommittedEvent::ChildAgentCreationProposed(proposal),
             ),
         ];
@@ -3778,7 +4194,7 @@ mod tests {
         let (identity, digest, mut events) = proposed_child_creation_fixture();
         let mut wrong = events.clone();
         wrong.push(envelope(
-            8,
+            12,
             RuntimeCommittedEvent::ChildAgentCreationApproved(ChildAgentCreationApprovedEvent {
                 identity: identity.clone(),
                 action_digest: ContentHash::digest(b"wrong"),
@@ -3790,18 +4206,18 @@ mod tests {
         ));
 
         events.push(envelope(
-            8,
+            12,
             RuntimeCommittedEvent::ChildAgentCreationApproved(ChildAgentCreationApprovedEvent {
                 identity: identity.clone(),
                 action_digest: digest,
             }),
         ));
         events.push(envelope(
-            9,
+            13,
             RuntimeCommittedEvent::ChildAgentCreated(ChildAgentCreatedEvent {
                 identity: identity.clone(),
                 child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
-                parent_action_sequence: Sequence::new(7).expect("proposal sequence"),
+                parent_action_sequence: Sequence::new(11).expect("proposal sequence"),
                 child_style: String::from("ephemeral-turn@1.1.0"),
             }),
         ));
@@ -3815,6 +4231,29 @@ mod tests {
                 .state,
             ChildAgentState::Active
         );
+    }
+
+    #[test]
+    fn planner_task_plan_rejects_duplicate_runtime_task_identity() {
+        let (_, _, mut events) = proposed_child_creation_fixture();
+        events.truncate(7);
+        let RuntimeCommittedEvent::TaskPlanCommitted(plan) =
+            &mut events.last_mut().expect("plan event").payload
+        else {
+            panic!("expected task plan");
+        };
+        plan.tasks[1].task_id = plan.tasks[0].task_id.clone();
+        let resealed = EventEnvelope::seal(
+            events.last().expect("plan event").metadata.clone(),
+            events.last().expect("plan event").payload.clone(),
+        )
+        .expect("reseal changed plan");
+        *events.last_mut().expect("plan event") = resealed;
+
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
     }
 
     fn compiled_graph() -> ExecutableGraph {

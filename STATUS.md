@@ -8,12 +8,13 @@ implementation state; planned interfaces and scaffolds do not count as implement
 ## Current phase
 
 Session-style refocus, Phase 4 — additional built-in execution modes. The
-registry, immutable session binding, generic persistent/ephemeral turn executor,
+registry, immutable session binding, generic persistent/ephemeral/research executor,
 and style-selected context composition are live. No/file/SQLite memory and
 none/sliding-window/tool-output-eviction compaction run through recoverable
-canonical lifecycle boundaries before provider requests. Research loop,
-declarative graph, planner-worker-reviewer, summary/artifact compaction, and
-automatic memory writes remain incomplete.
+canonical lifecycle boundaries before provider requests. The research loop now
+runs bounded fresh-context iterations with immutable findings. Declarative
+graph, planner-worker-reviewer, summary/artifact compaction, and automatic
+memory writes remain incomplete.
 
 ## Completed capabilities
 
@@ -51,10 +52,11 @@ automatic memory writes remain incomplete.
 | Harness continuation gate | Integration tested | Tool-call generation stops at a proposal; explicit runtime continuation issues a fresh provider request exactly once, with replacement structured context |
 | Native Git host | End-to-end validated | Discovery/status/diff, detached worktrees, commit-free integrity-checked checkpoints and guarded restore have 9 host tests; runtime routing uses keyed grants and `tests/e2e/runtime_git_loop.ps1` validates a real repository status round trip |
 | Native LSP host | End-to-end validated | Separate five-crate host implements LSP 3.17 lifecycle, all required query/edit-proposal operations, cancellation, timeout, restart, workspace containment, keyed authorization and deterministic fixture coverage; runtime project-root routing passes a process E2E |
-| Session-style SDK | Implemented and unit tested | Five built-ins, strict owned TOML/JSON manifests, STYLE001–STYLE029 validation, graph/pipeline compilation, availability/budget checks, inspectable descriptors and compatibility-bound cache keys; 21 tests. Exact-version `research-loop@1.1.0` now declares a bounded fresh-context/model/tool/artifact/loop graph with runtime-owned deterministic completion input, and `declarative-graph@1.1.0` supplies a fail-closed branch/approval/tool/bounded-loop fixture. Their runtime node adapters remain incomplete |
+| Session-style SDK | Implemented and unit tested | Five built-ins, strict owned TOML/JSON manifests, STYLE001–STYLE029 validation, graph/pipeline compilation, availability/budget checks, inspectable descriptors and compatibility-bound cache keys; 21 tests. Exact-version `research-loop@1.1.0` declares the live bounded fresh-context/model/tool/artifact/loop graph with runtime-owned deterministic completion input, and `declarative-graph@1.1.0` supplies a fail-closed branch/approval/tool/bounded-loop fixture whose runtime adapter remains incomplete |
 | Runtime session-style registry and binding | End-to-end validated on Windows | Runtime dependency discovers bounded user/project/plugin TOML/JSON sources and disable markers and persists compiled cache records; data compiles through the SDK and owns catalog/cache records; logic owns exact ID/version selection, compatibility, immutable binding, and fail-closed restart validation; service exposes list/inspect/validate/compile and binds creation/branch operations. Complete identity, manifest, compiled descriptor, memory/compaction/tool/harness/budget/permission selections are canonical and atomic in schema-v2 session metadata, `style.json`, and `style.lock`. CLI commands and the TUI Styles view select live styles. `runtime_style_registry.ps1` proves two distinct durable bindings, persistent and ephemeral restart continuation, branch restyling with continued parent and branch execution, and no fallback after disablement; the Unix equivalent has been syntax-checked but not process-executed |
 | Generic runtime session-style executor | End-to-end validated for persistent chat on Windows | Runtime logic consumes the exact SDK-compiled graph retained by the immutable session binding, verifies all cache identity hashes, maps every compiled node kind to a runtime-owned directive, and rejects missing or ambiguous transitions. Canonical `style.execution_initialized`, `style.node_entered`, `style.node_completed`, `style.node_failed`, and `style.transition_selected` events reconstruct active/completed/failed nodes and transitions during replay without dispatching effects. Persistent chat follows `respond → tool → done` through this executor while its node adapters reuse the existing provider authorization, harness, tool proposal, permission, receipt, continuation, and assistant-commit paths. Turn-scoped provider failures clear the active node canonically; retained graph and style step limits fail closed. Windows durable-turn, streaming, reconnect, tool, process, approval, cancellation, registry/restart, and workspace tests pass; Unix equivalents are updated but not executed |
 | Ephemeral-turn style execution | End-to-end validated on Windows | The SDK-compiled `fresh-context → respond → tool → done` graph executes through the generic style executor. Each turn authorizes and canonically records one current-turn-only provider projection, retains typed canonical user/assistant history without fabricated handoff messages, and authorizes a phase-bound empty projection before completing the turn. Exact graph-edge, run, request, provider, model, options, and input identities govern recovery; journal-cut tests cover fresh replacement, context-to-model transition, assistant commit, discard phase, and discard boundary without duplicate user commits or provider redispatch. `runtime_ephemeral_turn.ps1` proves two isolated turns across restart, empty dormant projection, complete canonical history, and no turn-one input/output in turn two's fresh provider projection; the Unix equivalent has been syntax-checked but not process-executed |
+| Research-loop style execution | End-to-end validated on Windows | The SDK-compiled `fresh-context → research → tool → persist → repeat` graph executes through the generic style executor with a deterministic, style-bounded completion criterion. Every iteration receives a fresh provider projection, can execute native tools and resume approvals, commits visible output, persists a policy-approved immutable JSON finding through a canonical proposal/approval/dispatch/completion outbox, and records loop transitions and terminal lifecycle state. Replay retains structured provider tool proposals so restart cannot change finding bytes; exact request hashes reject changed provider/model/options/criteria. Unit crash matrices cover assistant, policy, dispatch, receipt, node, loop, transition, terminal lifecycle, tool, and approval cuts without ambiguous redispatch. `runtime_research_loop.ps1` proves three findings, three inspectable iterations, daemon restart, and pure replay; the Unix equivalent is syntax-checked but has not been process-executed |
 | Style-selected context, memory, and compaction | End-to-end validated for no/file/SQLite memory and none/sliding compaction on Windows | The SDK compiles retrieval timing, query construction, write policy, injection location, reserved context tokens, projection limits, and typed preservation requirements with fail-safe schema-v1 defaults. Runtime data routes no-memory, checksum-protected file memory, and SQLite FTS through distinct selected dependencies with session isolation plus item, query-byte, contribution-byte, projection-token, and hard serialized-byte bounds. Context construction, replacement, and compaction proposals traverse the existing style/plugin/user/mandatory pipeline; canonical boundary/phase events enforce exact memory-before-compaction ordering, bind retries to provider/model/options/current-input identity, recompute projection measurements during replay, recover completed phases exactly once, and fail closed after an ambiguous interceptor start. Canonical replacements preserve full conversation history and complete provenance. `runtime_style_context.ps1` proves no/file/SQLite selection, isolation, restart retrieval, branch-to-no-memory cleanup, limits, first-turn pressure, reserved budgets, and none-vs-sliding projection differences while preserving canonical history. Summary/artifact handoff and automatic writes remain incomplete; the Unix process script has only been syntax-checked |
 | Runtime local RPC transport | Integration tested | Bounded framed negotiation, mandatory bootstrap-token authentication, concurrent local socket/named-pipe connections, request dispatch, ordered `StreamItem`/`StreamEnd` frames, committed-sequence binding, and bounded channel backpressure tests |
 | Runtime↔harness durable turn | End-to-end validated | CLI create/run traverses authenticated named pipe, runtime replay/commit, ordered interception and policy, short-lived keyed grant, supervised harness, deterministic provider, canonical proposal/approval/started/delta/completion events, and assistant commit; Windows E2E passes and Unix automation is present |
@@ -91,9 +93,9 @@ automatic memory writes remain incomplete.
 None. `cargo test --workspace --all-targets --all-features --locked`,
 `cargo test --workspace --doc --all-features --locked`, strict workspace
 Clippy, formatting, and the 88-package architecture command and fixture tests
-pass locally on Windows for the current tree. The ephemeral and style-registry
-process E2Es pass on Windows; their Unix scripts have been syntax-checked but
-not process-executed.
+pass locally on Windows for the current tree. The ephemeral, research-loop, and
+style-registry process E2Es pass on Windows; their Unix scripts have been
+syntax-checked but not process-executed.
 
 ## Blockers
 
@@ -101,8 +103,7 @@ None.
 
 ## Next tasks
 
-1. Implement research loop and declarative graph, then
-   planner-worker-reviewer child sessions.
+1. Implement declarative graph, then planner-worker-reviewer child sessions.
 2. Finish summary/artifact/write context paths, then connect plugin composition
    and the harness capability registry.
 

@@ -77,6 +77,19 @@ pub struct ToolCallAction {
     pub source: Option<String>,
 }
 
+/// Structured immutable artifact persistence proposal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactPersistenceAction {
+    /// Hash of the exact bytes to persist.
+    pub content_hash: ContentHash,
+    /// Valid media type.
+    pub mime_type: String,
+    /// Exact byte count.
+    pub byte_size: u64,
+    /// Stable retention selection.
+    pub retention: String,
+}
+
 /// Every consequential runtime action class.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
@@ -136,6 +149,8 @@ pub enum ConsequentialAction {
         /// Hash of bounded content.
         content_hash: ContentHash,
     },
+    /// Persist approved bytes as an immutable content-addressed artifact.
+    ArtifactPersistence(ArtifactPersistenceAction),
     /// Compact provider context.
     Compaction {
         /// Stable strategy.
@@ -193,6 +208,7 @@ impl ConsequentialAction {
             Self::HttpRequest(_) => "http_request",
             Self::WebSearch { .. } => "web_search",
             Self::MemoryWrite { .. } => "memory_write",
+            Self::ArtifactPersistence(_) => "artifact_persistence",
             Self::Compaction { .. } => "compaction",
             Self::ChildAgentCreation { .. } => "child_agent_creation",
             Self::PluginStateChange { .. } => "plugin_state_change",

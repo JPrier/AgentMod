@@ -1,5 +1,6 @@
 //! Runtime business dataset construction.
 
+pub mod artifact;
 pub mod continuation;
 pub mod harness;
 pub mod identity;
@@ -57,6 +58,7 @@ pub struct RuntimeData<D> {
     dependency: D,
     style_cache: Arc<Mutex<BTreeMap<String, style::CachedSessionStyle>>>,
     memory: Option<memory::RuntimeMemoryData>,
+    artifacts: Option<artifact::RuntimeArtifactData>,
 }
 
 impl<D> RuntimeData<D> {
@@ -67,6 +69,7 @@ impl<D> RuntimeData<D> {
             dependency,
             style_cache: Arc::new(Mutex::new(BTreeMap::new())),
             memory: None,
+            artifacts: None,
         }
     }
 
@@ -75,6 +78,35 @@ impl<D> RuntimeData<D> {
     pub fn with_memory(mut self, memory: memory::RuntimeMemoryData) -> Self {
         self.memory = Some(memory);
         self
+    }
+
+    /// Adds the explicit first-party immutable artifact router.
+    #[must_use]
+    pub fn with_artifacts(mut self, artifacts: artifact::RuntimeArtifactData) -> Self {
+        self.artifacts = Some(artifacts);
+        self
+    }
+}
+
+impl<D> artifact::ArtifactDataPort for RuntimeData<D> {
+    fn persist_artifact(
+        &self,
+        request: artifact::PersistArtifactDataRequest,
+    ) -> Result<artifact::PersistedArtifactDataRecord, artifact::ArtifactDataError> {
+        self.artifacts
+            .as_ref()
+            .ok_or(artifact::ArtifactDataError::InvalidRequest)?
+            .persist_artifact(request)
+    }
+
+    fn inspect_artifact(
+        &self,
+        request: artifact::InspectArtifactDataRequest,
+    ) -> Result<artifact::PersistedArtifactDataRecord, artifact::ArtifactDataError> {
+        self.artifacts
+            .as_ref()
+            .ok_or(artifact::ArtifactDataError::InvalidRequest)?
+            .inspect_artifact(request)
     }
 }
 

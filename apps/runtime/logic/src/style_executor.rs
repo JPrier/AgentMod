@@ -41,6 +41,7 @@ pub(crate) enum StyleNodeDirective {
 pub(crate) enum StyleAdapterKind {
     PersistentTurn,
     EphemeralTurn,
+    ResearchLoop,
 }
 
 impl StyleNodeDirective {
@@ -220,8 +221,11 @@ impl CompiledStyleExecutor {
         if self.supports_persistent_turn() {
             return Some(StyleAdapterKind::PersistentTurn);
         }
-        self.supports_ephemeral_turn()
-            .then_some(StyleAdapterKind::EphemeralTurn)
+        if self.supports_ephemeral_turn() {
+            return Some(StyleAdapterKind::EphemeralTurn);
+        }
+        self.supports_research_loop()
+            .then_some(StyleAdapterKind::ResearchLoop)
     }
 
     /// Returns whether this graph is the exact fresh-context turn lifecycle.
@@ -254,6 +258,66 @@ impl CompiledStyleExecutor {
         to_complete.to.directive == StyleNodeDirective::CompleteTurn
             && self
                 .transition(to_complete.to.index, &serde_json::json!({}))
+                .is_ok_and(|transition| transition.is_none())
+    }
+
+    /// Returns whether this graph is the bounded research lifecycle supported
+    /// by the runtime-owned research adapter.
+    fn supports_research_loop(&self) -> bool {
+        if self.compiled.graph.nodes.len() != 6 || self.compiled.graph.edges.len() != 6 {
+            return false;
+        }
+        let Ok(fresh) = self.entry() else {
+            return false;
+        };
+        if fresh.directive != StyleNodeDirective::ContextTransform {
+            return false;
+        }
+        let Ok(Some(to_model)) = self.transition(fresh.index, &serde_json::json!({})) else {
+            return false;
+        };
+        if to_model.to.directive != StyleNodeDirective::ModelCall {
+            return false;
+        }
+        let Ok(Some(to_tools)) = self.transition(to_model.to.index, &serde_json::json!({})) else {
+            return false;
+        };
+        if to_tools.to.directive != StyleNodeDirective::ToolExecutionGate {
+            return false;
+        }
+        let Ok(Some(to_artifact)) = self.transition(to_tools.to.index, &serde_json::json!({}))
+        else {
+            return false;
+        };
+        if to_artifact.to.directive != StyleNodeDirective::PersistArtifact {
+            return false;
+        }
+        let Ok(Some(to_loop)) = self.transition(to_artifact.to.index, &serde_json::json!({}))
+        else {
+            return false;
+        };
+        if to_loop.to.directive != StyleNodeDirective::Loop || to_loop.to.max_iterations.is_none() {
+            return false;
+        }
+        let Ok(Some(repeat)) = self.transition(
+            to_loop.to.index,
+            &serde_json::json!({"completion":{"criteria_met":false}}),
+        ) else {
+            return false;
+        };
+        let Ok(Some(complete)) = self.transition(
+            to_loop.to.index,
+            &serde_json::json!({"completion":{"criteria_met":true}}),
+        ) else {
+            return false;
+        };
+        repeat.to.index == fresh.index
+            && complete.to.directive == StyleNodeDirective::CompleteSession
+            && self
+                .transition(
+                    complete.to.index,
+                    &serde_json::json!({"completion":{"criteria_met":true}}),
+                )
                 .is_ok_and(|transition| transition.is_none())
     }
 
@@ -496,6 +560,10 @@ pub(crate) mod tests {
         let executor = CompiledStyleExecutor::from_binding(&binding(BuiltInStyle::ResearchLoop))
             .expect("executor");
         assert!(!executor.supports_persistent_turn());
+        assert_eq!(
+            executor.adapter_kind(),
+            Some(super::StyleAdapterKind::ResearchLoop)
+        );
         let loop_node = executor.node("repeat").expect("loop");
         let repeat = executor
             .transition(

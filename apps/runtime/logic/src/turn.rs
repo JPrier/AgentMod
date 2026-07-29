@@ -19,6 +19,7 @@ use agentmod_primitives::{
     CausationId, ContentHash, ContinuationId, Sequence, SessionId, TimestampMillis, Version,
 };
 use agentmod_runtime_data::{
+    artifact::ArtifactDataPort,
     continuation::ContinuationDataPort,
     harness::HarnessDataPort,
     identity::{
@@ -35,6 +36,9 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     action::{ActionProposal, ConsequentialAction, ProposalId},
+    artifact::{
+        ArtifactPersistenceLogic, ArtifactRetention, ArtifactSecurity, PersistArtifactCommand,
+    },
     compaction::{CompactionContext, CompactionError, CompactionStrategy, compact_projection},
     continuation::{
         ApprovalDisposition, ContinuationLogic, ContinuationLogicPort, ContinuationPayload,
@@ -64,6 +68,9 @@ use crate::{
     },
     session::{
         ApprovalRequestedEvent, ApprovalResolvedEvent, ApprovalState,
+        ArtifactPersistenceApprovedEvent, ArtifactPersistenceCompletedEvent,
+        ArtifactPersistenceDispatchedEvent, ArtifactPersistenceIdentity,
+        ArtifactPersistenceProposedEvent, ArtifactPersistenceResumeAction,
         ContextBoundaryCompletedEvent, ContextBoundaryIdentity, ContextBoundaryOrigin,
         ContextBoundaryStartedEvent, ContextPhaseCompletedEvent, ContextPhaseIdentity,
         ContextPhaseStartedEvent, ContextProjectionReplacedEvent, ConversationEntryCommittedEvent,
@@ -150,6 +157,8 @@ struct ActiveStyleTurn {
     executor: CompiledStyleExecutor,
     current: StyleNodeCursor,
     position: JournalPosition,
+    attempt: u32,
+    loop_iteration: u32,
     step: u64,
     max_steps: u64,
 }
@@ -405,6 +414,7 @@ pub struct TurnLogic<D> {
     data: D,
     provider: ProviderExecutionLogic<D>,
     tools: ToolExecutionLogic<D>,
+    artifacts: ArtifactPersistenceLogic<D>,
     policy: ProviderExecutionPolicy,
     session_gates: Arc<Mutex<BTreeMap<String, Weak<Mutex<()>>>>>,
 }
@@ -420,6 +430,7 @@ impl<D: Clone> TurnLogic<D> {
         };
         Self {
             provider: ProviderExecutionLogic::new(data.clone(), policy.clone()),
+            artifacts: ArtifactPersistenceLogic::new(data.clone(), policy.clone()),
             policy,
             tools: ToolExecutionLogic::new(data.clone(), tool_policy),
             data,
@@ -450,6 +461,7 @@ where
         + HarnessDataPort
         + ContinuationDataPort
         + MemoryDataPort
+        + ArtifactDataPort
         + agentmod_runtime_data::tool::ToolDataPort
         + 'static,
 {
@@ -520,6 +532,7 @@ where
         + HarnessDataPort
         + ContinuationDataPort
         + MemoryDataPort
+        + ArtifactDataPort
         + agentmod_runtime_data::tool::ToolDataPort
         + 'static,
 {
@@ -640,6 +653,26 @@ where
                 awaiting_continuation: None,
             });
         }
+        if preflight
+            .state
+            .style_binding
+            .as_ref()
+            .and_then(|binding| CompiledStyleExecutor::from_binding(binding).ok())
+            .and_then(|executor| executor.adapter_kind())
+            == Some(StyleAdapterKind::ResearchLoop)
+        {
+            return self
+                .run_research_loop(
+                    command,
+                    sink,
+                    scheduled,
+                    session_id,
+                    session_directory,
+                    persistence,
+                    preflight,
+                )
+                .await;
+        }
         let (style_driven, resume_context) = match preflight.state.style_binding.as_ref() {
             Some(binding) => {
                 let executor = CompiledStyleExecutor::from_binding(binding)
@@ -651,6 +684,8 @@ where
                     "never"
                     | "turnstart"
                     | "turn_start"
+                    | "iterationstart"
+                    | "iteration_start"
                     | "beforemodelrequest"
                     | "before_model_request" => {}
                     unsupported => {
@@ -779,7 +814,7 @@ where
                         )
                         .await
                     }
-                    StyleAdapterKind::EphemeralTurn => {
+                    StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop => {
                         let (state, position) = match execution.current.directive {
                             StyleNodeDirective::ContextTransform => {
                                 let (_state, position) = self
@@ -1070,6 +1105,647 @@ where
             awaiting_continuation: None,
         })
     }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the research adapter keeps each compiled node adjacent to its existing effect-safe runtime path"
+    )]
+    async fn run_research_loop(
+        &self,
+        command: RunTurnCommand,
+        sink: Option<&mpsc::Sender<Result<RunTurnStreamItem, RunTurnError>>>,
+        scheduled: Option<ScheduledTurnPrelude>,
+        session_id: SessionId,
+        session_directory: PathBuf,
+        persistence: SessionPersistenceLogic<D>,
+        preflight: LoadSessionResult,
+    ) -> Result<RunTurnResult, RunTurnError> {
+        let (user_sequence, mut execution) =
+            if let Some(canonical) = preflight.state.style_execution.as_ref() {
+                if let Some(reason) = canonical.termination_reason.as_ref() {
+                    if reason == "complete_session"
+                        && preflight.state.lifecycle == crate::session::SessionLifecycle::Active
+                    {
+                        let user_sequence = current_run_user_sequence(&preflight.state, &command)?;
+                        let (sequence, _) = self.commit_next(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            preflight.state.last_sequence,
+                            preflight.last_event_id,
+                            RuntimeCommittedEvent::SessionLifecycleChanged(
+                                crate::session::SessionLifecycleChangedEvent {
+                                    lifecycle: crate::session::SessionLifecycle::Completed,
+                                    reason: Some(String::from("research criteria satisfied")),
+                                },
+                            ),
+                        )?;
+                        return Ok(RunTurnResult {
+                            events: Vec::new(),
+                            first_committed_sequence: user_sequence,
+                            last_committed_sequence: sequence,
+                            awaiting_continuation: None,
+                        });
+                    }
+                    return Err(RunTurnError::StyleExecutionTerminalReason(reason.clone()));
+                }
+                validate_research_resume_request(&preflight.state, &command)?;
+                let user_sequence = current_run_user_sequence(&preflight.state, &command)?;
+                let execution = Self::resume_active_style_turn(
+                    &preflight.state,
+                    JournalPosition {
+                        sequence: preflight.state.last_sequence,
+                        event_id: preflight.last_event_id,
+                    },
+                )?
+                .ok_or(RunTurnError::StyleGraphMismatch)?;
+                (user_sequence, execution)
+            } else {
+                if let Some(scheduled) = scheduled {
+                    self.commit_scheduler_fired(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        scheduled,
+                    )?;
+                }
+                let (state, user_sequence, user_event) =
+                    self.commit_user(&persistence, session_id, &session_directory, &command)?;
+                let execution = self.begin_style_turn(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &state,
+                    JournalPosition {
+                        sequence: user_sequence,
+                        event_id: user_event.metadata.event_id,
+                    },
+                )?;
+                (user_sequence, execution)
+            };
+        if execution.executor.adapter_kind() != Some(StyleAdapterKind::ResearchLoop) {
+            return Err(RunTurnError::StyleGraphMismatch);
+        }
+        let loop_limit = execution
+            .executor
+            .compiled()
+            .graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == agentmod_graph_engine::NodeKind::Loop)
+            .and_then(|node| node.max_iterations)
+            .ok_or(RunTurnError::StyleGraphMismatch)?;
+        let completion_after = research_completion_after(&command.options, loop_limit)?;
+        let mut all_events = Vec::new();
+
+        loop {
+            let mut iteration_command = command.clone();
+            iteration_command.cancellation_id = research_iteration_cancellation_id(
+                &command.cancellation_id,
+                execution
+                    .loop_iteration
+                    .checked_add(1)
+                    .ok_or(RunTurnError::SequenceOverflow)?,
+            );
+            if execution.current.directive == StyleNodeDirective::ContextTransform {
+                let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                let (_state, position) = self
+                    .compose_style_context(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        state,
+                        execution.position,
+                        &command,
+                        ContextCompositionBoundary::TurnStart,
+                        ContextCompositionOrigin::UserTurn,
+                    )
+                    .await?;
+                execution.position = position;
+                let loop_iteration = execution.loop_iteration;
+                self.complete_and_enter_next(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &mut execution,
+                    Some(format!(
+                        "research-context:{}:{loop_iteration}",
+                        command.cancellation_id
+                    )),
+                )?;
+            }
+            let mut events = Vec::new();
+            if execution.current.directive == StyleNodeDirective::ModelCall {
+                let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                if let Some(recovered) =
+                    recoverable_research_model_events(&state, &iteration_command)
+                {
+                    events = recovered;
+                } else {
+                    if !recoverable_context_retry(&state, &command) {
+                        return Err(RunTurnError::StyleRecoveryRequired(
+                            execution.current.id.clone(),
+                        ));
+                    }
+                    let (state, position) = self
+                        .compose_style_context(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            state,
+                            execution.position,
+                            &command,
+                            ContextCompositionBoundary::BeforeModelRequest,
+                            ContextCompositionOrigin::UserTurn,
+                        )
+                        .await?;
+                    let authorized = self
+                        .authorize_and_commit(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            position,
+                            state,
+                            &iteration_command,
+                        )
+                        .await?;
+                    let (executed, observed) = self
+                        .execute_and_commit(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            authorized,
+                            &iteration_command.cancellation_id,
+                            sink,
+                        )
+                        .await?;
+                    execution.position = observed;
+                    events = executed;
+                }
+                if let Some(reason) = provider_node_failure(&events) {
+                    execution.position = self.fail_style_node_at_head(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &execution,
+                        reason,
+                        Some("research_model_failed"),
+                    )?;
+                    return Ok(RunTurnResult {
+                        events,
+                        first_committed_sequence: user_sequence,
+                        last_committed_sequence: execution.position.sequence,
+                        awaiting_continuation: None,
+                    });
+                }
+                self.complete_and_enter_next(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &mut execution,
+                    Some(format!(
+                        "research-model:{}",
+                        iteration_command.cancellation_id
+                    )),
+                )?;
+            }
+            if events.is_empty()
+                && execution.current.directive != StyleNodeDirective::ContextTransform
+            {
+                events = recoverable_research_model_events(
+                    &Self::load_state(&persistence, session_id, &session_directory)?,
+                    &iteration_command,
+                )
+                .ok_or_else(|| RunTurnError::StyleRecoveryRequired(execution.current.id.clone()))?;
+            }
+            if execution.current.directive == StyleNodeDirective::ToolExecutionGate {
+                let tool_outcome = self
+                    .resolve_tool_calls(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &iteration_command,
+                        events,
+                        execution.position,
+                        sink,
+                    )
+                    .await?;
+                let (resolved_events, observed) = match tool_outcome {
+                    ToolLoopOutcome::Complete { events, position } => (events, position),
+                    ToolLoopOutcome::Awaiting {
+                        events,
+                        position,
+                        continuation_id,
+                    } => {
+                        return Ok(RunTurnResult {
+                            events,
+                            first_committed_sequence: user_sequence,
+                            last_committed_sequence: position.sequence,
+                            awaiting_continuation: Some(continuation_id.to_string()),
+                        });
+                    }
+                };
+                events = resolved_events;
+                execution.position = observed;
+                if let Some(reason) = provider_node_failure(&events) {
+                    execution.position = self.fail_style_node_at_head(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &execution,
+                        reason,
+                        Some("research_tool_loop_failed"),
+                    )?;
+                    return Ok(RunTurnResult {
+                        events,
+                        first_committed_sequence: user_sequence,
+                        last_committed_sequence: execution.position.sequence,
+                        awaiting_continuation: None,
+                    });
+                }
+                self.complete_and_enter_next(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &mut execution,
+                    Some(String::from("research-tool-gate:complete")),
+                )?;
+            }
+            if execution.current.directive == StyleNodeDirective::PersistArtifact {
+                let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                let artifact_started = state.artifact_persistences.values().any(|record| {
+                    record.identity.node_id == execution.current.id
+                        && record.identity.attempt == execution.attempt
+                        && record.identity.loop_iteration == execution.loop_iteration
+                        && record.identity.step == execution.step
+                });
+                if !artifact_started
+                    && !research_assistant_committed(
+                        &state,
+                        &iteration_command.cancellation_id,
+                        &events,
+                    )
+                {
+                    execution.position = self.commit_visible_assistant(
+                        &persistence,
+                        session_id,
+                        session_directory.clone(),
+                        execution.position.sequence,
+                        execution.position.event_id,
+                        &iteration_command.cancellation_id,
+                        &events,
+                    )?;
+                }
+                let finding =
+                    research_finding_bytes(&command.prompt, execution.loop_iteration, &events)?;
+                let artifact_reference = self
+                    .persist_research_finding(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        finding,
+                    )
+                    .await?;
+                let loop_iteration = execution.loop_iteration;
+                self.complete_and_enter_next_with(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &mut execution,
+                    Some(format!("research-finding:{loop_iteration}")),
+                    Some(artifact_reference),
+                    &json!({}),
+                    false,
+                )?;
+            }
+            if execution.current.directive != StyleNodeDirective::Loop
+                && execution.current.directive != StyleNodeDirective::CompleteSession
+            {
+                return Err(RunTurnError::UnexpectedStyleNode {
+                    expected: "persist_artifact, loop, or complete_session",
+                    actual: execution.current.id.clone(),
+                });
+            }
+            let completed_iterations = execution
+                .loop_iteration
+                .checked_add(1)
+                .ok_or(RunTurnError::SequenceOverflow)?;
+            let criteria_met = completed_iterations >= completion_after;
+            if execution.current.directive == StyleNodeDirective::Loop {
+                self.complete_and_enter_next_with(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &mut execution,
+                    Some(format!("completion:criteria_met:{criteria_met}")),
+                    None,
+                    &json!({"completion":{"criteria_met":criteria_met}}),
+                    !criteria_met,
+                )?;
+            }
+            all_events.extend(events);
+            if execution.current.directive == StyleNodeDirective::CompleteSession {
+                if execution.current.directive != StyleNodeDirective::CompleteSession {
+                    return Err(RunTurnError::UnexpectedStyleNode {
+                        expected: "complete_session",
+                        actual: execution.current.id.clone(),
+                    });
+                }
+                self.complete_terminal_style_node(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &mut execution,
+                    Some(format!("research:completed:{completed_iterations}")),
+                )?;
+                (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    execution.position.sequence,
+                    execution.position.event_id,
+                    RuntimeCommittedEvent::SessionLifecycleChanged(
+                        crate::session::SessionLifecycleChangedEvent {
+                            lifecycle: crate::session::SessionLifecycle::Completed,
+                            reason: Some(String::from("research criteria satisfied")),
+                        },
+                    ),
+                )?;
+                return Ok(RunTurnResult {
+                    events: all_events,
+                    first_committed_sequence: user_sequence,
+                    last_committed_sequence: execution.position.sequence,
+                    awaiting_continuation: None,
+                });
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "artifact outbox recovery keeps proposal, approval, dispatch, exact-store reconciliation, and terminal evidence adjacent"
+    )]
+    async fn persist_research_finding(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+        bytes: Vec<u8>,
+    ) -> Result<String, RunTurnError> {
+        let content_hash = ContentHash::digest(&bytes);
+        let loaded = persistence
+            .load_session(LoadSessionCommand {
+                session_directory: session_directory.to_owned(),
+                expected_session_id: session_id,
+            })
+            .map_err(RunTurnError::Persistence)?;
+        if loaded.state.last_sequence != execution.position.sequence
+            || loaded.last_event_id != execution.position.event_id
+        {
+            return Err(RunTurnError::StyleRecoveryRequired(
+                execution.current.id.clone(),
+            ));
+        }
+        let existing = loaded
+            .state
+            .artifact_persistences
+            .values()
+            .find(|record| {
+                record.identity.node_id == execution.current.id
+                    && record.identity.attempt == execution.attempt
+                    && record.identity.loop_iteration == execution.loop_iteration
+                    && record.identity.step == execution.step
+            })
+            .cloned();
+        let (identity, command, mut approved_digest, mut resume_action) =
+            if let Some(record) = existing {
+                if record.identity.content_hash != content_hash
+                    || record.mime_type != "application/json"
+                    || record.byte_size
+                        != u64::try_from(bytes.len())
+                            .map_err(|_| RunTurnError::ResearchArtifactEncoding)?
+                {
+                    return Err(RunTurnError::StyleRecoveryRequired(
+                        execution.current.id.clone(),
+                    ));
+                }
+                let command = PersistArtifactCommand {
+                    proposal_id: record.identity.proposal_id.clone(),
+                    style: loaded.state.style.clone(),
+                    workspace: loaded.state.workspace.clone(),
+                    store_root: session_directory.join("artifacts").join("style"),
+                    creation_event: record.proposed_event.to_string(),
+                    producer: String::from("runtime.style"),
+                    mime_type: record.mime_type.clone(),
+                    bytes,
+                    security: ArtifactSecurity::Private,
+                    retention: ArtifactRetention::Session,
+                };
+                let resume_action = record.resume_action();
+                (
+                    record.identity,
+                    command,
+                    record.action_digest,
+                    Some(resume_action),
+                )
+            } else {
+                let reserved = self
+                    .data
+                    .allocate_event_identity(AllocateEventIdentityDataRequest)
+                    .map_err(RunTurnError::Identity)?;
+                let proposal_id = reserved.event_id.to_string();
+                let identity = ArtifactPersistenceIdentity {
+                    execution_id: format!(
+                        "research:{}:{}:{}:{}",
+                        execution.current.id,
+                        execution.attempt,
+                        execution.loop_iteration,
+                        execution.step
+                    ),
+                    proposal_id: proposal_id.clone(),
+                    node_id: execution.current.id.clone(),
+                    attempt: execution.attempt,
+                    loop_iteration: execution.loop_iteration,
+                    step: execution.step,
+                    content_hash,
+                };
+                let command = PersistArtifactCommand {
+                    proposal_id,
+                    style: loaded.state.style.clone(),
+                    workspace: loaded.state.workspace.clone(),
+                    store_root: session_directory.join("artifacts").join("style"),
+                    creation_event: reserved.event_id.to_string(),
+                    producer: String::from("runtime.style"),
+                    mime_type: String::from("application/json"),
+                    bytes,
+                    security: ArtifactSecurity::Private,
+                    retention: ArtifactRetention::Session,
+                };
+                let prepared = self
+                    .artifacts
+                    .prepare(command.clone())
+                    .map_err(RunTurnError::ResearchArtifact)?;
+                let sequence = execution
+                    .position
+                    .sequence
+                    .checked_next()
+                    .map_err(|_| RunTurnError::SequenceOverflow)?;
+                let event = Self::seal_event_with_identity(
+                    session_id,
+                    sequence,
+                    Some(CausationId::from_uuid(
+                        execution.position.event_id.into_uuid(),
+                    )),
+                    reserved,
+                    RuntimeCommittedEvent::ArtifactPersistenceProposed(
+                        ArtifactPersistenceProposedEvent {
+                            identity: identity.clone(),
+                            mime_type: command.mime_type.clone(),
+                            byte_size: u64::try_from(command.bytes.len())
+                                .map_err(|_| RunTurnError::ResearchArtifactEncoding)?,
+                        },
+                    ),
+                )?;
+                execution.position = JournalPosition {
+                    sequence,
+                    event_id: event.metadata.event_id,
+                };
+                persistence
+                    .commit_event(CommitSessionEventCommand {
+                        session_directory: session_directory.to_owned(),
+                        event,
+                        durability: CommitDurability::Data,
+                    })
+                    .map_err(RunTurnError::Persistence)?;
+                let authorized = self
+                    .artifacts
+                    .authorize_prepared(prepared)
+                    .await
+                    .map_err(RunTurnError::ResearchArtifact)?;
+                let action_digest = authorized
+                    .executable
+                    .digest()
+                    .map_err(|_| RunTurnError::Event)?;
+                (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    execution.position.sequence,
+                    execution.position.event_id,
+                    RuntimeCommittedEvent::ArtifactPersistenceApproved(
+                        ArtifactPersistenceApprovedEvent {
+                            identity: identity.clone(),
+                            action_digest,
+                        },
+                    ),
+                )?;
+                let command = command.clone();
+                (
+                    identity,
+                    command,
+                    Some(action_digest),
+                    Some(ArtifactPersistenceResumeAction::DispatchApproved),
+                )
+            };
+
+        if resume_action == Some(ArtifactPersistenceResumeAction::AwaitPolicyRecovery) {
+            let authorized = self
+                .artifacts
+                .authorize_prepared(
+                    self.artifacts
+                        .prepare(command.clone())
+                        .map_err(RunTurnError::ResearchArtifact)?,
+                )
+                .await
+                .map_err(RunTurnError::ResearchArtifact)?;
+            let action_digest = authorized
+                .executable
+                .digest()
+                .map_err(|_| RunTurnError::Event)?;
+            (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                execution.position.sequence,
+                execution.position.event_id,
+                RuntimeCommittedEvent::ArtifactPersistenceApproved(
+                    ArtifactPersistenceApprovedEvent {
+                        identity: identity.clone(),
+                        action_digest,
+                    },
+                ),
+            )?;
+            approved_digest = Some(action_digest);
+            resume_action = Some(ArtifactPersistenceResumeAction::DispatchApproved);
+        }
+        if resume_action == Some(ArtifactPersistenceResumeAction::CompleteNode) {
+            return loaded
+                .state
+                .artifact_persistences
+                .get(&identity.execution_id)
+                .and_then(|record| record.artifact_reference.clone())
+                .ok_or_else(|| RunTurnError::StyleRecoveryRequired(execution.current.id.clone()));
+        }
+        let action_digest =
+            approved_digest.ok_or_else(|| RunTurnError::StyleControlRecoveryRequired {
+                node: execution.current.id.clone(),
+                phase: "artifact_policy",
+            })?;
+
+        let authorized = self
+            .artifacts
+            .restore_authorized(command.clone(), action_digest)
+            .map_err(RunTurnError::ResearchArtifact)?;
+        if resume_action == Some(ArtifactPersistenceResumeAction::DispatchApproved) {
+            (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                execution.position.sequence,
+                execution.position.event_id,
+                RuntimeCommittedEvent::ArtifactPersistenceDispatched(
+                    ArtifactPersistenceDispatchedEvent {
+                        identity: identity.clone(),
+                        action_digest,
+                    },
+                ),
+            )?;
+        }
+        let persisted = if resume_action == Some(ArtifactPersistenceResumeAction::ReconcileReceipt)
+        {
+            self.artifacts
+                .reconcile(&command)
+                .map_err(RunTurnError::ResearchArtifact)?
+                .map_or_else(|| self.artifacts.persist_authorized(authorized), Ok)
+                .map_err(RunTurnError::ResearchArtifact)?
+        } else {
+            self.artifacts
+                .persist_authorized(authorized)
+                .map_err(RunTurnError::ResearchArtifact)?
+        };
+        (execution.position.sequence, execution.position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            execution.position.sequence,
+            execution.position.event_id,
+            RuntimeCommittedEvent::ArtifactPersistenceCompleted(
+                ArtifactPersistenceCompletedEvent {
+                    identity,
+                    action_digest,
+                    artifact_id: persisted.artifact_id,
+                    artifact_reference: persisted.artifact_reference.clone(),
+                    mime_type: persisted.mime_type,
+                    byte_size: persisted.byte_size,
+                },
+            ),
+        )?;
+        Ok(persisted.artifact_reference)
+    }
 }
 
 #[async_trait]
@@ -1118,7 +1794,9 @@ where
         + HarnessDataPort
         + ContinuationDataPort
         + MemoryDataPort
-        + agentmod_runtime_data::tool::ToolDataPort,
+        + ArtifactDataPort
+        + agentmod_runtime_data::tool::ToolDataPort
+        + 'static,
 {
     #[allow(clippy::too_many_lines)]
     async fn resolve_turn_approval(
@@ -1133,7 +1811,7 @@ where
             return Err(RunTurnError::Invalid);
         }
         let gate = self.session_gate(&command.session_id).await;
-        let _session_guard = gate.lock().await;
+        let session_guard = gate.lock().await;
         let session_directory = command.sessions_root.join(session_id.to_string());
         let persistence = SessionPersistenceLogic::new(self.data.clone());
         let continuation_logic = ContinuationLogic::new(self.data.clone());
@@ -1557,6 +2235,53 @@ where
                         execution,
                         Some(String::from("tool-gate:approval-resumed")),
                     )?;
+                    if execution.executor.adapter_kind() == Some(StyleAdapterKind::ResearchLoop) {
+                        if execution.current.directive != StyleNodeDirective::PersistArtifact {
+                            return Err(RunTurnError::UnexpectedStyleNode {
+                                expected: "persist_artifact",
+                                actual: execution.current.id.clone(),
+                            });
+                        }
+                        let preflight = persistence
+                            .load_session(LoadSessionCommand {
+                                session_directory: session_directory.clone(),
+                                expected_session_id: session_id,
+                            })
+                            .map_err(RunTurnError::Persistence)?;
+                        let prompt = current_run_user(&preflight.state, &resumed_turn)?
+                            .text
+                            .clone();
+                        let base_cancellation_id =
+                            research_base_run_id_from_state(&preflight.state)
+                                .ok_or(RunTurnError::InvalidContinuationPayload)?;
+                        let research_command = RunTurnCommand {
+                            sessions_root: resumed_turn.sessions_root.clone(),
+                            session_id: resumed_turn.session_id.clone(),
+                            prompt,
+                            provider: resumed_turn.provider.clone(),
+                            model: resumed_turn.model.clone(),
+                            options: resumed_turn.options.clone(),
+                            cancellation_id: base_cancellation_id.to_owned(),
+                        };
+                        drop(session_guard);
+                        let result = self
+                            .run_research_loop(
+                                research_command,
+                                None,
+                                None,
+                                session_id,
+                                session_directory,
+                                persistence,
+                                preflight,
+                            )
+                            .await?;
+                        return Ok(ResolveTurnApprovalResult {
+                            transitioned: true,
+                            events: result.events,
+                            last_committed_sequence: result.last_committed_sequence,
+                            awaiting_continuation: result.awaiting_continuation,
+                        });
+                    }
                     if execution.current.directive != StyleNodeDirective::CompleteTurn {
                         return Err(RunTurnError::UnexpectedStyleNode {
                             expected: "complete_turn",
@@ -1634,6 +2359,7 @@ where
         + HarnessDataPort
         + ContinuationDataPort
         + MemoryDataPort
+        + ArtifactDataPort
         + agentmod_runtime_data::tool::ToolDataPort
         + 'static,
 {
@@ -1930,7 +2656,16 @@ where
             .map_err(RunTurnError::StyleExecutor)?
             .adapter_kind()
             .ok_or_else(|| RunTurnError::UnsupportedStyleExecution(binding.id.clone()))?;
-        let fresh_ephemeral_context = adapter_kind == StyleAdapterKind::EphemeralTurn
+        let fresh_context_kind = match adapter_kind {
+            StyleAdapterKind::EphemeralTurn => {
+                Some(("ephemeral-fresh-context", "ephemeral_fresh_context"))
+            }
+            StyleAdapterKind::ResearchLoop => {
+                Some(("research-fresh-context", "research_fresh_context"))
+            }
+            StyleAdapterKind::PersistentTurn => None,
+        };
+        let fresh_isolated_context = fresh_context_kind.is_some()
             && boundary == ContextCompositionBoundary::TurnStart
             && origin == ContextCompositionOrigin::UserTurn;
         let (next_state, next_position, boundary_identity, completed_phases, already_completed) =
@@ -1953,7 +2688,7 @@ where
         let retrieve_now = matches!(
             (timing, boundary),
             (
-                "turnstart" | "turn_start",
+                "turnstart" | "turn_start" | "iterationstart" | "iteration_start",
                 ContextCompositionBoundary::TurnStart
             ) | (
                 "beforemodelrequest" | "before_model_request",
@@ -1977,7 +2712,7 @@ where
                 memory_phase.clone(),
             )?;
             state = Self::load_state(persistence, session_id, session_directory)?;
-            let mut replacement = if fresh_ephemeral_context {
+            let mut replacement = if fresh_isolated_context {
                 vec![ConversationEntry::UserMessage(
                     current_run_user(&state, command)?.clone(),
                 )]
@@ -1987,7 +2722,7 @@ where
             let should_retrieve = binding.memory.provider != "none"
                 && retrieve_now
                 && binding.memory.injection_location != "none";
-            let fresh_source_sequence = fresh_ephemeral_context
+            let fresh_source_sequence = fresh_isolated_context
                 .then(|| current_run_user_sequence(&state, command))
                 .transpose()?;
             let mut reserved_identity = None;
@@ -2082,7 +2817,7 @@ where
                     &binding.memory.injection_location,
                 )?;
             }
-            if replacement == state.conversation.provider_projection() && !fresh_ephemeral_context {
+            if replacement == state.conversation.provider_projection() && !fresh_isolated_context {
                 position = self.commit_context_phase_completed(
                     persistence,
                     session_id,
@@ -2101,8 +2836,10 @@ where
                 let provenance = ProjectionProvenance {
                     projection_id: format!(
                         "{}:{}:{}",
-                        if fresh_ephemeral_context {
-                            "ephemeral-fresh-context"
+                        if fresh_isolated_context {
+                            fresh_context_kind
+                                .map(|(projection_prefix, _)| projection_prefix)
+                                .expect("fresh context kind exists")
                         } else {
                             "memory"
                         },
@@ -2110,8 +2847,10 @@ where
                         injection_sequence.get()
                     ),
                     source_range: fresh_source_sequence.map(|sequence| (sequence, sequence)),
-                    method: if fresh_ephemeral_context {
-                        String::from("ephemeral_fresh_context")
+                    method: if fresh_isolated_context {
+                        fresh_context_kind
+                            .map(|(_, method)| method.to_owned())
+                            .expect("fresh context kind exists")
                     } else {
                         format!("memory:{}", binding.memory.provider)
                     },
@@ -2122,7 +2861,7 @@ where
                     &binding.id,
                     &state.workspace,
                     &command.cancellation_id,
-                    if fresh_ephemeral_context {
+                    if fresh_isolated_context {
                         "fresh_context"
                     } else {
                         "memory"
@@ -3803,22 +4542,7 @@ where
             .ok_or(RunTurnError::StyleMigrationRequired)?;
         let executor =
             CompiledStyleExecutor::from_binding(binding).map_err(RunTurnError::StyleExecutor)?;
-        let step = state.style_execution.as_ref().map_or(1, |execution| {
-            execution
-                .completed_nodes
-                .iter()
-                .map(|node| node.step)
-                .chain(execution.failed_nodes.iter().map(|node| node.step))
-                .chain(
-                    execution
-                        .transitions
-                        .iter()
-                        .map(|transition| transition.step),
-                )
-                .max()
-                .unwrap_or(0)
-                .saturating_add(1)
-        });
+        let step = next_style_step(state);
         if let Some(execution) = &state.style_execution {
             if execution.graph.as_ref() != &executor.compiled().graph {
                 return Err(RunTurnError::StyleGraphMismatch);
@@ -3846,7 +4570,9 @@ where
         let current = executor.entry().map_err(RunTurnError::StyleExecutor)?;
         let expected_entry = match executor.adapter_kind() {
             Some(StyleAdapterKind::PersistentTurn) => StyleNodeDirective::ModelCall,
-            Some(StyleAdapterKind::EphemeralTurn) => StyleNodeDirective::ContextTransform,
+            Some(StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop) => {
+                StyleNodeDirective::ContextTransform
+            }
             None => {
                 return Err(RunTurnError::UnsupportedStyleExecution(binding.id.clone()));
             }
@@ -3894,6 +4620,8 @@ where
             executor,
             current,
             position,
+            attempt: 1,
+            loop_iteration: 0,
             step,
             max_steps,
         })
@@ -3938,7 +4666,7 @@ where
                 .node(&completed.node_id)
                 .map_err(RunTurnError::StyleExecutor)?;
             let transition = executor
-                .transition(from.index, &json!({}))
+                .transition(from.index, &style_transition_variables(completed)?)
                 .map_err(RunTurnError::StyleExecutor)?
                 .ok_or_else(|| RunTurnError::UnexpectedStyleNode {
                     expected: "nonterminal graph transition",
@@ -3975,12 +4703,19 @@ where
         let destination = executor
             .node(&selected.to_node_id)
             .map_err(RunTurnError::StyleExecutor)?;
-        let recoverable_fresh_model_entry = adapter_kind == StyleAdapterKind::EphemeralTurn
-            && destination.directive == StyleNodeDirective::ModelCall
+        let recoverable_fresh_model_entry = matches!(
+            adapter_kind,
+            StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop
+        ) && destination.directive
+            == StyleNodeDirective::ModelCall
             && executor
                 .node(&selected.from_node_id)
                 .is_ok_and(|source| source.directive == StyleNodeDirective::ContextTransform);
-        if destination.directive.requires_effect_evidence() && !recoverable_fresh_model_entry {
+        let recoverable_research_entry = adapter_kind == StyleAdapterKind::ResearchLoop;
+        if destination.directive.requires_effect_evidence()
+            && !recoverable_fresh_model_entry
+            && !recoverable_research_entry
+        {
             return Err(RunTurnError::StyleControlRecoveryRequired {
                 node: destination.id,
                 phase: "awaiting_destination_entry",
@@ -3990,6 +4725,20 @@ where
             .step
             .checked_add(1)
             .ok_or(RunTurnError::SequenceOverflow)?;
+        let loop_iteration = if executor
+            .node(&selected.from_node_id)
+            .map_err(RunTurnError::StyleExecutor)?
+            .directive
+            == StyleNodeDirective::Loop
+            && destination.directive != StyleNodeDirective::CompleteSession
+        {
+            selected
+                .loop_iteration
+                .checked_add(1)
+                .ok_or(RunTurnError::SequenceOverflow)?
+        } else {
+            selected.loop_iteration
+        };
         if step > max_steps {
             self.commit_style_budget_termination(
                 persistence,
@@ -4014,7 +4763,7 @@ where
             RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
                 node_id: destination.id,
                 attempt: selected.attempt,
-                loop_iteration: selected.loop_iteration,
+                loop_iteration,
                 step,
             }),
         )?;
@@ -4056,6 +4805,8 @@ where
             executor,
             current,
             position,
+            attempt: entered.attempt,
+            loop_iteration: entered.loop_iteration,
             step: entered.step,
             max_steps: binding
                 .budgets
@@ -4072,6 +4823,33 @@ where
         execution: &mut ActiveStyleTurn,
         result_reference: Option<String>,
     ) -> Result<(), RunTurnError> {
+        self.complete_and_enter_next_with(
+            persistence,
+            session_id,
+            session_directory,
+            execution,
+            result_reference,
+            None,
+            &json!({}),
+            false,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "compiled transition completion binds canonical counters, result identity, artifact identity, variables, and loop advancement"
+    )]
+    fn complete_and_enter_next_with(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+        result_reference: Option<String>,
+        artifact_reference: Option<String>,
+        variables: &Value,
+        advance_loop: bool,
+    ) -> Result<(), RunTurnError> {
         (execution.position.sequence, execution.position.event_id) = self.commit_next(
             persistence,
             session_id,
@@ -4080,16 +4858,16 @@ where
             execution.position.event_id,
             RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
                 node_id: execution.current.id.clone(),
-                attempt: 1,
-                loop_iteration: 0,
+                attempt: execution.attempt,
+                loop_iteration: execution.loop_iteration,
                 step: execution.step,
                 result_reference,
-                artifact_reference: None,
+                artifact_reference,
             }),
         )?;
         let transition = execution
             .executor
-            .transition(execution.current.index, &json!({}))
+            .transition(execution.current.index, variables)
             .map_err(RunTurnError::StyleExecutor)?
             .ok_or_else(|| RunTurnError::UnexpectedStyleNode {
                 expected: "nonterminal graph transition",
@@ -4104,8 +4882,8 @@ where
             RuntimeCommittedEvent::StyleTransitionSelected(StyleTransitionSelectedEvent {
                 from_node_id: transition.from.id,
                 to_node_id: transition.to.id.clone(),
-                attempt: 1,
-                loop_iteration: 0,
+                attempt: execution.attempt,
+                loop_iteration: execution.loop_iteration,
                 step: execution.step,
             }),
         )?;
@@ -4114,6 +4892,12 @@ where
             .checked_add(1)
             .ok_or(RunTurnError::SequenceOverflow)?;
         execution.current = transition.to;
+        if advance_loop {
+            execution.loop_iteration = execution
+                .loop_iteration
+                .checked_add(1)
+                .ok_or(RunTurnError::SequenceOverflow)?;
+        }
         if execution.step > execution.max_steps {
             execution.position = self.commit_style_budget_termination(
                 persistence,
@@ -4136,8 +4920,8 @@ where
             execution.position.event_id,
             RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
                 node_id: execution.current.id.clone(),
-                attempt: 1,
-                loop_iteration: 0,
+                attempt: execution.attempt,
+                loop_iteration: execution.loop_iteration,
                 step: execution.step,
             }),
         )?;
@@ -4201,8 +4985,8 @@ where
             execution.position.event_id,
             RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
                 node_id: execution.current.id.clone(),
-                attempt: 1,
-                loop_iteration: 0,
+                attempt: execution.attempt,
+                loop_iteration: execution.loop_iteration,
                 step: execution.step,
                 result_reference,
                 artifact_reference: None,
@@ -4657,10 +5441,13 @@ fn recoverable_context_retry(
             pristine_entry || boundary_at_head
         }
         (
-            StyleAdapterKind::EphemeralTurn,
+            StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop,
             Some(agentmod_graph_engine::NodeKind::ContextTransform),
         ) => pristine_entry || boundary_at_head,
-        (StyleAdapterKind::EphemeralTurn, Some(agentmod_graph_engine::NodeKind::ModelCall)) => {
+        (
+            StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop,
+            Some(agentmod_graph_engine::NodeKind::ModelCall),
+        ) => {
             boundary_at_head
                 || (pristine_entry
                     && execution.context_boundaries.iter().rev().any(|boundary| {
@@ -5024,7 +5811,7 @@ fn current_run_user<'a>(
     state: &'a crate::session::SessionState,
     command: &RunTurnCommand,
 ) -> Result<&'a TextEntry, RunTurnError> {
-    state
+    let exact = state
         .conversation
         .history()
         .iter()
@@ -5035,6 +5822,30 @@ fn current_run_user<'a>(
                     && user.id.0.strip_prefix("user:").is_some_and(|suffix| {
                         suffix.ends_with(&format!(":{}", command.cancellation_id))
                     }) =>
+            {
+                Some(user)
+            }
+            _ => None,
+        });
+    if exact.is_some() {
+        return exact.ok_or(RunTurnError::ContextRecoveryIdentityMismatch);
+    }
+    let base_run_id = research_base_run_id(&command.cancellation_id)
+        .or_else(|| research_base_run_id_from_state(state))
+        .ok_or(RunTurnError::ContextRecoveryIdentityMismatch)?;
+    state
+        .conversation
+        .history()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            ConversationEntry::UserMessage(user)
+                if (command.prompt.is_empty() || user.text == command.prompt)
+                    && user
+                        .id
+                        .0
+                        .strip_prefix("user:")
+                        .is_some_and(|suffix| suffix.ends_with(&format!(":{base_run_id}"))) =>
             {
                 Some(user)
             }
@@ -5207,8 +6018,26 @@ fn construct_memory_query(
                 command.prompt.clone()
             }
         }
-        "session_goal" | "current_input_and_goal" => {
-            return Err(RunTurnError::MemorySessionGoalUnavailable);
+        "session_goal" => state
+            .conversation
+            .history()
+            .iter()
+            .find_map(|entry| match entry {
+                ConversationEntry::UserMessage(user) => Some(user.text.clone()),
+                _ => None,
+            })
+            .ok_or(RunTurnError::MemorySessionGoalUnavailable)?,
+        "current_input_and_goal" => {
+            let goal = state
+                .conversation
+                .history()
+                .iter()
+                .find_map(|entry| match entry {
+                    ConversationEntry::UserMessage(user) => Some(user.text.as_str()),
+                    _ => None,
+                })
+                .ok_or(RunTurnError::MemorySessionGoalUnavailable)?;
+            format!("current input: {}\nsession goal: {goal}", command.prompt)
         }
         "explicit" => return Err(RunTurnError::ExplicitMemoryQueryRequired),
         _ => return Err(RunTurnError::InvalidMemoryQueryConfiguration),
@@ -5562,6 +6391,193 @@ fn provider_node_failure(events: &[ProviderEvent]) -> Option<&'static str> {
     })
 }
 
+fn research_completion_after(options: &Value, limit: u32) -> Result<u32, RunTurnError> {
+    let selected = options
+        .get("research_complete_after")
+        .map_or(Some(3), |value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|value| value.parse().ok()))
+                .and_then(|value| u32::try_from(value).ok())
+        })
+        .filter(|value| *value > 0 && *value <= limit)
+        .ok_or(RunTurnError::InvalidResearchCompletionCriterion)?;
+    Ok(selected)
+}
+
+fn next_style_step(state: &crate::session::SessionState) -> u64 {
+    state.style_execution.as_ref().map_or(1, |execution| {
+        execution
+            .completed_nodes
+            .iter()
+            .map(|node| node.step)
+            .chain(execution.failed_nodes.iter().map(|node| node.step))
+            .chain(
+                execution
+                    .transitions
+                    .iter()
+                    .map(|transition| transition.step),
+            )
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    })
+}
+
+fn style_transition_variables(completed: &StyleNodeCompletedEvent) -> Result<Value, RunTurnError> {
+    match completed.result_reference.as_deref() {
+        Some("completion:criteria_met:true") => Ok(json!({"completion":{"criteria_met":true}})),
+        Some("completion:criteria_met:false") => Ok(json!({"completion":{"criteria_met":false}})),
+        Some(value) if value.starts_with("completion:criteria_met:") => {
+            Err(RunTurnError::StyleGraphMismatch)
+        }
+        _ => Ok(json!({})),
+    }
+}
+
+fn research_finding_bytes(
+    goal: &str,
+    loop_iteration: u32,
+    events: &[ProviderEvent],
+) -> Result<Vec<u8>, RunTurnError> {
+    let finding: String = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    let tool_calls = events
+        .iter()
+        .filter(|event| matches!(event, ProviderEvent::ToolProposed { .. }))
+        .count();
+    serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "kind": "research_finding",
+        "iteration": loop_iteration.saturating_add(1),
+        "goal": goal,
+        "finding": finding,
+        "tool_calls": tool_calls,
+    }))
+    .map_err(|_| RunTurnError::ResearchArtifactEncoding)
+}
+
+fn recoverable_research_model_events(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> Option<Vec<ProviderEvent>> {
+    let evidence = state
+        .style_execution
+        .as_ref()?
+        .latest_model_execution
+        .as_ref()?;
+    if evidence.cancellation_id != command.cancellation_id || evidence.completed_at.is_none() {
+        return None;
+    }
+    if !evidence.response_completed && evidence.tool_proposals.is_empty() {
+        return None;
+    }
+    let mut events = Vec::new();
+    if !evidence.visible_text.is_empty() {
+        events.push(ProviderEvent::Text(evidence.visible_text.clone()));
+    }
+    events.extend(
+        evidence
+            .tool_proposals
+            .iter()
+            .map(|proposal| ProviderEvent::ToolProposed {
+                continuation_id: proposal.continuation_id.clone(),
+                call_id: proposal.call_id.clone(),
+                tool: proposal.tool.clone(),
+                arguments: proposal.arguments.clone(),
+            }),
+    );
+    Some(events)
+}
+
+fn validate_research_resume_request(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> Result<(), RunTurnError> {
+    let Some(execution) = state.style_execution.as_ref() else {
+        return Err(RunTurnError::StyleGraphMismatch);
+    };
+    let Some(boundary) = execution
+        .context_boundaries
+        .iter()
+        .find(|boundary| boundary.identity.run_id == command.cancellation_id)
+    else {
+        return Ok(());
+    };
+    let request_hash = current_context_request_hash(state, command)?;
+    if boundary.identity.request_hash != request_hash {
+        return Err(RunTurnError::ContextRecoveryIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn research_base_run_id(cancellation_id: &str) -> Option<&str> {
+    let (base, iteration) = cancellation_id.rsplit_once("-research-")?;
+    (!base.is_empty()
+        && iteration
+            .parse::<u32>()
+            .ok()
+            .is_some_and(|iteration| iteration > 0))
+    .then_some(base)
+}
+
+fn research_base_run_id_from_state(state: &crate::session::SessionState) -> Option<&str> {
+    let binding = state.style_binding.as_ref()?;
+    let executor = CompiledStyleExecutor::from_binding(binding).ok()?;
+    if executor.adapter_kind() != Some(StyleAdapterKind::ResearchLoop) {
+        return None;
+    }
+    state
+        .style_execution
+        .as_ref()?
+        .context_boundaries
+        .iter()
+        .find(|boundary| {
+            boundary.identity.boundary == "turn_start"
+                && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+        })
+        .map(|boundary| boundary.identity.run_id.as_str())
+}
+
+fn research_iteration_cancellation_id(base: &str, iteration: u32) -> String {
+    uuid::Uuid::parse_str(base).map_or_else(
+        |_| format!("{base}-research-{iteration}"),
+        |base| {
+            uuid::Uuid::from_u128(base.as_u128() ^ u128::from(iteration))
+                .hyphenated()
+                .to_string()
+        },
+    )
+}
+
+fn research_assistant_committed(
+    state: &crate::session::SessionState,
+    cancellation_id: &str,
+    events: &[ProviderEvent],
+) -> bool {
+    let visible: String = events
+        .iter()
+        .filter_map(|event| match event {
+            ProviderEvent::Text(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    visible.is_empty()
+        || state.conversation.history().iter().rev().any(|entry| {
+            matches!(
+                entry,
+                ConversationEntry::AssistantMessage(assistant)
+                    if assistant.id.0.ends_with(&format!(":{cancellation_id}"))
+                        && assistant.text == visible
+            )
+        })
+}
+
 const fn active_graph_state_is_outside_projection() -> bool {
     false
 }
@@ -5586,6 +6602,8 @@ pub enum RunTurnError {
     StyleControlRecoveryRequired { node: String, phase: &'static str },
     #[error("style execution is terminal")]
     StyleExecutionTerminal,
+    #[error("style execution is terminal: {0}")]
+    StyleExecutionTerminalReason(String),
     #[error("session style `{0}` is not supported by the live turn executor")]
     UnsupportedStyleExecution(String),
     #[error("style graph step budget {limit} is exhausted")]
@@ -5691,6 +6709,12 @@ pub enum RunTurnError {
     ToolConversationRecoveryConflict(String),
     #[error("tool host returned an invalid artifact identifier")]
     InvalidArtifact,
+    #[error("research completion criterion is invalid or exceeds the compiled loop bound")]
+    InvalidResearchCompletionCriterion,
+    #[error("research finding artifact could not be encoded")]
+    ResearchArtifactEncoding,
+    #[error("research artifact persistence failed: {0}")]
+    ResearchArtifact(crate::artifact::ArtifactPersistenceError),
     #[error("durable tool receipt does not match dispatch {0}")]
     InvalidRecoveryReceipt(String),
     #[error(
@@ -5702,7 +6726,7 @@ pub enum RunTurnError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         sync::{
             Arc, Mutex as StdMutex,
             atomic::{AtomicU64, Ordering},
@@ -5718,6 +6742,10 @@ mod tests {
         ByteCount, ContentHash, CorrelationId, EventId, TimestampMillis, Version,
     };
     use agentmod_runtime_data::{
+        artifact::{
+            ArtifactDataError, ArtifactDataPort, InspectArtifactDataRequest,
+            PersistArtifactDataRequest, PersistedArtifactDataRecord,
+        },
         continuation::{
             ContinuationDataError, ContinuationDataPort, ContinuationPayloadRecord,
             ContinuationRecord, ContinuationStateRecord, ContinuationWakeRecord,
@@ -5784,6 +6812,8 @@ mod tests {
         harness_replies: StdMutex<VecDeque<Result<HarnessDataReply, HarnessDataError>>>,
         tool_reply: StdMutex<Result<Vec<ToolDataEvent>, ToolDataError>>,
         continuation: StdMutex<Option<ContinuationRecord>>,
+        artifact_records: StdMutex<BTreeMap<String, PersistedArtifactDataRecord>>,
+        artifact_persist_calls: AtomicU64,
         next_identity: AtomicU64,
     }
 
@@ -5796,6 +6826,8 @@ mod tests {
                     harness_replies: StdMutex::new(VecDeque::from([reply])),
                     tool_reply: StdMutex::new(Err(ToolDataError::Unavailable)),
                     continuation: StdMutex::new(None),
+                    artifact_records: StdMutex::new(BTreeMap::new()),
+                    artifact_persist_calls: AtomicU64::new(0),
                     next_identity: AtomicU64::new(100),
                 }),
             }
@@ -5824,6 +6856,18 @@ mod tests {
 
         fn with_continuation(self, continuation: ContinuationRecord) -> Self {
             *self.state.continuation.lock().expect("continuation") = Some(continuation);
+            self
+        }
+
+        fn with_artifact_records(
+            self,
+            records: BTreeMap<String, PersistedArtifactDataRecord>,
+        ) -> Self {
+            *self
+                .state
+                .artifact_records
+                .lock()
+                .expect("artifact records") = records;
             self
         }
 
@@ -5939,6 +6983,48 @@ mod tests {
             _request: RetrieveMemoryDataRequest,
         ) -> Result<Vec<RetrievedMemoryDataRecord>, MemoryDataError> {
             Ok(Vec::new())
+        }
+    }
+
+    impl ArtifactDataPort for MockTurnData {
+        fn persist_artifact(
+            &self,
+            request: PersistArtifactDataRequest,
+        ) -> Result<PersistedArtifactDataRecord, ArtifactDataError> {
+            self.state
+                .artifact_persist_calls
+                .fetch_add(1, Ordering::Relaxed);
+            let hash = ContentHash::digest(&request.bytes).to_hex();
+            let record = PersistedArtifactDataRecord {
+                artifact_id: format!("blake3:{hash}"),
+                artifact_reference: format!("artifact:blake3:{hash}"),
+                mime_type: request.mime_type,
+                byte_size: u64::try_from(request.bytes.len())
+                    .map_err(|_| ArtifactDataError::InvalidRequest)?,
+                creation_event: request.creation_event,
+                producer: request.producer,
+                content_hash: hash,
+                deduplicated: false,
+            };
+            self.state
+                .artifact_records
+                .lock()
+                .expect("artifact records")
+                .insert(record.artifact_reference.clone(), record.clone());
+            Ok(record)
+        }
+
+        fn inspect_artifact(
+            &self,
+            request: InspectArtifactDataRequest,
+        ) -> Result<PersistedArtifactDataRecord, ArtifactDataError> {
+            self.state
+                .artifact_records
+                .lock()
+                .expect("artifact records")
+                .get(&request.artifact_reference)
+                .cloned()
+                .ok_or(ArtifactDataError::NotFound)
         }
     }
 
@@ -6219,6 +7305,19 @@ mod tests {
         )]
     }
 
+    fn research_created_events() -> Vec<EventEnvelope<Value>> {
+        let mut binding = binding(BuiltInStyle::ResearchLoop);
+        binding.budgets.max_steps = 100;
+        vec![data_event(
+            1,
+            RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                workspace: String::from("fixture-workspace"),
+                style: binding.id.clone(),
+                style_binding: Some(Box::new(binding)),
+            }),
+        )]
+    }
+
     fn successful_harness_reply(text: &str) -> HarnessDataReply {
         HarnessDataReply::Events(vec![
             HarnessDataEvent::Started,
@@ -6229,6 +7328,539 @@ mod tests {
                 output_tokens: 1,
             },
         ])
+    }
+
+    #[tokio::test]
+    async fn research_loop_persists_three_findings_and_completes_deterministically() {
+        let data = MockTurnData::with_scenario(
+            research_created_events(),
+            vec![
+                Ok(successful_harness_reply("finding one")),
+                Ok(successful_harness_reply("finding two")),
+                Ok(successful_harness_reply("finding three")),
+            ],
+            Err(ToolDataError::Unavailable),
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+        let mut request = command();
+        request.options = json!({"research_complete_after":3});
+
+        let result = logic.run_turn(request).await.expect("research loop");
+        let state = load_mock_state(&data);
+        let execution = state.style_execution.expect("style execution");
+
+        assert_eq!(state.lifecycle, crate::session::SessionLifecycle::Completed);
+        assert_eq!(state.artifact_persistences.len(), 3);
+        assert!(state.artifact_persistences.values().all(|record| {
+            record.state == crate::session::ArtifactPersistenceState::Completed
+                && record.artifact_reference.is_some()
+        }));
+        assert_eq!(
+            execution
+                .completed_nodes
+                .iter()
+                .filter(|node| node.node_id == "persist")
+                .count(),
+            3
+        );
+        assert_eq!(
+            execution
+                .completed_nodes
+                .iter()
+                .filter(|node| node.node_id == "repeat")
+                .map(|node| node.loop_iteration)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(
+            execution.termination_reason.as_deref(),
+            Some("complete_session")
+        );
+        assert_eq!(
+            data.state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .iter()
+                .filter(|command| matches!(command, HarnessDataCommand::Execute { .. }))
+                .count(),
+            3
+        );
+        assert_eq!(result.events.len(), 9);
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the crash-cut matrix proves each durable artifact outbox phase has distinct recovery behavior"
+    )]
+    async fn research_artifact_crash_cuts_recover_without_ambiguous_redispatch() {
+        let seed = MockTurnData::with_scenario(
+            research_created_events(),
+            vec![Ok(successful_harness_reply("recoverable finding"))],
+            Err(ToolDataError::Unavailable),
+        );
+        let mut request = command();
+        request.options = json!({"research_complete_after":1});
+        TurnLogic::new(seed.clone(), policy(PermissionEffect::Allow))
+            .run_turn(request.clone())
+            .await
+            .expect("seed research turn");
+        let full = seed.state.events.lock().expect("events").clone();
+        let stored = seed
+            .state
+            .artifact_records
+            .lock()
+            .expect("artifact records")
+            .clone();
+        assert_eq!(stored.len(), 1);
+
+        let assistant_cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "conversation.entry_committed"
+                    && event.payload.to_string().contains("assistant_message")
+            })
+            .expect("assistant event");
+        let assistant_recovery = MockTurnData::with_events(
+            Err(HarnessDataError::Unavailable),
+            full[..=assistant_cut].to_vec(),
+        );
+        TurnLogic::new(assistant_recovery.clone(), policy(PermissionEffect::Allow))
+            .run_turn(request.clone())
+            .await
+            .expect("recover after assistant");
+        assert_eq!(
+            assistant_recovery
+                .state
+                .artifact_persist_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            assistant_recovery
+                .state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+
+        let proposed_cut = full
+            .iter()
+            .position(|event| event.metadata.event_type == "artifact.persistence_proposed")
+            .expect("proposed event");
+        let proposed_recovery = MockTurnData::with_events(
+            Err(HarnessDataError::Unavailable),
+            full[..=proposed_cut].to_vec(),
+        );
+        TurnLogic::new(proposed_recovery.clone(), policy(PermissionEffect::Allow))
+            .run_turn(request.clone())
+            .await
+            .expect("re-evaluate proposal policy before any dispatch");
+        assert_eq!(
+            proposed_recovery
+                .state
+                .artifact_persist_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let approved_cut = full
+            .iter()
+            .position(|event| event.metadata.event_type == "artifact.persistence_approved")
+            .expect("approved event");
+        let approved_recovery = MockTurnData::with_events(
+            Err(HarnessDataError::Unavailable),
+            full[..=approved_cut].to_vec(),
+        );
+        TurnLogic::new(approved_recovery.clone(), policy(PermissionEffect::Allow))
+            .run_turn(request.clone())
+            .await
+            .expect("dispatch approved artifact");
+        assert_eq!(
+            approved_recovery
+                .state
+                .artifact_persist_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let dispatched_cut = full
+            .iter()
+            .position(|event| event.metadata.event_type == "artifact.persistence_dispatched")
+            .expect("dispatched event");
+        let dispatched_recovery = MockTurnData::with_events(
+            Err(HarnessDataError::Unavailable),
+            full[..=dispatched_cut].to_vec(),
+        )
+        .with_artifact_records(stored.clone());
+        TurnLogic::new(dispatched_recovery.clone(), policy(PermissionEffect::Allow))
+            .run_turn(request.clone())
+            .await
+            .expect("reconcile dispatched artifact");
+        assert_eq!(
+            dispatched_recovery
+                .state
+                .artifact_persist_calls
+                .load(Ordering::Relaxed),
+            0,
+            "present immutable receipt must not be written again"
+        );
+
+        let completed_cut = full
+            .iter()
+            .position(|event| event.metadata.event_type == "artifact.persistence_completed")
+            .expect("completed event");
+        let completed_recovery = MockTurnData::with_events(
+            Err(HarnessDataError::Unavailable),
+            full[..=completed_cut].to_vec(),
+        )
+        .with_artifact_records(stored);
+        TurnLogic::new(completed_recovery.clone(), policy(PermissionEffect::Allow))
+            .run_turn(request)
+            .await
+            .expect("complete artifact node from terminal event");
+        assert_eq!(
+            completed_recovery
+                .state
+                .artifact_persist_calls
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn research_loop_control_cuts_resume_terminal_state_without_effects() {
+        let seed = MockTurnData::with_scenario(
+            research_created_events(),
+            vec![Ok(successful_harness_reply("terminal finding"))],
+            Err(ToolDataError::Unavailable),
+        );
+        let mut request = command();
+        request.options = json!({"research_complete_after":1});
+        TurnLogic::new(seed.clone(), policy(PermissionEffect::Allow))
+            .run_turn(request.clone())
+            .await
+            .expect("seed research turn");
+        let full = seed.state.events.lock().expect("events").clone();
+        let stored = seed
+            .state
+            .artifact_records
+            .lock()
+            .expect("artifact records")
+            .clone();
+        let cuts = full
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| {
+                let payload = event.payload.to_string();
+                ((event.metadata.event_type == "style.node_completed"
+                    && (payload.contains("\"repeat\"") || payload.contains("\"done\"")))
+                    || (event.metadata.event_type == "style.transition_selected"
+                        && payload.contains("\"done\""))
+                    || (event.metadata.event_type == "style.node_entered"
+                        && payload.contains("\"done\"")))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(cuts.len(), 4);
+
+        for cut in cuts {
+            let recovery = MockTurnData::with_events(
+                Err(HarnessDataError::Unavailable),
+                full[..=cut].to_vec(),
+            )
+            .with_artifact_records(stored.clone());
+            TurnLogic::new(recovery.clone(), policy(PermissionEffect::Allow))
+                .run_turn(request.clone())
+                .await
+                .expect("recover loop control cut");
+            assert!(
+                recovery
+                    .state
+                    .harness_commands
+                    .lock()
+                    .expect("commands")
+                    .is_empty()
+            );
+            assert_eq!(
+                recovery
+                    .state
+                    .artifact_persist_calls
+                    .load(Ordering::Relaxed),
+                0
+            );
+            let state = load_mock_state(&recovery);
+            assert_eq!(state.lifecycle, crate::session::SessionLifecycle::Completed);
+            assert_eq!(
+                state
+                    .style_execution
+                    .expect("execution")
+                    .termination_reason
+                    .as_deref(),
+                Some("complete_session")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn research_resume_rejects_changed_request_configuration() {
+        let seed = MockTurnData::with_scenario(
+            research_created_events(),
+            vec![
+                Ok(successful_harness_reply("finding one")),
+                Ok(successful_harness_reply("finding two")),
+                Ok(successful_harness_reply("finding three")),
+            ],
+            Err(ToolDataError::Unavailable),
+        );
+        let mut original = command();
+        original.options = json!({"research_complete_after":3});
+        TurnLogic::new(seed.clone(), policy(PermissionEffect::Allow))
+            .run_turn(original)
+            .await
+            .expect("seed research turn");
+        let full = seed.state.events.lock().expect("events").clone();
+        let cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "style.node_entered"
+                    && event.payload.to_string().contains("\"repeat\"")
+            })
+            .expect("first loop entry");
+        let recovery =
+            MockTurnData::with_events(Err(HarnessDataError::Unavailable), full[..=cut].to_vec());
+        let mut changed = command();
+        changed.options = json!({"research_complete_after":1});
+
+        let error = TurnLogic::new(recovery.clone(), policy(PermissionEffect::Allow))
+            .run_turn(changed)
+            .await
+            .expect_err("changed recovery request");
+
+        assert!(matches!(
+            error,
+            RunTurnError::ContextRecoveryIdentityMismatch
+        ));
+        assert!(
+            recovery
+                .state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+        assert_eq!(
+            recovery
+                .state
+                .artifact_persist_calls
+                .load(Ordering::Relaxed),
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the two crash cuts share one uninterrupted hash oracle and prove proposal and post-tool reconstruction together"
+    )]
+    async fn research_tool_crash_cuts_preserve_exact_finding_and_resume_canonical_call() {
+        let initial = HarnessDataReply::Events(vec![
+            HarnessDataEvent::Started,
+            HarnessDataEvent::Text(String::from("investigated ")),
+            HarnessDataEvent::ToolProposed {
+                continuation_id: String::from("research-continue"),
+                call_id: String::from("research-call"),
+                tool: String::from("filesystem.read"),
+                arguments: json!({"path":"README.md"}),
+            },
+        ]);
+        let final_reply = successful_harness_reply("repository");
+        let tool_reply = Ok(vec![
+            ToolDataEvent::Started {
+                call_id: String::from("research-call"),
+            },
+            ToolDataEvent::Completed {
+                call_id: String::from("research-call"),
+                result: json!({"content":"fixture"}),
+                artifact: None,
+                truncated: false,
+            },
+        ]);
+        let seed = MockTurnData::with_scenario(
+            research_created_events(),
+            vec![Ok(initial), Ok(final_reply.clone())],
+            tool_reply.clone(),
+        );
+        let mut request = command();
+        request.options = json!({"research_complete_after":1});
+        TurnLogic::new(seed.clone(), policy(PermissionEffect::Allow))
+            .run_turn(request.clone())
+            .await
+            .expect("seed research tool turn");
+        let full = seed.state.events.lock().expect("events").clone();
+        let expected_hash = seed
+            .state
+            .artifact_records
+            .lock()
+            .expect("artifact records")
+            .values()
+            .next()
+            .expect("artifact")
+            .content_hash
+            .clone();
+
+        let tool_entry_cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "style.node_entered"
+                    && event.payload.to_string().contains("\"tool\"")
+            })
+            .expect("tool entry");
+        let tool_recovery = MockTurnData::with_scenario(
+            full[..=tool_entry_cut].to_vec(),
+            vec![Ok(final_reply)],
+            tool_reply,
+        );
+        TurnLogic::new(tool_recovery.clone(), policy(PermissionEffect::Allow))
+            .run_turn(request.clone())
+            .await
+            .expect("recover tool node");
+        let recovered_hash = tool_recovery
+            .state
+            .artifact_records
+            .lock()
+            .expect("artifact records")
+            .values()
+            .next()
+            .expect("recovered artifact")
+            .content_hash
+            .clone();
+        assert_eq!(recovered_hash, expected_hash);
+        assert_eq!(
+            load_mock_state(&tool_recovery).tool_executions.len(),
+            1,
+            "canonical proposal executes one tool"
+        );
+
+        let persist_entry_cut = full
+            .iter()
+            .position(|event| {
+                event.metadata.event_type == "style.node_entered"
+                    && event.payload.to_string().contains("\"persist\"")
+            })
+            .expect("persist entry");
+        let persist_recovery = MockTurnData::with_events(
+            Err(HarnessDataError::Unavailable),
+            full[..=persist_entry_cut].to_vec(),
+        );
+        TurnLogic::new(persist_recovery.clone(), policy(PermissionEffect::Allow))
+            .run_turn(request)
+            .await
+            .expect("recover persist node");
+        let recovered_hash = persist_recovery
+            .state
+            .artifact_records
+            .lock()
+            .expect("artifact records")
+            .values()
+            .next()
+            .expect("recovered artifact")
+            .content_hash
+            .clone();
+        assert_eq!(recovered_hash, expected_hash);
+        assert!(
+            persist_recovery
+                .state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn research_tool_approval_resumes_artifact_loop_and_session_completion() {
+        let data = MockTurnData::with_scenario(
+            research_created_events(),
+            vec![
+                Ok(HarnessDataReply::Events(vec![
+                    HarnessDataEvent::Started,
+                    HarnessDataEvent::Text(String::from("approval finding ")),
+                    HarnessDataEvent::ToolProposed {
+                        continuation_id: String::from("research-continue"),
+                        call_id: String::from("research-call"),
+                        tool: String::from("filesystem.read"),
+                        arguments: json!({"path":"README.md"}),
+                    },
+                ])),
+                Ok(successful_harness_reply("approved")),
+            ],
+            Ok(vec![
+                ToolDataEvent::Started {
+                    call_id: String::from("research-call"),
+                },
+                ToolDataEvent::Completed {
+                    call_id: String::from("research-call"),
+                    result: json!({"content":"fixture"}),
+                    artifact: None,
+                    truncated: false,
+                },
+            ]),
+        );
+        let logic = TurnLogic::new(data.clone(), tool_approval_policy());
+        let mut request = command();
+        request.options = json!({"research_complete_after":1});
+        let awaiting = logic
+            .run_turn(request)
+            .await
+            .expect("request research tool approval");
+        let continuation_id = awaiting
+            .awaiting_continuation
+            .expect("approval continuation");
+        *data.state.continuation.lock().expect("continuation") = Some(ContinuationRecord {
+            session_id: session_id().to_string(),
+            id: continuation_id.clone(),
+            state: ContinuationStateRecord::Pending,
+            wake_condition: ContinuationWakeRecord::Manual,
+            payload: ContinuationPayloadRecord::ToolApproval(Box::new(ToolApprovalPayloadRecord {
+                session_id: session_id().to_string(),
+                workspace: String::from("fixture-workspace"),
+                call_id: String::from("research-call"),
+                tool: String::from("filesystem.read"),
+                arguments: json!({"path":"README.md"}),
+                cancellation_id: String::from("cancel-1-research-1"),
+                provider: String::from("deterministic-mock"),
+                model: String::from("fixture"),
+                options: json!({"research_complete_after":1}),
+                style: String::from("research-loop"),
+                harness_continuation: String::from("research-continue"),
+                remaining_tool_calls: Vec::new(),
+            })),
+            expires_at_millis: None,
+        });
+
+        let resolved = logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id,
+                approved: true,
+                resume_after_resolution: true,
+            })
+            .await
+            .expect("resume research approval");
+
+        assert!(resolved.transitioned);
+        assert!(resolved.awaiting_continuation.is_none());
+        let state = load_mock_state(&data);
+        assert_eq!(state.lifecycle, crate::session::SessionLifecycle::Completed);
+        assert_eq!(state.artifact_persistences.len(), 1);
+        assert_eq!(
+            data.state.harness_commands.lock().expect("commands").len(),
+            2
+        );
     }
 
     fn load_mock_state(data: &MockTurnData) -> crate::session::SessionState {
@@ -7507,14 +9139,14 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_bound_graph_fails_preflight_without_mutation() {
-        let binding = binding(BuiltInStyle::ResearchLoop);
+        let binding = binding(BuiltInStyle::DeclarativeGraph);
         let data = MockTurnData::with_events(
             Ok(HarnessDataReply::Events(Vec::new())),
             vec![data_event(
                 1,
                 RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
                     workspace: String::from("fixture-workspace"),
-                    style: String::from("research-loop"),
+                    style: String::from("declarative-graph"),
                     style_binding: Some(Box::new(binding)),
                 }),
             )],
@@ -7526,7 +9158,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            RunTurnError::UnsupportedStyleExecution(ref style) if style == "research-loop"
+            RunTurnError::UnsupportedStyleExecution(ref style) if style == "declarative-graph"
         ));
         assert_eq!(data.event_types(), before);
         assert!(

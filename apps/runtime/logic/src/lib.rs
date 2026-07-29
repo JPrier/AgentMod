@@ -1,6 +1,7 @@
 //! Runtime business logic.
 
 pub mod action;
+pub mod artifact;
 pub mod compaction;
 pub mod continuation;
 pub mod conversation;

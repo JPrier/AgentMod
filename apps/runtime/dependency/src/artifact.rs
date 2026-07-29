@@ -222,6 +222,13 @@ pub struct DependencyReadArtifactRangeRequest {
     pub length: u64,
 }
 
+/// Dependency-owned immutable artifact inspection request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyInspectArtifactRequest {
+    /// Validated portable artifact reference.
+    pub artifact_reference: ArtifactReference,
+}
+
 /// Bounded artifact range response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyReadArtifactRangeResponse {
@@ -289,6 +296,17 @@ pub trait ArtifactDependencyPort {
         &self,
         request: DependencyReadArtifactRangeRequest,
     ) -> Result<DependencyReadArtifactRangeResponse, ArtifactDependencyError>;
+
+    /// Reads and validates immutable metadata without loading artifact content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid references, missing objects, corruption, or
+    /// storage failures.
+    fn inspect(
+        &self,
+        request: DependencyInspectArtifactRequest,
+    ) -> Result<DependencyArtifactMetadata, ArtifactDependencyError>;
 
     /// Removes all transactions not atomically finalized.
     ///
@@ -476,6 +494,14 @@ impl ArtifactDependencyPort for LocalArtifactDependency {
             bytes,
             artifact_bytes: metadata.byte_size,
         })
+    }
+
+    fn inspect(
+        &self,
+        request: DependencyInspectArtifactRequest,
+    ) -> Result<DependencyArtifactMetadata, ArtifactDependencyError> {
+        let hash = artifact_hash_from_reference(request.artifact_reference.as_str())?;
+        read_metadata(&self.object_path(hash))
     }
 
     fn cleanup_incomplete(

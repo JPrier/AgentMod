@@ -282,7 +282,7 @@ fn research_memory() -> MemorySelection {
         max_items: 64,
         max_injected_bytes: 512 * 1024,
         write_policy: MemoryWritePolicy::IterationCompletion,
-        injection_location: MemoryInjectionLocation::ContextArtifact,
+        injection_location: MemoryInjectionLocation::BeforeCurrentInput,
     }
 }
 

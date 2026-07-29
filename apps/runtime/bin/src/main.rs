@@ -223,7 +223,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .parent()
                 .unwrap_or(&sessions_root)
                 .join("memory"),
-        ));
+        ))
+        .with_artifacts(agentmod_runtime_data::artifact::RuntimeArtifactData::first_party());
         let core = RuntimeService::new(
             RuntimeLogic::new(data.clone()),
             RuntimeServiceConfig {

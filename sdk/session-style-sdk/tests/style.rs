@@ -296,7 +296,7 @@ fn research_loop_1_1_declares_bounded_context_and_capabilities() {
     );
     assert_eq!(
         manifest.memory.injection_location,
-        MemoryInjectionLocation::ContextArtifact
+        MemoryInjectionLocation::BeforeCurrentInput
     );
 }
 
@@ -417,11 +417,11 @@ fn research_loop_version_and_cache_identity_are_exact_and_deterministic() {
     assert_eq!(first.style_version, "1.1.0");
     assert_eq!(
         first.cache_key.style_content_hash.to_hex(),
-        "e5bc6f185f79121fb01c3cb8895480bcac05d4184a93f8a2e1e4bea955c30da3"
+        "eedaca6b0d937baead9aafe5810f0be0f4a10852439374136bc62572b692177b"
     );
     assert_eq!(
         first.cache_key.combined_hash.to_hex(),
-        "a0581c68fa4ee97611434c794213f5d23ca25010f4228293fd7547f2e1609e56"
+        "7bc32da7244da3b773a20856ff4547e04c4127b03649679ce46025b1dcea013b"
     );
 
     let json = to_json(&manifest).expect("research JSON");

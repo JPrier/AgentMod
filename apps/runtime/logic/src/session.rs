@@ -367,7 +367,7 @@ pub struct ModelToolCallDeltaObservedEvent {
 }
 
 /// Provider tool call proposed; no tool execution is implied.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelToolCallProposedEvent {
     /// Harness continuation.
     pub continuation_id: String,
@@ -683,6 +683,75 @@ pub struct StyleExecutionTerminatedEvent {
     pub limit: Option<u64>,
 }
 
+/// Exact logical identity of one compiled artifact-persistence node effect.
+///
+/// The content store's BLAKE3 identity remains dependency-owned text. This
+/// identity instead binds the canonical graph attempt and approved content
+/// which recovery is allowed to reconcile.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactPersistenceIdentity {
+    /// Stable execution identity used by the durable receipt.
+    pub execution_id: String,
+    /// Stable proposal identity passed through interception and policy.
+    pub proposal_id: String,
+    /// Active compiled graph node.
+    pub node_id: String,
+    /// One-based node attempt.
+    pub attempt: u32,
+    /// Zero-based loop iteration.
+    pub loop_iteration: u32,
+    /// One-based graph step.
+    pub step: u64,
+    /// Hash of the exact approved bytes.
+    pub content_hash: ContentHash,
+}
+
+/// Canonical artifact-persistence proposal before blocking policy evaluation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactPersistenceProposedEvent {
+    /// Exact graph/content/proposal identity.
+    pub identity: ArtifactPersistenceIdentity,
+    /// Stable media type requested for the immutable object.
+    pub mime_type: String,
+    /// Exact bounded byte count.
+    pub byte_size: u64,
+}
+
+/// Final artifact-persistence action authorized before dispatch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactPersistenceApprovedEvent {
+    /// Exact graph/content/proposal identity.
+    pub identity: ArtifactPersistenceIdentity,
+    /// Digest of the final intercepted action.
+    pub action_digest: ContentHash,
+}
+
+/// Durable artifact-persistence outbox record committed before storage dispatch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactPersistenceDispatchedEvent {
+    /// Exact graph/content/proposal identity.
+    pub identity: ArtifactPersistenceIdentity,
+    /// Digest of the exact approved action sent to data.
+    pub action_digest: ContentHash,
+}
+
+/// Immutable artifact storage completed and has a durable terminal receipt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactPersistenceCompletedEvent {
+    /// Exact graph/content/proposal identity.
+    pub identity: ArtifactPersistenceIdentity,
+    /// Digest of the exact approved action.
+    pub action_digest: ContentHash,
+    /// Dependency-owned content-addressed BLAKE3 identity.
+    pub artifact_id: String,
+    /// Portable dependency-owned content reference.
+    pub artifact_reference: String,
+    /// Exact persisted media type.
+    pub mime_type: String,
+    /// Exact persisted byte count.
+    pub byte_size: u64,
+}
+
 /// Typed committed events consumed by the pure session reducer.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "event", content = "payload", rename_all = "snake_case")]
@@ -761,6 +830,14 @@ pub enum RuntimeCommittedEvent {
     StyleTransitionSelected(StyleTransitionSelectedEvent),
     /// Records a terminal control outcome without entering another node.
     StyleExecutionTerminated(StyleExecutionTerminatedEvent),
+    /// Records artifact-persistence intent before blocking policy evaluation.
+    ArtifactPersistenceProposed(ArtifactPersistenceProposedEvent),
+    /// Records the final approved artifact-persistence action.
+    ArtifactPersistenceApproved(ArtifactPersistenceApprovedEvent),
+    /// Records durable dispatch intent before artifact storage is called.
+    ArtifactPersistenceDispatched(ArtifactPersistenceDispatchedEvent),
+    /// Records a request-bound terminal artifact receipt.
+    ArtifactPersistenceCompleted(ArtifactPersistenceCompletedEvent),
 }
 
 impl RuntimeCommittedEvent {
@@ -805,6 +882,89 @@ impl RuntimeCommittedEvent {
             Self::StyleNodeFailed(_) => "style.node_failed",
             Self::StyleTransitionSelected(_) => "style.transition_selected",
             Self::StyleExecutionTerminated(_) => "style.execution_terminated",
+            Self::ArtifactPersistenceProposed(_) => "artifact.persistence_proposed",
+            Self::ArtifactPersistenceApproved(_) => "artifact.persistence_approved",
+            Self::ArtifactPersistenceDispatched(_) => "artifact.persistence_dispatched",
+            Self::ArtifactPersistenceCompleted(_) => "artifact.persistence_completed",
+        }
+    }
+}
+
+/// Replay-owned artifact-persistence outbox state.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactPersistenceState {
+    /// Proposal is canonical, but no policy outcome is canonical yet.
+    Proposed,
+    /// Policy approved the exact action; storage has not been dispatched.
+    Approved,
+    /// Dispatch intent is canonical; recovery must use an exact terminal receipt.
+    Dispatched,
+    /// A request-bound terminal receipt is canonical.
+    Completed,
+}
+
+/// Safe next action derived only from canonical artifact-persistence state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArtifactPersistenceResumeAction {
+    /// Policy evaluation has no canonical outcome and must not be inferred.
+    AwaitPolicyRecovery,
+    /// The exact approved request may be dispatched for the first time.
+    DispatchApproved,
+    /// Dispatch may already have crossed the effect boundary; reconcile only.
+    ReconcileReceipt,
+    /// The effect is terminal and must not be dispatched again.
+    CompleteNode,
+}
+
+/// Canonical artifact-persistence record reconstructed without opening storage.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ArtifactPersistenceRecord {
+    /// Exact graph/content/proposal identity.
+    pub identity: ArtifactPersistenceIdentity,
+    /// Requested and persisted media type.
+    pub mime_type: String,
+    /// Requested and persisted byte count.
+    pub byte_size: u64,
+    /// Latest durable outbox state.
+    pub state: ArtifactPersistenceState,
+    /// Digest of the approved action, once policy succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<ContentHash>,
+    /// Canonical proposal sequence.
+    pub proposed_at: Sequence,
+    /// Canonical proposal event used as dependency creation provenance.
+    pub proposed_event: EventId,
+    /// Canonical approval sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<Sequence>,
+    /// Canonical dispatch sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_at: Option<Sequence>,
+    /// Canonical terminal sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Sequence>,
+    /// Dependency-owned BLAKE3 content identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    /// Portable dependency-owned immutable reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_reference: Option<String>,
+}
+
+impl ArtifactPersistenceRecord {
+    /// Returns the only restart action legal at this canonical cut.
+    #[must_use]
+    pub const fn resume_action(&self) -> ArtifactPersistenceResumeAction {
+        match self.state {
+            ArtifactPersistenceState::Proposed => {
+                ArtifactPersistenceResumeAction::AwaitPolicyRecovery
+            }
+            ArtifactPersistenceState::Approved => ArtifactPersistenceResumeAction::DispatchApproved,
+            ArtifactPersistenceState::Dispatched => {
+                ArtifactPersistenceResumeAction::ReconcileReceipt
+            }
+            ArtifactPersistenceState::Completed => ArtifactPersistenceResumeAction::CompleteNode,
         }
     }
 }
@@ -836,6 +996,9 @@ pub struct SessionState {
     /// Durable tool-dispatch outbox projection keyed by provider call ID.
     #[serde(default)]
     pub tool_executions: BTreeMap<String, ToolExecutionRecord>,
+    /// Artifact-persistence outbox records keyed by stable execution identity.
+    #[serde(default)]
+    pub artifact_persistences: BTreeMap<String, ArtifactPersistenceRecord>,
     /// Restart/reconnect reconciliation state keyed by provider call ID.
     #[serde(default)]
     pub process_reconciliations: BTreeMap<String, ProcessReconciliationRecord>,
@@ -912,6 +1075,10 @@ pub struct ModelExecutionEvidence {
     pub started_at: Sequence,
     /// Concatenated visible deltas for the current turn across provider exchanges.
     pub visible_text: String,
+    /// Exact structured tool proposals observed in this provider exchange
+    /// chain, retained in canonical order for restart reconstruction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_proposals: Vec<ModelToolCallProposedEvent>,
     /// Matching successful terminal completion sequence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<Sequence>,
@@ -1133,6 +1300,7 @@ fn initialize(
         conversation: ConversationState::new(),
         approvals: BTreeMap::new(),
         tool_executions: BTreeMap::new(),
+        artifact_persistences: BTreeMap::new(),
         process_reconciliations: BTreeMap::new(),
         last_sequence: event.metadata.sequence,
         last_event_checksum: event.integrity_checksum,
@@ -1235,6 +1403,7 @@ fn apply_payload(
                         user_sequence,
                         started_at: event.metadata.sequence,
                         visible_text: String::new(),
+                        tool_proposals: Vec::new(),
                         completed_at: None,
                         response_completed: false,
                     });
@@ -1281,11 +1450,19 @@ fn apply_payload(
             }
             Ok(())
         }
-        RuntimeCommittedEvent::ModelToolCallProposed(_) => {
+        RuntimeCommittedEvent::ModelToolCallProposed(proposed) => {
             if let Some(execution) = state.style_execution.as_mut()
                 && let Some(evidence) = execution.latest_model_execution.as_mut()
                 && evidence.completed_at.is_none()
             {
+                if evidence
+                    .tool_proposals
+                    .iter()
+                    .any(|existing| existing.call_id == proposed.call_id)
+                {
+                    return Err(SessionReducerError::InvalidModelExecutionEvidence);
+                }
+                evidence.tool_proposals.push(proposed.clone());
                 evidence.completed_at = Some(event.metadata.sequence);
             }
             Ok(())
@@ -1327,6 +1504,23 @@ fn apply_payload(
         }
         RuntimeCommittedEvent::StyleExecutionTerminated(terminated) => {
             apply_style_execution_terminated(state, terminated)
+        }
+        RuntimeCommittedEvent::ArtifactPersistenceProposed(proposed) => {
+            apply_artifact_persistence_proposed(
+                state,
+                proposed,
+                event.metadata.sequence,
+                event.metadata.event_id,
+            )
+        }
+        RuntimeCommittedEvent::ArtifactPersistenceApproved(approved) => {
+            apply_artifact_persistence_approved(state, approved, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ArtifactPersistenceDispatched(dispatched) => {
+            apply_artifact_persistence_dispatched(state, dispatched, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ArtifactPersistenceCompleted(completed) => {
+            apply_artifact_persistence_completed(state, completed, event.metadata.sequence)
         }
         RuntimeCommittedEvent::ToolExecutionDispatched(dispatched) => {
             apply_tool_dispatch(state, dispatched, event.metadata.sequence)
@@ -1718,7 +1912,18 @@ fn apply_style_node_entered(
         StyleExecutionControlState::AwaitingDestinationEntry(selected) => StyleExecutionCursor {
             node_id: selected.to_node_id.clone(),
             attempt: selected.attempt,
-            loop_iteration: selected.loop_iteration,
+            loop_iteration: if graph_node_kind(&execution.graph, &selected.from_node_id)
+                == Some(NodeKind::Loop)
+                && graph_node_kind(&execution.graph, &selected.to_node_id)
+                    != Some(NodeKind::CompleteSession)
+            {
+                selected
+                    .loop_iteration
+                    .checked_add(1)
+                    .ok_or(SessionReducerError::StyleLoopIterationOverflow)?
+            } else {
+                selected.loop_iteration
+            },
             step: selected
                 .step
                 .checked_add(1)
@@ -1745,6 +1950,173 @@ fn apply_style_node_entered(
     Ok(())
 }
 
+fn active_artifact_persistence_identity_matches(
+    state: &SessionState,
+    identity: &ArtifactPersistenceIdentity,
+) -> bool {
+    let Some(execution) = state.style_execution.as_ref() else {
+        return false;
+    };
+    !identity.execution_id.trim().is_empty()
+        && !identity.proposal_id.trim().is_empty()
+        && !identity.node_id.trim().is_empty()
+        && valid_style_counters(identity.attempt, identity.step)
+        && graph_node_kind(&execution.graph, &identity.node_id) == Some(NodeKind::PersistArtifact)
+        && active_node_matches(
+            execution.active_node.as_ref(),
+            &identity.node_id,
+            identity.attempt,
+            identity.loop_iteration,
+            identity.step,
+        )
+        && matches!(
+            &execution.control,
+            StyleExecutionControlState::Active(active)
+                if active_node_matches(
+                    Some(active),
+                    &identity.node_id,
+                    identity.attempt,
+                    identity.loop_iteration,
+                    identity.step
+                )
+        )
+}
+
+fn apply_artifact_persistence_proposed(
+    state: &mut SessionState,
+    proposed: &ArtifactPersistenceProposedEvent,
+    sequence: Sequence,
+    event_id: EventId,
+) -> Result<(), SessionReducerError> {
+    let identity = &proposed.identity;
+    if proposed.mime_type.trim().is_empty()
+        || proposed.byte_size == 0
+        || !active_artifact_persistence_identity_matches(state, identity)
+    {
+        return Err(SessionReducerError::InvalidArtifactPersistenceTransition);
+    }
+    if state
+        .artifact_persistences
+        .contains_key(&identity.execution_id)
+        || state.artifact_persistences.values().any(|record| {
+            record.identity.proposal_id == identity.proposal_id
+                || (record.identity.node_id == identity.node_id
+                    && record.identity.attempt == identity.attempt
+                    && record.identity.loop_iteration == identity.loop_iteration
+                    && record.identity.step == identity.step)
+        })
+    {
+        return Err(SessionReducerError::DuplicateArtifactPersistence);
+    }
+    state.artifact_persistences.insert(
+        identity.execution_id.clone(),
+        ArtifactPersistenceRecord {
+            identity: identity.clone(),
+            mime_type: proposed.mime_type.clone(),
+            byte_size: proposed.byte_size,
+            state: ArtifactPersistenceState::Proposed,
+            action_digest: None,
+            proposed_at: sequence,
+            proposed_event: event_id,
+            approved_at: None,
+            dispatched_at: None,
+            completed_at: None,
+            artifact_id: None,
+            artifact_reference: None,
+        },
+    );
+    Ok(())
+}
+
+fn apply_artifact_persistence_approved(
+    state: &mut SessionState,
+    approved: &ArtifactPersistenceApprovedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if !active_artifact_persistence_identity_matches(state, &approved.identity) {
+        return Err(SessionReducerError::InvalidArtifactPersistenceTransition);
+    }
+    let record = state
+        .artifact_persistences
+        .get_mut(&approved.identity.execution_id)
+        .ok_or(SessionReducerError::InvalidArtifactPersistenceTransition)?;
+    if record.state != ArtifactPersistenceState::Proposed
+        || record.identity != approved.identity
+        || record.action_digest.is_some()
+        || record.approved_at.is_some()
+        || record.dispatched_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidArtifactPersistenceTransition);
+    }
+    record.state = ArtifactPersistenceState::Approved;
+    record.action_digest = Some(approved.action_digest);
+    record.approved_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_artifact_persistence_dispatched(
+    state: &mut SessionState,
+    dispatched: &ArtifactPersistenceDispatchedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if !active_artifact_persistence_identity_matches(state, &dispatched.identity) {
+        return Err(SessionReducerError::InvalidArtifactPersistenceTransition);
+    }
+    let record = state
+        .artifact_persistences
+        .get_mut(&dispatched.identity.execution_id)
+        .ok_or(SessionReducerError::InvalidArtifactPersistenceTransition)?;
+    if record.state != ArtifactPersistenceState::Approved
+        || record.identity != dispatched.identity
+        || record.action_digest != Some(dispatched.action_digest)
+        || record.approved_at.is_none()
+        || record.dispatched_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidArtifactPersistenceTransition);
+    }
+    record.state = ArtifactPersistenceState::Dispatched;
+    record.dispatched_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_artifact_persistence_completed(
+    state: &mut SessionState,
+    completed: &ArtifactPersistenceCompletedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if completed.artifact_id.trim().is_empty()
+        || completed.artifact_reference.trim().is_empty()
+        || completed.mime_type.trim().is_empty()
+        || !active_artifact_persistence_identity_matches(state, &completed.identity)
+    {
+        return Err(SessionReducerError::InvalidArtifactPersistenceTransition);
+    }
+    let record = state
+        .artifact_persistences
+        .get_mut(&completed.identity.execution_id)
+        .ok_or(SessionReducerError::InvalidArtifactPersistenceTransition)?;
+    if record.state != ArtifactPersistenceState::Dispatched
+        || record.identity != completed.identity
+        || record.action_digest != Some(completed.action_digest)
+        || record.mime_type != completed.mime_type
+        || record.byte_size != completed.byte_size
+        || record.approved_at.is_none()
+        || record.dispatched_at.is_none()
+        || record.completed_at.is_some()
+        || record.artifact_id.is_some()
+        || record.artifact_reference.is_some()
+    {
+        return Err(SessionReducerError::InvalidArtifactPersistenceTransition);
+    }
+    record.state = ArtifactPersistenceState::Completed;
+    record.completed_at = Some(sequence);
+    record.artifact_id = Some(completed.artifact_id.clone());
+    record.artifact_reference = Some(completed.artifact_reference.clone());
+    Ok(())
+}
+
 fn apply_style_node_completed(
     state: &mut SessionState,
     completed: &StyleNodeCompletedEvent,
@@ -1756,6 +2128,7 @@ fn apply_style_node_completed(
             .ok_or(SessionReducerError::StyleExecutionNotInitialized)?,
         &state.conversation,
         state.style_binding.as_ref(),
+        &state.artifact_persistences,
         completed,
         state.last_sequence,
     ) {
@@ -1998,86 +2371,60 @@ fn graph_has_transition(graph: &ExecutableGraph, from_node_id: &str, to_node_id:
     })
 }
 
+fn artifact_persistence_effect_evidence_complete(
+    artifact_persistences: &BTreeMap<String, ArtifactPersistenceRecord>,
+    completed: &StyleNodeCompletedEvent,
+    journal_head: Sequence,
+) -> bool {
+    let Some(artifact_reference) = completed.artifact_reference.as_deref() else {
+        return false;
+    };
+    artifact_persistences.values().any(|record| {
+        record.state == ArtifactPersistenceState::Completed
+            && record.identity.node_id == completed.node_id
+            && record.identity.attempt == completed.attempt
+            && record.identity.loop_iteration == completed.loop_iteration
+            && record.identity.step == completed.step
+            && record.completed_at == Some(journal_head)
+            && record.artifact_reference.as_deref() == Some(artifact_reference)
+    })
+}
+
 fn style_node_effect_evidence_complete(
     execution: &StyleExecutionState,
     conversation: &ConversationState,
     binding: Option<&SessionStyleBinding>,
+    artifact_persistences: &BTreeMap<String, ArtifactPersistenceRecord>,
     completed: &StyleNodeCompletedEvent,
     journal_head: Sequence,
 ) -> bool {
-    if !is_ephemeral_turn_graph(&execution.graph) {
+    if graph_node_kind(&execution.graph, &completed.node_id) == Some(NodeKind::PersistArtifact) {
+        return artifact_persistence_effect_evidence_complete(
+            artifact_persistences,
+            completed,
+            journal_head,
+        );
+    }
+    let fresh_context_method = if is_ephemeral_turn_graph(&execution.graph) {
+        Some("ephemeral_fresh_context")
+    } else if is_research_loop_graph(&execution.graph) {
+        Some("research_fresh_context")
+    } else {
+        None
+    };
+    if fresh_context_method.is_none() {
         return true;
     }
     match graph_node_kind(&execution.graph, &completed.node_id) {
-        Some(NodeKind::ContextTransform) => {
-            let Some(boundary) = execution.context_boundaries.last() else {
-                return false;
-            };
-            let Some(provenance) = conversation.projection_provenance() else {
-                return false;
-            };
-            let users = conversation
-                .provider_projection()
-                .iter()
-                .filter_map(|entry| match entry {
-                    ConversationEntry::UserMessage(user) => Some(user),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            let [user] = users.as_slice() else {
-                return false;
-            };
-            let Some(canonical_user) =
-                conversation
-                    .history()
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        ConversationEntry::UserMessage(candidate)
-                            if candidate.source_sequence <= boundary.identity.source_head =>
-                        {
-                            Some(candidate)
-                        }
-                        _ => None,
-                    })
-            else {
-                return false;
-            };
-            let Some(replacement_event) = boundary.phase_replacement_event else {
-                return false;
-            };
-            let Some(selected_memory_provider) =
-                binding.map(|binding| binding.memory.provider.as_str())
-            else {
-                return false;
-            };
-            if conversation.provider_projection().iter().any(|entry| {
-                !matches!(entry, ConversationEntry::UserMessage(_))
-                    && !matches!(
-                        entry,
-                        ConversationEntry::RetrievedMemory(memory)
-                            if memory.injection_sequence == provenance.committed_at
-                                && memory.injection_event == Some(replacement_event)
-                                && memory.provider == selected_memory_provider
-                                && selected_memory_provider != "none"
-                    )
-            }) {
-                return false;
-            }
-            boundary.identity.node_id == completed.node_id
-                && boundary.identity.boundary == "turn_start"
-                && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
-                && boundary.completed_phases.as_slice() == ["memory"]
-                && boundary.completed_at == Some(journal_head)
-                && provenance.method == "ephemeral_fresh_context"
-                && provenance.committed_at.checked_next().ok() == Some(journal_head)
-                && provenance.source_range == Some((user.source_sequence, user.source_sequence))
-                && *user == canonical_user
-                && user.id.0.strip_prefix("user:").is_some_and(|suffix| {
-                    suffix.ends_with(&format!(":{}", boundary.identity.run_id))
-                })
-        }
-        Some(NodeKind::CompleteTurn) => {
+        Some(NodeKind::ContextTransform) => fresh_context_effect_evidence_complete(
+            execution,
+            conversation,
+            binding,
+            completed,
+            journal_head,
+            fresh_context_method.expect("fresh context method exists"),
+        ),
+        Some(NodeKind::CompleteTurn) if is_ephemeral_turn_graph(&execution.graph) => {
             let Some(boundary) = execution.context_boundaries.last() else {
                 return false;
             };
@@ -2095,6 +2442,82 @@ fn style_node_effect_evidence_complete(
         }
         _ => true,
     }
+}
+
+fn fresh_context_effect_evidence_complete(
+    execution: &StyleExecutionState,
+    conversation: &ConversationState,
+    binding: Option<&SessionStyleBinding>,
+    completed: &StyleNodeCompletedEvent,
+    journal_head: Sequence,
+    method: &str,
+) -> bool {
+    let Some(boundary) = execution.context_boundaries.last() else {
+        return false;
+    };
+    let Some(provenance) = conversation.projection_provenance() else {
+        return false;
+    };
+    let users = conversation
+        .provider_projection()
+        .iter()
+        .filter_map(|entry| match entry {
+            ConversationEntry::UserMessage(user) => Some(user),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [user] = users.as_slice() else {
+        return false;
+    };
+    let Some(canonical_user) = conversation
+        .history()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            ConversationEntry::UserMessage(candidate)
+                if candidate.source_sequence <= boundary.identity.source_head =>
+            {
+                Some(candidate)
+            }
+            _ => None,
+        })
+    else {
+        return false;
+    };
+    let Some(replacement_event) = boundary.phase_replacement_event else {
+        return false;
+    };
+    let Some(selected_memory_provider) = binding.map(|binding| binding.memory.provider.as_str())
+    else {
+        return false;
+    };
+    if conversation.provider_projection().iter().any(|entry| {
+        !matches!(entry, ConversationEntry::UserMessage(_))
+            && !matches!(
+                entry,
+                ConversationEntry::RetrievedMemory(memory)
+                    if memory.injection_sequence == provenance.committed_at
+                        && memory.injection_event == Some(replacement_event)
+                        && memory.provider == selected_memory_provider
+                        && selected_memory_provider != "none"
+            )
+    }) {
+        return false;
+    }
+    boundary.identity.node_id == completed.node_id
+        && boundary.identity.boundary == "turn_start"
+        && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+        && boundary.completed_phases.as_slice() == ["memory"]
+        && boundary.completed_at == Some(journal_head)
+        && provenance.method == method
+        && provenance.committed_at.checked_next().ok() == Some(journal_head)
+        && provenance.source_range == Some((user.source_sequence, user.source_sequence))
+        && *user == canonical_user
+        && user
+            .id
+            .0
+            .strip_prefix("user:")
+            .is_some_and(|suffix| suffix.ends_with(&format!(":{}", boundary.identity.run_id)))
 }
 
 fn is_ephemeral_turn_graph(graph: &ExecutableGraph) -> bool {
@@ -2128,6 +2551,40 @@ fn is_ephemeral_turn_graph(graph: &ExecutableGraph) -> bool {
         index = edge.to;
     }
     false
+}
+
+fn is_research_loop_graph(graph: &ExecutableGraph) -> bool {
+    if graph.nodes.len() != 6 || graph.edges.len() != 6 {
+        return false;
+    }
+    let expected = [
+        ("fresh-context", NodeKind::ContextTransform),
+        ("research", NodeKind::ModelCall),
+        ("tool", NodeKind::ToolExecutionGate),
+        ("persist", NodeKind::PersistArtifact),
+        ("repeat", NodeKind::Loop),
+        ("done", NodeKind::CompleteSession),
+    ];
+    if expected.iter().any(|(id, kind)| {
+        graph
+            .nodes
+            .iter()
+            .find(|node| node.id == *id)
+            .map(|node| node.kind)
+            != Some(*kind)
+    }) {
+        return false;
+    }
+    graph
+        .nodes
+        .get(graph.entry_index)
+        .is_some_and(|node| node.id == "fresh-context")
+        && graph_has_transition(graph, "fresh-context", "research")
+        && graph_has_transition(graph, "research", "tool")
+        && graph_has_transition(graph, "tool", "persist")
+        && graph_has_transition(graph, "persist", "repeat")
+        && graph_has_transition(graph, "repeat", "fresh-context")
+        && graph_has_transition(graph, "repeat", "done")
 }
 
 const fn valid_style_counters(attempt: u32, step: u64) -> bool {
@@ -2398,6 +2855,12 @@ pub enum SessionReducerError {
     /// A style node lifecycle or graph transition is invalid.
     #[error("style execution state transition is invalid")]
     InvalidStyleExecutionTransition,
+    /// An artifact-persistence execution identity was proposed more than once.
+    #[error("artifact persistence was proposed more than once")]
+    DuplicateArtifactPersistence,
+    /// Artifact persistence did not follow proposal, approval, dispatch, receipt ordering.
+    #[error("artifact persistence state transition is invalid")]
+    InvalidArtifactPersistenceTransition,
     /// Context composition did not follow start, phase, completion ordering.
     #[error("context boundary state transition is invalid")]
     InvalidContextBoundaryTransition,
@@ -2416,6 +2879,9 @@ pub enum SessionReducerError {
     /// Style graph step arithmetic overflowed.
     #[error("style graph step counter overflowed")]
     StyleStepOverflow,
+    /// Style loop iteration arithmetic overflowed.
+    #[error("style graph loop iteration overflowed")]
+    StyleLoopIterationOverflow,
     /// Conversation state invariant failed.
     #[error("conversation state failed: {0}")]
     Conversation(ConversationError),
@@ -2630,6 +3096,73 @@ to = "done"
             CompilerLimits::default(),
         )
         .expect("ephemeral context graph")
+    }
+
+    fn artifact_graph() -> ExecutableGraph {
+        compile_graph(
+            r#"
+format_version = 1
+entry = "persist"
+[budget]
+max_steps = 10
+max_tokens = 100
+max_cost_micros = 100
+max_duration_ms = 1000
+[declarations]
+capabilities = ["artifacts"]
+[[nodes]]
+id = "persist"
+kind = "persist_artifact"
+[[nodes]]
+id = "done"
+kind = "complete_session"
+[[edges]]
+from = "persist"
+to = "done"
+"#,
+            &GraphCacheInputs {
+                plugin_set_hash: ContentHash::digest(b"plugins"),
+                runtime_api_version: "1.0.0".into(),
+                capability_set: BTreeSet::from([String::from("artifacts")]),
+            },
+            CompilerLimits::default(),
+        )
+        .expect("artifact graph")
+    }
+
+    fn artifact_identity() -> ArtifactPersistenceIdentity {
+        ArtifactPersistenceIdentity {
+            execution_id: String::from("artifact:persist:1:0:1"),
+            proposal_id: String::from("artifact-proposal:persist:1:0:1"),
+            node_id: String::from("persist"),
+            attempt: 1,
+            loop_iteration: 0,
+            step: 1,
+            content_hash: ContentHash::digest(br#"{"finding":"bounded"}"#),
+        }
+    }
+
+    fn active_artifact_events() -> Vec<EventEnvelope<RuntimeCommittedEvent>> {
+        vec![
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(artifact_graph()),
+                    },
+                )),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("persist"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+        ]
     }
 
     fn context_identity(
@@ -3621,6 +4154,261 @@ to = "done"
                 artifact_reference: None,
             }),
         )
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the replay test spells out each durable crash cut and terminal evidence"
+    )]
+    fn artifact_persistence_replays_explicit_crash_cuts_and_content_store_identity() {
+        let identity = artifact_identity();
+        let action_digest = ContentHash::digest(b"approved-artifact-action");
+        let mut events = active_artifact_events();
+        events.push(envelope(
+            4,
+            RuntimeCommittedEvent::ArtifactPersistenceProposed(ArtifactPersistenceProposedEvent {
+                identity: identity.clone(),
+                mime_type: String::from("application/vnd.agentmod.research-finding+json"),
+                byte_size: 21,
+            }),
+        ));
+        events.push(envelope(
+            5,
+            RuntimeCommittedEvent::ArtifactPersistenceApproved(ArtifactPersistenceApprovedEvent {
+                identity: identity.clone(),
+                action_digest,
+            }),
+        ));
+
+        let approved = replay(&events).expect("approved crash cut replays");
+        let record = approved
+            .artifact_persistences
+            .get(&identity.execution_id)
+            .expect("approved outbox record");
+        assert_eq!(record.identity, identity);
+        assert_eq!(record.state, ArtifactPersistenceState::Approved);
+        assert_eq!(
+            record.resume_action(),
+            ArtifactPersistenceResumeAction::DispatchApproved
+        );
+        assert_eq!(record.action_digest, Some(action_digest));
+        assert_eq!(
+            record.approved_at,
+            Some(Sequence::new(5).expect("sequence"))
+        );
+        assert_eq!(record.dispatched_at, None);
+        assert_eq!(record.completed_at, None);
+
+        events.push(envelope(
+            6,
+            RuntimeCommittedEvent::ArtifactPersistenceDispatched(
+                ArtifactPersistenceDispatchedEvent {
+                    identity: identity.clone(),
+                    action_digest,
+                },
+            ),
+        ));
+        let dispatched = replay(&events).expect("dispatched crash cut replays");
+        let record = dispatched
+            .artifact_persistences
+            .get(&identity.execution_id)
+            .expect("dispatched outbox record");
+        assert_eq!(record.state, ArtifactPersistenceState::Dispatched);
+        assert_eq!(
+            record.resume_action(),
+            ArtifactPersistenceResumeAction::ReconcileReceipt
+        );
+        assert_eq!(
+            record.dispatched_at,
+            Some(Sequence::new(6).expect("sequence"))
+        );
+
+        let artifact_id = format!("blake3:{}", "a".repeat(64));
+        let artifact_reference = format!("artifact:{artifact_id}");
+        events.push(envelope(
+            7,
+            RuntimeCommittedEvent::ArtifactPersistenceCompleted(
+                ArtifactPersistenceCompletedEvent {
+                    identity: identity.clone(),
+                    action_digest,
+                    artifact_id: artifact_id.clone(),
+                    artifact_reference: artifact_reference.clone(),
+                    mime_type: String::from("application/vnd.agentmod.research-finding+json"),
+                    byte_size: 21,
+                },
+            ),
+        ));
+        let completed = replay(&events).expect("terminal receipt replays");
+        let record = completed
+            .artifact_persistences
+            .get(&identity.execution_id)
+            .expect("completed outbox record");
+        assert_eq!(record.state, ArtifactPersistenceState::Completed);
+        assert_eq!(
+            record.resume_action(),
+            ArtifactPersistenceResumeAction::CompleteNode
+        );
+        assert_eq!(record.artifact_id.as_deref(), Some(artifact_id.as_str()));
+        assert_eq!(
+            record.artifact_reference.as_deref(),
+            Some(artifact_reference.as_str())
+        );
+
+        assert!(matches!(
+            reduce(
+                Some(completed.clone()),
+                &envelope(
+                    8,
+                    RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                        node_id: String::from("persist"),
+                        attempt: 1,
+                        loop_iteration: 0,
+                        step: 1,
+                        result_reference: None,
+                        artifact_reference: Some(String::from("artifact:blake3:mismatched")),
+                    }),
+                ),
+            ),
+            Err(SessionReducerError::InvalidStyleExecutionTransition)
+        ));
+
+        events.push(envelope(
+            8,
+            RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                node_id: String::from("persist"),
+                attempt: 1,
+                loop_iteration: 0,
+                step: 1,
+                result_reference: None,
+                artifact_reference: Some(artifact_reference),
+            }),
+        ));
+        let state = replay(&events).expect("receipt authorizes node completion");
+        assert!(matches!(
+            state.style_execution.expect("style execution").control,
+            StyleExecutionControlState::AwaitingTransition(_)
+        ));
+    }
+
+    #[test]
+    fn persist_artifact_node_rejects_completion_without_terminal_evidence() {
+        let mut events = active_artifact_events();
+        events.push(envelope(
+            4,
+            RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                node_id: String::from("persist"),
+                attempt: 1,
+                loop_iteration: 0,
+                step: 1,
+                result_reference: None,
+                artifact_reference: Some(String::from("artifact:blake3:missing")),
+            }),
+        ));
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidStyleExecutionTransition)
+        ));
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the rejection test keeps each invalid ordering and identity case explicit"
+    )]
+    fn artifact_persistence_rejects_out_of_order_and_mismatched_requests() {
+        let identity = artifact_identity();
+        let action_digest = ContentHash::digest(b"approved-artifact-action");
+        let mut proposed_events = active_artifact_events();
+        proposed_events.push(envelope(
+            4,
+            RuntimeCommittedEvent::ArtifactPersistenceProposed(ArtifactPersistenceProposedEvent {
+                identity: identity.clone(),
+                mime_type: String::from("application/vnd.agentmod.research-finding+json"),
+                byte_size: 21,
+            }),
+        ));
+        let proposed = replay(&proposed_events).expect("proposal replays");
+
+        assert!(matches!(
+            reduce(
+                Some(proposed.clone()),
+                &envelope(
+                    5,
+                    RuntimeCommittedEvent::ArtifactPersistenceDispatched(
+                        ArtifactPersistenceDispatchedEvent {
+                            identity: identity.clone(),
+                            action_digest,
+                        },
+                    ),
+                ),
+            ),
+            Err(SessionReducerError::InvalidArtifactPersistenceTransition)
+        ));
+
+        let mut wrong_identity = identity.clone();
+        wrong_identity.content_hash = ContentHash::digest(b"different-content");
+        assert!(matches!(
+            reduce(
+                Some(proposed.clone()),
+                &envelope(
+                    5,
+                    RuntimeCommittedEvent::ArtifactPersistenceApproved(
+                        ArtifactPersistenceApprovedEvent {
+                            identity: wrong_identity,
+                            action_digest,
+                        },
+                    ),
+                ),
+            ),
+            Err(SessionReducerError::InvalidArtifactPersistenceTransition)
+        ));
+
+        let approved = reduce(
+            Some(proposed),
+            &envelope(
+                5,
+                RuntimeCommittedEvent::ArtifactPersistenceApproved(
+                    ArtifactPersistenceApprovedEvent {
+                        identity: identity.clone(),
+                        action_digest,
+                    },
+                ),
+            ),
+        )
+        .expect("approval replays");
+        let dispatched = reduce(
+            Some(approved),
+            &envelope(
+                6,
+                RuntimeCommittedEvent::ArtifactPersistenceDispatched(
+                    ArtifactPersistenceDispatchedEvent {
+                        identity: identity.clone(),
+                        action_digest,
+                    },
+                ),
+            ),
+        )
+        .expect("dispatch replays");
+        assert!(matches!(
+            reduce(
+                Some(dispatched),
+                &envelope(
+                    7,
+                    RuntimeCommittedEvent::ArtifactPersistenceCompleted(
+                        ArtifactPersistenceCompletedEvent {
+                            identity,
+                            action_digest,
+                            artifact_id: format!("blake3:{}", "b".repeat(64)),
+                            artifact_reference: format!("artifact:blake3:{}", "b".repeat(64)),
+                            mime_type: String::from("application/json"),
+                            byte_size: 21,
+                        },
+                    ),
+                ),
+            ),
+            Err(SessionReducerError::InvalidArtifactPersistenceTransition)
+        ));
     }
 
     fn style_transition(

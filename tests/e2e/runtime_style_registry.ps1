@@ -64,7 +64,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "style-bound session creation failed" }
 
         foreach ($entry in @(
-            @($persistent.session_id, "persistent-chat", "1.0.0"),
+            @($persistent.session_id, "persistent-chat", "1.1.0"),
             @($ephemeral.session_id, "ephemeral-turn", "1.1.0")
         )) {
             $inspection = & $cli session inspect $entry[0] --json | ConvertFrom-Json

@@ -12,8 +12,8 @@ use semver::{Version, VersionReq};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ApprovalDefaults, BuiltInStyle, ChildAgentLimits, CompactionSelection, CompactionStrategy,
-    DecisionCapability, ExecutionBudgets, GraphSource, InterceptorDeclaration,
+    ApprovalDefaults, BuiltInStyle, ChildAgentLimits, ChildWorkspaceMode, CompactionSelection,
+    CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource, InterceptorDeclaration,
     MemoryInjectionLocation, MemoryRetrievalTiming, MemorySelection, MemoryWritePolicy,
     RetryPolicy, SessionStyleManifest, StyleKind, TerminationOutcome, TerminationPolicy,
     TopLevelSelection,
@@ -262,9 +262,10 @@ pub fn compile_style(
     validate_approvals(&manifest.approvals, &root, &mut diagnostics);
     validate_budgets(manifest.budgets, limits, &root, &mut diagnostics);
     validate_children(
-        manifest.child_agents,
+        &manifest.child_agents,
         manifest.budgets,
         &manifest.required_capabilities,
+        &manifest.allowed_tool_groups,
         limits,
         &root,
         &mut diagnostics,
@@ -309,7 +310,7 @@ pub fn compile_style(
         compaction: manifest.compaction.clone(),
         approvals: manifest.approvals.clone(),
         budgets: manifest.budgets,
-        child_agents: manifest.child_agents,
+        child_agents: manifest.child_agents.clone(),
         retry: manifest.retry.clone(),
         termination: manifest.termination.clone(),
         selection: manifest.selection,
@@ -875,9 +876,10 @@ fn validate_budgets(
 }
 
 fn validate_children(
-    children: ChildAgentLimits,
+    children: &ChildAgentLimits,
     budgets: ExecutionBudgets,
     required_capabilities: &[String],
+    allowed_tool_groups: &[String],
     limits: StyleCompilerLimits,
     root: &str,
     diagnostics: &mut Vec<Diagnostic>,
@@ -886,7 +888,39 @@ fn validate_children(
     let valid_disabled = !disabled
         || (children.max_concurrent == 0
             && children.max_depth == 0
-            && children.per_child_token_budget == 0);
+            && children.per_child_token_budget == 0
+            && children.child_style.is_none()
+            && children.workspace_mode.is_none()
+            && children.custom_workspace.is_none()
+            && children.inherit_provider.is_none()
+            && children.inherit_model.is_none()
+            && children.context_budget_tokens.is_none()
+            && children.per_child_cost_budget_micros.is_none()
+            && children.tool_groups.is_empty()
+            && children.memory_access.is_none()
+            && children.join_behavior.is_none()
+            && children.cancellation_behavior.is_none()
+            && children.reviewer_max_attempts.is_none());
+    let child_style_valid = children.child_style.as_deref().is_some_and(|selector| {
+        selector.split_once('@').is_some_and(|(id, version)| {
+            !id.trim().is_empty()
+                && Version::parse(version).is_ok()
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    });
+    let workspace_valid = match (
+        children.workspace_mode,
+        children.custom_workspace.as_deref(),
+    ) {
+        (Some(ChildWorkspaceMode::ExplicitCustomWorkspace), Some(path)) => !path.trim().is_empty(),
+        (Some(mode), None) => mode != ChildWorkspaceMode::ExplicitCustomWorkspace,
+        (None | Some(_), Some(_)) | (None, None) => false,
+    };
+    let tool_groups_valid = children.tool_groups.iter().all(|group| {
+        !group.trim().is_empty() && allowed_tool_groups.iter().any(|allowed| allowed == group)
+    });
     let valid_enabled = disabled
         || (children.max_children <= limits.max_children
             && children.max_concurrent > 0
@@ -895,7 +929,24 @@ fn validate_children(
             && children.max_depth > 0
             && children.max_depth <= limits.max_child_depth
             && children.per_child_token_budget > 0
-            && children.per_child_token_budget <= budgets.max_tokens);
+            && children.per_child_token_budget <= budgets.max_tokens
+            && child_style_valid
+            && workspace_valid
+            && children.inherit_provider.is_some()
+            && children.inherit_model.is_some()
+            && children
+                .context_budget_tokens
+                .is_some_and(|budget| budget > 0 && budget <= children.per_child_token_budget)
+            && children
+                .per_child_cost_budget_micros
+                .is_some_and(|budget| budget > 0 && budget <= budgets.max_cost_micros)
+            && tool_groups_valid
+            && children.memory_access.is_some()
+            && children.join_behavior.is_some()
+            && children.cancellation_behavior.is_some()
+            && children
+                .reviewer_max_attempts
+                .is_some_and(|attempts| attempts > 0 && attempts <= budgets.max_iterations));
     let capability_declared = disabled || required_capabilities.iter().any(|item| item == "agents");
     if !valid_disabled || !valid_enabled || !capability_declared {
         diagnostics.push(error(

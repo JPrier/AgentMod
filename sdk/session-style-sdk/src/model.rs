@@ -400,7 +400,7 @@ pub struct ExecutionBudgets {
 }
 
 /// Child-session resource bounds.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChildAgentLimits {
     /// Total children created by one session.
@@ -411,6 +411,94 @@ pub struct ChildAgentLimits {
     pub max_depth: u16,
     /// Token budget for one child.
     pub per_child_token_budget: u64,
+    /// Exact child style selector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_style: Option<String>,
+    /// Workspace isolation selected for every child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mode: Option<ChildWorkspaceMode>,
+    /// Explicit custom workspace locator when that mode is selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_workspace: Option<String>,
+    /// Whether a child inherits the parent provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_provider: Option<bool>,
+    /// Whether a child inherits the parent model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_model: Option<bool>,
+    /// Maximum provider-context contribution for one child.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_budget_tokens: Option<u64>,
+    /// Maximum cost for one child in micros.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_child_cost_budget_micros: Option<u64>,
+    /// Tool groups available to children.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_groups: Vec<String>,
+    /// Child access to parent/session memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_access: Option<ChildMemoryAccess>,
+    /// Parent wait/join behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_behavior: Option<ChildJoinBehavior>,
+    /// Parent cancellation propagation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancellation_behavior: Option<ChildCancellationBehavior>,
+    /// Maximum reviewer attempts involving child revisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer_max_attempts: Option<u32>,
+}
+
+/// Workspace isolation for runtime-managed child sessions.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildWorkspaceMode {
+    /// Children may read the shared workspace but may not mutate it.
+    SharedReadOnly,
+    /// Children share one workspace with runtime-serialized writes.
+    SharedSerializedWrites,
+    /// Each child receives an independent Git worktree.
+    IndependentGitWorktree,
+    /// Each child receives a temporary workspace copy.
+    TemporaryCopy,
+    /// The style provides an explicit custom workspace locator.
+    ExplicitCustomWorkspace,
+}
+
+/// Memory visibility granted to a child.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildMemoryAccess {
+    /// Child receives no memory access.
+    None,
+    /// Child may retrieve but not write memory.
+    ReadOnly,
+    /// Child may retrieve and write within selected scopes.
+    ReadWrite,
+}
+
+/// Parent join semantics for a child set.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildJoinBehavior {
+    /// Wait for every expected child.
+    All,
+    /// Continue after the first successful child.
+    FirstSuccess,
+    /// Continue after any child reaches a terminal state.
+    AnyTerminal,
+}
+
+/// Parent cancellation propagation for active children.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildCancellationBehavior {
+    /// Parent cancellation propagates to every active child.
+    Cascade,
+    /// Children remain independently active.
+    Detach,
+    /// Parent cancellation waits for child terminal states.
+    Wait,
 }
 
 /// Bounded business retry policy.

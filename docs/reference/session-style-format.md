@@ -91,6 +91,23 @@ preservation_requirements = [
   "active_graph_state",
   "tool_call_correlation",
 ]
+
+[child_agents]
+max_children = 4
+max_concurrent = 2
+max_depth = 1
+per_child_token_budget = 16000
+child_style = "ephemeral-turn@1.1.0"
+workspace_mode = "shared_read_only"
+inherit_provider = true
+inherit_model = true
+context_budget_tokens = 12000
+per_child_cost_budget_micros = 250000
+tool_groups = []
+memory_access = "none"
+join_behavior = "all"
+cancellation_behavior = "cascade"
+reviewer_max_attempts = 2
 ```
 
 Memory retrieval timing is one of `never`, `turn_start`,
@@ -114,6 +131,24 @@ validates structure, reachability, termination, bounded cycles, declarations,
 parallel writes, retries, budgets, and constrained expressions.
 
 Compilation itself does not execute nodes. The runtime generic executor
-currently supports persistent-chat compatible graph shapes. The remaining
-declared node kinds are not all live runtime operations yet; validation success
-therefore does not imply that every graph is currently executable.
+currently supports persistent-chat, ephemeral-turn, research-loop, and the
+bounded built-in declarative fixture. The remaining declared node kinds are not
+all live runtime operations yet; validation success therefore does not imply
+that every graph is currently executable.
+
+Set every child-agent field to zero and omit the extended fields to disable
+children. An enabled policy must declare every extended field shown above.
+`child_style` is an exact `style-id@semver` selector. `workspace_mode` is
+`shared_read_only`, `shared_serialized_writes`, `independent_git_worktree`,
+`temporary_copy`, or `explicit_custom_workspace`; the last also requires
+`custom_workspace`. Memory access is `none`, `read_only`, or `read_write`.
+Join behavior is `all`, `first_success`, or `any_terminal`; cancellation
+behavior is `cascade`, `detach`, or `wait`. Child budgets must fit within the
+parent style budgets, and child tool groups must be a subset of the style's
+allowed tool groups.
+
+The complete child policy was added in `persistent-chat@1.1.0` and
+`planner-worker@1.1.0`. Style bindings are exact and immutable, so the runtime
+does not substitute `1.1.0` for a persisted `1.0.0` binding. An unavailable old
+version produces a compatibility error until the caller performs an explicit
+migration or branches with a selected replacement style.

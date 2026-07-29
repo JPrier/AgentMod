@@ -948,7 +948,7 @@ mod tests {
                 .records
                 .iter()
                 .filter(|record| record.id.as_deref() == Some("persistent-chat")
-                    && record.version.as_deref() == Some("1.0.0"))
+                    && record.version.as_deref() == Some("1.1.0"))
                 .all(|record| record
                     .diagnostics
                     .iter()
@@ -966,7 +966,7 @@ mod tests {
             discovery: DependencyStyleDiscovery {
                 manifests: vec![dependency_manifest(
                     "next.toml",
-                    &style.replacen("version = \"1.0.0\"", "version = \"1.0.1\"", 1),
+                    &style.replacen("version = \"1.1.0\"", "version = \"1.1.1\"", 1),
                 )],
                 ..DependencyStyleDiscovery::default()
             },
@@ -983,12 +983,12 @@ mod tests {
             .expect("catalog");
         assert!(catalog.records.iter().any(|record| {
             record.id.as_deref() == Some("persistent-chat")
-                && record.version.as_deref() == Some("1.0.0")
+                && record.version.as_deref() == Some("1.1.0")
                 && record.status == SessionStyleCatalogStatus::Available
         }));
         assert!(catalog.records.iter().any(|record| {
             record.id.as_deref() == Some("persistent-chat")
-                && record.version.as_deref() == Some("1.0.1")
+                && record.version.as_deref() == Some("1.1.1")
                 && record.status == SessionStyleCatalogStatus::Available
         }));
     }

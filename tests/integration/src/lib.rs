@@ -139,7 +139,7 @@ mod tests {
         let ephemeral = create("ephemeral-turn@1.1.0");
 
         for (session_id, expected_style, expected_version) in [
-            (persistent, "persistent-chat", "1.0.0"),
+            (persistent, "persistent-chat", "1.1.0"),
             (ephemeral, "ephemeral-turn", "1.1.0"),
         ] {
             let RuntimeResponse::SessionInspected { state, .. } = service

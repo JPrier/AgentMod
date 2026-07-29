@@ -3,12 +3,13 @@ use std::collections::BTreeMap;
 use agentmod_graph_engine::{CompilerLimits, GraphDefinition};
 
 use crate::{
-    ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits,
-    CompactionPreservationRequirement, CompactionSelection, CompactionStrategy, DecisionCapability,
-    ExecutionBudgets, GraphSource, InterceptorDeclaration, MemoryInjectionLocation,
-    MemoryQueryConstruction, MemoryQuerySource, MemoryRetrievalTiming, MemoryScope,
-    MemorySelection, MemoryWritePolicy, RetryPolicy, SessionStyleManifest, StyleIdentity,
-    StyleKind, TerminationOutcome, TerminationPolicy, TopLevelSelection,
+    ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits, ChildCancellationBehavior,
+    ChildJoinBehavior, ChildMemoryAccess, ChildWorkspaceMode, CompactionPreservationRequirement,
+    CompactionSelection, CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource,
+    InterceptorDeclaration, MemoryInjectionLocation, MemoryQueryConstruction, MemoryQuerySource,
+    MemoryRetrievalTiming, MemoryScope, MemorySelection, MemoryWritePolicy, RetryPolicy,
+    SessionStyleManifest, StyleIdentity, StyleKind, TerminationOutcome, TerminationPolicy,
+    TopLevelSelection,
 };
 
 /// Constructs one of the five required built-in semantic descriptors.
@@ -115,14 +116,14 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
     let tuple = match style {
         BuiltInStyle::PersistentChat => (
             "persistent-chat",
-            "1.0.0",
+            "1.1.0",
             32,
             PERSISTENT_CHAT_GRAPH,
             vec!["agents", "approval", "model", "tools"],
             vec!["filesystem"],
             file_memory(),
             summary_compaction(),
-            bounded_children(8, 2, 2, 50_000),
+            persistent_children(),
             vec![TerminationOutcome::CompleteTurn, TerminationOutcome::Fail],
         ),
         BuiltInStyle::EphemeralTurn => (
@@ -154,14 +155,14 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
         ),
         BuiltInStyle::PlannerWorker => (
             "planner-worker",
-            "1.0.0",
+            "1.1.0",
             32,
             PLANNER_WORKER_GRAPH,
             vec!["agents", "approval", "model"],
             Vec::new(),
             planner_memory(),
             summary_compaction(),
-            bounded_children(16, 4, 2, 100_000),
+            planner_children(),
             vec![
                 TerminationOutcome::CompleteSession,
                 TerminationOutcome::Fail,
@@ -353,26 +354,66 @@ fn required_projection_records() -> Vec<CompactionPreservationRequirement> {
     ]
 }
 
-const fn no_children() -> ChildAgentLimits {
+fn no_children() -> ChildAgentLimits {
     ChildAgentLimits {
         max_children: 0,
         max_concurrent: 0,
         max_depth: 0,
         per_child_token_budget: 0,
+        child_style: None,
+        workspace_mode: None,
+        custom_workspace: None,
+        inherit_provider: None,
+        inherit_model: None,
+        context_budget_tokens: None,
+        per_child_cost_budget_micros: None,
+        tool_groups: Vec::new(),
+        memory_access: None,
+        join_behavior: None,
+        cancellation_behavior: None,
+        reviewer_max_attempts: None,
     }
 }
 
-const fn bounded_children(
-    max_children: u32,
-    max_concurrent: u32,
-    max_depth: u16,
-    per_child_token_budget: u64,
-) -> ChildAgentLimits {
+fn planner_children() -> ChildAgentLimits {
     ChildAgentLimits {
-        max_children,
-        max_concurrent,
-        max_depth,
-        per_child_token_budget,
+        max_children: 16,
+        max_concurrent: 4,
+        max_depth: 2,
+        per_child_token_budget: 100_000,
+        child_style: Some(String::from("ephemeral-turn@1.1.0")),
+        workspace_mode: Some(ChildWorkspaceMode::SharedReadOnly),
+        custom_workspace: None,
+        inherit_provider: Some(true),
+        inherit_model: Some(true),
+        context_budget_tokens: Some(64_000),
+        per_child_cost_budget_micros: Some(10_000_000),
+        tool_groups: Vec::new(),
+        memory_access: Some(ChildMemoryAccess::None),
+        join_behavior: Some(ChildJoinBehavior::All),
+        cancellation_behavior: Some(ChildCancellationBehavior::Cascade),
+        reviewer_max_attempts: Some(8),
+    }
+}
+
+fn persistent_children() -> ChildAgentLimits {
+    ChildAgentLimits {
+        max_children: 8,
+        max_concurrent: 2,
+        max_depth: 2,
+        per_child_token_budget: 50_000,
+        child_style: Some(String::from("ephemeral-turn@1.1.0")),
+        workspace_mode: Some(ChildWorkspaceMode::SharedReadOnly),
+        custom_workspace: None,
+        inherit_provider: Some(true),
+        inherit_model: Some(true),
+        context_budget_tokens: Some(32_000),
+        per_child_cost_budget_micros: Some(5_000_000),
+        tool_groups: vec![String::from("filesystem")],
+        memory_access: Some(ChildMemoryAccess::ReadOnly),
+        join_behavior: Some(ChildJoinBehavior::All),
+        cancellation_behavior: Some(ChildCancellationBehavior::Cascade),
+        reviewer_max_attempts: Some(4),
     }
 }
 

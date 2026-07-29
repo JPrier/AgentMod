@@ -3617,63 +3617,11 @@ mod tests {
         )
     }
 
-    #[test]
-    fn child_session_link_replays_typed_task_without_conversation_input() {
-        let parent = SessionId::from_uuid(uuid("018f6f83-7b80-7000-8000-000000000099"));
-        let task = String::from("inspect the scheduler recovery invariant");
-        let linked = envelope(
-            2,
-            RuntimeCommittedEvent::ChildSessionLinked(ChildSessionLinkedEvent {
-                parent_session_id: parent,
-                parent_action_sequence: Sequence::new(17).expect("sequence"),
-                parent_graph_node_id: String::from("spawn-workers"),
-                task_id: String::from("task-1"),
-                revision: 0,
-                depth: 1,
-                input_hash: ContentHash::digest(task.as_bytes()),
-                task: task.clone(),
-                token_budget: 10_000,
-            }),
-        );
-
-        let events = [created(), linked];
-        let state = replay(&events).expect("child replay");
-
-        let origin = state.child_origin.expect("typed child origin");
-        assert_eq!(origin.parent_session_id, parent);
-        assert_eq!(origin.task, task);
-        assert!(state.ancestry.is_none());
-        assert!(state.conversation.history().is_empty());
-    }
-
-    #[test]
-    fn child_session_link_rejects_mismatched_task_hash() {
-        let linked = envelope(
-            2,
-            RuntimeCommittedEvent::ChildSessionLinked(ChildSessionLinkedEvent {
-                parent_session_id: SessionId::from_uuid(uuid(
-                    "018f6f83-7b80-7000-8000-000000000099",
-                )),
-                parent_action_sequence: Sequence::new(17).expect("sequence"),
-                parent_graph_node_id: String::from("spawn-workers"),
-                task_id: String::from("task-1"),
-                revision: 0,
-                depth: 1,
-                task: String::from("exact task"),
-                input_hash: ContentHash::digest(b"different task"),
-                token_budget: 10_000,
-            }),
-        );
-
-        let events = [created(), linked];
-        assert!(matches!(
-            replay(&events),
-            Err(SessionReducerError::InvalidChildSessionLink)
-        ));
-    }
-
-    #[test]
-    fn child_creation_requires_exact_policy_digest_before_atomic_receipt() {
+    fn proposed_child_creation_fixture() -> (
+        ChildAgentExecutionIdentity,
+        ContentHash,
+        Vec<EventEnvelope<RuntimeCommittedEvent>>,
+    ) {
         let style_binding = binding(BuiltInStyle::PlannerWorker);
         let graph: CompiledSessionStyle =
             serde_json::from_str(&style_binding.compiled_style_json).expect("compiled style");
@@ -3705,7 +3653,7 @@ mod tests {
         }
         .digest()
         .expect("digest");
-        let mut events = vec![
+        let events = vec![
             envelope(
                 1,
                 RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
@@ -3767,6 +3715,67 @@ mod tests {
                 RuntimeCommittedEvent::ChildAgentCreationProposed(proposal),
             ),
         ];
+        (identity, digest, events)
+    }
+
+    #[test]
+    fn child_session_link_replays_typed_task_without_conversation_input() {
+        let parent = SessionId::from_uuid(uuid("018f6f83-7b80-7000-8000-000000000099"));
+        let task = String::from("inspect the scheduler recovery invariant");
+        let linked = envelope(
+            2,
+            RuntimeCommittedEvent::ChildSessionLinked(ChildSessionLinkedEvent {
+                parent_session_id: parent,
+                parent_action_sequence: Sequence::new(17).expect("sequence"),
+                parent_graph_node_id: String::from("spawn-workers"),
+                task_id: String::from("task-1"),
+                revision: 0,
+                depth: 1,
+                input_hash: ContentHash::digest(task.as_bytes()),
+                task: task.clone(),
+                token_budget: 10_000,
+            }),
+        );
+
+        let events = [created(), linked];
+        let state = replay(&events).expect("child replay");
+
+        let origin = state.child_origin.expect("typed child origin");
+        assert_eq!(origin.parent_session_id, parent);
+        assert_eq!(origin.task, task);
+        assert!(state.ancestry.is_none());
+        assert!(state.conversation.history().is_empty());
+    }
+
+    #[test]
+    fn child_session_link_rejects_mismatched_task_hash() {
+        let linked = envelope(
+            2,
+            RuntimeCommittedEvent::ChildSessionLinked(ChildSessionLinkedEvent {
+                parent_session_id: SessionId::from_uuid(uuid(
+                    "018f6f83-7b80-7000-8000-000000000099",
+                )),
+                parent_action_sequence: Sequence::new(17).expect("sequence"),
+                parent_graph_node_id: String::from("spawn-workers"),
+                task_id: String::from("task-1"),
+                revision: 0,
+                depth: 1,
+                task: String::from("exact task"),
+                input_hash: ContentHash::digest(b"different task"),
+                token_budget: 10_000,
+            }),
+        );
+
+        let events = [created(), linked];
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidChildSessionLink)
+        ));
+    }
+
+    #[test]
+    fn child_creation_requires_exact_policy_digest_before_atomic_receipt() {
+        let (identity, digest, mut events) = proposed_child_creation_fixture();
         let mut wrong = events.clone();
         wrong.push(envelope(
             8,

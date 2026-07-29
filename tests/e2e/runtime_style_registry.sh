@@ -59,7 +59,7 @@ test -n "$persistent_id"
 test -n "$ephemeral_id"
 
 for pair in \
-    "$persistent_id:persistent-chat:1.0.0" \
+    "$persistent_id:persistent-chat:1.1.0" \
     "$ephemeral_id:ephemeral-turn:1.1.0"
 do
     session_id=${pair%%:*}

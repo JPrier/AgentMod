@@ -243,8 +243,8 @@ fn ephemeral_turn_version_selection_and_cache_identity_are_exact_and_determinist
     assert_eq!(manifest, built_in_manifest(BuiltInStyle::EphemeralTurn));
 
     for semantic in [BuiltInStyle::PersistentChat, BuiltInStyle::PlannerWorker] {
-        assert!(built_in_manifest_for_version(semantic, "1.0.0").is_some());
-        assert!(built_in_manifest_for_version(semantic, "1.1.0").is_none());
+        assert!(built_in_manifest_for_version(semantic, "1.0.0").is_none());
+        assert!(built_in_manifest_for_version(semantic, "1.1.0").is_some());
     }
 
     let first = compile_style(&manifest, &context(), StyleCompilerLimits::default())
@@ -275,6 +275,28 @@ fn ephemeral_turn_version_selection_and_cache_identity_are_exact_and_determinist
     let toml = to_toml(&manifest).expect("ephemeral TOML");
     assert_eq!(parse_json(&json).expect("JSON round trip"), manifest);
     assert_eq!(parse_toml(&toml).expect("TOML round trip"), manifest);
+}
+
+#[test]
+fn planner_worker_1_1_compiles_complete_child_execution_policy() {
+    let manifest = built_in_manifest(BuiltInStyle::PlannerWorker);
+    assert_eq!(manifest.identity.version, "1.1.0");
+    let compiled = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("planner worker compile");
+
+    assert_eq!(
+        compiled.child_agents.child_style.as_deref(),
+        Some("ephemeral-turn@1.1.0")
+    );
+    assert!(compiled.child_agents.workspace_mode.is_some());
+    assert_eq!(compiled.child_agents.inherit_provider, Some(true));
+    assert_eq!(compiled.child_agents.inherit_model, Some(true));
+    assert!(compiled.child_agents.context_budget_tokens.is_some());
+    assert!(compiled.child_agents.per_child_cost_budget_micros.is_some());
+    assert!(compiled.child_agents.memory_access.is_some());
+    assert!(compiled.child_agents.join_behavior.is_some());
+    assert!(compiled.child_agents.cancellation_behavior.is_some());
+    assert_eq!(compiled.child_agents.reviewer_max_attempts, Some(8));
 }
 
 #[test]

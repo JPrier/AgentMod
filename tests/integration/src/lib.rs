@@ -136,7 +136,7 @@ mod tests {
             session_id
         };
         let persistent = create("persistent-chat");
-        let ephemeral = create("ephemeral-turn@1.0.0");
+        let ephemeral = create("ephemeral-turn@1.1.0");
 
         for (session_id, expected_style) in [
             (persistent, "persistent-chat"),

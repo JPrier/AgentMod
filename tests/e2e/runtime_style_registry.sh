@@ -52,7 +52,7 @@ persistent=$("$cli" session create --workspace "$repository" \
 persistent_id=$(printf '%s' "$persistent" |
     sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
 ephemeral=$("$cli" session create --workspace "$repository" \
-    --style ephemeral-turn@1.0.0 --json)
+    --style ephemeral-turn@1.1.0 --json)
 ephemeral_id=$(printf '%s' "$ephemeral" |
     sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
 test -n "$persistent_id"

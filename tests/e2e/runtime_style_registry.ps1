@@ -58,7 +58,7 @@ try {
         $persistent = & $cli session create --workspace $repository `
             --style persistent-chat --json | ConvertFrom-Json
         $ephemeral = & $cli session create --workspace $repository `
-            --style ephemeral-turn@1.0.0 --json | ConvertFrom-Json
+            --style ephemeral-turn@1.1.0 --json | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw "style-bound session creation failed" }
 
         foreach ($entry in @(

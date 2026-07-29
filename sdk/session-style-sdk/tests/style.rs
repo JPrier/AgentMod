@@ -264,11 +264,11 @@ fn ephemeral_turn_version_selection_and_cache_identity_are_exact_and_determinist
     );
     assert_eq!(
         first.cache_key.style_content_hash.to_hex(),
-        "a18d8d2e4808a4c13ae7bcad117c1e5a860becaf44952db4a2fd0ca006ebb783"
+        "c28950785dcadaffd12861df0b02bac671f82a7a0d9f65a3cda9451def5feeda"
     );
     assert_eq!(
         first.cache_key.combined_hash.to_hex(),
-        "d44a22b0be917f2e349118efde64d19ef7004b24c6c5fb41c3d93e982d0b9f05"
+        "941929db2f0536e7624467a0ade02c9ccd95ea2edc02bc4285f18a309d92fb93"
     );
 
     let json = to_json(&manifest).expect("ephemeral JSON");
@@ -439,11 +439,11 @@ fn research_loop_version_and_cache_identity_are_exact_and_deterministic() {
     assert_eq!(first.style_version, "1.1.0");
     assert_eq!(
         first.cache_key.style_content_hash.to_hex(),
-        "eedaca6b0d937baead9aafe5810f0be0f4a10852439374136bc62572b692177b"
+        "4df10d7ea07306da14dc6735af520d37f3fb8ccf6136ebeca99dd378817a1bf2"
     );
     assert_eq!(
         first.cache_key.combined_hash.to_hex(),
-        "7bc32da7244da3b773a20856ff4547e04c4127b03649679ce46025b1dcea013b"
+        "f7d30ae18e812512ccce77e379fec38b289dcd321d5e584c1ec50fa53f998276"
     );
 
     let json = to_json(&manifest).expect("research JSON");
@@ -592,11 +592,11 @@ fn declarative_graph_version_and_cache_identity_are_exact_and_deterministic() {
     assert_eq!(first.style_version, "1.1.0");
     assert_eq!(
         first.cache_key.style_content_hash.to_hex(),
-        "45777c6850f12ec74b36cbc7a7082f79f8f1ae56dae716fe663be87de5c00486"
+        "4771b38f94121592175bff6ff9766f725e6a72efd493bd43e0ee3168ea4034b7"
     );
     assert_eq!(
         first.cache_key.combined_hash.to_hex(),
-        "78e81c532d97d8832c265520121f8717d1bc73e8498ed05f652bc33d1e470685"
+        "579af94d1a645cbeccabf59b174232fa874deeef94c6a4311e9e087202a266cf"
     );
 
     let json = to_json(&manifest).expect("declarative JSON");
@@ -954,6 +954,26 @@ fn catalog_style_ids_are_unique_and_graph_references_are_content_addressed() {
     )
     .expect_err("noncanonical hash");
     assert!(codes(&error).contains(&"STYLE027"));
+}
+
+#[test]
+fn harness_selection_is_compiled_and_invalid_identifiers_fail_closed() {
+    let mut manifest = built_in_manifest(BuiltInStyle::PersistentChat);
+    manifest.harness.id = String::from("fixture");
+    manifest.harness.required_capabilities = vec![
+        String::from("streaming"),
+        String::from("structured_context_replacement"),
+    ];
+    let compiled = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("harness selection compiles");
+    assert_eq!(compiled.harness, manifest.harness);
+
+    manifest.harness.id = String::from("../fixture");
+    manifest.harness.required_capabilities = vec![String::from("not valid")];
+    let error = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect_err("unsafe harness identifiers");
+    assert!(codes(&error).contains(&"STYLE030"));
+    assert!(codes(&error).contains(&"STYLE031"));
 }
 
 proptest! {

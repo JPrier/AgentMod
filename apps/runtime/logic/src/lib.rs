@@ -7,6 +7,7 @@ pub mod compaction;
 pub mod continuation;
 pub mod conversation;
 pub mod harness;
+pub mod harness_registry;
 pub mod history;
 pub mod interception;
 pub mod memory;

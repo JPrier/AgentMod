@@ -35,6 +35,7 @@ pub enum ServiceProviderEntry {
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServiceExecuteProviderRequest {
+    pub harness: String,
     pub session_id: String,
     pub provider: String,
     pub model: String,
@@ -86,10 +87,15 @@ pub trait ProviderServicePort: Send + Sync {
     ) -> Result<Vec<ServiceProviderEvent>, ProviderServiceError>;
     async fn continue_execution(
         &self,
+        harness: String,
         id: String,
         decision: ServiceProviderDecision,
     ) -> Result<Vec<ServiceProviderEvent>, ProviderServiceError>;
-    async fn cancel(&self, id: String) -> Result<Vec<ServiceProviderEvent>, ProviderServiceError>;
+    async fn cancel(
+        &self,
+        harness: String,
+        id: String,
+    ) -> Result<Vec<ServiceProviderEvent>, ProviderServiceError>;
 }
 #[derive(Clone)]
 pub struct ProviderService<L> {
@@ -109,6 +115,7 @@ impl<L: logic::ProviderExecutionPort> ProviderServicePort for ProviderService<L>
     ) -> Result<Vec<ServiceProviderEvent>, ProviderServiceError> {
         self.logic
             .execute(logic::ExecuteProviderCommand {
+                harness: r.harness,
                 session_id: r.session_id,
                 provider: r.provider,
                 model: r.model,
@@ -124,11 +131,13 @@ impl<L: logic::ProviderExecutionPort> ProviderServicePort for ProviderService<L>
     }
     async fn continue_execution(
         &self,
+        harness: String,
         id: String,
         d: ServiceProviderDecision,
     ) -> Result<Vec<ServiceProviderEvent>, ProviderServiceError> {
         self.logic
             .continue_execution(
+                harness,
                 id,
                 match d {
                     ServiceProviderDecision::Continue => logic::ProviderDecision::Continue,
@@ -143,9 +152,13 @@ impl<L: logic::ProviderExecutionPort> ProviderServicePort for ProviderService<L>
             .map(|v| v.into_iter().map(map_event).collect())
             .map_err(map_error)
     }
-    async fn cancel(&self, id: String) -> Result<Vec<ServiceProviderEvent>, ProviderServiceError> {
+    async fn cancel(
+        &self,
+        harness: String,
+        id: String,
+    ) -> Result<Vec<ServiceProviderEvent>, ProviderServiceError> {
         self.logic
-            .cancel(id)
+            .cancel(harness, id)
             .await
             .map(|v| v.into_iter().map(map_event).collect())
             .map_err(map_error)
@@ -284,6 +297,7 @@ mod tests {
 
         async fn continue_execution(
             &self,
+            _harness: String,
             _id: String,
             _decision: logic::ProviderDecision,
         ) -> Result<Vec<logic::ProviderEvent>, logic::ProviderExecutionError> {
@@ -292,6 +306,7 @@ mod tests {
 
         async fn cancel(
             &self,
+            _harness: String,
             _id: String,
         ) -> Result<Vec<logic::ProviderEvent>, logic::ProviderExecutionError> {
             Ok(vec![logic::ProviderEvent::Cancelled])
@@ -305,6 +320,7 @@ mod tests {
         });
         let response = service
             .execute(ServiceExecuteProviderRequest {
+                harness: "native".into(),
                 session_id: "session".into(),
                 provider: "deterministic-mock".into(),
                 model: "mock-model".into(),
@@ -342,7 +358,10 @@ mod tests {
             executed: Mutex::new(Vec::new()),
         });
         assert_eq!(
-            service.cancel("cancel".into()).await.expect("cancel"),
+            service
+                .cancel("native".into(), "cancel".into())
+                .await
+                .expect("cancel"),
             vec![ServiceProviderEvent::Cancelled]
         );
     }

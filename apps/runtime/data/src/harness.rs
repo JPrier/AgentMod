@@ -44,6 +44,7 @@ pub enum HarnessDataDecision {
 #[derive(Clone, Debug, PartialEq)]
 pub enum HarnessDataCommand {
     Execute {
+        harness_id: String,
         session_id: String,
         provider: String,
         model: String,
@@ -53,13 +54,17 @@ pub enum HarnessDataCommand {
         cancellation_id: String,
     },
     Continue {
+        harness_id: String,
         continuation_id: String,
         decision: HarnessDataDecision,
     },
     Cancel {
+        harness_id: String,
         cancellation_id: String,
     },
-    Health,
+    Health {
+        harness_id: String,
+    },
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum HarnessDataEvent {
@@ -194,14 +199,22 @@ impl<D: dependency::HarnessDependencyPort> HarnessDataPort for super::RuntimeDat
 }
 fn map_command(v: HarnessDataCommand) -> dependency::DependencyCommand {
     match v {
-        HarnessDataCommand::Health => dependency::DependencyCommand::Health,
-        HarnessDataCommand::Cancel { cancellation_id } => {
-            dependency::DependencyCommand::Cancel { cancellation_id }
+        HarnessDataCommand::Health { harness_id } => {
+            dependency::DependencyCommand::Health { harness_id }
         }
+        HarnessDataCommand::Cancel {
+            harness_id,
+            cancellation_id,
+        } => dependency::DependencyCommand::Cancel {
+            harness_id,
+            cancellation_id,
+        },
         HarnessDataCommand::Continue {
+            harness_id,
             continuation_id,
             decision,
         } => dependency::DependencyCommand::Continue {
+            harness_id,
             continuation_id,
             decision: match decision {
                 HarnessDataDecision::Continue => dependency::DependencyDecision::Continue,
@@ -213,6 +226,7 @@ fn map_command(v: HarnessDataCommand) -> dependency::DependencyCommand {
             },
         },
         HarnessDataCommand::Execute {
+            harness_id,
             session_id,
             provider,
             model,
@@ -221,6 +235,7 @@ fn map_command(v: HarnessDataCommand) -> dependency::DependencyCommand {
             grant,
             cancellation_id,
         } => dependency::DependencyCommand::Execute {
+            harness_id,
             session_id,
             provider,
             model,
@@ -398,6 +413,7 @@ mod tests {
         });
         let response = data
             .exchange(HarnessDataCommand::Execute {
+                harness_id: String::from("native"),
                 session_id: "session".into(),
                 provider: "provider".into(),
                 model: "model".into(),

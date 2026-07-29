@@ -13,10 +13,10 @@ pub use model::{
     ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits, ChildCancellationBehavior,
     ChildJoinBehavior, ChildMemoryAccess, ChildWorkspaceMode, CompactionPreservationRequirement,
     CompactionSelection, CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource,
-    InterceptorDeclaration, MemoryInjectionLocation, MemoryQueryConstruction, MemoryQuerySource,
-    MemoryRetrievalTiming, MemoryScope, MemorySelection, MemoryWritePolicy, RetryPolicy,
-    SessionStyleManifest, StyleIdentity, StyleKind, TerminationOutcome, TerminationPolicy,
-    TopLevelSelection,
+    HarnessSelection, InterceptorDeclaration, MemoryInjectionLocation, MemoryQueryConstruction,
+    MemoryQuerySource, MemoryRetrievalTiming, MemoryScope, MemorySelection, MemoryWritePolicy,
+    RetryPolicy, SessionStyleManifest, StyleIdentity, StyleKind, TerminationOutcome,
+    TerminationPolicy, TopLevelSelection,
 };
 pub use parsing::{ManifestFormat, ManifestParseError, parse_json, parse_toml, to_json, to_toml};
 pub use validation::{

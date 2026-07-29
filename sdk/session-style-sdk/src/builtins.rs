@@ -6,10 +6,10 @@ use crate::{
     ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits, ChildCancellationBehavior,
     ChildJoinBehavior, ChildMemoryAccess, ChildWorkspaceMode, CompactionPreservationRequirement,
     CompactionSelection, CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource,
-    InterceptorDeclaration, MemoryInjectionLocation, MemoryQueryConstruction, MemoryQuerySource,
-    MemoryRetrievalTiming, MemoryScope, MemorySelection, MemoryWritePolicy, RetryPolicy,
-    SessionStyleManifest, StyleIdentity, StyleKind, TerminationOutcome, TerminationPolicy,
-    TopLevelSelection,
+    HarnessSelection, InterceptorDeclaration, MemoryInjectionLocation, MemoryQueryConstruction,
+    MemoryQuerySource, MemoryRetrievalTiming, MemoryScope, MemorySelection, MemoryWritePolicy,
+    RetryPolicy, SessionStyleManifest, StyleIdentity, StyleKind, TerminationOutcome,
+    TerminationPolicy, TopLevelSelection,
 };
 
 /// Constructs one of the five required built-in semantic descriptors.
@@ -43,6 +43,7 @@ fn manifest_from_parts(style: BuiltInStyle, parts: BuiltInParts) -> SessionStyle
     } else {
         2
     };
+    let harness_requires_tools = !parts.tool_groups.is_empty();
     SessionStyleManifest {
         schema_version: 1,
         identity: StyleIdentity {
@@ -64,6 +65,21 @@ fn manifest_from_parts(style: BuiltInStyle, parts: BuiltInParts) -> SessionStyle
             Vec::new()
         },
         allowed_plugins: vec!["runtime.security".to_owned()],
+        harness: HarnessSelection {
+            id: String::from("native"),
+            required_capabilities: {
+                let mut capabilities = vec![
+                    String::from("cancellation"),
+                    String::from("streaming"),
+                    String::from("structured_context_replacement"),
+                    String::from("token_usage"),
+                ];
+                if harness_requires_tools {
+                    capabilities.push(String::from("tool_calls"));
+                }
+                capabilities
+            },
+        },
         memory: parts.memory,
         compaction: parts.compaction,
         approvals: ApprovalDefaults {

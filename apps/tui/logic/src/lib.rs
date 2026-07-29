@@ -10,8 +10,8 @@
 
 use agentmod_primitives::{CancellationId, Sequence};
 use agentmod_tui_data::{
-    SessionDataRecord, SessionEventDataRecord, StyleDataAvailability, StyleDataRecord,
-    StyleDataSourceKind, TuiDataError, TuiDataPort, TurnDataEvent, TurnDataStream,
+    HarnessDataRecord, SessionDataRecord, SessionEventDataRecord, StyleDataAvailability,
+    StyleDataRecord, StyleDataSourceKind, TuiDataError, TuiDataPort, TurnDataEvent, TurnDataStream,
     TurnDataStreamItem,
 };
 use serde_json::{Value, json};
@@ -24,6 +24,7 @@ pub enum View {
     Events,
     Context,
     Styles,
+    Harnesses,
     Help,
 }
 
@@ -66,6 +67,16 @@ impl StyleSummary {
     }
 }
 
+/// Logic-owned harness registry row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessSummary {
+    pub id: String,
+    pub version: String,
+    pub capabilities: Vec<String>,
+    pub capability_set_hash: String,
+    pub availability: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TranscriptRole {
     System,
@@ -103,6 +114,8 @@ pub struct TuiState {
     pub sessions: Vec<SessionDataRecord>,
     pub styles: Vec<StyleSummary>,
     pub selected_style: Option<String>,
+    pub harnesses: Vec<HarnessSummary>,
+    pub selected_harness: String,
     pub default_style: String,
     pub selected_session: Option<usize>,
     pub transcript: Vec<TranscriptEntry>,
@@ -131,6 +144,8 @@ impl Default for TuiState {
             sessions: Vec::new(),
             styles: Vec::new(),
             selected_style: None,
+            harnesses: Vec::new(),
+            selected_harness: String::from("native"),
             default_style: String::from("persistent-chat"),
             selected_session: None,
             transcript: Vec::new(),
@@ -178,6 +193,7 @@ pub trait TuiLogicPort {
     fn bootstrap(&mut self) -> Result<(), TuiLogicError>;
     fn refresh_sessions(&mut self) -> Result<(), TuiLogicError>;
     fn refresh_styles(&mut self) -> Result<(), TuiLogicError>;
+    fn refresh_harnesses(&mut self) -> Result<(), TuiLogicError>;
     fn select_relative(&mut self, delta: i32) -> Result<(), TuiLogicError>;
     fn submit_editor(&mut self) -> Result<(), TuiLogicError>;
     fn poll_runtime(&mut self) -> Result<(), TuiLogicError>;
@@ -224,6 +240,7 @@ impl<D: TuiDataPort> TuiLogicPort for TuiLogic<D> {
             String::from("runtime degraded")
         };
         self.refresh_styles()?;
+        self.refresh_harnesses()?;
         self.refresh_sessions()
     }
 
@@ -252,6 +269,26 @@ impl<D: TuiDataPort> TuiLogicPort for TuiLogic<D> {
                 .any(|style| style.selector() == *selected)
         {
             self.state.selected_style = None;
+        }
+        Ok(())
+    }
+
+    fn refresh_harnesses(&mut self) -> Result<(), TuiLogicError> {
+        self.state.harnesses = self
+            .data
+            .list_harnesses()
+            .map_err(map_error)?
+            .into_iter()
+            .map(map_harness)
+            .collect();
+        if !self.state.harnesses.is_empty()
+            && !self
+                .state
+                .harnesses
+                .iter()
+                .any(|harness| harness.id == self.state.selected_harness)
+        {
+            self.state.selected_harness = self.state.harnesses[0].id.clone();
         }
         Ok(())
     }
@@ -489,26 +526,56 @@ impl<D: TuiDataPort> TuiLogic<D> {
                 let style = parts
                     .next()
                     .map_or_else(|| self.state.active_style().to_owned(), ToOwned::to_owned);
+                let harness = parts
+                    .next()
+                    .map_or_else(|| self.state.selected_harness.clone(), ToOwned::to_owned);
                 if parts.next().is_some() {
                     return Err(TuiLogicError::InvalidCommand(String::from(
-                        "/new [workspace] [style]",
+                        "/new [workspace] [style] [harness]",
                     )));
                 }
                 let id = self
                     .data
-                    .create_session(workspace, style.clone())
+                    .create_session_with_harness(workspace, style.clone(), Some(harness.clone()))
                     .map_err(map_error)?;
                 self.refresh_sessions()?;
                 self.state.selected_session =
                     self.state.sessions.iter().position(|value| value.id == id);
                 self.reload_selected_history()?;
-                self.state.status = format!("created session {id} with {style}");
+                self.state.status = format!("created session {id} with {style} on {harness}");
             }
             "/sessions" => self.refresh_sessions()?,
             "/styles" => {
                 self.refresh_styles()?;
                 self.state.view = View::Styles;
                 self.state.status = format!("{} styles available", self.state.styles.len());
+            }
+            "/harnesses" => {
+                self.refresh_harnesses()?;
+                self.state.view = View::Harnesses;
+                self.state.status = format!("{} harnesses available", self.state.harnesses.len());
+            }
+            "/harness" => {
+                let id = required_argument(parts.next(), "/harness <id>")?;
+                if parts.next().is_some() {
+                    return Err(TuiLogicError::InvalidCommand(String::from("/harness <id>")));
+                }
+                let harness = self
+                    .state
+                    .harnesses
+                    .iter()
+                    .find(|harness| harness.id == id)
+                    .ok_or_else(|| {
+                        TuiLogicError::InvalidCommand(format!("unknown harness {id}"))
+                    })?;
+                if harness.availability != "available" {
+                    return Err(TuiLogicError::InvalidCommand(format!(
+                        "harness {id} is {}",
+                        harness.availability
+                    )));
+                }
+                self.state.selected_harness.clone_from(&id);
+                self.state.status = format!("harness: {id}");
             }
             "/style" => {
                 let selector = required_argument(parts.next(), "/style <id[@version]>")?;
@@ -724,6 +791,16 @@ fn map_style(style: StyleDataRecord) -> StyleSummary {
     }
 }
 
+fn map_harness(harness: HarnessDataRecord) -> HarnessSummary {
+    HarnessSummary {
+        id: harness.id,
+        version: harness.version,
+        capabilities: harness.capabilities,
+        capability_set_hash: harness.capability_set_hash,
+        availability: harness.availability,
+    }
+}
+
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum TuiLogicError {
     #[error("TUI runtime data failed: {0}")]
@@ -752,7 +829,7 @@ mod tests {
 
     use agentmod_primitives::{CancellationId, SessionId};
     use agentmod_tui_data::{
-        RuntimeHealthDataRecord, SessionDataRecord, SessionEventDataRecord,
+        HarnessDataRecord, RuntimeHealthDataRecord, SessionDataRecord, SessionEventDataRecord,
         SessionEventPageDataRecord, TurnDataEvent, TurnDataStream,
     };
     use serde_json::json;
@@ -762,7 +839,7 @@ mod tests {
 
     #[derive(Default)]
     struct FixtureData {
-        created: RefCell<Vec<(String, String)>>,
+        created: RefCell<Vec<(String, String, Option<String>)>>,
     }
 
     impl TuiDataPort for FixtureData {
@@ -785,6 +862,16 @@ mod tests {
             }])
         }
 
+        fn list_harnesses(&self) -> Result<Vec<HarnessDataRecord>, TuiDataError> {
+            Ok(vec![HarnessDataRecord {
+                id: String::from("fixture"),
+                version: String::from("1.0.0"),
+                capabilities: vec![String::from("streaming")],
+                capability_set_hash: String::from("harness-hash"),
+                availability: String::from("available"),
+            }])
+        }
+
         fn list_sessions(&self, _limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError> {
             Ok(vec![SessionDataRecord {
                 id: SessionId::from_uuid(Uuid::nil()),
@@ -800,7 +887,17 @@ mod tests {
             workspace: String,
             style: String,
         ) -> Result<SessionId, TuiDataError> {
-            self.created.borrow_mut().push((workspace, style));
+            self.created.borrow_mut().push((workspace, style, None));
+            Ok(SessionId::from_uuid(Uuid::from_u128(2)))
+        }
+
+        fn create_session_with_harness(
+            &self,
+            workspace: String,
+            style: String,
+            harness: Option<String>,
+        ) -> Result<SessionId, TuiDataError> {
+            self.created.borrow_mut().push((workspace, style, harness));
             Ok(SessionId::from_uuid(Uuid::from_u128(2)))
         }
 
@@ -894,11 +991,13 @@ mod tests {
     }
 
     #[test]
-    fn selected_non_default_style_reaches_create_session() {
+    fn selected_style_and_harness_reach_create_session() {
         let mut logic = TuiLogic::new(FixtureData::default());
         logic.bootstrap().expect("bootstrap");
         logic.insert_text("/style focused@1.0.0");
         logic.submit_editor().expect("select style");
+        logic.insert_text("/harness fixture");
+        logic.submit_editor().expect("select harness");
         logic.insert_text("/new workspace");
         logic.submit_editor().expect("create session");
 
@@ -908,7 +1007,11 @@ mod tests {
         );
         assert_eq!(
             logic.data.created.into_inner(),
-            vec![(String::from("workspace"), String::from("focused@1.0.0"))]
+            vec![(
+                String::from("workspace"),
+                String::from("focused@1.0.0"),
+                Some(String::from("fixture"))
+            )]
         );
     }
 }

@@ -8,7 +8,13 @@ agentmod run "<prompt>" --session <id> [--provider <id>] [--model <id>]
              [--option <key=value>]... [--cancellation-id <uuid>]
              [--json | --stream-json]
 agentmod cancel <cancellation-id> [--reason <text>] [--json]
-agentmod session create [--workspace <path>] [--style <id>] [--json]
+agentmod harness list [--json]
+agentmod harness inspect <id> [--json]
+agentmod style list [--json]
+agentmod style inspect <id-or-id@version> [--json]
+agentmod style validate <file> [--json]
+agentmod style compile <file> [--json]
+agentmod session create [--workspace <path>] [--style <id>] [--harness <id>] [--json]
 agentmod session list [--limit <count>] [--json]
 agentmod session inspect <id> [--at <sequence>] [--json]
 agentmod session replay <id> [--at <sequence>] [--json]
@@ -34,7 +40,10 @@ agentmod-acp
 
 `--json` emits a stable JSON object. `--strict` asks logic to treat degraded
 runtime status as unsuccessful. Session creation defaults to the current
-workspace and `persistent-chat`.
+workspace, `persistent-chat`, and the style-selected `native` harness. Use
+`harness list` and `harness inspect` to view adapter versions, availability,
+capabilities, and the exact capability-set hash. An explicit `--harness`
+override is accepted only when it satisfies the selected style.
 
 `run` executes one durable turn in an existing session. Provider options are
 repeatable and accept JSON scalars/objects or plain strings. The bundled offline
@@ -133,7 +142,8 @@ cargo run -p agentmod-runtime -- serve
 # in a second terminal with the same variable
 cargo run -p agentmod-cli -- doctor
 cargo run -p agentmod-cli -- doctor --json --strict
-cargo run -p agentmod-cli -- session create --workspace . --json
+cargo run -p agentmod-cli -- harness list --json
+cargo run -p agentmod-cli -- session create --workspace . --style persistent-chat --harness native --json
 cargo run -p agentmod-cli -- session list --json
 ```
 

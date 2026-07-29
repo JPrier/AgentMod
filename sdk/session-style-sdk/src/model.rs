@@ -31,6 +31,9 @@ pub struct SessionStyleManifest {
     /// Plugin IDs permitted in the style.
     #[serde(default)]
     pub allowed_plugins: Vec<String>,
+    /// Harness selection and capability requirements.
+    #[serde(default)]
+    pub harness: HarnessSelection,
     /// Memory provider selection.
     pub memory: MemorySelection,
     /// Compaction strategy selection.
@@ -47,6 +50,26 @@ pub struct SessionStyleManifest {
     pub termination: TerminationPolicy,
     /// Top-level style selection policy.
     pub selection: TopLevelSelection,
+}
+
+/// Harness selected by a style and the capabilities execution requires.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessSelection {
+    /// Stable harness registry ID.
+    pub id: String,
+    /// Harness capabilities required in addition to runtime capabilities.
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+}
+
+impl Default for HarnessSelection {
+    fn default() -> Self {
+        Self {
+            id: String::from("native"),
+            required_capabilities: Vec::new(),
+        }
+    }
 }
 
 /// Stable style identity and runtime compatibility.

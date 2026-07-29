@@ -66,6 +66,7 @@ mod tests {
             .handle_wire(&RuntimeRequest::CreateSession {
                 workspace: workspace.path().display().to_string(),
                 style: String::from("persistent-chat"),
+                harness: Some(String::from("native")),
             })
             .expect("create through complete layer chain")
         else {
@@ -128,6 +129,7 @@ mod tests {
                 .handle_wire(&RuntimeRequest::CreateSession {
                     workspace: workspace.path().display().to_string(),
                     style: style.to_owned(),
+                    harness: None,
                 })
                 .expect("create style-bound session")
             else {
@@ -203,6 +205,96 @@ mod tests {
     }
 
     #[test]
+    fn harness_registry_selects_adapters_and_rejects_missing_capabilities() {
+        let storage = tempfile::tempdir().expect("storage");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions_root = storage.path().join("sessions");
+        let mut styles =
+            agentmod_runtime_service::RuntimeStyleServiceConfig::native(&sessions_root);
+        styles.plugin_style_roots.push(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("fixtures")
+                .join("styles"),
+        );
+        let service = RuntimeService::new(
+            RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
+            RuntimeServiceConfig {
+                session_root: sessions_root.clone(),
+                version: String::from("test"),
+                styles,
+            },
+        );
+
+        let RuntimeResponse::Harnesses { harnesses } = service
+            .handle_wire(&RuntimeRequest::ListHarnesses)
+            .expect("list harnesses")
+        else {
+            panic!("harness list response")
+        };
+        assert_eq!(
+            harnesses
+                .iter()
+                .map(|harness| harness.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fixture", "native"]
+        );
+        let fixture = harnesses
+            .iter()
+            .find(|harness| harness.id == "fixture")
+            .expect("fixture harness");
+        assert_eq!(fixture.availability, "available");
+        assert!(fixture.capabilities.contains(&String::from("tool_calls")));
+        assert!(!fixture.capabilities.contains(&String::from("images")));
+        assert_eq!(fixture.capability_set_hash.len(), 64);
+
+        let RuntimeResponse::HarnessInspected { harness } = service
+            .handle_wire(&RuntimeRequest::InspectHarness {
+                id: String::from("fixture"),
+            })
+            .expect("inspect fixture harness")
+        else {
+            panic!("harness inspection response")
+        };
+        assert_eq!(harness, *fixture);
+
+        let RuntimeResponse::SessionCreated { session_id } = service
+            .handle_wire(&RuntimeRequest::CreateSession {
+                workspace: workspace.path().display().to_string(),
+                style: String::from("persistent-chat"),
+                harness: Some(String::from("fixture")),
+            })
+            .expect("select compatible fixture harness")
+        else {
+            panic!("created response")
+        };
+        let RuntimeResponse::SessionInspected { state, .. } = service
+            .handle_wire(&RuntimeRequest::InspectSession {
+                session_id,
+                at: None,
+            })
+            .expect("inspect fixture-bound session")
+        else {
+            panic!("inspection response")
+        };
+        assert_eq!(state["style_binding"]["harness"], "fixture");
+        assert_eq!(state["style_binding"]["harness_version"], "1.0.0");
+        assert_eq!(
+            state["style_binding"]["harness_capability_set_hash"],
+            fixture.capability_set_hash
+        );
+
+        let error = service
+            .handle_wire(&RuntimeRequest::CreateSession {
+                workspace: workspace.path().display().to_string(),
+                style: String::from("fixture-harness-incompatible"),
+                harness: None,
+            })
+            .expect_err("fixture cannot satisfy the style's image requirement");
+        assert!(error.to_string().contains("images"), "{error}");
+    }
+
+    #[test]
     fn runtime_replay_and_branch_use_fresh_child_history() {
         let storage = tempfile::tempdir().expect("storage");
         let workspace = tempfile::tempdir().expect("workspace");
@@ -220,6 +312,7 @@ mod tests {
             .handle_wire(&RuntimeRequest::CreateSession {
                 workspace: workspace.path().display().to_string(),
                 style: String::from("persistent-chat"),
+                harness: None,
             })
             .expect("create parent")
         else {

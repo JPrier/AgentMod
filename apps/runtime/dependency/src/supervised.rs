@@ -16,7 +16,11 @@ use crate::{
     },
     harness::{
         DependencyCommand, DependencyEventStream, DependencyReply, HarnessDependencyError,
-        HarnessDependencyPort, ProcessHarnessDependency,
+        HarnessDependencyPort,
+    },
+    harness_registry::{
+        DependencyHarnessDescriptor, HarnessRegistryDependency, HarnessRegistryDependencyError,
+        HarnessRegistryDependencyPort,
     },
     identity::{
         DependencyAllocateEventIdentityRequest, DependencyEventIdentity,
@@ -52,10 +56,10 @@ use crate::{
     },
 };
 
-/// First-party local storage plus one supervised native harness.
+/// First-party local storage plus an injected harness registry.
 #[derive(Clone)]
 pub struct SupervisedRuntimeDependencies {
-    harness: ProcessHarnessDependency,
+    harnesses: HarnessRegistryDependency,
     browser: ProcessToolHostDependency,
     filesystem: ProcessToolHostDependency,
     processes: ProcessCapabilityDependency,
@@ -135,7 +139,7 @@ impl SupervisedRuntimeDependencies {
         reason = "the composition root explicitly injects each isolated capability boundary"
     )]
     pub fn new(
-        harness: ProcessHarnessDependency,
+        harnesses: HarnessRegistryDependency,
         browser: ProcessToolHostDependency,
         filesystem: ProcessToolHostDependency,
         processes: ProcessCapabilityDependency,
@@ -148,7 +152,7 @@ impl SupervisedRuntimeDependencies {
         scheduler: ProcessSchedulerDependency,
     ) -> Self {
         Self {
-            harness,
+            harnesses,
             browser,
             filesystem,
             processes,
@@ -355,18 +359,26 @@ impl HarnessDependencyPort for SupervisedRuntimeDependencies {
         &self,
         command: DependencyCommand,
     ) -> Result<DependencyReply, HarnessDependencyError> {
-        self.harness.exchange(command).await
+        self.harnesses.exchange(command).await
     }
 
     async fn exchange_events(
         &self,
         command: DependencyCommand,
     ) -> Result<DependencyEventStream, HarnessDependencyError> {
-        self.harness.exchange_events(command).await
+        self.harnesses.exchange_events(command).await
     }
 
     async fn shutdown(&self) {
-        self.harness.shutdown().await;
+        self.harnesses.shutdown().await;
+    }
+}
+
+impl HarnessRegistryDependencyPort for SupervisedRuntimeDependencies {
+    fn list_harnesses(
+        &self,
+    ) -> Result<Vec<DependencyHarnessDescriptor>, HarnessRegistryDependencyError> {
+        self.harnesses.list_harnesses()
     }
 }
 

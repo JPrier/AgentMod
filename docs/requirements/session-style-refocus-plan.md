@@ -1,6 +1,6 @@
 # Session-Style Refocus Implementation Map
 
-Status: Phases 1-4 executable; Phase 5 interceptor/observer vertical slice live
+Status: Phases 1-6 executable; Phase 7 product surfaces and introspection active
 
 Branch: `feature/session-style-registry`
 
@@ -33,6 +33,10 @@ and live compaction run before provider requests with canonical provenance.
 Plugin-sourced styles can activate process blocking interceptors and
 committed-event observers; activation and blocking invocation state is
 canonical and replay-inspectable.
+Native and deterministic fixture harnesses are registered through an injected
+N-tier adapter catalog. Style requirements and explicit client overrides are
+capability-checked before creation, and the exact adapter identity is retained
+and revalidated across restart.
 
 The following documents contradict the implementation and require reconciliation:
 
@@ -143,6 +147,24 @@ another style.
 7. Complete frontend and introspection surfaces.
 8. Recovery matrix, benchmarks, traceability, documentation, and Windows/Unix
    process-level acceptance evidence.
+
+## Phase 6 verified result
+
+Completed 2026-07-28 on Windows. The runtime dependency registry owns exact
+adapter descriptors and routes approved model work by retained harness ID; data
+and logic expose a normalized catalog, deterministic capability hashes,
+availability, and compatibility decisions. Session selection persists adapter
+ID/version/capability hash and binds model proposals, grants, canonical request
+events, and restart validation to that identity. CLI and command-driven TUI
+selection operate only through the runtime protocol.
+
+`tests/e2e/runtime_harness_selection.ps1` passed with native and independently
+supervised fixture sessions, a negative image-capability style, canonical
+identity assertions, daemon restart, and successful post-restart fixture
+execution. The Unix script passes syntax validation but has not been
+process-executed. The fixture defaults to the same credential-free deterministic
+harness executable through a separate adapter/process configuration; complete
+third-party harness implementations are not claimed.
 
 ## Phase 1 proof obligations
 

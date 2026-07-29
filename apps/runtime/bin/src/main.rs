@@ -12,6 +12,7 @@ use agentmod_runtime_dependency::{
     LocalRuntimeDependencies,
     continuation::FileContinuationDependency,
     harness::{HarnessDependencyConfig, HarnessDependencyPort, ProcessHarnessDependency},
+    harness_registry::{DependencyHarnessDescriptor, HarnessRegistryDependency},
     local_rpc::{cleanup_local_endpoint, prepare_local_endpoint},
     plugin::{
         ProcessPluginDependency, ProcessPluginDependencyConfig, read_plugin_manifest_sources,
@@ -106,7 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             None
         };
-        let harness = ProcessHarnessDependency::new(HarnessDependencyConfig {
+        let native_harness = ProcessHarnessDependency::new(HarnessDependencyConfig {
             program: std::env::var("AGENTMOD_HARNESS_PROGRAM")
                 .map_or_else(|_| sibling_binary("agentmod-harness"), PathBuf::from)
                 .to_string_lossy()
@@ -122,6 +123,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ),
             authorization_key: ProcessHarnessDependency::generate_authorization_key(),
         })?;
+        let fixture_harness = ProcessHarnessDependency::new(HarnessDependencyConfig {
+            program: std::env::var("AGENTMOD_FIXTURE_HARNESS_PROGRAM")
+                .or_else(|_| std::env::var("AGENTMOD_HARNESS_PROGRAM"))
+                .map_or_else(|_| sibling_binary("agentmod-harness"), PathBuf::from)
+                .to_string_lossy()
+                .into_owned(),
+            arguments: Vec::new(),
+            maximum_frame_bytes: 16 * 1024 * 1024,
+            request_timeout: std::time::Duration::from_secs(120),
+            frame_pacing: std::time::Duration::from_millis(0),
+            authorization_key: ProcessHarnessDependency::generate_authorization_key(),
+        })?;
+        let harnesses = HarnessRegistryDependency::new(vec![
+            (
+                DependencyHarnessDescriptor {
+                    id: String::from("fixture"),
+                    version: String::from("1.0.0"),
+                    capabilities: [
+                        "cancellation",
+                        "streaming",
+                        "structured_context_replacement",
+                        "structured_output",
+                        "token_usage",
+                        "tool_calls",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                    available: true,
+                },
+                Arc::new(fixture_harness),
+            ),
+            (
+                DependencyHarnessDescriptor {
+                    id: String::from("native"),
+                    version: String::from("1.0.0"),
+                    capabilities: [
+                        "cancellation",
+                        "cost_metadata",
+                        "fine_grained_proposal_boundaries",
+                        "images",
+                        "multiple_tool_calls",
+                        "provider_switching",
+                        "streaming",
+                        "structured_context_replacement",
+                        "structured_output",
+                        "token_usage",
+                        "tool_calls",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                    available: true,
+                },
+                Arc::new(native_harness),
+            ),
+        ])?;
         let filesystem = ProcessToolHostDependency::new(ToolHostDependencyConfig {
             kind: ToolHostKind::Filesystem,
             program: std::env::var("AGENTMOD_FILESYSTEM_HOST_PROGRAM")
@@ -249,7 +307,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             maximum_frame_bytes: 1024 * 1024,
         })?;
         let mut data = RuntimeData::new(SupervisedRuntimeDependencies::new(
-            harness,
+            harnesses,
             browser,
             filesystem,
             processes,
@@ -497,6 +555,7 @@ async fn run_harness_smoke() -> Result<(), Box<dyn std::error::Error>> {
     let service = ProviderService::new(logic);
     let events = service
         .execute(ServiceExecuteProviderRequest {
+            harness: String::from("native"),
             session_id: uuid::Uuid::now_v7().to_string(),
             provider: "deterministic-mock".into(),
             model: "mock-model".into(),

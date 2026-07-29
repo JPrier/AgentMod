@@ -54,6 +54,8 @@ pub struct HttpRequestAction {
 /// Structured provider request proposal.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ModelRequestAction {
+    /// Harness registry ID authorized to execute the request.
+    pub harness: String,
     /// Provider adapter ID.
     pub provider: String,
     /// Provider model ID.

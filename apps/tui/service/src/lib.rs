@@ -140,6 +140,10 @@ impl<L: TuiLogicPort> TuiService<L> {
                     Ok(())
                 }
                 KeyCode::Char('5') => {
+                    self.logic.set_view(View::Harnesses);
+                    Ok(())
+                }
+                KeyCode::Char('6') => {
                     self.logic.set_view(View::Help);
                     Ok(())
                 }
@@ -227,6 +231,7 @@ fn render(frame: &mut Frame<'_>, state: &TuiState) {
         View::Events => render_events(frame, state, content),
         View::Context => render_context(frame, state, content),
         View::Styles => render_styles(frame, state, content),
+        View::Harnesses => render_harnesses(frame, state, content),
         View::Help => render_help(frame, content),
     }
     render_editor(frame, state, editor);
@@ -244,13 +249,14 @@ fn render(frame: &mut Frame<'_>, state: &TuiState) {
 }
 
 fn render_header(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
-    let tabs = Tabs::new(["Chat", "Events", "Context", "Styles", "Help"])
+    let tabs = Tabs::new(["Chat", "Events", "Context", "Styles", "Harnesses", "Help"])
         .select(match state.view {
             View::Chat => 0,
             View::Events => 1,
             View::Context => 2,
             View::Styles => 3,
-            View::Help => 4,
+            View::Harnesses => 4,
+            View::Help => 5,
         })
         .block(
             Block::new()
@@ -435,14 +441,61 @@ fn render_styles(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
     );
 }
 
+fn render_harnesses(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+    let lines = if state.harnesses.is_empty() {
+        vec![Line::from("No harnesses returned by the runtime.")]
+    } else {
+        state
+            .harnesses
+            .iter()
+            .flat_map(|harness| {
+                let selected = harness.id == state.selected_harness;
+                vec![
+                    Line::from(Span::styled(
+                        format!(
+                            "{} {}@{} · {}",
+                            if selected { "●" } else { " " },
+                            harness.id,
+                            harness.version,
+                            harness.availability
+                        ),
+                        if selected {
+                            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::new()
+                        },
+                    )),
+                    Line::from(Span::styled(
+                        format!(
+                            "  hash={} capabilities={}",
+                            harness.capability_set_hash,
+                            harness.capabilities.join(",")
+                        ),
+                        Style::new().fg(Color::DarkGray),
+                    )),
+                ]
+            })
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" Harness catalog · /harness <id> "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from("Ctrl+1…5 views · Tab cycle · Alt+↑/↓ sessions · Ctrl+R refresh"),
+            Line::from("Ctrl+1…6 views · Tab cycle · Alt+↑/↓ sessions · Ctrl+R refresh"),
             Line::from("Enter send · Shift+Enter newline · ↑/↓ prompt history"),
             Line::from("Ctrl+C cancel active generation · Ctrl+Q or Esc quit"),
             Line::default(),
-            Line::from("/new [workspace] [style]  /sessions  /styles  /style <id[@version]>"),
+            Line::from(
+                "/new [workspace] [style] [harness]  /sessions  /styles  /style <id[@version]>",
+            ),
+            Line::from("/harnesses  /harness <id>"),
             Line::from("/model <id>  /provider <id>  /chat  /events  /context  /help  /cancel"),
             Line::from("/approve  /deny  /quit"),
             Line::default(),
@@ -549,7 +602,8 @@ const fn next_view(view: View) -> View {
         View::Chat => View::Events,
         View::Events => View::Context,
         View::Context => View::Styles,
-        View::Styles => View::Help,
+        View::Styles => View::Harnesses,
+        View::Harnesses => View::Help,
         View::Help => View::Chat,
     }
 }
@@ -560,7 +614,8 @@ const fn previous_view(view: View) -> View {
         View::Events => View::Chat,
         View::Context => View::Events,
         View::Styles => View::Context,
-        View::Help => View::Styles,
+        View::Harnesses => View::Styles,
+        View::Help => View::Harnesses,
     }
 }
 
@@ -601,8 +656,8 @@ pub enum TuiServiceError {
 #[cfg(test)]
 mod tests {
     use agentmod_tui_logic::{
-        StyleAvailability, StyleSourceKind, StyleSummary, TranscriptEntry, TranscriptRole,
-        TuiState, View,
+        HarnessSummary, StyleAvailability, StyleSourceKind, StyleSummary, TranscriptEntry,
+        TranscriptRole, TuiState, View,
     };
     use ratatui::{Terminal, backend::TestBackend};
 
@@ -670,5 +725,34 @@ mod tests {
         assert!(screen.contains("Style catalog"));
         assert!(screen.contains("focused@1.0.0"));
         assert!(screen.contains("content-hash"));
+    }
+
+    #[test]
+    fn harness_catalog_renders_selection_and_capabilities() {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut state = TuiState::default();
+        state.view = View::Harnesses;
+        state.selected_harness = String::from("fixture");
+        state.harnesses.push(HarnessSummary {
+            id: String::from("fixture"),
+            version: String::from("1.0.0"),
+            capabilities: vec![String::from("streaming")],
+            capability_set_hash: String::from("harness-hash"),
+            availability: String::from("available"),
+        });
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("render");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("Harness catalog"));
+        assert!(screen.contains("fixture@1.0.0"));
+        assert!(screen.contains("streaming"));
     }
 }

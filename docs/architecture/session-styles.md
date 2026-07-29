@@ -58,6 +58,25 @@ canonical and replay-inspectable. Additional lifecycle-specific interceptor
 boundaries and plugin-provided memory, compaction, and context transforms remain
 incomplete.
 
+Harness selection is also part of the immutable binding. The runtime harness
+registry follows the same service -> logic -> data -> dependency layering as
+the style registry. Its injected dependency registry owns adapter descriptors
+and routes approved execution by an explicit harness ID; logic owns
+availability and capability-set validation. Session creation resolves either
+the style's harness declaration or an explicit client override, verifies every
+required capability, and persists the exact adapter version and capability-set
+hash. Model proposals, action digests, grants, and canonical request events
+retain that ID. Restart reports incompatibility instead of silently choosing
+the native adapter.
+
+The production composition root currently registers `native` and `fixture`.
+Both use independently supervised process adapters; the fixture uses the
+credential-free deterministic harness executable unless
+`AGENTMOD_FIXTURE_HARNESS_PROGRAM` selects another fixture binary. It
+intentionally omits image support so negative negotiation is deterministic.
+This is the adapter seam for future harnesses, not a claim that third-party
+Pi, OpenCode, Claude Code, or Codex adapters are complete.
+
 Enabled child-agent policies are complete execution contracts rather than only
 numeric limits. They select an exact `style-id@semver`, workspace mode,
 provider/model inheritance, context/token/cost budgets, tool groups, memory

@@ -20,7 +20,9 @@ The workspace currently contains:
 - isolated harness, plugin-host, and first-party tool-host processes connected by
   versioned protocols;
 - an N-tier session-style registry, immutable per-session style bindings, and a
-  generic compiled-graph executor used by persistent chat;
+  generic compiled-graph executor used by the live built-in modes;
+- an N-tier harness registry with per-session adapter identity and capability
+  negotiation;
 - per-session memory retrieval and compaction with canonical projection
   provenance;
 - protocol-only CLI, TUI, and ACP frontends;
@@ -50,12 +52,13 @@ crates may not import another process's internal layer crates.
 
 ## Partial product integrations
 
-The process topology is live, but session-style execution is not complete.
-Persistent-chat compatible graphs execute generically; ephemeral turn, research
-loop, planner-worker-reviewer, arbitrary declarative graphs, runtime-managed
-child sessions, plugin-composed pipelines, and per-session harness capability
-selection remain active development. Consult `STATUS.md` for the evidence level
-of each tool host, protocol, recovery path, and frontend surface.
+The process topology and the five built-in execution adapters are live, but
+session-style execution is not complete. Arbitrary user graph shapes,
+artifact-backed/concurrent planner workers, plugin-provided context components,
+the full lifecycle-boundary pipeline matrix, rich introspection, and complete
+cross-platform execution evidence remain active development. Consult
+`STATUS.md` for the evidence level of each tool host, protocol, recovery path,
+and frontend surface.
 
 See [Initial maps](initial-maps.md), [N-tier rules](n-tier.md), and
 [Process boundaries](process-boundaries.md).

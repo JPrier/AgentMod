@@ -56,6 +56,7 @@ pub enum DependencyDecision {
 #[derive(Clone, Debug, PartialEq)]
 pub enum DependencyCommand {
     Execute {
+        harness_id: String,
         session_id: String,
         provider: String,
         model: String,
@@ -65,13 +66,30 @@ pub enum DependencyCommand {
         cancellation_id: String,
     },
     Continue {
+        harness_id: String,
         continuation_id: String,
         decision: DependencyDecision,
     },
     Cancel {
+        harness_id: String,
         cancellation_id: String,
     },
-    Health,
+    Health {
+        harness_id: String,
+    },
+}
+
+impl DependencyCommand {
+    /// Returns the adapter identity selected by runtime logic.
+    #[must_use]
+    pub fn harness_id(&self) -> &str {
+        match self {
+            Self::Execute { harness_id, .. }
+            | Self::Continue { harness_id, .. }
+            | Self::Cancel { harness_id, .. }
+            | Self::Health { harness_id } => harness_id,
+        }
+    }
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyUsage {
@@ -128,6 +146,12 @@ pub struct DependencyEventStream {
 impl DependencyEventStream {
     pub async fn next(&mut self) -> Option<Result<DependencyEvent, HarnessDependencyError>> {
         self.receiver.recv().await
+    }
+
+    pub(crate) const fn from_receiver(
+        receiver: mpsc::Receiver<Result<DependencyEvent, HarnessDependencyError>>,
+    ) -> Self {
+        Self { receiver }
     }
 }
 #[derive(Clone, Debug)]
@@ -390,7 +414,10 @@ impl HarnessDependencyPort for ProcessHarnessDependency {
         &self,
         command: DependencyCommand,
     ) -> Result<DependencyReply, HarnessDependencyError> {
-        if let DependencyCommand::Cancel { cancellation_id } = &command {
+        if let DependencyCommand::Cancel {
+            cancellation_id, ..
+        } = &command
+        {
             if cancellation_id.trim().is_empty() {
                 return Err(HarnessDependencyError::InvalidRequest);
             }
@@ -457,7 +484,7 @@ impl HarnessDependencyPort for ProcessHarnessDependency {
     ) -> Result<DependencyEventStream, HarnessDependencyError> {
         if matches!(
             command,
-            DependencyCommand::Health | DependencyCommand::Cancel { .. }
+            DependencyCommand::Health { .. } | DependencyCommand::Cancel { .. }
         ) {
             return Err(HarnessDependencyError::InvalidRequest);
         }
@@ -466,7 +493,7 @@ impl HarnessDependencyPort for ProcessHarnessDependency {
                 cancellation_id, ..
             } => Some(cancellation_id.clone()),
             DependencyCommand::Continue { .. } => None,
-            DependencyCommand::Cancel { .. } | DependencyCommand::Health => unreachable!(),
+            DependencyCommand::Cancel { .. } | DependencyCommand::Health { .. } => unreachable!(),
         };
         let cancellation = if let Some(id) = &active_id {
             let mut cancellations = self.cancellations.lock().await;
@@ -521,8 +548,10 @@ fn to_wire(
     authorization_key: &[u8; 32],
 ) -> Result<wire::HarnessCommand, HarnessDependencyError> {
     Ok(match v {
-        DependencyCommand::Health => wire::HarnessCommand::Health,
-        DependencyCommand::Cancel { cancellation_id } => wire::HarnessCommand::Cancel {
+        DependencyCommand::Health { .. } => wire::HarnessCommand::Health,
+        DependencyCommand::Cancel {
+            cancellation_id, ..
+        } => wire::HarnessCommand::Cancel {
             cancellation_id: cancellation_id
                 .parse()
                 .map_err(|_| HarnessDependencyError::Protocol)?,
@@ -530,6 +559,7 @@ fn to_wire(
         DependencyCommand::Continue {
             continuation_id,
             decision,
+            ..
         } => wire::HarnessCommand::Continue {
             continuation_id: continuation_id
                 .parse()
@@ -557,6 +587,7 @@ fn to_wire(
             options,
             grant,
             cancellation_id,
+            ..
         } => wire::HarnessCommand::Execute {
             session_id: session_id
                 .parse()
@@ -761,6 +792,7 @@ mod tests {
         assert_eq!(
             dependency
                 .exchange(DependencyCommand::Cancel {
+                    harness_id: String::from("native"),
                     cancellation_id: String::from("cancel-before-start"),
                 })
                 .await
@@ -769,6 +801,7 @@ mod tests {
         );
         let mut stream = dependency
             .exchange_events(DependencyCommand::Execute {
+                harness_id: String::from("native"),
                 session_id: String::from("session"),
                 provider: String::from("provider"),
                 model: String::from("model"),

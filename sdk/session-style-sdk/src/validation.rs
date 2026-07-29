@@ -205,6 +205,8 @@ pub struct CompiledSessionStyle {
     pub allowed_providers: Vec<String>,
     /// Allowed plugins.
     pub allowed_plugins: Vec<String>,
+    /// Harness selection and required capabilities.
+    pub harness: crate::HarnessSelection,
     /// Memory selection.
     pub memory: MemorySelection,
     /// Compaction selection.
@@ -253,6 +255,7 @@ pub fn compile_style(
     validate_kind(manifest, &root, &mut diagnostics);
     validate_collections(manifest, limits, &root, &mut diagnostics);
     validate_availability(manifest, context, &root, &mut diagnostics);
+    validate_harness(manifest, &root, &mut diagnostics);
     validate_interceptors(manifest, context, limits, &root, &mut diagnostics);
     validate_memory(&manifest.memory, context, limits, &root, &mut diagnostics);
     validate_compaction(
@@ -310,6 +313,7 @@ pub fn compile_style(
         allowed_tool_groups: sorted(&manifest.allowed_tool_groups),
         allowed_providers: sorted(&manifest.allowed_providers),
         allowed_plugins: sorted(&manifest.allowed_plugins),
+        harness: manifest.harness.clone(),
         memory: manifest.memory.clone(),
         compaction: manifest.compaction.clone(),
         approvals: manifest.approvals.clone(),
@@ -320,6 +324,31 @@ pub fn compile_style(
         selection: manifest.selection,
         cache_key,
     })
+}
+
+fn validate_harness(
+    manifest: &SessionStyleManifest,
+    root: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if !is_name(&manifest.harness.id) {
+        diagnostics.push(error(
+            "STYLE030",
+            format!("{root}.harness.id"),
+            "harness ID is invalid",
+            "use a registered lowercase harness ID",
+        ));
+    }
+    for (index, capability) in manifest.harness.required_capabilities.iter().enumerate() {
+        if !is_name(capability) {
+            diagnostics.push(error(
+                "STYLE031",
+                format!("{root}.harness.required_capabilities[{index}]"),
+                "harness capability ID is invalid",
+                "use a lowercase capability ID",
+            ));
+        }
+    }
 }
 
 fn ordered_interceptors(

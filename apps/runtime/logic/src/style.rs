@@ -53,6 +53,19 @@ pub struct StyleEnvironment {
     pub supported_decisions: BTreeSet<StyleDecisionCapability>,
     /// Resolved content-addressed graph sources.
     pub graph_references: BTreeMap<String, String>,
+    /// Available harnesses and their exact capabilities.
+    pub harnesses: BTreeMap<String, StyleHarnessDescriptor>,
+}
+
+/// Logic-owned harness compatibility input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleHarnessDescriptor {
+    /// Exact adapter version.
+    pub version: String,
+    /// Capabilities advertised by the adapter.
+    pub capabilities: BTreeSet<String>,
+    /// Whether the adapter accepts new sessions.
+    pub available: bool,
 }
 
 /// Logic-owned interceptor decision capability.
@@ -203,6 +216,17 @@ pub struct ValidateStyleBindingCommand {
     pub environment: StyleEnvironment,
 }
 
+/// Explicit per-session harness selection command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectStyleHarnessCommand {
+    /// Fully compiled style binding.
+    pub binding: SessionStyleBinding,
+    /// User/configuration selected harness ID.
+    pub harness: String,
+    /// Current runtime compatibility environment.
+    pub environment: StyleEnvironment,
+}
+
 /// Narrow session-style logic boundary.
 pub trait SessionStyleLogicPort {
     /// Lists the live style catalog.
@@ -244,6 +268,19 @@ pub trait SessionStyleLogicPort {
         &self,
         command: InspectStyleCommand,
     ) -> Result<ResolvedStyle, SessionStyleLogicError>;
+
+    /// Rebinds a compiled style to an explicitly selected compatible harness.
+    ///
+    /// # Errors
+    ///
+    /// Returns an availability or capability error when the selected adapter
+    /// cannot execute the compiled style.
+    fn select_style_harness(
+        &self,
+        _command: SelectStyleHarnessCommand,
+    ) -> Result<ResolvedStyle, SessionStyleLogicError> {
+        Err(SessionStyleLogicError::InvalidData)
+    }
 
     /// Confirms that a persisted binding still resolves to the exact same
     /// compatible compiled style. No replacement or version fallback occurs.
@@ -335,6 +372,11 @@ where
         let selector = format!("{}@{}", command.binding.id, command.binding.version);
         let resolved = self.resolve_style(InspectStyleCommand {
             selector: selector.clone(),
+            environment: command.environment.clone(),
+        })?;
+        let resolved = self.select_style_harness(SelectStyleHarnessCommand {
+            binding: resolved.binding,
+            harness: command.binding.harness.clone(),
             environment: command.environment,
         })?;
         if resolved.binding != command.binding {
@@ -346,6 +388,15 @@ where
             });
         }
         Ok(())
+    }
+
+    fn select_style_harness(
+        &self,
+        command: SelectStyleHarnessCommand,
+    ) -> Result<ResolvedStyle, SessionStyleLogicError> {
+        let mut binding = command.binding;
+        apply_harness_selection(&mut binding, &command.harness, &command.environment)?;
+        Ok(ResolvedStyle { binding })
     }
 }
 
@@ -542,8 +593,11 @@ fn binding(
     let compaction = required_child(&compiled, "compaction")?;
     let budgets = required_child(&compiled, "budgets")?;
     let approvals = required_child(&compiled, "approvals")?;
+    let harness = required_child(&compiled, "harness")?;
     let cache_key = required_child(&compiled, "cache_key")?;
-    Ok(SessionStyleBinding {
+    let harness_id = required_value_string(harness, "id")?;
+    let harness_required_capabilities = string_array(Some(harness), "required_capabilities");
+    let mut binding = SessionStyleBinding {
         id: required_string(record.id.as_deref())?,
         version: required_string(record.version.as_deref())?,
         content_hash: parse_hash(record.manifest_hash.as_deref())?,
@@ -587,7 +641,10 @@ fn binding(
             preservation_requirements: string_array(Some(compaction), "preservation_requirements"),
         },
         tool_groups: string_array(Some(&compiled), "allowed_tool_groups"),
-        harness: String::from("native"),
+        harness: harness_id.clone(),
+        harness_version: String::new(),
+        harness_capability_set_hash: ContentHash::digest(b"unbound-harness"),
+        harness_required_capabilities,
         required_capabilities: string_array(Some(&compiled), "required_capabilities"),
         interceptor_order: string_array(Some(&compiled), "interceptor_order"),
         budgets: SessionStyleBudgets {
@@ -617,7 +674,44 @@ fn binding(
         child_agent_policy_json: canonical_child_json(&compiled, "child_agents")?,
         retry_policy_json: canonical_child_json(&compiled, "retry")?,
         termination_policy_json: canonical_child_json(&compiled, "termination")?,
-    })
+    };
+    apply_harness_selection(&mut binding, &harness_id, environment)?;
+    Ok(binding)
+}
+
+fn apply_harness_selection(
+    binding: &mut SessionStyleBinding,
+    harness_id: &str,
+    environment: &StyleEnvironment,
+) -> Result<(), SessionStyleLogicError> {
+    let descriptor = environment
+        .harnesses
+        .get(harness_id)
+        .ok_or_else(|| SessionStyleLogicError::HarnessUnavailable(harness_id.to_owned()))?;
+    if !descriptor.available {
+        return Err(SessionStyleLogicError::HarnessUnavailable(
+            harness_id.to_owned(),
+        ));
+    }
+    let missing = binding
+        .harness_required_capabilities
+        .iter()
+        .filter(|capability| !descriptor.capabilities.contains(*capability))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(SessionStyleLogicError::HarnessIncompatible {
+            harness: harness_id.to_owned(),
+            missing,
+        });
+    }
+    let capabilities = descriptor.capabilities.iter().cloned().collect::<Vec<_>>();
+    harness_id.clone_into(&mut binding.harness);
+    binding.harness_version.clone_from(&descriptor.version);
+    binding.harness_capability_set_hash = ContentHash::digest(
+        &serde_json::to_vec(&capabilities).map_err(|_| SessionStyleLogicError::InvalidData)?,
+    );
+    Ok(())
 }
 
 fn required_child<'a>(value: &'a Value, key: &str) -> Result<&'a Value, SessionStyleLogicError> {
@@ -757,5 +851,16 @@ pub enum SessionStyleLogicError {
         selector: String,
         /// Stable safe incompatibility explanation.
         reason: String,
+    },
+    /// A compiled style selected an absent or disabled harness.
+    #[error("session harness `{0}` is unavailable")]
+    HarnessUnavailable(String),
+    /// A compiled style requires capabilities absent from its harness.
+    #[error("session harness `{harness}` is incompatible; missing capabilities: {missing:?}")]
+    HarnessIncompatible {
+        /// Selected harness.
+        harness: String,
+        /// Stable sorted missing capability IDs.
+        missing: Vec<String>,
     },
 }

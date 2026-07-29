@@ -622,6 +622,9 @@ pub(crate) mod tests {
             },
             tool_groups: Vec::new(),
             harness: String::from("native"),
+            harness_version: String::from("1.0.0"),
+            harness_capability_set_hash: plugin_set_hash,
+            harness_required_capabilities: compiled.harness.required_capabilities.clone(),
             required_capabilities: Vec::new(),
             interceptor_order: Vec::new(),
             budgets: SessionStyleBudgets {

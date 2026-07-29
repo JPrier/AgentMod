@@ -171,6 +171,8 @@ fn validate_create(command: &CreateSessionCommand) -> Result<(), SessionRegistry
         return Err(SessionRegistryLogicError::InvalidStyle);
     }
     if command.style_binding.version.trim().is_empty()
+        || command.style_binding.harness.trim().is_empty()
+        || command.style_binding.harness_version.trim().is_empty()
         || command.style_binding.runtime_api_version.trim().is_empty()
         || command.style_binding.source_locator.trim().is_empty()
         || command.style_binding.configuration_json.is_empty()

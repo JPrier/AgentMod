@@ -57,6 +57,15 @@ id = "example"
 version = "1.0.0"
 runtime_api = "^1.0"
 
+[harness]
+id = "native"
+required_capabilities = [
+  "cancellation",
+  "streaming",
+  "structured_context_replacement",
+  "token_usage",
+]
+
 [graph]
 kind = "inline"
 source = '''...graph TOML...'''
@@ -152,3 +161,15 @@ The complete child policy was added in `persistent-chat@1.1.0` and
 does not substitute `1.1.0` for a persisted `1.0.0` binding. An unavailable old
 version produces a compatibility error until the caller performs an explicit
 migration or branches with a selected replacement style.
+
+`harness.id` is a stable runtime harness-registry ID.
+`required_capabilities` uses lower-case identifiers such as `streaming`,
+`tool_calls`, `multiple_tool_calls`, `cancellation`, `images`,
+`structured_output`, `structured_context_replacement`, `provider_switching`,
+`token_usage`, `cost_metadata`, `external_tool_ownership`, and
+`fine_grained_proposal_boundaries`. The SDK validates identifier syntax; the
+runtime validates availability and the actual descriptor set during selection.
+The exact harness ID, adapter version, capability-set hash, and required set
+are retained in the immutable session binding and revalidated on resume.
+Schema-v1 manifests that omit this table select `native` with no additional
+requirements.

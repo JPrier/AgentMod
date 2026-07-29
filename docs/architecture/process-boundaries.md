@@ -9,10 +9,13 @@ enforced N-tier crates. Executables share protocol crates and core primitives,
 not one another's internal layers.
 
 The production CLI path uses an authenticated Unix-domain socket or Windows
-named pipe. The runtime lazily starts the native harness over bounded JSONL
-stdio, keeps the child alive across requests, kills it on desynchronization, and
-never automatically retries an ambiguous provider exchange. Runtime and harness
-negotiate provider behavior through `agentmod-harness-protocol`.
+named pipe. The runtime lazily starts the per-session selected harness adapter
+over bounded JSONL stdio, keeps its child alive across requests, kills it on
+desynchronization, and never automatically retries an ambiguous provider
+exchange. Runtime and harness negotiate provider behavior through
+`agentmod-harness-protocol`. The composition root registers the native adapter
+and an independent deterministic fixture adapter; neither adapter is imported
+as a runtime internal.
 
 Harness process launch uses a runtime-generated 256-bit key passed only through
 the child environment. Each approved model action receives a short-lived,
@@ -23,6 +26,7 @@ original proposal and final approved action before dispatch.
 The real process path is automated by:
 
 - `tests/e2e/runtime_harness.ps1` and `.sh`;
+- `tests/e2e/runtime_harness_selection.ps1` and `.sh`;
 - `tests/e2e/runtime_cli.ps1` and `.sh`.
 
 The latter creates a durable session through the frontend protocol, executes a
@@ -31,7 +35,7 @@ canonical event order in the journal.
 
 ## Remaining boundary work
 
-The runtime supervises the native harness and first-party capability hosts.
+The runtime supervises selected harness adapters and first-party capability hosts.
 Harness events traverse independent bounded frames with explicit credit
 windows. Active cancellation covers provider startup, provider streaming,
 approval waits, and foreground process-tool execution; exact process

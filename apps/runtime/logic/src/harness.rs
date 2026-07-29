@@ -48,6 +48,7 @@ pub enum ProviderEntry {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExecuteProviderCommand {
+    pub harness: String,
     pub session_id: String,
     pub provider: String,
     pub model: String,
@@ -117,11 +118,16 @@ pub trait ProviderExecutionPort: Send + Sync {
 
     async fn continue_execution(
         &self,
+        harness: String,
         id: String,
         decision: ProviderDecision,
     ) -> Result<Vec<ProviderEvent>, ProviderExecutionError>;
 
-    async fn cancel(&self, id: String) -> Result<Vec<ProviderEvent>, ProviderExecutionError>;
+    async fn cancel(
+        &self,
+        harness: String,
+        id: String,
+    ) -> Result<Vec<ProviderEvent>, ProviderExecutionError>;
 }
 
 #[derive(Clone)]
@@ -179,6 +185,7 @@ impl<D> ProviderExecutionLogic<D> {
         let original = ActionProposal {
             id: ProposalId(format!("model-request:{}", command.cancellation_id)),
             action: ConsequentialAction::ModelRequest(ModelRequestAction {
+                harness: command.harness,
                 provider: command.provider,
                 model: command.model,
                 projection_hash: ContentHash::digest(&projection_bytes),
@@ -246,9 +253,14 @@ impl<D> ProviderExecutionLogic<D> {
         let ConsequentialAction::ModelRequest(action) = &executable.action else {
             return Err(ProviderExecutionError::InvalidInterceptionReplacement);
         };
+        let ConsequentialAction::ModelRequest(original_action) = &original.action else {
+            return Err(ProviderExecutionError::InvalidInterceptionReplacement);
+        };
         let projection_bytes =
             serde_json::to_vec(&entries).map_err(|_| ProviderExecutionError::Invalid)?;
-        if action.projection_hash != ContentHash::digest(&projection_bytes) {
+        if action.projection_hash != ContentHash::digest(&projection_bytes)
+            || action.harness != original_action.harness
+        {
             return Err(ProviderExecutionError::InvalidInterceptionReplacement);
         }
         Ok(AuthorizedProviderRequest {
@@ -292,6 +304,7 @@ impl<D: data::HarnessDataPort> ProviderExecutionPort for ProviderExecutionLogic<
 
     async fn continue_execution(
         &self,
+        harness: String,
         id: String,
         decision: ProviderDecision,
     ) -> Result<Vec<ProviderEvent>, ProviderExecutionError> {
@@ -299,6 +312,7 @@ impl<D: data::HarnessDataPort> ProviderExecutionPort for ProviderExecutionLogic<
             return Err(ProviderExecutionError::Invalid);
         }
         self.exchange(data::HarnessDataCommand::Continue {
+            harness_id: harness,
             continuation_id: id,
             decision: match decision {
                 ProviderDecision::Continue => data::HarnessDataDecision::Continue,
@@ -312,11 +326,16 @@ impl<D: data::HarnessDataPort> ProviderExecutionPort for ProviderExecutionLogic<
         .await
     }
 
-    async fn cancel(&self, id: String) -> Result<Vec<ProviderEvent>, ProviderExecutionError> {
+    async fn cancel(
+        &self,
+        harness: String,
+        id: String,
+    ) -> Result<Vec<ProviderEvent>, ProviderExecutionError> {
         if id.is_empty() {
             return Err(ProviderExecutionError::Invalid);
         }
         self.exchange(data::HarnessDataCommand::Cancel {
+            harness_id: harness,
             cancellation_id: id,
         })
         .await
@@ -355,6 +374,7 @@ impl<D: data::HarnessDataPort> ProviderExecutionLogic<D> {
             return Err(ProviderExecutionError::InvalidInterceptionReplacement);
         };
         self.stream(data::HarnessDataCommand::Execute {
+            harness_id: action.harness,
             session_id: authorized.session_id,
             provider: action.provider,
             model: action.model,
@@ -373,6 +393,7 @@ impl<D: data::HarnessDataPort> ProviderExecutionLogic<D> {
     /// Returns [`ProviderExecutionError`] for an invalid continuation or unavailable harness data.
     pub async fn continue_execution_stream(
         &self,
+        harness: String,
         id: String,
         decision: ProviderDecision,
     ) -> Result<ProviderEventStream, ProviderExecutionError> {
@@ -380,6 +401,7 @@ impl<D: data::HarnessDataPort> ProviderExecutionLogic<D> {
             return Err(ProviderExecutionError::Invalid);
         }
         self.stream(data::HarnessDataCommand::Continue {
+            harness_id: harness,
             continuation_id: id,
             decision: match decision {
                 ProviderDecision::Continue => data::HarnessDataDecision::Continue,
@@ -433,6 +455,7 @@ impl<D: data::HarnessDataPort> ProviderExecutionLogic<D> {
 
 fn validate_execute(command: &ExecuteProviderCommand) -> Result<(), ProviderExecutionError> {
     if command.session_id.trim().is_empty()
+        || command.harness.trim().is_empty()
         || command.provider.trim().is_empty()
         || command.model.trim().is_empty()
         || command.entries.is_empty()
@@ -627,6 +650,7 @@ mod tests {
 
     fn command(provider: &str) -> ExecuteProviderCommand {
         ExecuteProviderCommand {
+            harness: "native".into(),
             session_id: "session".into(),
             provider: provider.into(),
             model: "model".into(),

@@ -31,12 +31,22 @@ pub enum RuntimeRequest {
         /// Serialization format of `manifest`.
         format: RuntimeStyleManifestFormat,
     },
+    /// List registered harness adapters and capability state.
+    ListHarnesses,
+    /// Inspect one registered harness adapter.
+    InspectHarness {
+        /// Stable harness registry ID.
+        id: String,
+    },
     /// Create a durable session.
     CreateSession {
         /// User-supplied workspace text, validated by service and logic.
         workspace: String,
         /// Explicit top-level execution style.
         style: String,
+        /// Optional per-session harness override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        harness: Option<String>,
     },
     /// List sessions without loading their conversations.
     ListSessions {
@@ -225,6 +235,16 @@ pub enum RuntimeResponse {
         /// Frontend-safe compiled style inspection.
         inspection: RuntimeStyleInspection,
     },
+    /// Bounded harness-registry rows.
+    Harnesses {
+        /// Stable descriptor order.
+        harnesses: Vec<RuntimeHarnessDescriptor>,
+    },
+    /// Complete descriptor for one harness.
+    HarnessInspected {
+        /// Selected harness.
+        harness: RuntimeHarnessDescriptor,
+    },
     /// Session was durably created.
     SessionCreated {
         /// Canonical session ID.
@@ -368,6 +388,21 @@ pub enum RuntimeResponse {
     },
     /// Operation cancellation was accepted.
     Cancelled,
+}
+
+/// Harness adapter descriptor exposed at the runtime protocol boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeHarnessDescriptor {
+    /// Stable registry ID.
+    pub id: String,
+    /// Exact adapter version.
+    pub version: String,
+    /// Sorted capabilities.
+    pub capabilities: Vec<String>,
+    /// Capability-set content hash.
+    pub capability_set_hash: String,
+    /// `available` or `disabled`.
+    pub availability: String,
 }
 
 /// Serialization format supplied for a style manifest.

@@ -12,6 +12,9 @@ use std::{
 
 use agentmod_runtime_logic::{
     GetRuntimeHealthCommand, LogicError, RuntimeHealthState, RuntimeLogicPort,
+    harness_registry::{
+        HarnessAvailability, HarnessDescriptor, HarnessRegistryLogicError, HarnessRegistryLogicPort,
+    },
     history::{
         BranchSessionCommand, InspectSessionCommand, SessionHistoryLogicPort,
         SubscribeSessionCommand,
@@ -26,17 +29,17 @@ use agentmod_runtime_logic::{
         ScheduledExecution, UpsertScheduleCommand,
     },
     style::{
-        InspectStyleCommand, ListStylesCommand, SessionStyleLogicError, SessionStyleLogicPort,
-        StyleAvailability, StyleDecisionCapability, StyleEnvironment, StyleInspection,
-        StyleManifestFormat, StyleSource, StyleSummary, ValidateStyleBindingCommand,
-        ValidateStyleCommand,
+        InspectStyleCommand, ListStylesCommand, SelectStyleHarnessCommand, SessionStyleLogicError,
+        SessionStyleLogicPort, StyleAvailability, StyleDecisionCapability, StyleEnvironment,
+        StyleHarnessDescriptor, StyleInspection, StyleManifestFormat, StyleSource, StyleSummary,
+        ValidateStyleBindingCommand, ValidateStyleCommand,
     },
 };
 use agentmod_runtime_protocol::{
-    RuntimeRequest, RuntimeResponse, RuntimeSchedulePayload, RuntimeScheduleSpec,
-    RuntimeScheduleTrigger, RuntimeScheduledExecution, RuntimeStyleAvailability,
-    RuntimeStyleDiagnostic, RuntimeStyleInspection, RuntimeStyleManifestFormat,
-    RuntimeStyleSourceKind, RuntimeStyleSummary, SessionSummary,
+    RuntimeHarnessDescriptor, RuntimeRequest, RuntimeResponse, RuntimeSchedulePayload,
+    RuntimeScheduleSpec, RuntimeScheduleTrigger, RuntimeScheduledExecution,
+    RuntimeStyleAvailability, RuntimeStyleDiagnostic, RuntimeStyleInspection,
+    RuntimeStyleManifestFormat, RuntimeStyleSourceKind, RuntimeStyleSummary, SessionSummary,
 };
 use thiserror::Error;
 
@@ -107,6 +110,19 @@ pub struct RuntimeStyleServiceConfig {
     pub supported_decisions: BTreeSet<ServiceStyleDecisionCapability>,
     /// Resolved graph references.
     pub graph_references: BTreeMap<String, String>,
+    /// Available harness descriptors used for style compatibility.
+    pub harnesses: BTreeMap<String, ServiceHarnessDescriptor>,
+}
+
+/// Service bootstrap representation of one harness adapter.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceHarnessDescriptor {
+    /// Exact adapter version.
+    pub version: String,
+    /// Advertised capability IDs.
+    pub capabilities: BTreeSet<String>,
+    /// Whether the adapter accepts new sessions.
+    pub available: bool,
 }
 
 /// Service-owned advertised interceptor decision.
@@ -183,6 +199,49 @@ impl RuntimeStyleServiceConfig {
                 ServiceStyleDecisionCapability::Fork,
             ]),
             graph_references: BTreeMap::new(),
+            harnesses: BTreeMap::from([
+                (
+                    String::from("fixture"),
+                    ServiceHarnessDescriptor {
+                        version: String::from("1.0.0"),
+                        capabilities: [
+                            "cancellation",
+                            "streaming",
+                            "structured_context_replacement",
+                            "structured_output",
+                            "token_usage",
+                            "tool_calls",
+                        ]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                        available: true,
+                    },
+                ),
+                (
+                    String::from("native"),
+                    ServiceHarnessDescriptor {
+                        version: String::from("1.0.0"),
+                        capabilities: [
+                            "cancellation",
+                            "cost_metadata",
+                            "fine_grained_proposal_boundaries",
+                            "images",
+                            "multiple_tool_calls",
+                            "provider_switching",
+                            "streaming",
+                            "structured_context_replacement",
+                            "structured_output",
+                            "token_usage",
+                            "tool_calls",
+                        ]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                        available: true,
+                    },
+                ),
+            ]),
         }
     }
 
@@ -213,6 +272,20 @@ impl RuntimeStyleServiceConfig {
                 .map(to_logic_style_decision)
                 .collect(),
             graph_references: self.graph_references.clone(),
+            harnesses: self
+                .harnesses
+                .iter()
+                .map(|(id, descriptor)| {
+                    (
+                        id.clone(),
+                        StyleHarnessDescriptor {
+                            version: descriptor.version.clone(),
+                            capabilities: descriptor.capabilities.clone(),
+                            available: descriptor.available,
+                        },
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -237,7 +310,8 @@ where
     L: RuntimeLogicPort
         + SessionRegistryLogicPort
         + SessionHistoryLogicPort
-        + SessionStyleLogicPort,
+        + SessionStyleLogicPort
+        + HarnessRegistryLogicPort,
 {
     /// Handles the currently implemented runtime wire endpoints.
     ///
@@ -306,10 +380,31 @@ where
                     ),
                 })
             }
-            RuntimeRequest::CreateSession { workspace, style } => {
+            RuntimeRequest::ListHarnesses => Ok(RuntimeResponse::Harnesses {
+                harnesses: self
+                    .logic
+                    .list_harnesses()
+                    .map_err(ServiceError::HarnessRegistry)?
+                    .into_iter()
+                    .map(to_wire_harness_descriptor)
+                    .collect(),
+            }),
+            RuntimeRequest::InspectHarness { id } => Ok(RuntimeResponse::HarnessInspected {
+                harness: to_wire_harness_descriptor(
+                    self.logic
+                        .inspect_harness(id)
+                        .map_err(ServiceError::HarnessRegistry)?,
+                ),
+            }),
+            RuntimeRequest::CreateSession {
+                workspace,
+                style,
+                harness,
+            } => {
                 let service_request = ServiceCreateSessionRequest {
                     workspace: workspace.clone(),
                     style: style.clone(),
+                    harness: harness.clone(),
                 };
                 let created = self.create_session(service_request)?;
                 Ok(RuntimeResponse::SessionCreated {
@@ -639,13 +734,23 @@ where
         if request.workspace.trim().is_empty() || request.style.trim().is_empty() {
             return Err(ServiceError::InvalidSessionRequest);
         }
-        let resolved = self
+        let mut resolved = self
             .logic
             .resolve_style(InspectStyleCommand {
                 selector: request.style,
                 environment: self.style_environment(Some(&request.workspace)),
             })
             .map_err(ServiceError::SessionStyle)?;
+        if let Some(harness) = request.harness {
+            resolved = self
+                .logic
+                .select_style_harness(SelectStyleHarnessCommand {
+                    binding: resolved.binding,
+                    harness,
+                    environment: self.style_environment(Some(&request.workspace)),
+                })
+                .map_err(ServiceError::SessionStyle)?;
+        }
         let result = self
             .logic
             .create_session(CreateSessionCommand {
@@ -1001,6 +1106,8 @@ pub struct ServiceCreateSessionRequest {
     pub workspace: String,
     /// Endpoint style text.
     pub style: String,
+    /// Optional per-session harness override.
+    pub harness: Option<String>,
 }
 
 /// Service-owned create-session response.
@@ -1404,6 +1511,19 @@ fn to_wire_style_inspection(value: ServiceStyleInspection) -> RuntimeStyleInspec
     }
 }
 
+fn to_wire_harness_descriptor(value: HarnessDescriptor) -> RuntimeHarnessDescriptor {
+    RuntimeHarnessDescriptor {
+        id: value.id,
+        version: value.version,
+        capabilities: value.capabilities.into_iter().collect(),
+        capability_set_hash: value.capability_set_hash.to_string(),
+        availability: match value.availability {
+            HarnessAvailability::Available => String::from("available"),
+            HarnessAvailability::Disabled => String::from("disabled"),
+        },
+    }
+}
+
 fn from_logic_execution(value: ScheduledExecution) -> ServiceScheduledExecution {
     ServiceScheduledExecution {
         execution_id: value.execution_id,
@@ -1479,6 +1599,9 @@ pub enum ServiceError {
     /// Session style discovery, validation, or selection failed.
     #[error("session style operation failed: {0}")]
     SessionStyle(SessionStyleLogicError),
+    /// Harness discovery or inspection failed.
+    #[error("harness registry operation failed: {0}")]
+    HarnessRegistry(HarnessRegistryLogicError),
     /// Style endpoint request failed validation.
     #[error("session style request is invalid")]
     InvalidStyleRequest,
@@ -1608,6 +1731,19 @@ mod tests {
             _command: agentmod_runtime_logic::style::ValidateStyleBindingCommand,
         ) -> Result<(), SessionStyleLogicError> {
             Err(SessionStyleLogicError::InvalidSelector)
+        }
+    }
+
+    impl HarnessRegistryLogicPort for MockLogic {
+        fn list_harnesses(&self) -> Result<Vec<HarnessDescriptor>, HarnessRegistryLogicError> {
+            Ok(Vec::new())
+        }
+
+        fn inspect_harness(
+            &self,
+            id: &str,
+        ) -> Result<HarnessDescriptor, HarnessRegistryLogicError> {
+            Err(HarnessRegistryLogicError::NotFound(id.to_owned()))
         }
     }
 

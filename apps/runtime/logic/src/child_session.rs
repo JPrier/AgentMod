@@ -496,6 +496,9 @@ mod tests {
                 String::from("filesystem.write"),
             ],
             harness: String::from("native"),
+            harness_version: String::from("1.0.0"),
+            harness_capability_set_hash: hash,
+            harness_required_capabilities: Vec::new(),
             required_capabilities: Vec::new(),
             interceptor_order: Vec::new(),
             budgets: SessionStyleBudgets {

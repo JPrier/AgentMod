@@ -5,12 +5,12 @@ use std::ffi::OsString;
 use agentmod_cli_logic::{
     BranchSessionCommand, BranchSessionResult, CancelTurnCommand, CliLogicPort,
     CreateSessionCommand, DeferredScheduleCommand, DoctorResult, DoctorState,
-    InspectSessionCommand, InspectSessionResult, ListSessionsCommand, ResolveApprovalCommand,
-    ResolveApprovalResult, RunDoctorCommand, RunTurnCommand, RunTurnResult, RunTurnStream,
-    RunTurnStreamItem, ScheduleCommand as LogicScheduleCommand, SchedulePayload, ScheduleResult,
-    ScheduleTrigger, SessionEventPageResult, SessionSummaryResult, StyleAvailability,
-    StyleDiagnostic, StyleFileCommand, StyleInspectionResult, StyleSourceKind, StyleSummaryResult,
-    StyleValidationResult, SubscribeSessionCommand, TurnEvent,
+    HarnessDescriptorResult, InspectSessionCommand, InspectSessionResult, ListSessionsCommand,
+    ResolveApprovalCommand, ResolveApprovalResult, RunDoctorCommand, RunTurnCommand, RunTurnResult,
+    RunTurnStream, RunTurnStreamItem, ScheduleCommand as LogicScheduleCommand, SchedulePayload,
+    ScheduleResult, ScheduleTrigger, SessionEventPageResult, SessionSummaryResult,
+    StyleAvailability, StyleDiagnostic, StyleFileCommand, StyleInspectionResult, StyleSourceKind,
+    StyleSummaryResult, StyleValidationResult, SubscribeSessionCommand, TurnEvent,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use thiserror::Error;
@@ -89,6 +89,12 @@ pub enum CliCommand {
         /// Style operation.
         #[command(subcommand)]
         command: StyleCommand,
+    },
+    /// Inspect registered harness adapters.
+    Harness {
+        /// Harness operation.
+        #[command(subcommand)]
+        command: HarnessCommand,
     },
     /// Cancel one active provider request.
     Cancel {
@@ -252,6 +258,25 @@ pub enum StyleCommand {
     },
 }
 
+/// Harness registry CLI operations.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum HarnessCommand {
+    /// List registered harnesses.
+    List {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one harness and its capabilities.
+    Inspect {
+        /// Stable harness ID.
+        id: String,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Durable approval CLI operations.
 #[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
 pub enum ApprovalCommand {
@@ -289,6 +314,9 @@ pub enum SessionCommand {
         /// Explicit top-level style.
         #[arg(long, default_value = "persistent-chat")]
         style: String,
+        /// Explicit harness registry ID.
+        #[arg(long)]
+        harness: Option<String>,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -629,8 +657,9 @@ where
                 SessionCommand::Create {
                     workspace,
                     style,
+                    harness,
                     json,
-                } => self.create_session(workspace, style, json),
+                } => self.create_session(workspace, style, harness, json),
                 SessionCommand::List { limit, json } => self.list_sessions(limit, json),
                 SessionCommand::Inspect { session, at, json } => {
                     self.inspect_session(&session, at, false, json)
@@ -723,6 +752,10 @@ where
                 StyleCommand::Inspect { selector, json } => self.inspect_style(selector, json),
                 StyleCommand::Validate { file, json } => self.validate_style(file, json),
                 StyleCommand::Compile { file, json } => self.compile_style(file, json),
+            },
+            CliCommand::Harness { command } => match command {
+                HarnessCommand::List { json } => self.list_harnesses(json),
+                HarnessCommand::Inspect { id, json } => self.inspect_harness(&id, json),
             },
             CliCommand::Cancel {
                 cancellation_id,
@@ -1047,6 +1080,24 @@ where
         Ok(render_style_list(&styles, json))
     }
 
+    fn list_harnesses(&self, json: bool) -> Result<ServiceCommandResponse, ServiceError> {
+        let harnesses = self.logic.list_harnesses().map_err(logic_error)?;
+        Ok(render_harnesses(&harnesses, "harness_list", json))
+    }
+
+    fn inspect_harness(
+        &self,
+        id: &str,
+        json: bool,
+    ) -> Result<ServiceCommandResponse, ServiceError> {
+        let harness = self.logic.inspect_harness(id).map_err(logic_error)?;
+        Ok(render_harnesses(
+            std::slice::from_ref(&harness),
+            "harness_inspect",
+            json,
+        ))
+    }
+
     fn inspect_style(
         &self,
         selector: String,
@@ -1283,11 +1334,16 @@ where
         &self,
         workspace: String,
         style: String,
+        harness: Option<String>,
         json: bool,
     ) -> Result<ServiceCommandResponse, ServiceError> {
         let result = self
             .logic
-            .create_session(CreateSessionCommand { workspace, style })
+            .create_session(CreateSessionCommand {
+                workspace,
+                style,
+                harness,
+            })
             .map_err(|error| ServiceError::Logic {
                 detail: error.to_string(),
             })?;
@@ -1495,6 +1551,48 @@ fn render_style_list(styles: &[ServiceStyleSummary], json: bool) -> ServiceComma
             .join("\n")
     };
     render_value(value, json, text)
+}
+
+fn render_harnesses(
+    harnesses: &[HarnessDescriptorResult],
+    command: &str,
+    json: bool,
+) -> ServiceCommandResponse {
+    let rows = harnesses
+        .iter()
+        .map(|harness| {
+            serde_json::json!({
+                "id": harness.id,
+                "version": harness.version,
+                "availability": harness.availability,
+                "capability_set_hash": harness.capability_set_hash,
+                "capabilities": harness.capabilities,
+            })
+        })
+        .collect::<Vec<_>>();
+    let text = if harnesses.is_empty() {
+        String::from("no harnesses")
+    } else {
+        harnesses
+            .iter()
+            .map(|harness| {
+                format!(
+                    "{}@{}\t{}\t{}\t{}",
+                    harness.id,
+                    harness.version,
+                    harness.availability,
+                    harness.capability_set_hash,
+                    harness.capabilities.join(","),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    render_value(
+        serde_json::json!({"command": command, "harnesses": rows}),
+        json,
+        text,
+    )
 }
 
 fn render_style_inspection(

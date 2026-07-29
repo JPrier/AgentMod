@@ -5,7 +5,8 @@ execute/continue/cancel/health commands, visible text and tool-call deltas,
 tool-call proposals, normalized completion/failure, usage, and structured
 context-replacement decisions.
 
-The native harness is a separate bounded JSONL process endpoint. Its complete
+The native harness and deterministic fixture are separately registered bounded
+JSONL process endpoints. The native implementation's complete
 service → logic → data → dependency path currently implements a deterministic
 mock provider with text, streaming fragments, one or multiple tool calls,
 malformed arguments, timeout, rate limit, partial failure, cancellation,
@@ -20,7 +21,7 @@ Runtime provider execution follows this implemented sequence:
 5. run user policy and mandatory runtime policy;
 6. commit the original proposal and final approved action;
 7. issue a short-lived keyed harness grant;
-8. execute through the supervised harness process;
+8. execute through the exact per-session selected supervised harness adapter;
 9. commit started, delta/tool proposal, completion/failure/cancellation events;
 10. commit consolidated visible assistant content.
 
@@ -41,7 +42,7 @@ each committed item as NDJSON before provider completion; `--json` retains
 backwards-compatible aggregation. Negotiated request-bound credits limit
 nonterminal delivery, and canonical session-event pages support
 reconnect-from-sequence without repeating effects. Interactive TUI rendering
-and continuous live subscription after catch-up remain incomplete.
+is live; continuous live subscription after catch-up remains incomplete.
 
 OpenAI-compatible, OpenRouter, OpenAI, Anthropic, Gemini, and local HTTP
 adapters, authentication, live discovery, structured output, cost metadata, and

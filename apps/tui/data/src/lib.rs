@@ -54,6 +54,16 @@ pub struct StyleDataRecord {
     pub required_capabilities: Vec<String>,
 }
 
+/// Data-owned harness descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessDataRecord {
+    pub id: String,
+    pub version: String,
+    pub capabilities: Vec<String>,
+    pub capability_set_hash: String,
+    pub availability: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionDataRecord {
     pub id: SessionId,
@@ -137,8 +147,20 @@ impl TurnDataStream {
 pub trait TuiDataPort {
     fn runtime_health(&self) -> Result<RuntimeHealthDataRecord, TuiDataError>;
     fn list_styles(&self) -> Result<Vec<StyleDataRecord>, TuiDataError>;
+    fn list_harnesses(&self) -> Result<Vec<HarnessDataRecord>, TuiDataError> {
+        Ok(Vec::new())
+    }
     fn list_sessions(&self, limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError>;
     fn create_session(&self, workspace: String, style: String) -> Result<SessionId, TuiDataError>;
+    fn create_session_with_harness(
+        &self,
+        workspace: String,
+        style: String,
+        harness: Option<String>,
+    ) -> Result<SessionId, TuiDataError> {
+        let _ = harness;
+        self.create_session(workspace, style)
+    }
     fn session_events(
         &self,
         session_id: SessionId,
@@ -226,6 +248,24 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
             .map_err(map_error)
     }
 
+    fn list_harnesses(&self) -> Result<Vec<HarnessDataRecord>, TuiDataError> {
+        self.dependency
+            .list_harnesses()
+            .map(|values| {
+                values
+                    .into_iter()
+                    .map(|value| HarnessDataRecord {
+                        id: value.id,
+                        version: value.version,
+                        capabilities: value.capabilities,
+                        capability_set_hash: value.capability_set_hash,
+                        availability: value.availability,
+                    })
+                    .collect()
+            })
+            .map_err(map_error)
+    }
+
     fn list_sessions(&self, limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError> {
         self.dependency
             .list_sessions(limit)
@@ -247,6 +287,17 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
     fn create_session(&self, workspace: String, style: String) -> Result<SessionId, TuiDataError> {
         self.dependency
             .create_session(workspace, style)
+            .map_err(map_error)
+    }
+
+    fn create_session_with_harness(
+        &self,
+        workspace: String,
+        style: String,
+        harness: Option<String>,
+    ) -> Result<SessionId, TuiDataError> {
+        self.dependency
+            .create_session_with_harness(workspace, style, harness)
             .map_err(map_error)
     }
 

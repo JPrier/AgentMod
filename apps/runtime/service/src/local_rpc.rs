@@ -91,6 +91,7 @@ where
         + SessionRegistryLogicPort
         + SessionHistoryLogicPort
         + agentmod_runtime_logic::style::SessionStyleLogicPort
+        + agentmod_runtime_logic::harness_registry::HarnessRegistryLogicPort
         + Send
         + Sync,
 {
@@ -103,7 +104,7 @@ where
 }
 
 /// Runtime protocol version accepted by this service.
-pub const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 1);
+pub const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 2);
 
 /// Local endpoint configuration supplied by the composition root.
 #[derive(Clone, Debug)]
@@ -711,6 +712,31 @@ mod tests {
             _command: agentmod_runtime_logic::style::ValidateStyleBindingCommand,
         ) -> Result<(), agentmod_runtime_logic::style::SessionStyleLogicError> {
             Err(agentmod_runtime_logic::style::SessionStyleLogicError::InvalidSelector)
+        }
+    }
+
+    impl agentmod_runtime_logic::harness_registry::HarnessRegistryLogicPort for MockLogic {
+        fn list_harnesses(
+            &self,
+        ) -> Result<
+            Vec<agentmod_runtime_logic::harness_registry::HarnessDescriptor>,
+            agentmod_runtime_logic::harness_registry::HarnessRegistryLogicError,
+        > {
+            Ok(Vec::new())
+        }
+
+        fn inspect_harness(
+            &self,
+            id: &str,
+        ) -> Result<
+            agentmod_runtime_logic::harness_registry::HarnessDescriptor,
+            agentmod_runtime_logic::harness_registry::HarnessRegistryLogicError,
+        > {
+            Err(
+                agentmod_runtime_logic::harness_registry::HarnessRegistryLogicError::NotFound(
+                    id.to_owned(),
+                ),
+            )
         }
     }
 

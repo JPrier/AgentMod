@@ -187,6 +187,15 @@ pub struct SessionStyleBinding {
     pub tool_groups: Vec<String>,
     /// Harness selected for this session.
     pub harness: String,
+    /// Exact harness adapter version selected at session creation.
+    #[serde(default = "legacy_harness_version")]
+    pub harness_version: String,
+    /// Hash of the selected harness capability set.
+    #[serde(default = "legacy_harness_capability_hash")]
+    pub harness_capability_set_hash: ContentHash,
+    /// Capabilities the compiled style requires from the harness.
+    #[serde(default)]
+    pub harness_required_capabilities: Vec<String>,
     /// Runtime capabilities required by the style.
     pub required_capabilities: Vec<String>,
     /// Ordered blocking interceptor IDs.
@@ -201,6 +210,14 @@ pub struct SessionStyleBinding {
     pub retry_policy_json: String,
     /// Canonical termination policy copied from the compiled style.
     pub termination_policy_json: String,
+}
+
+fn legacy_harness_version() -> String {
+    String::from("unversioned")
+}
+
+fn legacy_harness_capability_hash() -> ContentHash {
+    ContentHash::digest(b"legacy-unversioned-harness")
 }
 
 /// Session creation payload.
@@ -348,6 +365,9 @@ pub struct ContextBoundaryCompletedEvent {
 pub struct ModelRequestProposedEvent {
     /// Logic proposal identifier.
     pub proposal_id: String,
+    /// Selected harness registry ID.
+    #[serde(default = "default_native_harness")]
+    pub harness: String,
     /// Requested provider.
     pub provider: String,
     /// Requested model.
@@ -361,12 +381,19 @@ pub struct ModelRequestProposedEvent {
 pub struct ModelRequestApprovedEvent {
     /// Original logic proposal identifier.
     pub proposal_id: String,
+    /// Authorized harness registry ID.
+    #[serde(default = "default_native_harness")]
+    pub harness: String,
     /// Final provider after interception.
     pub provider: String,
     /// Final model after interception.
     pub model: String,
     /// Digest bound into the short-lived harness grant.
     pub action_digest: ContentHash,
+}
+
+fn default_native_harness() -> String {
+    String::from("native")
 }
 
 /// Provider execution began.

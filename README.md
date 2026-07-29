@@ -43,13 +43,15 @@ export AGENTMOD_RUNTIME_AUTH_TOKEN=<private-secret-at-least-32-bytes>
 cargo run -p agentmod-runtime -- serve
 # then, from another terminal:
 cargo run -p agentmod-cli -- style list
-cargo run -p agentmod-cli -- session create --workspace . --style persistent-chat --json
+cargo run -p agentmod-cli -- harness list
+cargo run -p agentmod-cli -- session create --workspace . --style persistent-chat --harness native --json
 cargo run -p agentmod-cli -- run "hello" --session <id> --json
 ```
 
 On Windows, `tests/e2e/runtime_cli.ps1`,
 `tests/e2e/runtime_style_registry.ps1`, and
-`tests/e2e/runtime_style_context.ps1` exercise the real daemon over a named
+`tests/e2e/runtime_style_context.ps1`, and
+`tests/e2e/runtime_harness_selection.ps1` exercise the real daemon over a named
 pipe. Matching Unix scripts exist, but `STATUS.md` records which platforms were
 actually executed.
 

@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 1);
+const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 2);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencySession {
@@ -362,7 +362,11 @@ impl AcpRuntimeDependencyPort for LocalRuntimeDependency {
         style: String,
     ) -> Result<SessionId, AcpDependencyError> {
         let RuntimeResponse::SessionCreated { session_id } = self
-            .send(RuntimeRequest::CreateSession { workspace, style })
+            .send(RuntimeRequest::CreateSession {
+                workspace,
+                style,
+                harness: None,
+            })
             .await?
         else {
             return Err(AcpDependencyError::UnexpectedResponse);

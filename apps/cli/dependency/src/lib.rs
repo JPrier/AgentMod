@@ -23,17 +23,17 @@ use agentmod_protocol_support::{
     write_frame,
 };
 use agentmod_runtime_protocol::{
-    RuntimeProviderEvent, RuntimeRequest, RuntimeResponse, RuntimeSchedulePayload,
-    RuntimeScheduleSpec, RuntimeScheduleTrigger, RuntimeSessionEvent, RuntimeStyleAvailability,
-    RuntimeStyleDiagnostic, RuntimeStyleInspection, RuntimeStyleManifestFormat,
-    RuntimeStyleSourceKind, RuntimeStyleSummary,
+    RuntimeHarnessDescriptor, RuntimeProviderEvent, RuntimeRequest, RuntimeResponse,
+    RuntimeSchedulePayload, RuntimeScheduleSpec, RuntimeScheduleTrigger, RuntimeSessionEvent,
+    RuntimeStyleAvailability, RuntimeStyleDiagnostic, RuntimeStyleInspection,
+    RuntimeStyleManifestFormat, RuntimeStyleSourceKind, RuntimeStyleSummary,
 };
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
-const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 1);
+const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 2);
 const MAX_STYLE_MANIFEST_BYTES: u64 = 1_048_576;
 
 /// Dependency-owned style manifest format.
@@ -113,6 +113,16 @@ pub struct DependencyStyleValidationResult {
     pub diagnostics: Vec<DependencyStyleDiagnostic>,
 }
 
+/// Dependency-owned harness descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyHarnessDescriptor {
+    pub id: String,
+    pub version: String,
+    pub capabilities: Vec<String>,
+    pub capability_set_hash: String,
+    pub availability: String,
+}
+
 /// Dependency-owned runtime health request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyRuntimeHealthRequest {
@@ -136,6 +146,8 @@ pub struct DependencyCreateSessionRequest {
     pub workspace: String,
     /// Explicit style.
     pub style: String,
+    /// Optional harness override.
+    pub harness: Option<String>,
 }
 
 /// Dependency-owned create-session response.
@@ -546,6 +558,14 @@ pub trait CliDependencyPort {
         Err(DependencyError::UnsupportedRuntimeRequest)
     }
 
+    fn list_harnesses(&self) -> Result<Vec<DependencyHarnessDescriptor>, DependencyError> {
+        Err(DependencyError::UnsupportedRuntimeRequest)
+    }
+
+    fn inspect_harness(&self, _id: &str) -> Result<DependencyHarnessDescriptor, DependencyError> {
+        Err(DependencyError::UnsupportedRuntimeRequest)
+    }
+
     fn upsert_schedule(
         &self,
         _schedule: DependencySchedule,
@@ -658,6 +678,7 @@ impl CliDependencyPort for DeterministicRuntimeClient {
         let response = self.send(&RuntimeRequest::CreateSession {
             workspace: request.workspace,
             style: request.style,
+            harness: request.harness,
         })?;
         let RuntimeResponse::SessionCreated { session_id } = response else {
             return Err(DependencyError::UnexpectedRuntimeResponse);
@@ -1090,6 +1111,24 @@ impl CliDependencyPort for LocalRuntimeClient {
         Ok(styles.into_iter().map(map_style_summary).collect())
     }
 
+    fn list_harnesses(&self) -> Result<Vec<DependencyHarnessDescriptor>, DependencyError> {
+        let RuntimeResponse::Harnesses { harnesses } =
+            self.send_local(RuntimeRequest::ListHarnesses)?
+        else {
+            return Err(DependencyError::UnexpectedRuntimeResponse);
+        };
+        Ok(harnesses.into_iter().map(map_harness_descriptor).collect())
+    }
+
+    fn inspect_harness(&self, id: &str) -> Result<DependencyHarnessDescriptor, DependencyError> {
+        let RuntimeResponse::HarnessInspected { harness } =
+            self.send_local(RuntimeRequest::InspectHarness { id: id.to_owned() })?
+        else {
+            return Err(DependencyError::UnexpectedRuntimeResponse);
+        };
+        Ok(map_harness_descriptor(harness))
+    }
+
     fn inspect_style(
         &self,
         request: DependencyInspectStyleRequest,
@@ -1141,6 +1180,7 @@ impl CliDependencyPort for LocalRuntimeClient {
             self.send_local(RuntimeRequest::CreateSession {
                 workspace: request.workspace,
                 style: request.style,
+                harness: request.harness,
             })?
         else {
             return Err(DependencyError::UnexpectedRuntimeResponse);
@@ -1672,6 +1712,16 @@ fn map_style_summary(summary: RuntimeStyleSummary) -> DependencyStyleSummary {
         style_content_hash: summary.style_content_hash,
         compiled_cache_key: summary.compiled_cache_key,
         required_capabilities: summary.required_capabilities,
+    }
+}
+
+fn map_harness_descriptor(value: RuntimeHarnessDescriptor) -> DependencyHarnessDescriptor {
+    DependencyHarnessDescriptor {
+        id: value.id,
+        version: value.version,
+        capabilities: value.capabilities,
+        capability_set_hash: value.capability_set_hash,
+        availability: value.availability,
     }
 }
 

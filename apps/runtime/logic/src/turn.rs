@@ -3302,7 +3302,7 @@ where
         }
         let events = self
             .provider
-            .cancel(command.cancellation_id)
+            .cancel(String::new(), command.cancellation_id)
             .await
             .map_err(RunTurnError::Provider)?;
         if events
@@ -5250,8 +5250,13 @@ where
             )?;
         }
         let provider = ProviderExecutionLogic::new(self.data.clone(), session_policy.execution);
+        let harness = state
+            .style_binding
+            .as_ref()
+            .map_or_else(|| String::from("native"), |binding| binding.harness.clone());
         let prepared = provider
             .prepare(ExecuteProviderCommand {
+                harness,
                 session_id: command.session_id.clone(),
                 provider: command.provider.clone(),
                 model: command.model.clone(),
@@ -5273,6 +5278,7 @@ where
             position.event_id,
             RuntimeCommittedEvent::ModelRequestProposed(ModelRequestProposedEvent {
                 proposal_id: prepared.original.id.0.clone(),
+                harness: original.harness.clone(),
                 provider: original.provider.clone(),
                 model: original.model.clone(),
                 projection_hash: original.projection_hash,
@@ -5324,6 +5330,7 @@ where
             invocation_position.event_id,
             RuntimeCommittedEvent::ModelRequestApproved(ModelRequestApprovedEvent {
                 proposal_id: request.original.id.0.clone(),
+                harness: executable.harness.clone(),
                 provider: executable.provider.clone(),
                 model: executable.model.clone(),
                 action_digest,
@@ -5517,6 +5524,13 @@ where
             let stream = self
                 .provider
                 .continue_execution_stream(
+                    loaded
+                        .state
+                        .style_binding
+                        .as_ref()
+                        .ok_or(RunTurnError::StyleMigrationRequired)?
+                        .harness
+                        .clone(),
                     resume_continuation,
                     crate::harness::ProviderDecision::Replace(project(
                         loaded.state.conversation.provider_projection(),

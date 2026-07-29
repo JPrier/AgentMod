@@ -579,6 +579,7 @@ where
         + agentmod_runtime_logic::registry::SessionRegistryLogicPort
         + agentmod_runtime_logic::history::SessionHistoryLogicPort
         + agentmod_runtime_logic::style::SessionStyleLogicPort
+        + agentmod_runtime_logic::harness_registry::HarnessRegistryLogicPort
         + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort,
     T: TurnLogicPort
         + CommittedEventObserverLogicPort
@@ -1129,6 +1130,7 @@ where
         + agentmod_runtime_logic::registry::SessionRegistryLogicPort
         + agentmod_runtime_logic::history::SessionHistoryLogicPort
         + agentmod_runtime_logic::style::SessionStyleLogicPort
+        + agentmod_runtime_logic::harness_registry::HarnessRegistryLogicPort
         + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort
         + Clone
         + Send

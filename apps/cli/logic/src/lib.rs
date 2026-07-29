@@ -10,13 +10,13 @@
 
 use agentmod_cli_data::{
     BranchSessionDataRequest, CancelTurnDataRequest, CliDataPort, CreateDeferredTurnDataRequest,
-    CreateSessionDataRequest, InspectSessionDataRequest, InspectStyleDataRequest,
-    ListSessionsDataRequest, ResolveApprovalDataRequest, RunTurnDataRequest, RunTurnDataStream,
-    RunTurnDataStreamItem, RuntimeHealthDataAvailability, RuntimeHealthDataRequest,
-    ScheduleDataPayload, ScheduleDataRecord, ScheduleDataTrigger, ScheduledExecutionDataRecord,
-    ScheduledRunDataRecord, StyleDataAvailability, StyleDataSourceKind, StyleDiagnosticDataRecord,
-    StyleFileDataRequest, StyleInspectionDataRecord, StyleSummaryDataRecord,
-    SubscribeSessionDataRequest, TurnDataEvent,
+    CreateSessionDataRequest, HarnessDescriptorDataRecord, InspectSessionDataRequest,
+    InspectStyleDataRequest, ListSessionsDataRequest, ResolveApprovalDataRequest,
+    RunTurnDataRequest, RunTurnDataStream, RunTurnDataStreamItem, RuntimeHealthDataAvailability,
+    RuntimeHealthDataRequest, ScheduleDataPayload, ScheduleDataRecord, ScheduleDataTrigger,
+    ScheduledExecutionDataRecord, ScheduledRunDataRecord, StyleDataAvailability,
+    StyleDataSourceKind, StyleDiagnosticDataRecord, StyleFileDataRequest,
+    StyleInspectionDataRecord, StyleSummaryDataRecord, SubscribeSessionDataRequest, TurnDataEvent,
 };
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use serde_json::Value;
@@ -92,6 +92,16 @@ pub struct StyleValidationResult {
     pub diagnostics: Vec<StyleDiagnostic>,
 }
 
+/// Logic-owned harness descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessDescriptorResult {
+    pub id: String,
+    pub version: String,
+    pub capabilities: Vec<String>,
+    pub capability_set_hash: String,
+    pub availability: String,
+}
+
 /// Logic-owned doctor command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunDoctorCommand {
@@ -141,6 +151,8 @@ pub struct CreateSessionCommand {
     pub workspace: String,
     /// Explicit style.
     pub style: String,
+    /// Optional harness override.
+    pub harness: Option<String>,
 }
 
 /// Logic-owned create result.
@@ -549,6 +561,14 @@ pub trait CliLogicPort {
         Err(LogicError::StyleData)
     }
 
+    fn list_harnesses(&self) -> Result<Vec<HarnessDescriptorResult>, LogicError> {
+        Err(LogicError::StyleData)
+    }
+
+    fn inspect_harness(&self, _id: &str) -> Result<HarnessDescriptorResult, LogicError> {
+        Err(LogicError::StyleData)
+    }
+
     fn upsert_schedule(
         &self,
         _schedule: ScheduleCommand,
@@ -646,6 +666,23 @@ where
             .map_err(|_| LogicError::StyleData)
     }
 
+    fn list_harnesses(&self) -> Result<Vec<HarnessDescriptorResult>, LogicError> {
+        self.data
+            .list_harnesses()
+            .map(|values| values.into_iter().map(map_harness_descriptor).collect())
+            .map_err(|_| LogicError::StyleData)
+    }
+
+    fn inspect_harness(&self, id: &str) -> Result<HarnessDescriptorResult, LogicError> {
+        if id.trim().is_empty() {
+            return Err(LogicError::InvalidStyleSelector);
+        }
+        self.data
+            .inspect_harness(id)
+            .map(map_harness_descriptor)
+            .map_err(|_| LogicError::StyleData)
+    }
+
     fn inspect_style(
         &self,
         command: InspectStyleCommand,
@@ -705,6 +742,7 @@ where
             .create_session(CreateSessionDataRequest {
                 workspace: command.workspace,
                 style: command.style,
+                harness: command.harness,
             })
             .map(|record| CreateSessionResult {
                 session_id: record.session_id,
@@ -1232,6 +1270,16 @@ fn map_style_summary(summary: StyleSummaryDataRecord) -> StyleSummaryResult {
         style_content_hash: summary.style_content_hash,
         compiled_cache_key: summary.compiled_cache_key,
         required_capabilities: summary.required_capabilities,
+    }
+}
+
+fn map_harness_descriptor(value: HarnessDescriptorDataRecord) -> HarnessDescriptorResult {
+    HarnessDescriptorResult {
+        id: value.id,
+        version: value.version,
+        capabilities: value.capabilities,
+        capability_set_hash: value.capability_set_hash,
+        availability: value.availability,
     }
 }
 

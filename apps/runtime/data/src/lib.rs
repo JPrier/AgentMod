@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod continuation;
 pub mod harness;
+pub mod harness_registry;
 pub mod identity;
 pub mod journal;
 pub mod memory;

@@ -191,6 +191,16 @@ status = "planned"
 limitation = "No implementation exists yet."
 
 [[requirement]]
+id = "E2E-20"
+capability = "per-session-harness-selection"
+owner = "runtime/harness/frontends"
+tests = ["harness_registry_selects_adapters_and_rejects_missing_capabilities", "registry_routes_distinct_adapters_and_rejects_missing_ids", "selected_style_and_harness_reach_create_session", "harness_catalog_renders_selection_and_capabilities", "runtime_harness_selection"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["sdk/session-style-sdk/src/model.rs", "apps/runtime/dependency/src/harness_registry.rs", "apps/runtime/data/src/harness_registry.rs", "apps/runtime/logic/src/harness_registry.rs", "apps/runtime/logic/src/style.rs", "apps/runtime/service/src/lib.rs", "apps/cli/service/src/lib.rs", "apps/tui/logic/src/lib.rs", "tests/integration/src/lib.rs", "tests/e2e/runtime_harness_selection.ps1", "tests/e2e/runtime_harness_selection.sh"]
+status = "partial"
+limitation = "The Windows process E2E proves native and independently supervised deterministic fixture discovery, explicit per-session selection, incompatible capability rejection, canonical identity retention, restart validation, and post-restart execution. The Unix script is syntax-checked but has not been process-executed. The fixture defaults to the same deterministic harness executable through a separate adapter configuration; complete third-party adapters remain planned."
+
+[[requirement]]
 id = "E2E-19"
 capability = "process-isolation"
 owner = "runtime/supervision"

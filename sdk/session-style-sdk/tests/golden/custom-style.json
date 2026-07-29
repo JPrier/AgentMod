@@ -35,6 +35,10 @@
   "allowed_tool_groups": [],
   "allowed_providers": [],
   "allowed_plugins": [],
+  "harness": {
+    "id": "native",
+    "required_capabilities": []
+  },
   "memory": {
     "provider": "none",
     "scopes": [],

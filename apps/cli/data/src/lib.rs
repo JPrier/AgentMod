@@ -8,14 +8,14 @@
 use agentmod_cli_dependency::{
     CliDependencyPort, DependencyBranchSessionRequest, DependencyCancelTurnRequest,
     DependencyCreateDeferredTurnRequest, DependencyCreateSessionRequest,
-    DependencyInspectSessionRequest, DependencyInspectStyleRequest, DependencyListSessionsRequest,
-    DependencyResolveApprovalRequest, DependencyRunTurnRequest, DependencyRunTurnStream,
-    DependencyRunTurnStreamItem, DependencyRuntimeAvailability, DependencyRuntimeHealthRequest,
-    DependencySchedule, DependencySchedulePayload, DependencyScheduleTrigger,
-    DependencyScheduledExecution, DependencyScheduledRun, DependencyStyleAvailability,
-    DependencyStyleDiagnostic, DependencyStyleFileRequest, DependencyStyleInspection,
-    DependencyStyleSourceKind, DependencyStyleSummary, DependencySubscribeSessionRequest,
-    DependencyTurnEvent,
+    DependencyHarnessDescriptor, DependencyInspectSessionRequest, DependencyInspectStyleRequest,
+    DependencyListSessionsRequest, DependencyResolveApprovalRequest, DependencyRunTurnRequest,
+    DependencyRunTurnStream, DependencyRunTurnStreamItem, DependencyRuntimeAvailability,
+    DependencyRuntimeHealthRequest, DependencySchedule, DependencySchedulePayload,
+    DependencyScheduleTrigger, DependencyScheduledExecution, DependencyScheduledRun,
+    DependencyStyleAvailability, DependencyStyleDiagnostic, DependencyStyleFileRequest,
+    DependencyStyleInspection, DependencyStyleSourceKind, DependencyStyleSummary,
+    DependencySubscribeSessionRequest, DependencyTurnEvent,
 };
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use serde_json::Value;
@@ -91,6 +91,16 @@ pub struct StyleValidationDataRecord {
     pub diagnostics: Vec<StyleDiagnosticDataRecord>,
 }
 
+/// Data-owned harness descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessDescriptorDataRecord {
+    pub id: String,
+    pub version: String,
+    pub capabilities: Vec<String>,
+    pub capability_set_hash: String,
+    pub availability: String,
+}
+
 /// Data-owned request for the runtime portion of a doctor report.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimeHealthDataRequest {
@@ -125,6 +135,8 @@ pub struct CreateSessionDataRequest {
     pub workspace: String,
     /// Explicit style.
     pub style: String,
+    /// Optional harness override.
+    pub harness: Option<String>,
 }
 
 /// Data-owned create result.
@@ -528,6 +540,14 @@ pub trait CliDataPort {
         Err(style_unavailable())
     }
 
+    fn list_harnesses(&self) -> Result<Vec<HarnessDescriptorDataRecord>, DataError> {
+        Err(style_unavailable())
+    }
+
+    fn inspect_harness(&self, _id: &str) -> Result<HarnessDescriptorDataRecord, DataError> {
+        Err(style_unavailable())
+    }
+
     fn upsert_schedule(
         &self,
         _schedule: ScheduleDataRecord,
@@ -622,6 +642,20 @@ where
             .map_err(|_| style_unavailable())
     }
 
+    fn list_harnesses(&self) -> Result<Vec<HarnessDescriptorDataRecord>, DataError> {
+        self.dependency
+            .list_harnesses()
+            .map(|values| values.into_iter().map(map_harness_descriptor).collect())
+            .map_err(|_| style_unavailable())
+    }
+
+    fn inspect_harness(&self, id: &str) -> Result<HarnessDescriptorDataRecord, DataError> {
+        self.dependency
+            .inspect_harness(id)
+            .map(map_harness_descriptor)
+            .map_err(|_| style_unavailable())
+    }
+
     fn inspect_style(
         &self,
         request: InspectStyleDataRequest,
@@ -669,6 +703,7 @@ where
             .create_session(DependencyCreateSessionRequest {
                 workspace: request.workspace,
                 style: request.style,
+                harness: request.harness,
             })
             .map(|response| CreateSessionDataRecord {
                 session_id: response.session_id,
@@ -953,6 +988,16 @@ fn map_style_summary(summary: DependencyStyleSummary) -> StyleSummaryDataRecord 
         style_content_hash: summary.style_content_hash,
         compiled_cache_key: summary.compiled_cache_key,
         required_capabilities: summary.required_capabilities,
+    }
+}
+
+fn map_harness_descriptor(value: DependencyHarnessDescriptor) -> HarnessDescriptorDataRecord {
+    HarnessDescriptorDataRecord {
+        id: value.id,
+        version: value.version,
+        capabilities: value.capabilities,
+        capability_set_hash: value.capability_set_hash,
+        availability: value.availability,
     }
 }
 

@@ -30,7 +30,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
-const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 1);
+const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 2);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyRuntimeHealth {
@@ -68,6 +68,16 @@ pub struct DependencyStyleSummary {
     pub style_content_hash: String,
     pub compiled_cache_key: String,
     pub required_capabilities: Vec<String>,
+}
+
+/// Dependency-owned harness descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyHarnessDescriptor {
+    pub id: String,
+    pub version: String,
+    pub capabilities: Vec<String>,
+    pub capability_set_hash: String,
+    pub availability: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +163,9 @@ impl DependencyTurnStream {
 pub trait TuiRuntimeDependencyPort: Send + Sync {
     fn health(&self) -> Result<DependencyRuntimeHealth, TuiDependencyError>;
     fn list_styles(&self) -> Result<Vec<DependencyStyleSummary>, TuiDependencyError>;
+    fn list_harnesses(&self) -> Result<Vec<DependencyHarnessDescriptor>, TuiDependencyError> {
+        Ok(Vec::new())
+    }
     fn list_sessions(
         &self,
         limit: u32,
@@ -162,6 +175,14 @@ pub trait TuiRuntimeDependencyPort: Send + Sync {
         workspace: String,
         style: String,
     ) -> Result<SessionId, TuiDependencyError>;
+    fn create_session_with_harness(
+        &self,
+        workspace: String,
+        style: String,
+        _harness: Option<String>,
+    ) -> Result<SessionId, TuiDependencyError> {
+        self.create_session(workspace, style)
+    }
     fn session_events(
         &self,
         session_id: SessionId,
@@ -510,6 +531,23 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
             .collect())
     }
 
+    fn list_harnesses(&self) -> Result<Vec<DependencyHarnessDescriptor>, TuiDependencyError> {
+        let RuntimeResponse::Harnesses { harnesses } = self.send(RuntimeRequest::ListHarnesses)?
+        else {
+            return Err(TuiDependencyError::UnexpectedResponse);
+        };
+        Ok(harnesses
+            .into_iter()
+            .map(|harness| DependencyHarnessDescriptor {
+                id: harness.id,
+                version: harness.version,
+                capabilities: harness.capabilities,
+                capability_set_hash: harness.capability_set_hash,
+                availability: harness.availability,
+            })
+            .collect())
+    }
+
     fn list_sessions(
         &self,
         limit: u32,
@@ -537,7 +575,29 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
         style: String,
     ) -> Result<SessionId, TuiDependencyError> {
         let RuntimeResponse::SessionCreated { session_id } =
-            self.send(RuntimeRequest::CreateSession { workspace, style })?
+            self.send(RuntimeRequest::CreateSession {
+                workspace,
+                style,
+                harness: None,
+            })?
+        else {
+            return Err(TuiDependencyError::UnexpectedResponse);
+        };
+        Ok(session_id)
+    }
+
+    fn create_session_with_harness(
+        &self,
+        workspace: String,
+        style: String,
+        harness: Option<String>,
+    ) -> Result<SessionId, TuiDependencyError> {
+        let RuntimeResponse::SessionCreated { session_id } =
+            self.send(RuntimeRequest::CreateSession {
+                workspace,
+                style,
+                harness,
+            })?
         else {
             return Err(TuiDependencyError::UnexpectedResponse);
         };

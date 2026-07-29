@@ -1,8 +1,11 @@
 # Session-Style Refocus Implementation Map
 
-Status: Phase 1 complete; Phase 2 active  
-Branch: `feature/session-style-registry`  
-Baseline commit: `e99e9e1bf02f10475ada0a48fcb746f9fa1ead6b`  
+Status: Phases 1-2 complete; Phase 3 hardening active; Phase 4 mapped
+
+Branch: `feature/session-style-registry`
+
+Baseline commit: `e99e9e1bf02f10475ada0a48fcb746f9fa1ead6b`
+
 Verified: 2026-07-28 on Windows
 
 ## Verified current state
@@ -16,12 +19,18 @@ proposal and permission path, harness supervision, canonical journal, artifacts,
 continuations, receipts, replay, branching, scheduling, and first-party tool
 hosts are live and tested.
 
-No production runtime crate currently consumes `agentmod-session-style-sdk`.
-Session creation accepts a syntax-checked style string, writes that string to the
-initial event, `metadata.json`, `style.json`, and `style.lock`, and then runs the
-same hard-coded turn loop for every value. The TUI `/new` command always selects
-`persistent-chat`. Branching can replace the string, but it does not resolve or
-compile the replacement.
+The production runtime now consumes `agentmod-session-style-sdk` through an
+N-tier registry. Session creation and deliberate restyling resolve and compile
+the selected manifest, persist the full immutable binding, and validate that
+binding before execution resumes. The CLI and TUI expose style discovery and
+selection through the runtime protocol.
+
+The generic style executor consumes the retained compiled graph and persistent
+chat runs through its model -> tool gate -> complete-turn path. Style-selected
+memory retrieval, context composition, projection replacement, and live
+compaction run before the provider request with canonical provenance. Other
+built-in styles remain non-executable and fail before journal mutation until
+their node adapters and recovery paths are implemented.
 
 The following documents contradict the implementation and require reconciliation:
 
@@ -29,10 +38,9 @@ The following documents contradict the implementation and require reconciliation
   health-only runtime, harness, and CLI.
 - `docs/architecture/plugin-system.md` and `docs/reference/plugin-sdk.md` say the
   plugin SDK and isolated plugin host do not exist.
-- `docs/architecture/session-styles.md`,
-  `docs/reference/session-style-format.md`, and
-  `docs/guides/creating-a-session-style.md` say the style manifest SDK and
-  built-ins do not exist.
+- `docs/guides/creating-a-session-style.md` still requires reconciliation with
+  the live registry and executable-node subset. The session-style architecture
+  and format references were updated with Phase 3.
 - `docs/architecture/event-pipeline.md` understates the live runtime
   interception path, although style/plugin pipeline assembly is still empty.
 
@@ -177,6 +185,40 @@ Full workspace tests, strict Clippy, formatting, and the 88-package architecture
 check pass. One process-host cancellation test timed out during the first
 workspace run, passed immediately in isolation, and the complete workspace run
 then passed.
+
+## Phase 2 verified result
+
+Completed 2026-07-28 on Windows. `CompiledStyleExecutor` loads the exact retained
+SDK descriptor, verifies all binding hashes and identities, selects graph nodes
+and transitions, and emits canonical initialization, node, and transition
+events. Persistent-chat compatible graphs use this executor while provider,
+tool, permission, receipt, continuation, and recovery behavior remains on the
+existing runtime paths. Unsupported compiled graphs are rejected before turn
+history changes.
+
+## Phase 3 vertical-slice evidence
+
+The initial slice passed its Windows checks on 2026-07-28. Session bindings now retain retrieval timing,
+query construction, memory write policy and injection location, compaction
+budgets, and preservation requirements. The runtime routes no-memory, file, and
+SQLite FTS retrieval through dependency -> data -> logic, applies item/byte and
+scope limits, authorizes context and compaction proposals, and records complete
+memory and projection provenance. No compaction, sliding-window, and
+tool-output-eviction strategies execute live; summary/artifact modes fail
+closed without approved material.
+
+`tests/e2e/runtime_style_context.ps1` passed with file-versus-none context and
+provenance assertions plus 18-turn no-compaction-versus-sliding-window
+comparison. Provider projections differed as configured while canonical
+conversation history remained identical. The matching Unix script was syntax
+checked but has not been executed.
+
+Independent review then identified remaining release-blocking hardening:
+branch-to-no-memory projection cleanup, enforcement of projection and
+preservation limits, exact retrieval lifecycle timing on resumed model calls,
+projection-pressure-based compaction triggering, and stronger storage-isolation,
+SQLite, restart, and boundary E2Es. Phase 3 remains active until those findings
+are resolved and reverified.
 
 ## Later acceptance accounting
 

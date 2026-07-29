@@ -8,38 +8,40 @@ caller, and each layer defines separate request, result, and error types.
 
 | Layer | Current responsibility and principal types |
 |---|---|
-| Service | Maps `RuntimeRequest::Health` to `ServiceHealthRequest`, calls `RuntimeLogicPort`, and maps `ServiceHealthResponse` to `RuntimeResponse`. Other wire requests return `UnsupportedEndpoint`. |
-| Logic | `RuntimeLogic` evaluates health. The `action`, `conversation`, `permission`, and `session` modules implement proposal, projection, policy, and reducer primitives, but are not yet exposed as endpoints. |
-| Data | `RuntimeDataPort` constructs health data. `JournalEventDataPort` maps verified generic events to append/scan/recovery dependency requests. `SnapshotDataPort` normalizes, selects, and verifies versioned snapshots. |
-| Dependency | `LocalRuntimeDependencies` checks storage. `JsonlJournalDependency` implements the journal, `LocalSnapshotDependency` stores immutable snapshots, and `LocalArtifactDependency` implements transactional content-addressed artifacts. |
+| Service | Maps runtime protocol requests for health, styles, sessions, replay/branch, turns, streams, approvals, cancellation, continuations, and schedules into service-owned requests and responses. |
+| Logic | Owns session-style selection and binding, graph interpretation, session and turn state, proposals, permission ordering, context composition, memory/compaction policy, replay, branching, continuations, scheduling, and recovery decisions. |
+| Data | Normalizes style catalogs and caches, session and journal records, memory/context operations, artifacts, snapshots, action grants, continuations, receipts, schedules, and tool/provider routing before selecting dependencies. |
+| Dependency | Owns filesystem and SQLite serialization, journal/snapshot/artifact stores, style manifest and cache files, process supervision, harness and tool-host protocols, plugin-host transport, memory adapters, and scheduler persistence. |
 
 The composition root is `apps/runtime/bin`. It constructs concrete layers and
-executes one health request. `agentmod-runtime-protocol` is the wire contract;
-only its health operation is currently served.
+runs the authenticated local daemon, background scheduler recovery, and process
+supervision. `agentmod-runtime-protocol` is the wire contract; protocol DTOs do
+not enter runtime logic or data.
 
 ## Harness
 
 | Layer | Current responsibility and principal types |
 |---|---|
-| Service | `HarnessService` maps `HarnessCommand::Health` to `ServiceHealthRequest` and maps `HarnessHealthResult` to `ServiceHealthResponse`. |
-| Logic | `HarnessHealthManager` validates requested capability names and classifies readiness as ready, degraded, or unavailable. |
-| Data | `HarnessHealthDataStore` aggregates configured/ready provider counts and capability sets. |
-| Dependency | `StaticProviderCatalogDependency` returns the deterministic mock provider catalog. |
+| Service | Maps harness health, provider execution, continuation, cancellation, stream, and recovery commands at the process boundary. |
+| Logic | Owns provider-call lifecycle, proposal/continuation state, terminal receipt semantics, cancellation, and protocol-independent provider results. |
+| Data | Normalizes provider requests, continuation records, stream fragments, usage, and terminal results before dependency dispatch. |
+| Dependency | Owns provider SDKs and deterministic fixtures plus their external serialization and streaming behavior. |
 
-The composition root is `apps/harness/bin`. Provider execution commands are wire
-types only and currently return an unsupported-command error.
+The composition root is `apps/harness/bin`. Runtime and harness exchange only
+the harness protocol; neither imports the other's internals.
 
 ## CLI
 
 | Layer | Current responsibility and principal types |
 |---|---|
-| Service | `CliService` owns Clap parsing, `ServiceDoctorRequest`, output selection, rendering, and exit-code mapping. |
-| Logic | `CliLogic` evaluates `RunDoctorCommand` and produces `DoctorResult`, `DoctorState`, and checks. |
-| Data | `CliData` maps logic health requests into dependency health requests and normalizes availability. |
-| Dependency | `DeterministicRuntimeClient` constructs and normalizes runtime health wire DTOs without a real transport. |
+| Service | Owns Clap parsing, command-specific service requests, rendering, output mode, and exit-code mapping. |
+| Logic | Owns doctor, style, session, turn, replay/branch, approval, cancellation, and scheduling command decisions using CLI-owned types. |
+| Data | Maps CLI logic operations into dependency requests and normalizes runtime availability and streamed results. |
+| Dependency | Owns authenticated local runtime transport and runtime protocol DTO construction, plus deterministic fixtures used by layer tests. |
 
-The composition root is `apps/cli/bin`. It assembles the layers and runs the
-single implemented `doctor` command.
+The composition root is `apps/cli/bin`. It assembles the layers and exposes the
+implemented doctor, style, session, turn, replay/branch, approval, cancellation,
+and scheduling commands.
 
 ## Allowed and prohibited dependencies
 

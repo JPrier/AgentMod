@@ -14,12 +14,23 @@ The workspace currently contains:
 - a checksummed JSONL journal, content-addressed artifact dependency, canonical
   conversation structures, validated snapshot data/dependency adapters, reducers,
   action proposals, and permission evaluation;
+- an authenticated long-running runtime with durable sessions, replay and
+  branching, streamed turns, approvals, continuations, schedules, receipts, and
+  crash recovery;
+- isolated harness, plugin-host, and first-party tool-host processes connected by
+  versioned protocols;
+- an N-tier session-style registry, immutable per-session style bindings, and a
+  generic compiled-graph executor used by persistent chat;
+- per-session memory retrieval and compaction with canonical projection
+  provenance;
+- protocol-only CLI, TUI, and ACP frontends;
 - deterministic architecture enforcement and intentional violating fixtures.
 
-The runnable binaries are presently health/doctor vertical slices. The runtime
-prints a health response and exits; it is not yet a daemon. The harness reports a
-deterministic provider catalog; it does not call a model API. The CLI implements
-only `doctor` and uses a deterministic runtime client rather than local IPC.
+The runnable runtime is an authenticated local daemon. The CLI and TUI connect
+over local IPC and can discover and select styles, create and inspect sessions,
+run streamed turns, replay and branch history, resolve approvals, cancel work,
+and manage schedules. Deterministic provider, harness, plugin, memory, and tool
+fixtures keep the default suite credential-free.
 
 ## Dependency topology
 
@@ -37,13 +48,14 @@ harness service -> harness wire DTOs
 Composition roots may construct every layer in their own process. Process-layer
 crates may not import another process's internal layer crates.
 
-## Target topology, not yet implemented
+## Partial product integrations
 
-The intended topology has a long-running runtime coordinating separate harness,
-tool-host, plugin-host, scheduler, and frontend processes through authenticated
-versioned protocols. TUI, ACP, tool hosts, plugin host, scheduler, provider
-adapters, MCP, LSP, browser, Git, memory providers, session-style execution, and
-multi-agent orchestration remain planned.
+The process topology is live, but session-style execution is not complete.
+Persistent-chat compatible graphs execute generically; ephemeral turn, research
+loop, planner-worker-reviewer, arbitrary declarative graphs, runtime-managed
+child sessions, plugin-composed pipelines, and per-session harness capability
+selection remain active development. Consult `STATUS.md` for the evidence level
+of each tool host, protocol, recovery path, and frontend surface.
 
 See [Initial maps](initial-maps.md), [N-tier rules](n-tier.md), and
 [Process boundaries](process-boundaries.md).

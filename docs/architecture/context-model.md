@@ -30,6 +30,21 @@ source, score, creation time, injection event, reference, and byte contribution.
 The `SQLite` adapter follows FTS5 `MATCH` with deterministic `rank` ordering.
 
 `agentmod-harness-protocol` defines a smaller provider-visible `ProjectedEntry`
-wire representation. Live runtime retrieval/compaction event coordination,
-memory interceptor dispatch, token accounting, provider-specific serialization,
-and cancellation/rebuild flows remain incomplete.
+wire representation. Before a provider request, runtime logic composes context
+from the session's compiled style. It routes no-memory, file, and SQLite FTS
+retrieval through dependency -> data -> logic; enforces configured timing,
+query, scopes, item and byte limits, and injection location; and records
+provider, query, source, score, reference, byte contribution, injection event,
+and sequence as canonical provenance.
+
+Context construction, context replacement, and compaction are authorized
+through the existing blocking proposal pipeline. Approved projection
+replacement is recorded canonically and never changes immutable conversation
+history. Provider token counters and compaction checkpoints are replay-derived.
+No compaction, sliding-window compaction, and tool-output eviction execute live.
+Typed-summary, artifact-handoff, and context-artifact modes fail closed when no
+approved material is available.
+
+Automatic style-selected memory writes, plugin-provided memory or compaction
+implementations, plugin-composed context transforms, and all cancellation/rebuild
+cases remain integration work.

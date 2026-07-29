@@ -42,12 +42,16 @@ The current authenticated daemon/session vertical slice can be exercised with:
 export AGENTMOD_RUNTIME_AUTH_TOKEN=<private-secret-at-least-32-bytes>
 cargo run -p agentmod-runtime -- serve
 # then, from another terminal:
-cargo run -p agentmod-cli -- session create --workspace . --json
+cargo run -p agentmod-cli -- style list
+cargo run -p agentmod-cli -- session create --workspace . --style persistent-chat --json
 cargo run -p agentmod-cli -- run "hello" --session <id> --json
 ```
 
-On Windows, `tests/e2e/runtime_cli.ps1` builds the two binaries and verifies a
-real named-pipe health/create/list cycle. Unix uses `tests/e2e/runtime_cli.sh`.
+On Windows, `tests/e2e/runtime_cli.ps1`,
+`tests/e2e/runtime_style_registry.ps1`, and
+`tests/e2e/runtime_style_context.ps1` exercise the real daemon over a named
+pipe. Matching Unix scripts exist, but `STATUS.md` records which platforms were
+actually executed.
 
 ## License
 

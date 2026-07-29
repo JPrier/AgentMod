@@ -5,7 +5,7 @@
 )]
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     str::FromStr,
     sync::{Arc, Weak},
@@ -48,9 +48,9 @@ use crate::{
         TextEntry, ToolCallEntry, ToolResultEntry,
     },
     harness::{
-        AuthorizedProviderRequest, ExecuteProviderCommand, ProviderEntry, ProviderEvent,
-        ProviderEventStream, ProviderExecutionError, ProviderExecutionLogic,
-        ProviderExecutionPolicy, ProviderExecutionPort,
+        AuthorizedProviderRequest, ExecuteProviderCommand, ProviderEvent, ProviderEventStream,
+        ProviderExecutionError, ProviderExecutionLogic, ProviderExecutionPolicy,
+        ProviderExecutionPort,
     },
     interception::{InterceptionOutcome, intercept_action},
     memory::{MemoryLogic, MemoryLogicError, MemoryLogicPort, MemoryScope, RetrieveMemoryCommand},
@@ -58,9 +58,15 @@ use crate::{
         CommitDurability, CommitSessionEventCommand, LoadSessionCommand, LoadSessionResult,
         SessionPersistenceLogic, SessionPersistenceLogicError, SessionPersistenceLogicPort,
     },
+    projection::{
+        ProjectionMeasure, ProjectionMeasureError, canonical_json_bytes, measure_projection,
+        project,
+    },
     session::{
         ApprovalRequestedEvent, ApprovalResolvedEvent, ApprovalState,
-        ContextProjectionReplacedEvent, ConversationEntryCommittedEvent,
+        ContextBoundaryCompletedEvent, ContextBoundaryIdentity, ContextBoundaryOrigin,
+        ContextBoundaryStartedEvent, ContextPhaseCompletedEvent, ContextPhaseIdentity,
+        ContextPhaseStartedEvent, ContextProjectionReplacedEvent, ConversationEntryCommittedEvent,
         ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent, ModelRequestCancelledEvent,
         ModelRequestFailedEvent, ModelRequestProposedEvent, ModelRequestStartedEvent,
         ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent, ModelToolCallProposedEvent,
@@ -71,7 +77,7 @@ use crate::{
         StyleNodeEnteredEvent, StyleNodeFailedEvent, StyleTransitionSelectedEvent,
         ToolCallApprovedEvent, ToolCallProposedEvent, ToolExecutionCompletedEvent,
         ToolExecutionDispatchedEvent, ToolExecutionFailedEvent, ToolExecutionStartedEvent,
-        ToolExecutionState, ToolOutputObservedEvent, reduce,
+        ToolExecutionState, ToolExecutionTerminalOutcome, ToolOutputObservedEvent, reduce,
     },
     style_executor::{
         CompiledStyleExecutor, StyleExecutorError, StyleNodeCursor, StyleNodeDirective,
@@ -85,8 +91,22 @@ use crate::{
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_STEPS: usize = 16;
 const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
-const MAX_MEMORY_QUERY_BYTES: usize = 8 * 1024;
+const MAX_MEMORY_QUERY_BYTES: usize = 1024 * 1024;
 const DEFAULT_SLIDING_WINDOW_ENTRIES: usize = 32;
+const MAX_PROVIDER_PROJECTION_BYTES: u64 = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContextCompositionBoundary {
+    TurnStart,
+    BeforeModelRequest,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContextCompositionOrigin {
+    UserTurn,
+    ToolContinuation,
+    ApprovalContinuation,
+}
 
 fn process_reconciliation_id(action: &crate::action::ToolCallAction) -> Option<String> {
     (action.tool == "process.reattach")
@@ -530,71 +550,138 @@ where
             &session_directory,
             preflight,
         )?;
-        let style_driven = match preflight.state.style_binding.as_ref() {
+        let (style_driven, resume_context) = match preflight.state.style_binding.as_ref() {
             Some(binding) => {
                 let executor = CompiledStyleExecutor::from_binding(binding)
                     .map_err(RunTurnError::StyleExecutor)?;
                 if !executor.supports_persistent_turn() {
                     return Err(RunTurnError::UnsupportedStyleExecution(binding.id.clone()));
                 }
-                if let Some(execution) = &preflight.state.style_execution {
-                    if let Some(active) = &execution.active_node {
-                        return Err(RunTurnError::StyleRecoveryRequired(active.node_id.clone()));
-                    }
-                    if execution.termination_reason.is_some() {
-                        return Err(RunTurnError::StyleExecutionTerminal);
+                match binding.memory.retrieval_timing.as_str() {
+                    "never"
+                    | "turnstart"
+                    | "turn_start"
+                    | "beforemodelrequest"
+                    | "before_model_request" => {}
+                    unsupported => {
+                        return Err(RunTurnError::UnsupportedMemoryRetrievalTiming(
+                            unsupported.to_owned(),
+                        ));
                     }
                 }
-                true
+                if let Some(execution) = &preflight.state.style_execution {
+                    if let Some(active) = &execution.active_node {
+                        if !recoverable_context_retry(&preflight.state, &command) {
+                            return Err(RunTurnError::StyleRecoveryRequired(
+                                active.node_id.clone(),
+                            ));
+                        }
+                        if execution.termination_reason.is_some() {
+                            return Err(RunTurnError::StyleExecutionTerminal);
+                        }
+                        (true, true)
+                    } else {
+                        if execution.termination_reason.is_some() {
+                            return Err(RunTurnError::StyleExecutionTerminal);
+                        }
+                        (true, false)
+                    }
+                } else {
+                    (true, false)
+                }
             }
-            None => false,
+            None => (false, false),
         };
         if let Some(scheduled) = scheduled {
             self.commit_scheduler_fired(&persistence, session_id, &session_directory, scheduled)?;
         }
-        let (state, user_sequence, user_event) =
-            self.commit_user(&persistence, session_id, &session_directory, &command)?;
-        // The service boundary rejects legacy unbound sessions before they
-        // reach this path. Keeping the internal fallback preserves replay and
-        // focused logic fixtures without silently migrating durable sessions.
-        let mut style_turn = style_driven
-            .then(|| {
-                self.begin_style_turn(
-                    &persistence,
-                    session_id,
-                    &session_directory,
-                    &state,
-                    JournalPosition {
-                        sequence: user_sequence,
-                        event_id: user_event.metadata.event_id,
-                    },
-                )
-            })
-            .transpose()?;
-        let provider_position = style_turn.as_ref().map_or(
-            JournalPosition {
-                sequence: user_sequence,
-                event_id: user_event.metadata.event_id,
-            },
-            |execution| execution.position,
-        );
+        let (state, user_sequence, mut style_turn, provider_position) = if resume_context {
+            let user_sequence = current_run_user_sequence(&preflight.state, &command)?;
+            let position = JournalPosition {
+                sequence: preflight.state.last_sequence,
+                event_id: preflight.last_event_id,
+            };
+            let style_turn = Self::resume_active_style_turn(&preflight.state, position)?;
+            (preflight.state, user_sequence, style_turn, position)
+        } else {
+            let (state, user_sequence, user_event) =
+                self.commit_user(&persistence, session_id, &session_directory, &command)?;
+            // The service boundary rejects legacy unbound sessions before they
+            // reach this path. Keeping the internal fallback preserves replay
+            // and focused logic fixtures without silently migrating sessions.
+            let style_turn = style_driven
+                .then(|| {
+                    self.begin_style_turn(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &state,
+                        JournalPosition {
+                            sequence: user_sequence,
+                            event_id: user_event.metadata.event_id,
+                        },
+                    )
+                })
+                .transpose()?;
+            let position = style_turn.as_ref().map_or(
+                JournalPosition {
+                    sequence: user_sequence,
+                    event_id: user_event.metadata.event_id,
+                },
+                |execution| execution.position,
+            );
+            (state, user_sequence, style_turn, position)
+        };
         let state = if style_turn.is_some() {
             Self::load_state(&persistence, session_id, &session_directory)?
         } else {
             state
         };
         let (state, provider_position) = if style_turn.is_some() {
-            match self
-                .compose_style_context(
+            let composed = async {
+                if resume_context
+                    && latest_context_boundary_at_head(&state)
+                        .is_some_and(|identity| identity.boundary == "before_model_request")
+                {
+                    return self
+                        .compose_style_context(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            state,
+                            provider_position,
+                            &command,
+                            ContextCompositionBoundary::BeforeModelRequest,
+                            ContextCompositionOrigin::UserTurn,
+                        )
+                        .await;
+                }
+                let (state, position) = self
+                    .compose_style_context(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        state,
+                        provider_position,
+                        &command,
+                        ContextCompositionBoundary::TurnStart,
+                        ContextCompositionOrigin::UserTurn,
+                    )
+                    .await?;
+                self.compose_style_context(
                     &persistence,
                     session_id,
                     &session_directory,
                     state,
-                    provider_position,
+                    position,
                     &command,
+                    ContextCompositionBoundary::BeforeModelRequest,
+                    ContextCompositionOrigin::UserTurn,
                 )
                 .await
-            {
+            }
+            .await;
+            match composed {
                 Ok(value) => value,
                 Err(error) => {
                     if let Some(execution) = style_turn.as_ref() {
@@ -925,12 +1012,22 @@ where
             .tool_executions
             .get(&payload_ref.call_id)
             .cloned();
-        let recovery = approval_recovery_action(
+        let mut recovery = approval_recovery_action(
             resolved.transitioned,
             resolved.disposition,
             approval_state,
             execution_record.as_ref().map(|execution| execution.state),
         );
+        let tool_already_terminal = execution_record
+            .as_ref()
+            .is_some_and(|execution| execution.state == ToolExecutionState::Terminal);
+        if recovery == ApprovalRecoveryAction::Idempotent
+            && command.resume_after_resolution
+            && tool_already_terminal
+            && pending_model_resume_after_terminal_tool(&loaded.state, execution_record.as_ref())?
+        {
+            recovery = ApprovalRecoveryAction::Resume;
+        }
         let commit_resolution = match recovery {
             ApprovalRecoveryAction::CommitAndResume => true,
             ApprovalRecoveryAction::Resume | ApprovalRecoveryAction::Reconcile => false,
@@ -1001,83 +1098,97 @@ where
                 style: payload.style,
             })
             .map_err(RunTurnError::Tool)?;
+        let recovery_action_digest = prepared
+            .original
+            .digest()
+            .map_err(|_| RunTurnError::Event)?;
         let ConsequentialAction::ToolCall(action) = &prepared.original.action else {
             return Err(RunTurnError::InvalidContinuationPayload);
         };
         if resolved.disposition == ApprovalDisposition::Approved {
-            let authorized = self
-                .tools
-                .approve_pending(PrepareToolCommand {
-                    session_id: resumed_turn.session_id.clone(),
-                    workspace: PathBuf::from(prepared.original.workspace.clone()),
-                    call_id: payload.call_id.clone(),
-                    tool: action.tool.clone(),
-                    arguments: action.arguments.clone(),
-                    cancellation_id: resumed_turn.cancellation_id.clone(),
-                    style: prepared.original.style.clone(),
-                })
-                .map_err(RunTurnError::Tool)?;
-            let tool_result = self
-                .execute_authorized_tool(
-                    &persistence,
-                    session_id,
-                    &session_directory,
-                    position,
-                    &payload.call_id,
-                    authorized,
-                    dispatch_mode,
-                )
-                .await?;
-            position = tool_result.position;
-            if tool_result.cancelled {
-                let events = vec![ProviderEvent::Cancelled];
-                let (last_committed_sequence, _) = self.commit_provider_events(
-                    &persistence,
-                    session_id,
-                    &session_directory,
-                    position.sequence,
-                    position.event_id,
-                    &resumed_turn.cancellation_id,
-                    &events,
-                )?;
-                let last_committed_sequence = self
-                    .fail_active_bound_style_at_head(
+            if !tool_already_terminal {
+                let authorized = self
+                    .tools
+                    .approve_pending(PrepareToolCommand {
+                        session_id: resumed_turn.session_id.clone(),
+                        workspace: PathBuf::from(prepared.original.workspace.clone()),
+                        call_id: payload.call_id.clone(),
+                        tool: action.tool.clone(),
+                        arguments: action.arguments.clone(),
+                        cancellation_id: resumed_turn.cancellation_id.clone(),
+                        style: prepared.original.style.clone(),
+                    })
+                    .map_err(RunTurnError::Tool)?;
+                let tool_result = self
+                    .execute_authorized_tool(
                         &persistence,
                         session_id,
                         &session_directory,
-                        "model_request_cancelled",
-                    )?
-                    .map_or(last_committed_sequence, |position| position.sequence);
-                return Ok(ResolveTurnApprovalResult {
-                    transitioned: true,
-                    events,
-                    last_committed_sequence,
-                    awaiting_continuation: None,
-                });
+                        position,
+                        &payload.call_id,
+                        authorized,
+                        dispatch_mode,
+                    )
+                    .await?;
+                position = tool_result.position;
+                if tool_result.cancelled {
+                    let events = vec![ProviderEvent::Cancelled];
+                    let (last_committed_sequence, _) = self.commit_provider_events(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        position.sequence,
+                        position.event_id,
+                        &resumed_turn.cancellation_id,
+                        &events,
+                    )?;
+                    let last_committed_sequence = self
+                        .fail_active_bound_style_at_head(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            "model_request_cancelled",
+                        )?
+                        .map_or(last_committed_sequence, |position| position.sequence);
+                    return Ok(ResolveTurnApprovalResult {
+                        transitioned: true,
+                        events,
+                        last_committed_sequence,
+                        awaiting_continuation: None,
+                    });
+                }
             }
-        } else {
+        } else if !tool_already_terminal {
             (position.sequence, position.event_id) = self.commit_tool_failure(
                 &persistence,
                 session_id,
                 &session_directory,
                 position,
                 &payload.call_id,
+                Some(recovery_action_digest),
                 "permission_denied",
                 "user denied the requested action",
                 false,
             )?;
-            position = self.commit_tool_conversation(
-                &persistence,
-                session_id,
-                &session_directory,
-                position,
-                &payload.call_id,
-                action,
-                &json!({"error":{"code":"permission_denied","message":"user denied the requested action"}}),
-                None,
-                false,
-            )?;
         }
+        let state_after_terminal = Self::load_state(&persistence, session_id, &session_directory)?;
+        let terminal = state_after_terminal
+            .tool_executions
+            .get(&payload.call_id)
+            .ok_or_else(|| {
+                RunTurnError::ToolConversationRecoveryConflict(payload.call_id.clone())
+            })?;
+        position = self.repair_terminal_tool_conversation(
+            &persistence,
+            session_id,
+            &session_directory,
+            &state_after_terminal,
+            position,
+            &payload.call_id,
+            action,
+            recovery_action_digest,
+            terminal,
+        )?;
         if !command.resume_after_resolution {
             let events = vec![ProviderEvent::Cancelled];
             let (last_committed_sequence, _) = self.commit_provider_events(
@@ -1161,13 +1272,39 @@ where
                 }
             }
         }
-        let state = persistence
+        let mut state = persistence
             .load_session(LoadSessionCommand {
                 session_directory: session_directory.clone(),
                 expected_session_id: session_id,
             })
             .map_err(RunTurnError::Persistence)?
             .state;
+        if state.style_binding.is_some() {
+            let composed = self
+                .compose_style_context(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    state,
+                    position,
+                    &resumed_turn,
+                    ContextCompositionBoundary::BeforeModelRequest,
+                    ContextCompositionOrigin::ApprovalContinuation,
+                )
+                .await;
+            match composed {
+                Ok(value) => (state, position) = value,
+                Err(error) => {
+                    self.fail_active_bound_style_at_head(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        "context_composition_failed",
+                    )?;
+                    return Err(error);
+                }
+            }
+        }
         let mut style_turn = Self::resume_active_style_turn(&state, position)?;
         let authorized = self
             .authorize_and_commit(
@@ -1515,7 +1652,7 @@ where
                 result.deferred_approval_count += 1;
                 continue;
             }
-            if execution.execution_id != receipt.execution_id {
+            if execution.execution_id.as_deref() != Some(receipt.execution_id.as_str()) {
                 return Err(RunTurnError::InvalidRecoveryReceipt(receipt.call_id));
             }
             let authorized = self
@@ -1534,8 +1671,8 @@ where
                 .executable
                 .digest()
                 .map_err(|_| RunTurnError::Event)?;
-            if digest != execution.action_digest
-                || authorized.original.id.0 != execution.execution_id
+            if execution.action_digest != Some(digest)
+                || execution.execution_id.as_deref() != Some(authorized.original.id.0.as_str())
             {
                 return Err(RunTurnError::InvalidRecoveryReceipt(receipt.call_id));
             }
@@ -1571,6 +1708,7 @@ where
         + agentmod_runtime_data::tool::ToolDataPort,
 {
     #[allow(
+        clippy::too_many_arguments,
         clippy::too_many_lines,
         reason = "context composition keeps proposal authorization, bounded retrieval, canonical replacement, and compaction ordering explicit"
     )]
@@ -1582,83 +1720,117 @@ where
         mut state: crate::session::SessionState,
         mut position: JournalPosition,
         command: &RunTurnCommand,
+        boundary: ContextCompositionBoundary,
+        origin: ContextCompositionOrigin,
     ) -> Result<(crate::session::SessionState, JournalPosition), RunTurnError> {
         let binding = state
             .style_binding
             .clone()
             .ok_or(RunTurnError::StyleMigrationRequired)?;
+        let (next_state, next_position, boundary_identity, completed_phases, already_completed) =
+            self.begin_or_resume_context_boundary(
+                persistence,
+                session_id,
+                session_directory,
+                &state,
+                position,
+                command,
+                boundary,
+                origin,
+            )?;
+        state = next_state;
+        position = next_position;
+        if already_completed {
+            return Ok((state, position));
+        }
+        let timing = binding.memory.retrieval_timing.as_str();
         let retrieve_now = matches!(
-            binding.memory.retrieval_timing.as_str(),
-            "turnstart" | "turn_start" | "beforemodelrequest" | "before_model_request"
-        );
-        if binding.memory.provider != "none"
-            && retrieve_now
-            && binding.memory.injection_location != "none"
-        {
-            if matches!(
-                binding.memory.injection_location.as_str(),
-                "contextartifact" | "context_artifact"
-            ) {
-                return Err(RunTurnError::MemoryContextArtifactRequired);
-            }
-            let query = construct_memory_query(&binding, &state, command)?;
-            self.authorize_style_action(
-                ActionProposal {
-                    id: ProposalId(format!("context-memory:{}", command.cancellation_id)),
-                    action: ConsequentialAction::ContextConstruction {
-                        strategy: format!("memory:{}", binding.memory.provider),
-                    },
-                    style: binding.id.clone(),
-                    workspace: state.workspace.clone(),
-                    origin: String::from("runtime"),
-                },
-                "memory retrieval",
+            (timing, boundary),
+            (
+                "turnstart" | "turn_start",
+                ContextCompositionBoundary::TurnStart
+            ) | (
+                "beforemodelrequest" | "before_model_request",
+                ContextCompositionBoundary::BeforeModelRequest
             )
-            .await?;
-            let identity = self
-                .data
-                .allocate_event_identity(AllocateEventIdentityDataRequest)
-                .map_err(RunTurnError::Identity)?;
+        );
+        let normalize_memory = boundary == ContextCompositionBoundary::TurnStart || retrieve_now;
+        if !completed_phases.iter().any(|phase| phase == "memory") {
+            if context_phase_started(&state, &boundary_identity, "memory") {
+                return Err(RunTurnError::AmbiguousContextPhase(String::from("memory")));
+            }
+            let memory_phase = ContextPhaseIdentity {
+                boundary: boundary_identity.clone(),
+                phase: String::from("memory"),
+            };
+            position = self.commit_context_phase_started(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                memory_phase.clone(),
+            )?;
+            state = Self::load_state(persistence, session_id, session_directory)?;
+            let mut replacement =
+                projection_without_retrieved_memory(state.conversation.provider_projection());
+            let should_retrieve = binding.memory.provider != "none"
+                && retrieve_now
+                && binding.memory.injection_location != "none";
+            let mut reserved_identity = None;
             let injection_sequence = position
                 .sequence
                 .checked_next()
                 .map_err(|_| RunTurnError::SequenceOverflow)?;
-            let mut replacement = state
-                .conversation
-                .provider_projection()
-                .iter()
-                .filter(|entry| !matches!(entry, ConversationEntry::RetrievedMemory(_)))
-                .cloned()
-                .collect::<Vec<_>>();
-            let had_previous_memory =
-                replacement.len() != state.conversation.provider_projection().len();
-            let memory = MemoryLogic::new(self.data.clone());
-            let mut retrieved_entries = Vec::new();
-            let mut remaining_items = usize::try_from(binding.memory.max_items)
-                .map_err(|_| RunTurnError::MemoryBoundOverflow)?;
-            let mut remaining_bytes = binding.memory.max_injected_bytes;
-            for scope in &binding.memory.scopes {
-                if remaining_items == 0 || remaining_bytes == 0 {
-                    break;
+            if normalize_memory && should_retrieve {
+                let identity = self
+                    .data
+                    .allocate_event_identity(AllocateEventIdentityDataRequest)
+                    .map_err(RunTurnError::Identity)?;
+                reserved_identity = Some(identity);
+                if matches!(
+                    binding.memory.injection_location.as_str(),
+                    "contextartifact" | "context_artifact"
+                ) {
+                    return Err(RunTurnError::MemoryContextArtifactRequired);
                 }
-                let scope = memory_scope(scope, session_id, &state.workspace)?;
-                let items = memory
-                    .retrieve_memory(RetrieveMemoryCommand {
-                        provider: binding.memory.provider.clone(),
-                        scope,
-                        query: query.clone(),
-                        limit: remaining_items,
-                        injection_event: identity.event_id,
-                    })
-                    .map_err(RunTurnError::Memory)?;
-                for item in items {
-                    if item.size.get() > remaining_bytes {
-                        continue;
+                let query = construct_memory_query(&binding, &state, command)?;
+                self.authorize_style_action(
+                    ActionProposal {
+                        id: ProposalId(format!("context-memory:{}", command.cancellation_id)),
+                        action: ConsequentialAction::ContextConstruction {
+                            strategy: format!("memory:{}", binding.memory.provider),
+                        },
+                        style: binding.id.clone(),
+                        workspace: state.workspace.clone(),
+                        origin: String::from("runtime"),
+                    },
+                    "memory retrieval",
+                )
+                .await?;
+                let memory = MemoryLogic::new(self.data.clone());
+                let mut retrieved_entries = Vec::new();
+                let mut remaining_items = usize::try_from(binding.memory.max_items)
+                    .map_err(|_| RunTurnError::MemoryBoundOverflow)?;
+                let mut remaining_bytes = binding.memory.max_injected_bytes;
+                for scope in &binding.memory.scopes {
+                    if remaining_items == 0 || remaining_bytes == 0 {
+                        break;
                     }
-                    remaining_bytes -= item.size.get();
-                    remaining_items -= 1;
-                    retrieved_entries.push(ConversationEntry::RetrievedMemory(
-                        RetrievedMemoryEntry {
+                    let scope = memory_scope(scope, session_id, &state.workspace)?;
+                    let items = memory
+                        .retrieve_memory(RetrieveMemoryCommand {
+                            provider: binding.memory.provider.clone(),
+                            scope,
+                            query: query.clone(),
+                            limit: remaining_items,
+                            injection_event: identity.event_id,
+                        })
+                        .map_err(RunTurnError::Memory)?;
+                    for item in items {
+                        if remaining_items == 0 {
+                            break;
+                        }
+                        let entry = ConversationEntry::RetrievedMemory(RetrievedMemoryEntry {
                             id: ConversationEntryId(format!(
                                 "memory:{}:{}:{}",
                                 binding.memory.provider,
@@ -1676,21 +1848,42 @@ where
                             injection_event: Some(item.injection_event),
                             created_at_millis: item.created_at.get(),
                             size_bytes: item.size.get(),
-                        },
-                    ));
-                    if remaining_items == 0 {
-                        break;
+                        });
+                        let (entry, contribution) = memory_entry_with_serialized_size(entry)?;
+                        if contribution > remaining_bytes {
+                            continue;
+                        }
+                        remaining_bytes = remaining_bytes
+                            .checked_sub(contribution)
+                            .ok_or(RunTurnError::MemoryBoundOverflow)?;
+                        remaining_items = remaining_items
+                            .checked_sub(1)
+                            .ok_or(RunTurnError::MemoryBoundOverflow)?;
+                        retrieved_entries.push(entry);
                     }
                 }
+                inject_memory(
+                    &mut replacement,
+                    retrieved_entries,
+                    &binding.memory.injection_location,
+                )?;
             }
-            inject_memory(
-                &mut replacement,
-                retrieved_entries,
-                &binding.memory.injection_location,
-            )?;
-            if had_previous_memory
-                || replacement.len() != state.conversation.provider_projection().len()
-            {
+            if replacement == state.conversation.provider_projection() {
+                position = self.commit_context_phase_completed(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position,
+                    memory_phase,
+                )?;
+            } else {
+                let identity = match reserved_identity {
+                    Some(identity) => identity,
+                    None => self
+                        .data
+                        .allocate_event_identity(AllocateEventIdentityDataRequest)
+                        .map_err(RunTurnError::Identity)?,
+                };
                 let provenance = ProjectionProvenance {
                     projection_id: format!(
                         "memory:{}:{}",
@@ -1718,94 +1911,319 @@ where
                     identity,
                     replacement,
                     provenance,
+                    Some(memory_phase),
                 )?;
-                state = Self::load_state(persistence, session_id, session_directory)?;
             }
+            state = Self::load_state(persistence, session_id, session_directory)?;
         }
 
-        let Some(trigger_tokens) = binding.compaction.trigger_tokens else {
-            return Ok((state, position));
-        };
-        if binding.compaction.strategy == "none" {
-            return Ok((state, position));
+        if boundary != ContextCompositionBoundary::BeforeModelRequest {
+            return self.complete_context_boundary(
+                persistence,
+                session_id,
+                session_directory,
+                &state,
+                position,
+                boundary_identity,
+            );
         }
+        let projection_measure = measure_projection(state.conversation.provider_projection())
+            .map_err(map_projection_measure_error)?;
+        let projection_limit = effective_projection_limit(&binding.compaction)?;
+        let pressure_triggered = binding
+            .compaction
+            .trigger_tokens
+            .is_some_and(|trigger| projection_measure.estimated_tokens >= trigger);
+        let over_limit =
+            projection_limit.is_some_and(|limit| projection_measure.estimated_tokens > limit);
+        let over_byte_cap = projection_measure.serialized_bytes > MAX_PROVIDER_PROJECTION_BYTES;
+        if !completed_phases.iter().any(|phase| phase == "compaction") {
+            if context_phase_started(&state, &boundary_identity, "compaction") {
+                return Err(RunTurnError::AmbiguousContextPhase(String::from(
+                    "compaction",
+                )));
+            }
+            let phase = ContextPhaseIdentity {
+                boundary: boundary_identity.clone(),
+                phase: String::from("compaction"),
+            };
+            position = self.commit_context_phase_started(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                phase.clone(),
+            )?;
+            state = Self::load_state(persistence, session_id, session_directory)?;
+            if pressure_triggered || over_limit || over_byte_cap {
+                if binding.compaction.strategy == "none" {
+                    if over_byte_cap {
+                        return Err(RunTurnError::ProviderProjectionByteLimitExceeded {
+                            serialized_bytes: projection_measure.serialized_bytes,
+                            limit: MAX_PROVIDER_PROJECTION_BYTES,
+                        });
+                    }
+                    return Err(RunTurnError::ProviderProjectionLimitExceeded {
+                        estimated_tokens: projection_measure.estimated_tokens,
+                        limit: projection_limit.unwrap_or(0),
+                    });
+                }
+                self.authorize_style_action(
+                    ActionProposal {
+                        id: ProposalId(format!("compaction:{}", command.cancellation_id)),
+                        action: ConsequentialAction::Compaction {
+                            strategy: binding.compaction.strategy.clone(),
+                        },
+                        style: binding.id.clone(),
+                        workspace: state.workspace.clone(),
+                        origin: String::from("runtime"),
+                    },
+                    "compaction",
+                )
+                .await?;
+                let committed_at = position
+                    .sequence
+                    .checked_next()
+                    .map_err(|_| RunTurnError::SequenceOverflow)?;
+                let context = CompactionContext {
+                    projection_id: format!(
+                        "compaction:{}:{}",
+                        command.cancellation_id,
+                        committed_at.get()
+                    ),
+                    committed_at,
+                };
+                let mut plan = match binding.compaction.strategy.as_str() {
+                    "sliding_window" => compact_sliding_window_to_bound(
+                        &state.conversation,
+                        &binding.compaction.preservation_requirements,
+                        projection_limit,
+                        &context,
+                    )?,
+                    "tool_output_eviction" => compact_projection(
+                        &state.conversation,
+                        CompactionStrategy::ToolOutputEviction {
+                            max_visible_bytes: MAX_TOOL_RESULT_BYTES,
+                        },
+                        context,
+                    )
+                    .map_err(RunTurnError::Compaction)?,
+                    "summary" => return Err(RunTurnError::ApprovedSummaryRequired),
+                    "artifact_handoff" => {
+                        return Err(RunTurnError::ApprovedArtifactHandoffRequired);
+                    }
+                    _ => {
+                        return Err(RunTurnError::UnsupportedCompactionStrategy(
+                            binding.compaction.strategy,
+                        ));
+                    }
+                };
+                validate_projection_preservation(
+                    state.conversation.provider_projection(),
+                    &plan.replacement,
+                    &binding.compaction.preservation_requirements,
+                )?;
+                validate_projection_measure(&plan.replacement, projection_limit)?;
+                self.authorize_context_replacement(
+                    &binding.id,
+                    &state.workspace,
+                    &command.cancellation_id,
+                    "compaction",
+                    &plan.replacement,
+                )
+                .await?;
+                plan.provenance.committed_at = committed_at;
+                let (sequence, event_id) = self.commit_next(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position.sequence,
+                    position.event_id,
+                    RuntimeCommittedEvent::ContextProjectionReplaced(
+                        ContextProjectionReplacedEvent {
+                            replacement: plan.replacement,
+                            provenance: plan.provenance,
+                            context_phase: Some(phase),
+                        },
+                    ),
+                )?;
+                position = JournalPosition { sequence, event_id };
+            } else {
+                position = self.commit_context_phase_completed(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position,
+                    phase,
+                )?;
+            }
+            state = Self::load_state(persistence, session_id, session_directory)?;
+        }
+        self.complete_context_boundary(
+            persistence,
+            session_id,
+            session_directory,
+            &state,
+            position,
+            boundary_identity,
+        )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "boundary recovery binds the exact session, journal head, run command, and lifecycle boundary"
+    )]
+    fn begin_or_resume_context_boundary(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        state: &crate::session::SessionState,
+        position: JournalPosition,
+        command: &RunTurnCommand,
+        boundary: ContextCompositionBoundary,
+        origin: ContextCompositionOrigin,
+    ) -> Result<
+        (
+            crate::session::SessionState,
+            JournalPosition,
+            ContextBoundaryIdentity,
+            Vec<String>,
+            bool,
+        ),
+        RunTurnError,
+    > {
         let execution = state
             .style_execution
             .as_ref()
             .ok_or(RunTurnError::StyleGraphMismatch)?;
-        let observed_tokens = execution
-            .input_tokens
-            .checked_add(execution.output_tokens)
-            .ok_or(RunTurnError::StyleTokenUsageOverflow)?;
-        if observed_tokens.saturating_sub(execution.tokens_at_last_compaction) < trigger_tokens {
-            return Ok((state, position));
-        }
-        self.authorize_style_action(
-            ActionProposal {
-                id: ProposalId(format!("compaction:{}", command.cancellation_id)),
-                action: ConsequentialAction::Compaction {
-                    strategy: binding.compaction.strategy.clone(),
-                },
-                style: binding.id.clone(),
-                workspace: state.workspace.clone(),
-                origin: String::from("runtime"),
-            },
-            "compaction",
-        )
-        .await?;
-        let strategy = match binding.compaction.strategy.as_str() {
-            "sliding_window" => CompactionStrategy::SlidingWindow {
-                max_recent_entries: DEFAULT_SLIDING_WINDOW_ENTRIES,
-            },
-            "tool_output_eviction" => CompactionStrategy::ToolOutputEviction {
-                max_visible_bytes: MAX_TOOL_RESULT_BYTES,
-            },
-            "summary" => return Err(RunTurnError::ApprovedSummaryRequired),
-            "artifact_handoff" => return Err(RunTurnError::ApprovedArtifactHandoffRequired),
-            _ => {
-                return Err(RunTurnError::UnsupportedCompactionStrategy(
-                    binding.compaction.strategy,
-                ));
-            }
+        let active = execution
+            .active_node
+            .as_ref()
+            .ok_or(RunTurnError::StyleGraphMismatch)?;
+        let boundary_name = match boundary {
+            ContextCompositionBoundary::TurnStart => "turn_start",
+            ContextCompositionBoundary::BeforeModelRequest => "before_model_request",
         };
-        let committed_at = position
-            .sequence
-            .checked_next()
-            .map_err(|_| RunTurnError::SequenceOverflow)?;
-        let plan = compact_projection(
-            &state.conversation,
-            strategy,
-            CompactionContext {
-                projection_id: format!(
-                    "compaction:{}:{}",
-                    command.cancellation_id,
-                    committed_at.get()
-                ),
-                committed_at,
-            },
-        )
-        .map_err(RunTurnError::Compaction)?;
-        self.authorize_context_replacement(
-            &binding.id,
-            &state.workspace,
-            &command.cancellation_id,
-            "compaction",
-            &plan.replacement,
-        )
-        .await?;
+        if let Some(existing) = execution.context_boundaries.iter().rev().find(|candidate| {
+            candidate.identity.node_id == active.node_id
+                && candidate.identity.boundary == boundary_name
+                && candidate.identity.run_id == command.cancellation_id
+                && candidate.identity.origin == boundary_origin(origin)
+                && current_context_request_hash(state, command)
+                    .is_ok_and(|hash| hash == candidate.identity.request_hash)
+                && candidate.last_sequence == position.sequence
+        }) {
+            let identity = existing.identity.clone();
+            let completed_phases = existing.completed_phases.clone();
+            let completed = existing.completed_at.is_some();
+            return Ok((
+                state.clone(),
+                position,
+                identity,
+                completed_phases,
+                completed,
+            ));
+        }
+        let request_hash = current_context_request_hash(state, command)?;
+        let identity = ContextBoundaryIdentity {
+            node_id: active.node_id.clone(),
+            boundary: boundary_name.into(),
+            run_id: command.cancellation_id.clone(),
+            origin: boundary_origin(origin),
+            request_hash,
+            source_head: position.sequence,
+        };
         let (sequence, event_id) = self.commit_next(
             persistence,
             session_id,
             session_directory,
             position.sequence,
             position.event_id,
-            RuntimeCommittedEvent::ContextProjectionReplaced(ContextProjectionReplacedEvent {
-                replacement: plan.replacement,
-                provenance: plan.provenance,
+            RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                identity: identity.clone(),
             }),
         )?;
-        position = JournalPosition { sequence, event_id };
-        state = Self::load_state(persistence, session_id, session_directory)?;
+        let position = JournalPosition { sequence, event_id };
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        Ok((state, position, identity, Vec::new(), false))
+    }
+
+    fn commit_context_phase_completed(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        position: JournalPosition,
+        identity: ContextPhaseIdentity,
+    ) -> Result<JournalPosition, RunTurnError> {
+        let (sequence, event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextPhaseCompleted(ContextPhaseCompletedEvent { identity }),
+        )?;
+        Ok(JournalPosition { sequence, event_id })
+    }
+
+    fn commit_context_phase_started(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        position: JournalPosition,
+        identity: ContextPhaseIdentity,
+    ) -> Result<JournalPosition, RunTurnError> {
+        let (sequence, event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextPhaseStarted(ContextPhaseStartedEvent { identity }),
+        )?;
+        Ok(JournalPosition { sequence, event_id })
+    }
+
+    fn complete_context_boundary(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        state: &crate::session::SessionState,
+        position: JournalPosition,
+        identity: ContextBoundaryIdentity,
+    ) -> Result<(crate::session::SessionState, JournalPosition), RunTurnError> {
+        let limit = effective_projection_limit(
+            &state
+                .style_binding
+                .as_ref()
+                .ok_or(RunTurnError::StyleMigrationRequired)?
+                .compaction,
+        )?;
+        let measure = if identity.boundary == "before_model_request" {
+            validate_projection_measure(state.conversation.provider_projection(), limit)?
+        } else {
+            measure_projection(state.conversation.provider_projection())
+                .map_err(map_projection_measure_error)?
+        };
+        let (sequence, event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextBoundaryCompleted(ContextBoundaryCompletedEvent {
+                identity,
+                projection_hash: measure.projection_hash,
+                estimated_tokens: measure.estimated_tokens,
+                serialized_bytes: measure.serialized_bytes,
+            }),
+        )?;
+        let position = JournalPosition { sequence, event_id };
+        let state = Self::load_state(persistence, session_id, session_directory)?;
         Ok((state, position))
     }
 
@@ -1879,6 +2297,7 @@ where
         identity: EventIdentityDataRecord,
         replacement: Vec<ConversationEntry>,
         provenance: ProjectionProvenance,
+        context_phase: Option<ContextPhaseIdentity>,
     ) -> Result<JournalPosition, RunTurnError> {
         let event = Self::seal_event_with_identity(
             session_id,
@@ -1888,6 +2307,7 @@ where
             RuntimeCommittedEvent::ContextProjectionReplaced(ContextProjectionReplacedEvent {
                 replacement,
                 provenance,
+                context_phase,
             }),
         )?;
         let position = JournalPosition {
@@ -2150,12 +2570,40 @@ where
                     }
                 }
             }
-            let loaded = persistence
+            let mut loaded = persistence
                 .load_session(LoadSessionCommand {
                     session_directory: session_directory.to_owned(),
                     expected_session_id: session_id,
                 })
                 .map_err(RunTurnError::Persistence)?;
+            if loaded.state.style_binding.is_some() {
+                let composed = self
+                    .compose_style_context(
+                        persistence,
+                        session_id,
+                        session_directory,
+                        loaded.state,
+                        position,
+                        command,
+                        ContextCompositionBoundary::BeforeModelRequest,
+                        ContextCompositionOrigin::ToolContinuation,
+                    )
+                    .await;
+                let (state, composed_position) = match composed {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.fail_active_bound_style_at_head(
+                            persistence,
+                            session_id,
+                            session_directory,
+                            "context_composition_failed",
+                        )?;
+                        return Err(error);
+                    }
+                };
+                loaded.state = state;
+                position = composed_position;
+            }
             let stream = self
                 .provider
                 .continue_execution_stream(
@@ -2320,6 +2768,10 @@ where
             return Err(RunTurnError::Tool(ToolExecutionError::InvalidReplacement));
         };
         let original_action = original_action.clone();
+        let original_action_digest = prepared
+            .original
+            .digest()
+            .map_err(|_| RunTurnError::Event)?;
         (position.sequence, position.event_id) = self.commit_next(
             persistence,
             session_id,
@@ -2387,6 +2839,7 @@ where
                     session_directory,
                     position,
                     call_id,
+                    Some(original_action_digest),
                     "authorization",
                     &error.to_string(),
                     false,
@@ -2545,6 +2998,7 @@ where
                     session_directory,
                     position,
                     call_id,
+                    None,
                     "host_unavailable",
                     &error.to_string(),
                     true,
@@ -2719,6 +3173,7 @@ where
                         json!({"error":{"code":code,"message":message,"retryable":retryable}});
                     RuntimeCommittedEvent::ToolExecutionFailed(ToolExecutionFailedEvent {
                         call_id,
+                        action_digest: None,
                         code,
                         message,
                         retryable,
@@ -2729,6 +3184,7 @@ where
                     final_result = json!({"error":{"code":"cancelled"}});
                     RuntimeCommittedEvent::ToolExecutionFailed(ToolExecutionFailedEvent {
                         call_id,
+                        action_digest: None,
                         code: "cancelled".into(),
                         message: "tool execution was cancelled".into(),
                         retryable: false,
@@ -2796,6 +3252,7 @@ where
         session_directory: &std::path::Path,
         position: JournalPosition,
         call_id: &str,
+        action_digest: Option<ContentHash>,
         code: &str,
         message: &str,
         retryable: bool,
@@ -2808,6 +3265,7 @@ where
             position.event_id,
             RuntimeCommittedEvent::ToolExecutionFailed(ToolExecutionFailedEvent {
                 call_id: call_id.into(),
+                action_digest,
                 code: code.into(),
                 message: message.into(),
                 retryable,
@@ -2848,20 +3306,36 @@ where
                 }),
             }),
         )?;
+        self.commit_tool_result_conversation(
+            persistence,
+            session_id,
+            session_directory,
+            position,
+            call_id,
+            result,
+            artifact,
+            truncated,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_tool_result_conversation(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        mut position: JournalPosition,
+        call_id: &str,
+        result: &Value,
+        artifact: Option<&str>,
+        truncated: bool,
+    ) -> Result<JournalPosition, RunTurnError> {
         let result_sequence = position
             .sequence
             .checked_next()
             .map_err(|_| RunTurnError::SequenceOverflow)?;
-        let mut content =
-            serde_json::to_string(result).map_err(|_| RunTurnError::ToolResultEncoding)?;
-        let projection_truncated = content.len() > MAX_TOOL_RESULT_BYTES;
-        if projection_truncated {
-            content.truncate(MAX_TOOL_RESULT_BYTES);
-        }
-        let artifact_id = artifact
-            .map(str::parse)
-            .transpose()
-            .map_err(|_| RunTurnError::InvalidArtifact)?;
+        let (content, artifact_id, result_truncated) =
+            project_tool_result(result, artifact, truncated)?;
         (position.sequence, position.event_id) = self.commit_next(
             persistence,
             session_id,
@@ -2877,12 +3351,99 @@ where
                     call_id: call_id.into(),
                     content,
                     artifact_id,
-                    truncated: truncated || projection_truncated,
+                    truncated: result_truncated,
                     source_sequence: result_sequence,
                 }),
             }),
         )?;
         Ok(position)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "repair binds the exact canonical session head, action, and terminal receipt"
+    )]
+    fn repair_terminal_tool_conversation(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        state: &crate::session::SessionState,
+        position: JournalPosition,
+        call_id: &str,
+        action: &crate::action::ToolCallAction,
+        expected_action_digest: ContentHash,
+        terminal: &crate::session::ToolExecutionRecord,
+    ) -> Result<JournalPosition, RunTurnError> {
+        if terminal.action_digest != Some(expected_action_digest) {
+            return Err(RunTurnError::InvalidRecoveryReceipt(call_id.to_owned()));
+        }
+        let calls = state
+            .conversation
+            .history()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                ConversationEntry::ToolCallRequest(call) if call.call_id == call_id => {
+                    Some((index, call))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let results = state
+            .conversation
+            .history()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                ConversationEntry::ToolResult(result) if result.call_id == call_id => {
+                    Some((index, result))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let (result, artifact, truncated) = terminal_projection(terminal, call_id)?;
+        let (content, artifact_id, result_truncated) =
+            project_tool_result(&result, artifact.as_deref(), truncated)?;
+        match (calls.as_slice(), results.as_slice()) {
+            ([], []) => self.commit_tool_conversation(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                call_id,
+                action,
+                &result,
+                artifact.as_deref(),
+                truncated,
+            ),
+            ([(call_index, call)], [(result_index, tool_result)])
+                if call.tool == action.tool
+                    && call.arguments == action.arguments
+                    && call_index < result_index
+                    && call.source_sequence < tool_result.source_sequence
+                    && tool_result.content == content
+                    && tool_result.artifact_id == artifact_id
+                    && tool_result.truncated == result_truncated =>
+            {
+                Ok(position)
+            }
+            ([(_, call)], []) if call.tool == action.tool && call.arguments == action.arguments => {
+                self.commit_tool_result_conversation(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position,
+                    call_id,
+                    &result,
+                    artifact.as_deref(),
+                    truncated,
+                )
+            }
+            _ => Err(RunTurnError::ToolConversationRecoveryConflict(
+                call_id.to_owned(),
+            )),
+        }
     }
 
     fn begin_style_turn(
@@ -3667,6 +4228,221 @@ fn validate(command: &RunTurnCommand) -> Result<(), RunTurnError> {
     Ok(())
 }
 
+fn recoverable_context_retry(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> bool {
+    let Some(execution) = state.style_execution.as_ref() else {
+        return false;
+    };
+    let Some(active) = execution.active_node.as_ref() else {
+        return false;
+    };
+    let is_model_node = execution.graph.nodes.iter().any(|node| {
+        node.id == active.node_id && node.kind == agentmod_graph_engine::NodeKind::ModelCall
+    });
+    let Ok(request_hash) = current_context_request_hash(state, command) else {
+        return false;
+    };
+    is_model_node
+        && execution.context_boundaries.iter().rev().any(|boundary| {
+            boundary.identity.node_id == active.node_id
+                && boundary.identity.run_id == command.cancellation_id
+                && request_hash == boundary.identity.request_hash
+                && boundary.last_sequence == state.last_sequence
+        })
+}
+
+fn latest_context_boundary_at_head(
+    state: &crate::session::SessionState,
+) -> Option<&ContextBoundaryIdentity> {
+    state
+        .style_execution
+        .as_ref()?
+        .context_boundaries
+        .iter()
+        .rev()
+        .find(|boundary| boundary.last_sequence == state.last_sequence)
+        .map(|boundary| &boundary.identity)
+}
+
+fn context_phase_started(
+    state: &crate::session::SessionState,
+    identity: &ContextBoundaryIdentity,
+    phase: &str,
+) -> bool {
+    state
+        .style_execution
+        .as_ref()
+        .and_then(|execution| {
+            execution
+                .context_boundaries
+                .iter()
+                .rev()
+                .find(|boundary| &boundary.identity == identity)
+        })
+        .is_some_and(|boundary| {
+            boundary
+                .started_phases
+                .iter()
+                .any(|started| started == phase)
+                && !boundary
+                    .completed_phases
+                    .iter()
+                    .any(|completed| completed == phase)
+        })
+}
+
+fn current_run_user_sequence(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> Result<Sequence, RunTurnError> {
+    Ok(current_run_user(state, command)?.source_sequence)
+}
+
+fn current_run_user<'a>(
+    state: &'a crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> Result<&'a TextEntry, RunTurnError> {
+    state
+        .conversation
+        .history()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            ConversationEntry::UserMessage(user)
+                if (command.prompt.is_empty() || user.text == command.prompt)
+                    && user.id.0.strip_prefix("user:").is_some_and(|suffix| {
+                        suffix.ends_with(&format!(":{}", command.cancellation_id))
+                    }) =>
+            {
+                Some(user)
+            }
+            _ => None,
+        })
+        .ok_or(RunTurnError::ContextRecoveryIdentityMismatch)
+}
+
+fn current_context_request_hash(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> Result<ContentHash, RunTurnError> {
+    let user = current_run_user(state, command)?;
+    context_request_hash(command, user.source_sequence, &user.text)
+}
+
+fn context_request_hash(
+    command: &RunTurnCommand,
+    user_sequence: Sequence,
+    current_input: &str,
+) -> Result<ContentHash, RunTurnError> {
+    let canonical_options =
+        canonical_json_bytes(&command.options).map_err(map_projection_measure_error)?;
+    let input_hash = ContentHash::digest(current_input.as_bytes());
+    let mut identity = Vec::from(b"agentmod.context-request.v1".as_slice());
+    append_identity_field(&mut identity, command.provider.as_bytes())?;
+    append_identity_field(&mut identity, command.model.as_bytes())?;
+    append_identity_field(&mut identity, &canonical_options)?;
+    identity.extend_from_slice(&user_sequence.get().to_le_bytes());
+    identity.extend_from_slice(input_hash.as_bytes());
+    Ok(ContentHash::digest(&identity))
+}
+
+fn append_identity_field(target: &mut Vec<u8>, value: &[u8]) -> Result<(), RunTurnError> {
+    let length = u64::try_from(value.len()).map_err(|_| RunTurnError::ProjectionSizeOverflow)?;
+    target.extend_from_slice(&length.to_le_bytes());
+    target.extend_from_slice(value);
+    Ok(())
+}
+
+const fn boundary_origin(origin: ContextCompositionOrigin) -> ContextBoundaryOrigin {
+    match origin {
+        ContextCompositionOrigin::UserTurn => ContextBoundaryOrigin::UserTurn,
+        ContextCompositionOrigin::ToolContinuation => ContextBoundaryOrigin::ToolContinuation,
+        ContextCompositionOrigin::ApprovalContinuation => {
+            ContextBoundaryOrigin::ApprovalContinuation
+        }
+    }
+}
+
+fn pending_model_resume_after_terminal_tool(
+    state: &crate::session::SessionState,
+    tool: Option<&crate::session::ToolExecutionRecord>,
+) -> Result<bool, RunTurnError> {
+    let Some(terminal_at) = tool.and_then(|record| record.terminal_at) else {
+        return Ok(false);
+    };
+    let Some(execution) = state.style_execution.as_ref() else {
+        return Ok(false);
+    };
+    let Some(active) = execution.active_node.as_ref() else {
+        return Ok(false);
+    };
+    if !execution.graph.nodes.iter().any(|node| {
+        node.id == active.node_id && node.kind == agentmod_graph_engine::NodeKind::ToolExecutionGate
+    }) {
+        return Ok(false);
+    }
+    if let Some(boundary) = execution.context_boundaries.iter().rev().find(|boundary| {
+        boundary.identity.node_id == active.node_id
+            && boundary.identity.boundary == "before_model_request"
+            && boundary.identity.source_head >= terminal_at
+    }) {
+        if boundary.completed_at.is_some() && boundary.last_sequence < state.last_sequence {
+            return Err(RunTurnError::AmbiguousProviderResume);
+        }
+        if boundary.completed_at.is_none() {
+            return Err(RunTurnError::AmbiguousContextPhase(String::from(
+                "approval_resume",
+            )));
+        }
+    }
+    Ok(true)
+}
+
+fn terminal_projection(
+    terminal: &crate::session::ToolExecutionRecord,
+    call_id: &str,
+) -> Result<(Value, Option<String>, bool), RunTurnError> {
+    match terminal.terminal_outcome.as_ref() {
+        Some(ToolExecutionTerminalOutcome::Completed {
+            result,
+            artifact,
+            truncated,
+        }) => Ok((result.clone(), artifact.clone(), *truncated)),
+        Some(ToolExecutionTerminalOutcome::Failed {
+            code,
+            message,
+            retryable,
+        }) => Ok((
+            json!({"error":{"code":code,"message":message,"retryable":retryable}}),
+            None,
+            false,
+        )),
+        None => Err(RunTurnError::ToolConversationRecoveryConflict(
+            call_id.to_owned(),
+        )),
+    }
+}
+
+fn project_tool_result(
+    result: &Value,
+    artifact: Option<&str>,
+    truncated: bool,
+) -> Result<(String, Option<agentmod_primitives::ArtifactId>, bool), RunTurnError> {
+    let mut content =
+        serde_json::to_string(result).map_err(|_| RunTurnError::ToolResultEncoding)?;
+    let projection_truncated = content.len() > MAX_TOOL_RESULT_BYTES;
+    if projection_truncated {
+        truncate_owned_utf8(&mut content, MAX_TOOL_RESULT_BYTES);
+    }
+    let artifact_id = artifact
+        .map(str::parse)
+        .transpose()
+        .map_err(|_| RunTurnError::InvalidArtifact)?;
+    Ok((content, artifact_id, truncated || projection_truncated))
+}
+
 fn memory_scope(
     scope: &str,
     session_id: SessionId,
@@ -3695,7 +4471,22 @@ fn construct_memory_query(
         .and_then(Value::as_str)
         .ok_or(RunTurnError::InvalidMemoryQueryConfiguration)?;
     let mut query = match source {
-        "current_input" => command.prompt.clone(),
+        "current_input" => {
+            if command.prompt.is_empty() {
+                state
+                    .conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        ConversationEntry::UserMessage(user) => Some(user.text.clone()),
+                        _ => None,
+                    })
+                    .ok_or(RunTurnError::CurrentInputMissing)?
+            } else {
+                command.prompt.clone()
+            }
+        }
         "session_goal" | "current_input_and_goal" => {
             return Err(RunTurnError::MemorySessionGoalUnavailable);
         }
@@ -3773,6 +4564,211 @@ fn inject_memory(
     Ok(())
 }
 
+fn serialized_entry_contribution(entry: &ConversationEntry) -> Result<u64, RunTurnError> {
+    u64::try_from(
+        serde_json::to_vec(entry)
+            .map_err(|_| RunTurnError::Event)?
+            .len(),
+    )
+    .map_err(|_| RunTurnError::MemoryBoundOverflow)
+}
+
+fn memory_entry_with_serialized_size(
+    mut entry: ConversationEntry,
+) -> Result<(ConversationEntry, u64), RunTurnError> {
+    loop {
+        let contribution = serialized_entry_contribution(&entry)?;
+        let ConversationEntry::RetrievedMemory(memory) = &mut entry else {
+            return Err(RunTurnError::Event);
+        };
+        if memory.size_bytes == contribution {
+            return Ok((entry, contribution));
+        }
+        memory.size_bytes = contribution;
+    }
+}
+
+fn projection_without_retrieved_memory(entries: &[ConversationEntry]) -> Vec<ConversationEntry> {
+    entries
+        .iter()
+        .filter(|entry| !matches!(entry, ConversationEntry::RetrievedMemory(_)))
+        .cloned()
+        .collect()
+}
+
+fn validate_projection_measure(
+    entries: &[ConversationEntry],
+    token_limit: Option<u64>,
+) -> Result<ProjectionMeasure, RunTurnError> {
+    let measure = measure_projection(entries).map_err(map_projection_measure_error)?;
+    if measure.serialized_bytes > MAX_PROVIDER_PROJECTION_BYTES {
+        return Err(RunTurnError::ProviderProjectionByteLimitExceeded {
+            serialized_bytes: measure.serialized_bytes,
+            limit: MAX_PROVIDER_PROJECTION_BYTES,
+        });
+    }
+    if token_limit.is_some_and(|limit| measure.estimated_tokens > limit) {
+        return Err(RunTurnError::ProviderProjectionLimitExceeded {
+            estimated_tokens: measure.estimated_tokens,
+            limit: token_limit.unwrap_or(0),
+        });
+    }
+    Ok(measure)
+}
+
+const fn map_projection_measure_error(error: ProjectionMeasureError) -> RunTurnError {
+    match error {
+        ProjectionMeasureError::Serialization => RunTurnError::Event,
+        ProjectionMeasureError::Overflow => RunTurnError::ProjectionSizeOverflow,
+    }
+}
+
+fn effective_projection_limit(
+    compaction: &crate::session::SessionCompactionConfiguration,
+) -> Result<Option<u64>, RunTurnError> {
+    if compaction.max_provider_projection_tokens == 0 {
+        if compaction.reserved_context_tokens == 0 {
+            return Ok(None);
+        }
+        return Err(RunTurnError::InvalidProjectionBudget);
+    }
+    compaction
+        .max_provider_projection_tokens
+        .checked_sub(compaction.reserved_context_tokens)
+        .filter(|limit| *limit > 0)
+        .map(Some)
+        .ok_or(RunTurnError::InvalidProjectionBudget)
+}
+
+fn compact_sliding_window_to_bound(
+    conversation: &crate::conversation::ConversationState,
+    requirements: &[String],
+    limit: Option<u64>,
+    context: &CompactionContext,
+) -> Result<crate::compaction::CompactionPlan, RunTurnError> {
+    let source = conversation.provider_projection();
+    let maximum_window = DEFAULT_SLIDING_WINDOW_ENTRIES.min(source.len().max(1));
+    for window in (1..=maximum_window).rev() {
+        let mut plan = compact_projection(
+            conversation,
+            CompactionStrategy::SlidingWindow {
+                max_recent_entries: window,
+            },
+            context.clone(),
+        )
+        .map_err(RunTurnError::Compaction)?;
+        plan.replacement =
+            restore_required_projection_entries(source, &plan.replacement, requirements);
+        validate_projection_preservation(source, &plan.replacement, requirements)?;
+        let measure =
+            measure_projection(&plan.replacement).map_err(map_projection_measure_error)?;
+        if measure.serialized_bytes <= MAX_PROVIDER_PROJECTION_BYTES
+            && limit.is_none_or(|bound| measure.estimated_tokens <= bound)
+        {
+            return Ok(plan);
+        }
+    }
+    let minimum = restore_required_projection_entries(source, &[], requirements);
+    let measure = measure_projection(&minimum).map_err(map_projection_measure_error)?;
+    if measure.serialized_bytes > MAX_PROVIDER_PROJECTION_BYTES {
+        return Err(RunTurnError::ProviderProjectionByteLimitExceeded {
+            serialized_bytes: measure.serialized_bytes,
+            limit: MAX_PROVIDER_PROJECTION_BYTES,
+        });
+    }
+    Err(RunTurnError::ProviderProjectionLimitExceeded {
+        estimated_tokens: measure.estimated_tokens,
+        limit: limit.unwrap_or(0),
+    })
+}
+
+fn restore_required_projection_entries(
+    source: &[ConversationEntry],
+    candidate: &[ConversationEntry],
+    requirements: &[String],
+) -> Vec<ConversationEntry> {
+    let selected = candidate
+        .iter()
+        .map(|entry| entry.id().clone())
+        .collect::<BTreeSet<_>>();
+    let current_input = source
+        .iter()
+        .rfind(|entry| matches!(entry, ConversationEntry::UserMessage(_)))
+        .map(ConversationEntry::id);
+    source
+        .iter()
+        .filter(|entry| {
+            selected.contains(entry.id())
+                || projection_entry_is_required(entry, current_input, requirements)
+        })
+        .cloned()
+        .collect()
+}
+
+fn validate_projection_preservation(
+    source: &[ConversationEntry],
+    replacement: &[ConversationEntry],
+    requirements: &[String],
+) -> Result<(), RunTurnError> {
+    let retained = replacement
+        .iter()
+        .map(ConversationEntry::id)
+        .collect::<BTreeSet<_>>();
+    let current_input = source
+        .iter()
+        .rfind(|entry| matches!(entry, ConversationEntry::UserMessage(_)))
+        .map(ConversationEntry::id);
+    if let Some(missing) = source.iter().find(|entry| {
+        projection_entry_is_required(entry, current_input, requirements)
+            && !retained.contains(entry.id())
+    }) {
+        return Err(RunTurnError::CompactionPreservationViolation(
+            missing.id().0.clone(),
+        ));
+    }
+    Ok(())
+}
+
+fn projection_entry_is_required(
+    entry: &ConversationEntry,
+    current_input: Option<&ConversationEntryId>,
+    requirements: &[String],
+) -> bool {
+    requirements
+        .iter()
+        .any(|requirement| match requirement.as_str() {
+            "system_instructions" => matches!(
+                entry,
+                ConversationEntry::SystemInstruction(_)
+                    | ConversationEntry::ProjectInstruction(_)
+                    | ConversationEntry::UserInstruction(_)
+            ),
+            "current_input" => current_input.is_some_and(|id| id == entry.id()),
+            "pending_control_state" => matches!(
+                entry,
+                ConversationEntry::PendingTask(_)
+                    | ConversationEntry::ActiveProcessSummary(_)
+                    | ConversationEntry::ChildAgentHandoff(_)
+            ),
+            "artifact_references" => matches!(
+                entry,
+                ConversationEntry::Attachment(_)
+                    | ConversationEntry::Image(_)
+                    | ConversationEntry::ArtifactReference(_)
+            ),
+            "memory_provenance" => matches!(entry, ConversationEntry::RetrievedMemory(_)),
+            // Active graph state is canonical style control state rather than a
+            // provider-projection entry, so there is nothing representable here
+            // to drop or preserve.
+            "active_graph_state" => active_graph_state_is_outside_projection(),
+            "tool_call_correlation" => matches!(
+                entry,
+                ConversationEntry::ToolCallRequest(_) | ConversationEntry::ToolResult(_)
+            ),
+            _ => false,
+        })
+}
+
 fn truncate_owned_utf8(value: &mut String, max_bytes: usize) {
     if value.len() <= max_bytes {
         return;
@@ -3794,115 +4790,44 @@ const fn approval_recovery_action(
         return ApprovalRecoveryAction::CommitAndResume;
     }
     match (disposition, approval_state, execution_state) {
-        (ApprovalDisposition::Denied, _, _)
+        (
+            ApprovalDisposition::Denied | ApprovalDisposition::Approved,
+            ApprovalState::Pending,
+            _,
+        ) => ApprovalRecoveryAction::CommitAndResume,
+        (ApprovalDisposition::Denied, ApprovalState::Denied, None)
+        | (ApprovalDisposition::Approved, ApprovalState::Approved, None) => {
+            ApprovalRecoveryAction::Resume
+        }
+        (
+            ApprovalDisposition::Denied,
+            ApprovalState::Denied,
+            Some(ToolExecutionState::Terminal),
+        )
         | (
             ApprovalDisposition::Approved,
             ApprovalState::Approved,
             Some(ToolExecutionState::Terminal),
         ) => ApprovalRecoveryAction::Idempotent,
-        (ApprovalDisposition::Approved, ApprovalState::Pending, _) => {
-            ApprovalRecoveryAction::CommitAndResume
-        }
-        (ApprovalDisposition::Approved, ApprovalState::Approved, None) => {
-            ApprovalRecoveryAction::Resume
+        (
+            ApprovalDisposition::Denied,
+            ApprovalState::Denied,
+            Some(ToolExecutionState::Dispatched | ToolExecutionState::Started),
+        )
+        | (ApprovalDisposition::Denied, ApprovalState::Approved, _)
+        | (ApprovalDisposition::Approved, ApprovalState::Denied, _) => {
+            ApprovalRecoveryAction::Invalid
         }
         (
             ApprovalDisposition::Approved,
             ApprovalState::Approved,
             Some(ToolExecutionState::Dispatched | ToolExecutionState::Started),
         ) => ApprovalRecoveryAction::Reconcile,
-        (ApprovalDisposition::Approved, ApprovalState::Denied, _) => {
-            ApprovalRecoveryAction::Invalid
-        }
     }
 }
 
 fn invalid_replacement() -> RunTurnError {
     RunTurnError::Provider(ProviderExecutionError::InvalidInterceptionReplacement)
-}
-
-fn project(entries: &[ConversationEntry]) -> Vec<ProviderEntry> {
-    entries
-        .iter()
-        .map(|entry| match entry {
-            ConversationEntry::SystemInstruction(value)
-            | ConversationEntry::ProjectInstruction(value)
-            | ConversationEntry::UserInstruction(value) => {
-                ProviderEntry::System(value.text.clone())
-            }
-            ConversationEntry::UserMessage(value) => ProviderEntry::User(value.text.clone()),
-            ConversationEntry::AssistantMessage(value) => {
-                ProviderEntry::Assistant(value.text.clone())
-            }
-            ConversationEntry::ToolCallRequest(value) => ProviderEntry::ToolCall {
-                call_id: value.call_id.clone(),
-                tool: value.tool.clone(),
-                arguments: value.arguments.clone(),
-            },
-            ConversationEntry::ToolResult(value) => ProviderEntry::ToolResult {
-                call_id: value.call_id.clone(),
-                content: value.content.clone(),
-                truncated: value.truncated,
-            },
-            ConversationEntry::ContextSummary(value) => ProviderEntry::Summary {
-                text: value.text.clone(),
-                start: value.source_start.get(),
-                end: value.source_end.get(),
-            },
-            ConversationEntry::ProviderVisibleMetadata(value) => ProviderEntry::Metadata {
-                key: value.key.clone(),
-                value: value.value.clone(),
-            },
-            ConversationEntry::RetrievedMemory(value) => ProviderEntry::Metadata {
-                key: format!("memory:{}", value.provider),
-                value: json!({
-                    "scope": value.scope,
-                    "source": value.source,
-                    "score": value.score,
-                    "content": value.content
-                }),
-            },
-            ConversationEntry::RuntimeAnnotation(value) => ProviderEntry::Metadata {
-                key: "runtime_annotation".into(),
-                value: Value::String(value.text.clone()),
-            },
-            ConversationEntry::Attachment(value)
-            | ConversationEntry::Image(value)
-            | ConversationEntry::ArtifactReference(value) => ProviderEntry::Metadata {
-                key: "artifact".into(),
-                value: json!({
-                    "id": value.artifact_id,
-                    "hash": value.content_hash,
-                    "mime_type": value.mime_type,
-                    "label": value.label
-                }),
-            },
-            ConversationEntry::PendingTask(value) => ProviderEntry::Metadata {
-                key: "pending_task".into(),
-                value: json!({
-                    "id": value.task_id,
-                    "description": value.description,
-                    "state": value.state
-                }),
-            },
-            ConversationEntry::ActiveProcessSummary(value) => ProviderEntry::Metadata {
-                key: "active_process".into(),
-                value: json!({
-                    "id": value.process_id,
-                    "label": value.label,
-                    "state": value.state
-                }),
-            },
-            ConversationEntry::ChildAgentHandoff(value) => ProviderEntry::Metadata {
-                key: "child_agent_handoff".into(),
-                value: json!({
-                    "session": value.child_session,
-                    "summary": value.summary,
-                    "artifact_id": value.artifact_id
-                }),
-            },
-        })
-        .collect()
 }
 
 fn provider_node_failure(events: &[ProviderEvent]) -> Option<&'static str> {
@@ -3915,6 +4840,10 @@ fn provider_node_failure(events: &[ProviderEvent]) -> Option<&'static str> {
         | ProviderEvent::ToolProposed { .. }
         | ProviderEvent::Completed { .. } => None,
     })
+}
+
+const fn active_graph_state_is_outside_projection() -> bool {
+    false
 }
 
 #[derive(Debug, Error)]
@@ -3964,6 +4893,14 @@ pub enum RunTurnError {
     CurrentInputMissing,
     #[error("memory injection location `{0}` is unsupported")]
     UnsupportedMemoryInjection(String),
+    #[error("memory retrieval timing `{0}` has no live runtime lifecycle hook")]
+    UnsupportedMemoryRetrievalTiming(String),
+    #[error("context recovery run identity does not match the active canonical turn")]
+    ContextRecoveryIdentityMismatch,
+    #[error("context phase `{0}` may have invoked a blocking interceptor and requires a receipt")]
+    AmbiguousContextPhase(String),
+    #[error("provider resume may have crossed the proposal or dispatch boundary")]
+    AmbiguousProviderResume,
     #[error("context-artifact memory injection requires an approved immutable artifact")]
     MemoryContextArtifactRequired,
     #[error("style provider token usage overflowed")]
@@ -3976,6 +4913,20 @@ pub enum RunTurnError {
     ApprovedArtifactHandoffRequired,
     #[error("compaction strategy `{0}` is not supported by the live adapter")]
     UnsupportedCompactionStrategy(String),
+    #[error("provider projection budget is invalid")]
+    InvalidProjectionBudget,
+    #[error("provider projection size cannot be represented")]
+    ProjectionSizeOverflow,
+    #[error(
+        "provider projection is estimated at {estimated_tokens} tokens, exceeding the effective limit {limit}"
+    )]
+    ProviderProjectionLimitExceeded { estimated_tokens: u64, limit: u64 },
+    #[error(
+        "provider projection serialization is {serialized_bytes} bytes, exceeding the hard safety limit {limit}"
+    )]
+    ProviderProjectionByteLimitExceeded { serialized_bytes: u64, limit: u64 },
+    #[error("compaction would discard required provider entry `{0}`")]
+    CompactionPreservationViolation(String),
     #[error("an interceptor changed a context proposal into an incompatible action")]
     InvalidContextInterceptionReplacement,
     #[error("{operation} requires approval: {reason}")]
@@ -4016,6 +4967,8 @@ pub enum RunTurnError {
     ToolStepLimit,
     #[error("tool result could not be encoded")]
     ToolResultEncoding,
+    #[error("terminal tool conversation for call `{0}` is missing or conflicts with its receipt")]
+    ToolConversationRecoveryConflict(String),
     #[error("tool host returned an invalid artifact identifier")]
     InvalidArtifact,
     #[error("durable tool receipt does not match dispatch {0}")]
@@ -4037,15 +4990,19 @@ mod tests {
     };
 
     use agentmod_event_model::{EventClassification, EventMetadata, EventOrigin, EventScope};
-    use agentmod_event_pipeline::BlockingPipelineBuilder;
+    use agentmod_event_pipeline::{
+        BlockingInterceptor, BlockingPipelineBuilder, Decision, FailurePolicy, InterceptorError,
+        InterceptorRegistration, OrderingSpec,
+    };
     use agentmod_primitives::{
         ByteCount, ContentHash, CorrelationId, EventId, TimestampMillis, Version,
     };
     use agentmod_runtime_data::{
         continuation::{
             ContinuationDataError, ContinuationDataPort, ContinuationPayloadRecord,
-            ContinuationRecord, ContinuationStateRecord, CreateContinuationDataRequest,
-            ResolveContinuationDataRecord, ResolveContinuationDataRequest,
+            ContinuationRecord, ContinuationStateRecord, ContinuationWakeRecord,
+            CreateContinuationDataRequest, ResolveContinuationDataRecord,
+            ResolveContinuationDataRequest, ToolApprovalPayloadRecord,
         },
         harness::{
             HarnessDataCommand, HarnessDataError, HarnessDataEvent, HarnessDataPort,
@@ -4083,6 +5040,19 @@ mod tests {
 
     use super::*;
 
+    struct ContextReplacingInterceptor;
+
+    #[async_trait]
+    impl BlockingInterceptor<ActionProposal> for ContextReplacingInterceptor {
+        async fn intercept(
+            &self,
+            mut proposal: ActionProposal,
+        ) -> Result<Decision<ActionProposal>, InterceptorError> {
+            proposal.origin = String::from("fixture-replacement");
+            Ok(Decision::Replace(proposal))
+        }
+    }
+
     #[derive(Clone)]
     struct MockTurnData {
         state: Arc<MockTurnState>,
@@ -4093,6 +5063,7 @@ mod tests {
         harness_commands: StdMutex<Vec<HarnessDataCommand>>,
         harness_replies: StdMutex<VecDeque<Result<HarnessDataReply, HarnessDataError>>>,
         tool_reply: StdMutex<Result<Vec<ToolDataEvent>, ToolDataError>>,
+        continuation: StdMutex<Option<ContinuationRecord>>,
         next_identity: AtomicU64,
     }
 
@@ -4104,6 +5075,7 @@ mod tests {
                     harness_commands: StdMutex::new(Vec::new()),
                     harness_replies: StdMutex::new(VecDeque::from([reply])),
                     tool_reply: StdMutex::new(Err(ToolDataError::Unavailable)),
+                    continuation: StdMutex::new(None),
                     next_identity: AtomicU64::new(100),
                 }),
             }
@@ -4128,6 +5100,11 @@ mod tests {
             *data.state.harness_replies.lock().expect("replies") = harness_replies.into();
             *data.state.tool_reply.lock().expect("tool reply") = tool_reply;
             data
+        }
+
+        fn with_continuation(self, continuation: ContinuationRecord) -> Self {
+            *self.state.continuation.lock().expect("continuation") = Some(continuation);
+            self
         }
 
         fn event_types(&self) -> Vec<String> {
@@ -4255,22 +5232,44 @@ mod tests {
 
         fn load(
             &self,
-            _session_id: &str,
-            _id: &str,
+            session_id: &str,
+            id: &str,
         ) -> Result<ContinuationRecord, ContinuationDataError> {
-            unreachable!("fixture does not load continuations")
+            let record = self
+                .state
+                .continuation
+                .lock()
+                .expect("continuation")
+                .clone()
+                .expect("fixture continuation");
+            assert_eq!(record.session_id, session_id);
+            assert_eq!(record.id, id);
+            Ok(record)
         }
 
         fn resolve(
             &self,
-            _request: ResolveContinuationDataRequest,
+            request: ResolveContinuationDataRequest,
         ) -> Result<ResolveContinuationDataRecord, ContinuationDataError> {
+            let mut continuation = self.state.continuation.lock().expect("continuation");
+            let record = continuation.as_mut().expect("fixture continuation");
+            assert_eq!(record.session_id, request.session_id);
+            assert_eq!(record.id, request.id);
+            let requested_state = if request.approved {
+                ContinuationStateRecord::Resumed
+            } else {
+                ContinuationStateRecord::Cancelled
+            };
+            let transitioned = record.state == ContinuationStateRecord::Pending;
+            if transitioned {
+                record.state = requested_state;
+            } else if record.state != requested_state {
+                panic!("fixture continuation resolution conflict");
+            }
             Ok(ResolveContinuationDataRecord {
-                transitioned: false,
-                state: ContinuationStateRecord::Cancelled,
-                payload: ContinuationPayloadRecord::Opaque {
-                    label: "fixture".into(),
-                },
+                transitioned,
+                state: record.state,
+                payload: record.payload.clone(),
             })
         }
     }
@@ -4383,6 +5382,56 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn context_interceptor_replacement_fails_closed_until_typed_application_exists() {
+        let mut style = BlockingPipelineBuilder::new();
+        style.register(InterceptorRegistration::new(
+            OrderingSpec::new("replace-context", "fixture"),
+            std::time::Duration::from_secs(1),
+            FailurePolicy::Abort,
+            Arc::new(ContextReplacingInterceptor),
+        ));
+        let empty = Arc::new(
+            BlockingPipelineBuilder::new()
+                .compile()
+                .expect("empty pipeline"),
+        );
+        let logic = TurnLogic::new(
+            MockTurnData::new(Err(HarnessDataError::Unavailable)),
+            ProviderExecutionPolicy {
+                style_pipeline: Arc::new(style.compile().expect("style pipeline")),
+                plugin_pipeline: empty,
+                user_policy: PermissionPolicy::new(
+                    "user",
+                    vec![],
+                    PermissionEffect::Allow,
+                    "allow",
+                ),
+                mandatory_policy: PermissionPolicy::new(
+                    "mandatory",
+                    vec![],
+                    PermissionEffect::Allow,
+                    "allow",
+                ),
+            },
+        );
+        let proposal = ActionProposal {
+            id: ProposalId(String::from("context")),
+            action: ConsequentialAction::ContextConstruction {
+                strategy: String::from("memory:file"),
+            },
+            style: String::from("persistent-chat"),
+            workspace: String::from("workspace"),
+            origin: String::from("runtime"),
+        };
+        assert!(matches!(
+            logic
+                .authorize_style_action(proposal, "memory retrieval")
+                .await,
+            Err(RunTurnError::InvalidContextInterceptionReplacement)
+        ));
+    }
+
     fn command() -> RunTurnCommand {
         RunTurnCommand {
             sessions_root: PathBuf::from("sessions"),
@@ -4404,6 +5453,124 @@ mod tests {
         value.compaction.strategy = String::from("none");
         value.compaction.trigger_tokens = None;
         value
+    }
+
+    fn text_entry(id: &str, text: &str, sequence: u64) -> TextEntry {
+        TextEntry {
+            id: ConversationEntryId(id.into()),
+            text: text.into(),
+            source_sequence: Sequence::new(sequence).expect("sequence"),
+        }
+    }
+
+    #[test]
+    fn no_memory_projection_normalization_removes_only_retrieved_records() {
+        let input = ConversationEntry::UserMessage(text_entry("user", "hello", 2));
+        let memory = ConversationEntry::RetrievedMemory(RetrievedMemoryEntry {
+            id: ConversationEntryId(String::from("memory")),
+            provider: String::from("file"),
+            query: String::from("hello"),
+            scope: String::from("session:parent"),
+            source: String::from("fixture"),
+            reference: String::from("m1"),
+            score: Some(1.0),
+            content: String::from("parent-only memory"),
+            injection_sequence: Sequence::new(3).expect("sequence"),
+            injection_event: Some(EventId::from_uuid(Uuid::from_u128(30))),
+            created_at_millis: 1,
+            size_bytes: 18,
+        });
+        assert_eq!(
+            projection_without_retrieved_memory(&[memory, input.clone()]),
+            vec![input]
+        );
+    }
+
+    #[test]
+    fn projection_estimate_includes_serialized_provider_metadata() {
+        let memory = ConversationEntry::RetrievedMemory(RetrievedMemoryEntry {
+            id: ConversationEntryId(String::from("memory")),
+            provider: String::from("file"),
+            query: String::from("q"),
+            scope: String::from("session:s1"),
+            source: String::from("fixture"),
+            reference: String::from("m1"),
+            score: None,
+            content: String::from("x"),
+            injection_sequence: Sequence::FIRST,
+            injection_event: None,
+            created_at_millis: 1,
+            size_bytes: 1,
+        });
+        let measure =
+            measure_projection(std::slice::from_ref(&memory)).expect("projection estimate");
+        assert!(
+            measure.estimated_tokens > 1,
+            "metadata and per-entry overhead must be counted"
+        );
+        assert!(
+            measure.estimated_tokens < measure.serialized_bytes,
+            "token pressure and serialized-byte safety use distinct units"
+        );
+        assert!(
+            serialized_entry_contribution(&memory).expect("entry bytes") > measure.estimated_tokens,
+            "injection accounting includes provenance omitted from provider projection"
+        );
+    }
+
+    #[test]
+    fn hard_projection_byte_cap_is_independent_of_token_configuration() {
+        let oversized = ConversationEntry::UserMessage(text_entry(
+            "large",
+            &"x".repeat(usize::try_from(MAX_PROVIDER_PROJECTION_BYTES).expect("bound") + 1),
+            1,
+        ));
+        assert!(matches!(
+            validate_projection_measure(&[oversized], None),
+            Err(RunTurnError::ProviderProjectionByteLimitExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn reserved_tokens_reduce_the_effective_projection_limit() {
+        let mut binding = persistent_binding(10);
+        binding.compaction.max_provider_projection_tokens = 1_000;
+        binding.compaction.reserved_context_tokens = 250;
+        assert_eq!(
+            effective_projection_limit(&binding.compaction).expect("valid"),
+            Some(750)
+        );
+        binding.compaction.reserved_context_tokens = 1_000;
+        assert!(matches!(
+            effective_projection_limit(&binding.compaction),
+            Err(RunTurnError::InvalidProjectionBudget)
+        ));
+    }
+
+    #[test]
+    fn compaction_preserves_declared_current_input_and_system_instructions() {
+        let system = ConversationEntry::SystemInstruction(text_entry("system", "rules", 1));
+        let old = ConversationEntry::UserMessage(text_entry("old", "old", 2));
+        let current = ConversationEntry::UserMessage(text_entry("current", "current", 3));
+        let source = vec![system.clone(), old, current.clone()];
+        let restored = restore_required_projection_entries(
+            &source,
+            &[],
+            &[
+                String::from("system_instructions"),
+                String::from("current_input"),
+            ],
+        );
+        assert_eq!(restored, vec![system, current]);
+        validate_projection_preservation(
+            &source,
+            &restored,
+            &[
+                String::from("system_instructions"),
+                String::from("current_input"),
+            ],
+        )
+        .expect("required entries retained");
     }
 
     fn bound_control_events(include_transition: bool, max_steps: u64) -> Vec<EventEnvelope<Value>> {
@@ -4464,6 +5631,269 @@ mod tests {
             ));
         }
         events
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the recovery fixture spells out each canonical boundary and phase event"
+    )]
+    fn context_recovery_events(complete_memory_phase: bool) -> Vec<EventEnvelope<Value>> {
+        let binding = persistent_binding(10);
+        let graph = CompiledStyleExecutor::from_binding(&binding)
+            .expect("executor")
+            .compiled()
+            .graph
+            .clone();
+        let request_hash = context_request_hash(
+            &command(),
+            Sequence::new(2).expect("sequence"),
+            "inspect the repository",
+        )
+        .expect("request hash");
+        let turn_boundary = ContextBoundaryIdentity {
+            node_id: String::from("respond"),
+            boundary: String::from("turn_start"),
+            run_id: String::from("cancel-1"),
+            origin: ContextBoundaryOrigin::UserTurn,
+            request_hash,
+            source_head: Sequence::new(4).expect("sequence"),
+        };
+        let turn_phase = ContextPhaseIdentity {
+            boundary: turn_boundary.clone(),
+            phase: String::from("memory"),
+        };
+        let boundary = ContextBoundaryIdentity {
+            node_id: String::from("respond"),
+            boundary: String::from("before_model_request"),
+            run_id: String::from("cancel-1"),
+            origin: ContextBoundaryOrigin::UserTurn,
+            request_hash,
+            source_head: Sequence::new(8).expect("sequence"),
+        };
+        let phase = ContextPhaseIdentity {
+            boundary: boundary.clone(),
+            phase: String::from("memory"),
+        };
+        let user = ConversationEntry::UserMessage(text_entry(
+            "user:2:cancel-1",
+            "inspect the repository",
+            2,
+        ));
+        let mut events = vec![
+            data_event(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture-workspace"),
+                    style: String::from("persistent-chat"),
+                    style_binding: Some(Box::new(binding)),
+                }),
+            ),
+            data_event(
+                2,
+                RuntimeCommittedEvent::ConversationEntryCommitted(
+                    ConversationEntryCommittedEvent {
+                        entry: user.clone(),
+                    },
+                ),
+            ),
+            data_event(
+                3,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(graph),
+                    },
+                )),
+            ),
+            data_event(
+                4,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("respond"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+            data_event(
+                5,
+                RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                    identity: turn_boundary.clone(),
+                }),
+            ),
+            data_event(
+                6,
+                RuntimeCommittedEvent::ContextPhaseStarted(ContextPhaseStartedEvent {
+                    identity: turn_phase.clone(),
+                }),
+            ),
+            data_event(
+                7,
+                RuntimeCommittedEvent::ContextPhaseCompleted(ContextPhaseCompletedEvent {
+                    identity: turn_phase,
+                }),
+            ),
+            {
+                let measurement =
+                    measure_projection(std::slice::from_ref(&user)).expect("projection");
+                data_event(
+                    8,
+                    RuntimeCommittedEvent::ContextBoundaryCompleted(
+                        ContextBoundaryCompletedEvent {
+                            identity: turn_boundary,
+                            projection_hash: measurement.projection_hash,
+                            estimated_tokens: measurement.estimated_tokens,
+                            serialized_bytes: measurement.serialized_bytes,
+                        },
+                    ),
+                )
+            },
+            data_event(
+                9,
+                RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                    identity: boundary,
+                }),
+            ),
+            data_event(
+                10,
+                RuntimeCommittedEvent::ContextPhaseStarted(ContextPhaseStartedEvent {
+                    identity: phase.clone(),
+                }),
+            ),
+        ];
+        if complete_memory_phase {
+            events.push(data_event(
+                11,
+                RuntimeCommittedEvent::ContextProjectionReplaced(ContextProjectionReplacedEvent {
+                    replacement: vec![user],
+                    provenance: ProjectionProvenance {
+                        projection_id: String::from("memory:cancel-1:11"),
+                        source_range: None,
+                        method: String::from("memory:none"),
+                        committed_at: Sequence::new(11).expect("sequence"),
+                        artifact_id: None,
+                    },
+                    context_phase: Some(phase),
+                }),
+            ));
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn completed_context_phase_recovers_without_duplicate_user_or_replacement() {
+        let data = MockTurnData::with_events(
+            Ok(HarnessDataReply::Events(vec![
+                HarnessDataEvent::Started,
+                HarnessDataEvent::Text(String::from("recovered")),
+                HarnessDataEvent::Completed {
+                    reason: String::from("stop"),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ])),
+            context_recovery_events(true),
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        logic.run_turn(command()).await.expect("recover context");
+
+        let types = data.event_types();
+        assert_eq!(
+            types
+                .iter()
+                .filter(|event| event.as_str() == "context.projection_replaced")
+                .count(),
+            1
+        );
+        assert_eq!(
+            types
+                .iter()
+                .filter(|event| event.as_str() == "conversation.entry_committed")
+                .count(),
+            2,
+            "one original user and one recovered assistant"
+        );
+        assert_eq!(
+            data.state.harness_commands.lock().expect("commands").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn started_context_phase_without_completion_fails_closed() {
+        let data = MockTurnData::with_events(
+            Ok(HarnessDataReply::Events(Vec::new())),
+            context_recovery_events(false),
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        let error = logic
+            .run_turn(command())
+            .await
+            .expect_err("ambiguous phase");
+
+        assert!(matches!(
+            error,
+            RunTurnError::AmbiguousContextPhase(ref phase) if phase == "memory"
+        ));
+        assert!(
+            data.state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+        assert_eq!(
+            data.event_types()
+                .iter()
+                .filter(|event| event.as_str() == "context.phase_started")
+                .count(),
+            2,
+            "recovery must retain only the completed turn-start phase and one ambiguous model phase"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_retry_rejects_provider_model_and_options_mismatch_without_mutation() {
+        let variants = [
+            {
+                let mut value = command();
+                value.provider = String::from("different-provider");
+                value
+            },
+            {
+                let mut value = command();
+                value.model = String::from("different-model");
+                value
+            },
+            {
+                let mut value = command();
+                value.options = json!({"temperature":0.5});
+                value
+            },
+        ];
+        for mismatched in variants {
+            let data = MockTurnData::with_events(
+                Ok(HarnessDataReply::Events(Vec::new())),
+                context_recovery_events(true),
+            );
+            let before = data.event_types();
+            let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+            let error = logic
+                .run_turn(mismatched)
+                .await
+                .expect_err("mismatched retry identity");
+
+            assert!(matches!(error, RunTurnError::StyleRecoveryRequired(_)));
+            assert_eq!(data.event_types(), before);
+            assert!(
+                data.state
+                    .harness_commands
+                    .lock()
+                    .expect("commands")
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
@@ -4868,6 +6298,618 @@ mod tests {
                 Some(ToolExecutionState::Terminal),
             ),
             ApprovalRecoveryAction::Idempotent
+        );
+    }
+
+    #[test]
+    fn terminal_approved_tool_still_has_one_pending_model_resume() {
+        let mut events = bound_control_events(true, 3);
+        let digest = terminal_tool_action_digest();
+        events.extend([
+            data_event(
+                6,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("tool"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 2,
+                }),
+            ),
+            data_event(
+                7,
+                RuntimeCommittedEvent::ToolExecutionDispatched(ToolExecutionDispatchedEvent {
+                    execution_id: String::from("execution-1"),
+                    call_id: String::from("call-1"),
+                    action_digest: digest,
+                }),
+            ),
+            data_event(
+                8,
+                RuntimeCommittedEvent::ToolExecutionStarted(ToolExecutionStartedEvent {
+                    call_id: String::from("call-1"),
+                }),
+            ),
+            data_event(
+                9,
+                RuntimeCommittedEvent::ToolExecutionCompleted(ToolExecutionCompletedEvent {
+                    call_id: String::from("call-1"),
+                    result: json!({"ok":true}),
+                    artifact: None,
+                    truncated: false,
+                }),
+            ),
+        ]);
+        let data = MockTurnData::with_events(Ok(HarnessDataReply::Events(Vec::new())), events);
+        let state = SessionPersistenceLogic::new(data)
+            .load_session(LoadSessionCommand {
+                session_directory: PathBuf::from("sessions").join(session_id().to_string()),
+                expected_session_id: session_id(),
+            })
+            .expect("replay")
+            .state;
+        assert!(
+            pending_model_resume_after_terminal_tool(&state, state.tool_executions.get("call-1"))
+                .expect("safe resume")
+        );
+    }
+
+    fn terminal_tool_action_digest() -> ContentHash {
+        ActionProposal {
+            id: ProposalId(String::from("tool-call:call-1")),
+            action: ConsequentialAction::ToolCall(crate::action::ToolCallAction {
+                tool: String::from("filesystem.read"),
+                group: String::from("filesystem"),
+                arguments: json!({"path":"README.md"}),
+                source: None,
+            }),
+            style: String::from("persistent-chat"),
+            workspace: String::from("fixture-workspace"),
+            origin: String::from("runtime"),
+        }
+        .digest()
+        .expect("terminal tool action digest")
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture exposes the exact approval, receipt, and conversation crash positions"
+    )]
+    fn terminal_approval_fixture(
+        approved: bool,
+        conversation_entries: Vec<ConversationEntry>,
+        approved_digest: Option<ContentHash>,
+    ) -> (MockTurnData, ContinuationId) {
+        let continuation_id = ContinuationId::from_uuid(Uuid::from_u128(99));
+        let mut events = bound_control_events(true, 3);
+        events.extend([
+            data_event(
+                6,
+                RuntimeCommittedEvent::ConversationEntryCommitted(
+                    ConversationEntryCommittedEvent {
+                        entry: ConversationEntry::UserMessage(text_entry(
+                            "user:6:cancel-1",
+                            "inspect the repository",
+                            6,
+                        )),
+                    },
+                ),
+            ),
+            data_event(
+                7,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("tool"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 2,
+                }),
+            ),
+            data_event(
+                8,
+                RuntimeCommittedEvent::ApprovalRequested(ApprovalRequestedEvent {
+                    continuation_id,
+                    action_summary: String::from("fixture approval"),
+                }),
+            ),
+            data_event(
+                9,
+                RuntimeCommittedEvent::ApprovalResolved(ApprovalResolvedEvent {
+                    continuation_id,
+                    approved,
+                }),
+            ),
+        ]);
+        if approved {
+            let digest = approved_digest.unwrap_or_else(terminal_tool_action_digest);
+            events.extend([
+                data_event(
+                    10,
+                    RuntimeCommittedEvent::ToolExecutionDispatched(ToolExecutionDispatchedEvent {
+                        execution_id: String::from("execution-1"),
+                        call_id: String::from("call-1"),
+                        action_digest: digest,
+                    }),
+                ),
+                data_event(
+                    11,
+                    RuntimeCommittedEvent::ToolExecutionStarted(ToolExecutionStartedEvent {
+                        call_id: String::from("call-1"),
+                    }),
+                ),
+                data_event(
+                    12,
+                    RuntimeCommittedEvent::ToolExecutionCompleted(ToolExecutionCompletedEvent {
+                        call_id: String::from("call-1"),
+                        result: json!({"content":"fixture"}),
+                        artifact: None,
+                        truncated: false,
+                    }),
+                ),
+            ]);
+        } else {
+            events.push(data_event(
+                10,
+                RuntimeCommittedEvent::ToolExecutionFailed(ToolExecutionFailedEvent {
+                    call_id: String::from("call-1"),
+                    action_digest: Some(terminal_tool_action_digest()),
+                    code: String::from("permission_denied"),
+                    message: String::from("user denied the requested action"),
+                    retryable: false,
+                }),
+            ));
+        }
+        for entry in conversation_entries {
+            let sequence = u64::try_from(events.len() + 1).expect("sequence");
+            events.push(data_event(
+                sequence,
+                RuntimeCommittedEvent::ConversationEntryCommitted(
+                    ConversationEntryCommittedEvent { entry },
+                ),
+            ));
+        }
+        let continuation = ContinuationRecord {
+            session_id: session_id().to_string(),
+            id: continuation_id.to_string(),
+            state: if approved {
+                ContinuationStateRecord::Resumed
+            } else {
+                ContinuationStateRecord::Cancelled
+            },
+            wake_condition: ContinuationWakeRecord::Manual,
+            payload: ContinuationPayloadRecord::ToolApproval(Box::new(ToolApprovalPayloadRecord {
+                session_id: session_id().to_string(),
+                workspace: String::from("fixture-workspace"),
+                call_id: String::from("call-1"),
+                tool: String::from("filesystem.read"),
+                arguments: json!({"path":"README.md"}),
+                cancellation_id: String::from("cancel-1"),
+                provider: String::from("deterministic-mock"),
+                model: String::from("fixture"),
+                options: json!({}),
+                style: String::from("persistent-chat"),
+                harness_continuation: String::from("continue-1"),
+                remaining_tool_calls: Vec::new(),
+            })),
+            expires_at_millis: None,
+        };
+        (
+            MockTurnData::with_events(
+                Ok(HarnessDataReply::Events(vec![
+                    HarnessDataEvent::Started,
+                    HarnessDataEvent::Text(String::from("done")),
+                    HarnessDataEvent::Completed {
+                        reason: String::from("stop"),
+                        input_tokens: 4,
+                        output_tokens: 1,
+                    },
+                ])),
+                events,
+            )
+            .with_continuation(continuation),
+            continuation_id,
+        )
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the full recovery fixture intentionally exposes every canonical lifecycle event"
+    )]
+    async fn repeated_approved_resolution_resumes_terminal_tool_without_duplicate_effects() {
+        let continuation_id = ContinuationId::from_uuid(Uuid::from_u128(99));
+        let mut events = bound_control_events(true, 3);
+        let digest = terminal_tool_action_digest();
+        events.extend([
+            data_event(
+                6,
+                RuntimeCommittedEvent::ConversationEntryCommitted(
+                    ConversationEntryCommittedEvent {
+                        entry: ConversationEntry::UserMessage(text_entry(
+                            "user:6:cancel-1",
+                            "inspect the repository",
+                            6,
+                        )),
+                    },
+                ),
+            ),
+            data_event(
+                7,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("tool"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 2,
+                }),
+            ),
+            data_event(
+                8,
+                RuntimeCommittedEvent::ApprovalRequested(ApprovalRequestedEvent {
+                    continuation_id,
+                    action_summary: String::from("fixture approval"),
+                }),
+            ),
+            data_event(
+                9,
+                RuntimeCommittedEvent::ApprovalResolved(ApprovalResolvedEvent {
+                    continuation_id,
+                    approved: true,
+                }),
+            ),
+            data_event(
+                10,
+                RuntimeCommittedEvent::ToolExecutionDispatched(ToolExecutionDispatchedEvent {
+                    execution_id: String::from("execution-1"),
+                    call_id: String::from("call-1"),
+                    action_digest: digest,
+                }),
+            ),
+            data_event(
+                11,
+                RuntimeCommittedEvent::ToolExecutionStarted(ToolExecutionStartedEvent {
+                    call_id: String::from("call-1"),
+                }),
+            ),
+            data_event(
+                12,
+                RuntimeCommittedEvent::ToolExecutionCompleted(ToolExecutionCompletedEvent {
+                    call_id: String::from("call-1"),
+                    result: json!({"content":"fixture"}),
+                    artifact: None,
+                    truncated: false,
+                }),
+            ),
+        ]);
+        let continuation = ContinuationRecord {
+            session_id: session_id().to_string(),
+            id: continuation_id.to_string(),
+            state: ContinuationStateRecord::Resumed,
+            wake_condition: ContinuationWakeRecord::Manual,
+            payload: ContinuationPayloadRecord::ToolApproval(Box::new(ToolApprovalPayloadRecord {
+                session_id: session_id().to_string(),
+                workspace: String::from("fixture-workspace"),
+                call_id: String::from("call-1"),
+                tool: String::from("filesystem.read"),
+                arguments: json!({"path":"README.md"}),
+                cancellation_id: String::from("cancel-1"),
+                provider: String::from("deterministic-mock"),
+                model: String::from("fixture"),
+                options: json!({}),
+                style: String::from("persistent-chat"),
+                harness_continuation: String::from("continue-1"),
+                remaining_tool_calls: Vec::new(),
+            })),
+            expires_at_millis: None,
+        };
+        let data = MockTurnData::with_events(
+            Ok(HarnessDataReply::Events(vec![
+                HarnessDataEvent::Started,
+                HarnessDataEvent::Text(String::from("done")),
+                HarnessDataEvent::Completed {
+                    reason: String::from("stop"),
+                    input_tokens: 4,
+                    output_tokens: 1,
+                },
+            ])),
+            events,
+        )
+        .with_continuation(continuation);
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        let result = logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id: continuation_id.to_string(),
+                approved: true,
+                resume_after_resolution: true,
+            })
+            .await
+            .expect("resume terminal approved tool");
+
+        assert!(result.transitioned);
+        assert_eq!(result.awaiting_continuation, None);
+        let event_types = data.event_types();
+        assert_eq!(
+            event_types
+                .iter()
+                .filter(|event_type| event_type.as_str() == "tool.execution_completed")
+                .count(),
+            1,
+            "the terminal tool receipt must not be duplicated"
+        );
+        assert!(
+            !event_types
+                .iter()
+                .any(|event_type| event_type == "tool.execution_failed"),
+            "an approved terminal tool must not be rewritten as a failure"
+        );
+        assert_eq!(
+            data.state.harness_commands.lock().expect("commands").len(),
+            1,
+            "exactly one pending provider resume is allowed"
+        );
+        assert!(
+            !data
+                .state
+                .events
+                .lock()
+                .expect("events")
+                .iter()
+                .any(|event| event.payload.to_string().contains("permission_denied")),
+            "an approved terminal tool must not append denial state"
+        );
+        let state = SessionPersistenceLogic::new(data.clone())
+            .load_session(LoadSessionCommand {
+                session_directory: PathBuf::from("sessions").join(session_id().to_string()),
+                expected_session_id: session_id(),
+            })
+            .expect("replay")
+            .state;
+        assert_eq!(
+            state
+                .conversation
+                .history()
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    ConversationEntry::ToolCallRequest(call) if call.call_id == "call-1"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .conversation
+                .history()
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    ConversationEntry::ToolResult(result) if result.call_id == "call-1"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            event_types.last().map(String::as_str),
+            Some("style.node_completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_approval_repairs_exact_partial_call_without_redispatch() {
+        let call = ConversationEntry::ToolCallRequest(ToolCallEntry {
+            id: ConversationEntryId(String::from("tool-call:call-1:13")),
+            call_id: String::from("call-1"),
+            tool: String::from("filesystem.read"),
+            arguments: json!({"path":"README.md"}),
+            source_sequence: Sequence::new(13).expect("sequence"),
+        });
+        let (data, continuation_id) = terminal_approval_fixture(true, vec![call], None);
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id: continuation_id.to_string(),
+                approved: true,
+                resume_after_resolution: true,
+            })
+            .await
+            .expect("repair partial tool conversation");
+
+        let state = SessionPersistenceLogic::new(data.clone())
+            .load_session(LoadSessionCommand {
+                session_directory: PathBuf::from("sessions").join(session_id().to_string()),
+                expected_session_id: session_id(),
+            })
+            .expect("replay")
+            .state;
+        assert_eq!(
+            state
+                .conversation
+                .history()
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    ConversationEntry::ToolCallRequest(call) if call.call_id == "call-1"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .conversation
+                .history()
+                .iter()
+                .filter(|entry| matches!(
+                    entry,
+                    ConversationEntry::ToolResult(result) if result.call_id == "call-1"
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            data.event_types()
+                .iter()
+                .filter(|kind| kind.as_str() == "tool.execution_completed")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_approval_rejects_conflicting_partial_call_without_mutation() {
+        let call = ConversationEntry::ToolCallRequest(ToolCallEntry {
+            id: ConversationEntryId(String::from("tool-call:call-1:13")),
+            call_id: String::from("call-1"),
+            tool: String::from("filesystem.read"),
+            arguments: json!({"path":"DIFFERENT.md"}),
+            source_sequence: Sequence::new(13).expect("sequence"),
+        });
+        let (data, continuation_id) = terminal_approval_fixture(true, vec![call], None);
+        let before = data.event_types();
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        let error = logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id: continuation_id.to_string(),
+                approved: true,
+                resume_after_resolution: true,
+            })
+            .await
+            .expect_err("conflicting partial call");
+
+        assert!(matches!(
+            error,
+            RunTurnError::ToolConversationRecoveryConflict(ref call) if call == "call-1"
+        ));
+        assert_eq!(data.event_types(), before);
+        assert!(
+            data.state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_approval_rejects_mismatched_receipt_digest_without_mutation() {
+        let (data, continuation_id) = terminal_approval_fixture(
+            true,
+            Vec::new(),
+            Some(ContentHash::digest(b"different approved action")),
+        );
+        let before = data.event_types();
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        let error = logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id: continuation_id.to_string(),
+                approved: true,
+                resume_after_resolution: true,
+            })
+            .await
+            .expect_err("mismatched terminal receipt");
+
+        assert!(matches!(
+            error,
+            RunTurnError::InvalidRecoveryReceipt(ref call) if call == "call-1"
+        ));
+        assert_eq!(data.event_types(), before);
+        assert!(
+            data.state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_approval_rejects_reversed_conversation_pair_without_mutation() {
+        let result = ConversationEntry::ToolResult(ToolResultEntry {
+            id: ConversationEntryId(String::from("tool-result:call-1:13")),
+            call_id: String::from("call-1"),
+            content: String::from(r#"{"content":"fixture"}"#),
+            artifact_id: None,
+            truncated: false,
+            source_sequence: Sequence::new(13).expect("sequence"),
+        });
+        let call = ConversationEntry::ToolCallRequest(ToolCallEntry {
+            id: ConversationEntryId(String::from("tool-call:call-1:14")),
+            call_id: String::from("call-1"),
+            tool: String::from("filesystem.read"),
+            arguments: json!({"path":"README.md"}),
+            source_sequence: Sequence::new(14).expect("sequence"),
+        });
+        let (data, continuation_id) = terminal_approval_fixture(true, vec![result, call], None);
+        let before = data.event_types();
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        let error = logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id: continuation_id.to_string(),
+                approved: true,
+                resume_after_resolution: true,
+            })
+            .await
+            .expect_err("reversed tool conversation");
+
+        assert!(matches!(
+            error,
+            RunTurnError::ToolConversationRecoveryConflict(ref call) if call == "call-1"
+        ));
+        assert_eq!(data.event_types(), before);
+        assert!(
+            data.state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_terminal_gap_repairs_structured_failure_without_dispatch() {
+        let (data, continuation_id) = terminal_approval_fixture(false, Vec::new(), None);
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id: continuation_id.to_string(),
+                approved: false,
+                resume_after_resolution: true,
+            })
+            .await
+            .expect("repair denied terminal gap");
+
+        assert_eq!(
+            data.event_types()
+                .iter()
+                .filter(|kind| kind.as_str() == "tool.execution_failed")
+                .count(),
+            1
+        );
+        assert!(
+            data.state
+                .events
+                .lock()
+                .expect("events")
+                .iter()
+                .any(|event| event.payload.to_string().contains("permission_denied"))
+        );
+        assert_eq!(
+            data.state.harness_commands.lock().expect("commands").len(),
+            1
         );
     }
 

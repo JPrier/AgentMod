@@ -147,7 +147,11 @@ try {
             $_.metadata.event_type -eq "tool.execution_dispatched"
         }).Count -ne 1 -or @($afterFirst | Where-Object {
             $_.metadata.event_type -eq "tool.execution_started"
-        }).Count -ne 1) {
+        }).Count -ne 1 -or @($afterFirst | Where-Object {
+            $_.metadata.event_type -eq "tool.execution_completed"
+        }).Count -ne 1 -or @($afterFirst | Where-Object {
+            $_.metadata.event_type -eq "tool.execution_failed"
+        }).Count -ne 0) {
             throw "approved lifecycle did not execute exactly once"
         }
 
@@ -164,7 +168,15 @@ try {
                 $_.metadata.event_type -eq "tool.execution_dispatched"
             }).Count -ne 1 -or @($afterDuplicate | Where-Object {
                 $_.metadata.event_type -eq "tool.execution_started"
-            }).Count -ne 1) {
+            }).Count -ne 1 -or @($afterDuplicate | Where-Object {
+                $_.metadata.event_type -eq "tool.execution_completed"
+            }).Count -ne 1 -or @($afterDuplicate | Where-Object {
+                $_.metadata.event_type -eq "tool.execution_failed"
+            }).Count -ne 0 -or @($afterDuplicate | Where-Object {
+                $_.metadata.event_type -eq "conversation.entry_committed" -and
+                $_.payload.payload.entry.kind -eq "tool_result" -and
+                $_.payload.payload.entry.content.content -match "permission_denied"
+            }).Count -ne 0) {
             throw "duplicate approval changed canonical state or reran the tool"
         }
         $continued = & $cli run "continue after approved graph completion" `

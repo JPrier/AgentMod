@@ -58,20 +58,29 @@ ephemeral_id=$(printf '%s' "$ephemeral" |
 test -n "$persistent_id"
 test -n "$ephemeral_id"
 
-for pair in "$persistent_id:persistent-chat" "$ephemeral_id:ephemeral-turn"; do
+for pair in \
+    "$persistent_id:persistent-chat:1.0.0" \
+    "$ephemeral_id:ephemeral-turn:1.1.0"
+do
     session_id=${pair%%:*}
-    style=${pair#*:}
+    remainder=${pair#*:}
+    style=${remainder%%:*}
+    version=${remainder#*:}
     inspected=$("$cli" session inspect "$session_id" --json)
     printf '%s' "$inspected" | grep -F "\"id\":\"$style\"" >/dev/null
-    printf '%s' "$inspected" | grep -F '"version":"1.0.0"' >/dev/null
+    printf '%s' "$inspected" | grep -F "\"version\":\"$version\"" >/dev/null
     printf '%s' "$inspected" | grep -F '"harness":"native"' >/dev/null
     printf '%s' "$inspected" | grep -F '"style_compatibility":{"status":"compatible"}' >/dev/null
 done
 
-"$cli" run "persistent before restart" --session "$persistent_id" \
+persistent_before=$("$cli" run "persistent before restart" --session "$persistent_id" \
     --option 'mock_scenario="streaming_text"' \
-    --option 'mock_text="persistent-before"' --json |
-    grep -F '"last_committed_sequence":19' >/dev/null
+    --option 'mock_text="persistent-before"' --json)
+persistent_before_sequence=$(printf '%s' "$persistent_before" |
+    sed -n 's/.*"last_committed_sequence":\([0-9][0-9]*\).*/\1/p')
+persistent_journal="$run_root/sessions/$persistent_id/events.jsonl"
+test -n "$persistent_before_sequence"
+test "$persistent_before_sequence" -eq "$(wc -l <"$persistent_journal" | tr -d ' ')"
 if "$cli" run "ephemeral before restart" --session "$ephemeral_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="ephemeral-before"' --json >/dev/null 2>&1; then
@@ -86,10 +95,14 @@ for session_id in "$persistent_id" "$ephemeral_id"; do
     "$cli" session inspect "$session_id" --json |
         grep -F '"style_compatibility":{"status":"compatible"}' >/dev/null
 done
-"$cli" run "persistent after restart" --session "$persistent_id" \
+persistent_after=$("$cli" run "persistent after restart" --session "$persistent_id" \
     --option 'mock_scenario="streaming_text"' \
-    --option 'mock_text="persistent-after"' --json |
-    grep -F '"last_committed_sequence":36' >/dev/null
+    --option 'mock_text="persistent-after"' --json)
+persistent_after_sequence=$(printf '%s' "$persistent_after" |
+    sed -n 's/.*"last_committed_sequence":\([0-9][0-9]*\).*/\1/p')
+test -n "$persistent_after_sequence"
+test "$persistent_after_sequence" -gt "$persistent_before_sequence"
+test "$persistent_after_sequence" -eq "$(wc -l <"$persistent_journal" | tr -d ' ')"
 if "$cli" run "ephemeral after restart" --session "$ephemeral_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="ephemeral-after"' --json >/dev/null 2>&1; then
@@ -98,7 +111,7 @@ if "$cli" run "ephemeral after restart" --session "$ephemeral_id" \
 fi
 test "$(wc -l < "$run_root/sessions/$ephemeral_id/events.jsonl")" -eq 1
 
-branch=$("$cli" session branch "$persistent_id" --at 19 \
+branch=$("$cli" session branch "$persistent_id" --at "$persistent_before_sequence" \
     --style ephemeral-turn --json)
 branch_id=$(printf '%s' "$branch" |
     sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')

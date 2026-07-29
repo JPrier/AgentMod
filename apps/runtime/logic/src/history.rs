@@ -499,6 +499,7 @@ where
             RuntimeCommittedEvent::ContextProjectionReplaced(ContextProjectionReplacedEvent {
                 replacement: state.conversation.provider_projection().to_vec(),
                 provenance,
+                context_phase: None,
             }),
         )?);
     }
@@ -564,6 +565,7 @@ where
                 committed_at: sequence,
                 artifact_id: Some(artifact_id),
             },
+            context_phase: None,
         }),
         vec![ArtifactReference {
             id: artifact_id,

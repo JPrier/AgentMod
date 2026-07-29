@@ -8,7 +8,7 @@ use agentmod_runtime_data::memory::{
 use thiserror::Error;
 
 const MAX_MEMORY_CONTENT: usize = 1024 * 1024;
-const MAX_QUERY_LENGTH: usize = 8 * 1024;
+const MAX_QUERY_LENGTH: usize = 1024 * 1024;
 const MAX_RETRIEVAL_ITEMS: usize = 100;
 
 /// Logic-owned memory scope.
@@ -180,15 +180,20 @@ where
             return Err(MemoryLogicError::InvalidLimit);
         }
         let query = command.query;
+        let limit = command.limit;
         self.data
             .retrieve_memory(RetrieveMemoryDataRequest {
                 provider: command.provider,
                 scope: to_data_scope(command.scope)?,
                 query: query.clone(),
-                limit: command.limit,
+                limit,
             })
             .map_err(MemoryLogicError::Data)?
             .into_iter()
+            // A dependency is outside the logic trust boundary. Enforce the
+            // style-selected item cap again even when a provider ignores the
+            // requested limit.
+            .take(limit)
             .map(|record| {
                 let size = u64::try_from(record.content.len())
                     .map_err(|_| MemoryLogicError::SizeOverflow)?;
@@ -348,5 +353,53 @@ mod tests {
         assert_eq!(items[0].scope, "project:p1");
         assert_eq!(items[0].injection_event, injection);
         assert_eq!(items[0].size, ByteCount::new(13));
+    }
+
+    struct OverReturningData;
+
+    impl MemoryDataPort for OverReturningData {
+        fn write_memory(
+            &self,
+            _request: WriteMemoryDataRequest,
+        ) -> Result<WriteMemoryDataRecord, MemoryDataError> {
+            unreachable!("fixture does not write memory")
+        }
+
+        fn retrieve_memory(
+            &self,
+            _request: RetrieveMemoryDataRequest,
+        ) -> Result<Vec<RetrievedMemoryDataRecord>, MemoryDataError> {
+            Ok((0..5)
+                .map(|index| RetrievedMemoryDataRecord {
+                    provider: String::from("mock"),
+                    reference: format!("m{index}"),
+                    scope: String::from("runtime"),
+                    source: String::from("fixture"),
+                    content: format!("record {index}"),
+                    score: None,
+                    created_at_millis: i64::from(index),
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn retrieval_reenforces_item_limit_against_over_returning_provider() {
+        let items = MemoryLogic::new(OverReturningData)
+            .retrieve_memory(RetrieveMemoryCommand {
+                provider: String::from("mock"),
+                scope: MemoryScope::Runtime,
+                query: String::from("bounded"),
+                limit: 2,
+                injection_event: EventId::from_uuid(Uuid::from_u128(9)),
+            })
+            .expect("retrieve");
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.reference.as_str())
+                .collect::<Vec<_>>(),
+            ["m0", "m1"]
+        );
     }
 }

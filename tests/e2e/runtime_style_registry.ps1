@@ -25,8 +25,10 @@ try {
         $process = Start-Process -FilePath $runtime -ArgumentList "serve" `
             -WorkingDirectory $runRoot -WindowStyle Hidden -PassThru
         for ($attempt = 0; $attempt -lt 80; $attempt++) {
-            & $cli doctor --json 2>$null | Out-Null
-            if ($LASTEXITCODE -eq 0) { return $process }
+            try {
+                & $cli doctor --json 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) { return $process }
+            } catch {}
             Start-Sleep -Milliseconds 100
         }
         if (-not $process.HasExited) { Stop-Process -Id $process.Id -Force }
@@ -62,14 +64,14 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "style-bound session creation failed" }
 
         foreach ($entry in @(
-            @($persistent.session_id, "persistent-chat"),
-            @($ephemeral.session_id, "ephemeral-turn")
+            @($persistent.session_id, "persistent-chat", "1.0.0"),
+            @($ephemeral.session_id, "ephemeral-turn", "1.1.0")
         )) {
             $inspection = & $cli session inspect $entry[0] --json | ConvertFrom-Json
             if ($inspection.state.style_binding.id -ne $entry[1]) {
                 throw "session style binding mismatch"
             }
-            if ($inspection.state.style_binding.version -ne "1.0.0") {
+            if ($inspection.state.style_binding.version -ne $entry[2]) {
                 throw "session style version mismatch"
             }
             if ($inspection.state.style_binding.harness -ne "native") {
@@ -84,17 +86,29 @@ try {
             --session $persistent.session_id `
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="persistent-before"' --json | ConvertFrom-Json
-        & $cli run "ephemeral before restart" `
-            --session $ephemeral.session_id `
-            --option 'mock_scenario="streaming_text"' `
-            --option 'mock_text="ephemeral-before"' --json 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $savedErrorPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $cli run "ephemeral before restart" `
+                --session $ephemeral.session_id `
+                --option 'mock_scenario="streaming_text"' `
+                --option 'mock_text="ephemeral-before"' --json 2>$null | Out-Null
+            $ephemeralBeforeExit = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $savedErrorPreference
+        }
+        if ($ephemeralBeforeExit -eq 0) {
             throw "unimplemented ephemeral graph silently used the legacy turn path"
         }
         $ephemeralJournal = Join-Path $runRoot (
             "sessions\" + $ephemeral.session_id + "\events.jsonl"
         )
-        if ($persistentTurn.last_committed_sequence -ne 19 -or
+        $persistentJournal = Join-Path $runRoot (
+            "sessions\" + $persistent.session_id + "\events.jsonl"
+        )
+        if ($persistentTurn.last_committed_sequence -ne
+                @(Get-Content $persistentJournal).Count -or
             @(Get-Content $ephemeralJournal).Count -ne 1) {
             throw "pre-restart style execution state was incorrect"
         }
@@ -112,19 +126,31 @@ try {
             --session $persistent.session_id `
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="persistent-after"' --json | ConvertFrom-Json
-        & $cli run "ephemeral after restart" `
-            --session $ephemeral.session_id `
-            --option 'mock_scenario="streaming_text"' `
-            --option 'mock_text="ephemeral-after"' --json 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $savedErrorPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $cli run "ephemeral after restart" `
+                --session $ephemeral.session_id `
+                --option 'mock_scenario="streaming_text"' `
+                --option 'mock_text="ephemeral-after"' --json 2>$null | Out-Null
+            $ephemeralAfterExit = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $savedErrorPreference
+        }
+        if ($ephemeralAfterExit -eq 0) {
             throw "unsupported style changed behavior after restart"
         }
-        if ($persistentAfter.last_committed_sequence -ne 36 -or
+        if ($persistentAfter.last_committed_sequence -le
+                $persistentTurn.last_committed_sequence -or
+            $persistentAfter.last_committed_sequence -ne
+                @(Get-Content $persistentJournal).Count -or
             @(Get-Content $ephemeralJournal).Count -ne 1) {
             throw "post-restart style execution state was incorrect"
         }
 
-        $branch = & $cli session branch $persistent.session_id --at 19 `
+        $branch = & $cli session branch $persistent.session_id `
+            --at $persistentTurn.last_committed_sequence `
             --style ephemeral-turn --json | ConvertFrom-Json
         $branchInspection = & $cli session inspect $branch.session_id --json |
             ConvertFrom-Json
@@ -142,9 +168,18 @@ try {
         if ($disabledInspection.state.style_compatibility.status -ne "incompatible") {
             throw "disabled persisted style was not reported as incompatible"
         }
-        & $cli run "must not silently substitute" --session $persistent.session_id `
-            --option 'mock_scenario="streaming_text"' --json 2>$null | Out-Null
-        if ($LASTEXITCODE -eq 0) {
+        $savedErrorPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $cli run "must not silently substitute" `
+                --session $persistent.session_id `
+                --option 'mock_scenario="streaming_text"' --json 2>$null | Out-Null
+            $disabledExit = $LASTEXITCODE
+        }
+        finally {
+            $ErrorActionPreference = $savedErrorPreference
+        }
+        if ($disabledExit -eq 0) {
             throw "disabled persisted style executed through a fallback"
         }
         Remove-Item -LiteralPath (
@@ -180,3 +215,4 @@ try {
 finally {
     Pop-Location
 }
+$global:LASTEXITCODE = 0

@@ -8,12 +8,14 @@ use std::path::PathBuf;
 
 use agentmod_runtime_dependency::memory::{
     DependencyMemoryWriteRequest, FileMemoryDependency, MemoryDependencyPort,
+    SqliteFtsMemoryDependency,
 };
 
 #[test]
 #[ignore = "invoked explicitly by the style-context process E2E"]
 fn seed_file_memory_for_process_e2e() {
-    let path = PathBuf::from(required("AGENTMOD_TEST_MEMORY_FILE"));
+    let path = PathBuf::from(required("AGENTMOD_TEST_MEMORY_PATH"));
+    let provider = required("AGENTMOD_TEST_MEMORY_PROVIDER");
     let scope = required("AGENTMOD_TEST_MEMORY_SCOPE");
     let source = required("AGENTMOD_TEST_MEMORY_SOURCE");
     let content = required("AGENTMOD_TEST_MEMORY_CONTENT");
@@ -21,14 +23,18 @@ fn seed_file_memory_for_process_e2e() {
         .parse()
         .expect("AGENTMOD_TEST_MEMORY_CREATED_AT_MS must be an i64");
 
-    let response = FileMemoryDependency::new(path)
-        .write(DependencyMemoryWriteRequest {
-            scope,
-            source,
-            content,
-            created_at_millis,
-        })
-        .expect("seed checksum-protected file memory");
+    let request = DependencyMemoryWriteRequest {
+        scope,
+        source,
+        content,
+        created_at_millis,
+    };
+    let response = match provider.as_str() {
+        "file" => FileMemoryDependency::new(path).write(request),
+        "sqlite-fts" => SqliteFtsMemoryDependency::new(path).write(request),
+        other => panic!("unsupported E2E memory provider: {other}"),
+    }
+    .expect("seed first-party process-E2E memory");
     assert!(response.retained);
     assert!(!response.id.is_empty());
 }

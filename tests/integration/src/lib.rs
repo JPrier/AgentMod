@@ -138,9 +138,9 @@ mod tests {
         let persistent = create("persistent-chat");
         let ephemeral = create("ephemeral-turn@1.1.0");
 
-        for (session_id, expected_style) in [
-            (persistent, "persistent-chat"),
-            (ephemeral, "ephemeral-turn"),
+        for (session_id, expected_style, expected_version) in [
+            (persistent, "persistent-chat", "1.0.0"),
+            (ephemeral, "ephemeral-turn", "1.1.0"),
         ] {
             let RuntimeResponse::SessionInspected { state, .. } = service
                 .handle_wire(&RuntimeRequest::InspectSession {
@@ -152,7 +152,7 @@ mod tests {
                 panic!("inspection response")
             };
             assert_eq!(state["style_binding"]["id"], expected_style);
-            assert_eq!(state["style_binding"]["version"], "1.0.0");
+            assert_eq!(state["style_binding"]["version"], expected_version);
             assert_eq!(state["style_binding"]["harness"], "native");
             assert_eq!(state["style_compatibility"]["status"], "compatible");
             for key in [

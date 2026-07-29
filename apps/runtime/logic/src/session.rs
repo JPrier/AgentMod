@@ -8,8 +8,9 @@ use agentmod_primitives::{ContentHash, ContinuationId, Sequence, SessionId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::conversation::{
-    ConversationEntry, ConversationError, ConversationState, ProjectionProvenance,
+use crate::{
+    conversation::{ConversationEntry, ConversationError, ConversationState, ProjectionProvenance},
+    projection::measure_projection,
 };
 
 /// Durable session lifecycle reconstructed by replay.
@@ -233,6 +234,81 @@ pub struct ContextProjectionReplacedEvent {
     pub replacement: Vec<ConversationEntry>,
     /// Source/method/artifact provenance.
     pub provenance: ProjectionProvenance,
+    /// Context phase atomically completed by this canonical replacement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_phase: Option<ContextPhaseIdentity>,
+}
+
+/// Stable identity for one recoverable context-composition boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextBoundaryIdentity {
+    /// Active compiled graph node.
+    pub node_id: String,
+    /// `turn_start` or `before_model_request`.
+    pub boundary: String,
+    /// Client/runtime run identity, normally the provider cancellation ID.
+    pub run_id: String,
+    /// Lifecycle path that requested this boundary.
+    pub origin: ContextBoundaryOrigin,
+    /// Exact provider/model/options/current-input identity.
+    pub request_hash: ContentHash,
+    /// Journal head before the boundary began.
+    pub source_head: Sequence,
+}
+
+/// Explicit lifecycle path that owns one context boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextBoundaryOrigin {
+    /// Initial model request for a user-authored turn.
+    UserTurn,
+    /// Model continuation after a non-approval tool batch.
+    ToolContinuation,
+    /// Model continuation after resolving a durable approval.
+    ApprovalContinuation,
+}
+
+/// Stable identity for one effect-bearing phase inside a context boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextPhaseIdentity {
+    /// Owning recoverable boundary.
+    pub boundary: ContextBoundaryIdentity,
+    /// `memory` or `compaction`.
+    pub phase: String,
+}
+
+/// Canonical intent to begin context composition before invoking its pipeline.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextBoundaryStartedEvent {
+    /// Exact recoverable boundary identity.
+    pub identity: ContextBoundaryIdentity,
+}
+
+/// Canonical completion for a phase which required no projection replacement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextPhaseCompletedEvent {
+    /// Exact phase identity.
+    pub identity: ContextPhaseIdentity,
+}
+
+/// Canonical intent before invoking one context phase's blocking pipeline.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextPhaseStartedEvent {
+    /// Exact phase identity.
+    pub identity: ContextPhaseIdentity,
+}
+
+/// Canonical completion of a provider-projection lifecycle boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextBoundaryCompletedEvent {
+    /// Exact recoverable boundary identity.
+    pub identity: ContextBoundaryIdentity,
+    /// Hash of the exact structured provider projection.
+    pub projection_hash: ContentHash,
+    /// Provider-independent approximate token pressure.
+    pub estimated_tokens: u64,
+    /// Exact serialized provider projection bytes.
+    pub serialized_bytes: u64,
 }
 
 /// Auditable model request proposal before authorization.
@@ -415,6 +491,9 @@ pub struct ToolExecutionCompletedEvent {
 pub struct ToolExecutionFailedEvent {
     /// Provider tool-call identifier.
     pub call_id: String,
+    /// Exact proposal digest when failure occurred before a dispatch record existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<ContentHash>,
     /// Stable failure code.
     pub code: String,
     /// Redacted failure message.
@@ -614,6 +693,14 @@ pub enum RuntimeCommittedEvent {
     ConversationEntryCommitted(ConversationEntryCommittedEvent),
     /// Replaces only provider-visible structured state.
     ContextProjectionReplaced(ContextProjectionReplacedEvent),
+    /// Begins one recoverable context lifecycle boundary.
+    ContextBoundaryStarted(ContextBoundaryStartedEvent),
+    /// Begins one effect-bearing context phase.
+    ContextPhaseStarted(ContextPhaseStartedEvent),
+    /// Completes one context phase without a replacement.
+    ContextPhaseCompleted(ContextPhaseCompletedEvent),
+    /// Completes one recoverable context lifecycle boundary.
+    ContextBoundaryCompleted(ContextBoundaryCompletedEvent),
     /// Records the original model request proposal.
     ModelRequestProposed(ModelRequestProposedEvent),
     /// Records the final approved request before its side effect.
@@ -683,6 +770,10 @@ impl RuntimeCommittedEvent {
             Self::SessionBranched(_) => "session.branched",
             Self::ConversationEntryCommitted(_) => "conversation.entry_committed",
             Self::ContextProjectionReplaced(_) => "context.projection_replaced",
+            Self::ContextBoundaryStarted(_) => "context.boundary_started",
+            Self::ContextPhaseStarted(_) => "context.phase_started",
+            Self::ContextPhaseCompleted(_) => "context.phase_completed",
+            Self::ContextBoundaryCompleted(_) => "context.boundary_completed",
             Self::ModelRequestProposed(_) => "model.request_proposed",
             Self::ModelRequestApproved(_) => "model.request_approved",
             Self::ModelRequestStarted(_) => "model.request_started",
@@ -793,6 +884,32 @@ pub struct StyleExecutionState {
     /// Cumulative provider tokens observed when compaction last committed.
     #[serde(default)]
     pub tokens_at_last_compaction: u64,
+    /// Recoverable context boundaries retained in canonical execution order.
+    #[serde(default)]
+    pub context_boundaries: Vec<ContextBoundaryExecutionState>,
+}
+
+/// Replay-derived progress for one context-composition boundary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextBoundaryExecutionState {
+    /// Stable boundary identity.
+    pub identity: ContextBoundaryIdentity,
+    /// Completed phases in canonical order.
+    pub completed_phases: Vec<String>,
+    /// Phases whose blocking pipeline may have been invoked.
+    #[serde(default)]
+    pub started_phases: Vec<String>,
+    /// Latest event belonging to this boundary.
+    pub last_sequence: Sequence,
+    /// Terminal boundary event sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Sequence>,
+    /// Final approximate token pressure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated_tokens: Option<u64>,
+    /// Final exact serialized bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serialized_bytes: Option<u64>,
 }
 
 /// Exact replay-derived control position for a compiled style graph.
@@ -840,23 +957,50 @@ pub enum ToolExecutionState {
 }
 
 /// Reducer-owned tool execution outbox record.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolExecutionRecord {
-    /// Stable execution identity.
-    pub execution_id: String,
+    /// Stable execution identity, absent for policy-denial terminals.
+    pub execution_id: Option<String>,
     /// Provider call identifier.
     pub call_id: String,
     /// Exact approved action digest.
-    pub action_digest: ContentHash,
+    pub action_digest: Option<ContentHash>,
     /// Latest durable execution state.
     pub state: ToolExecutionState,
     /// Dispatch sequence.
-    pub dispatched_at: Sequence,
+    pub dispatched_at: Option<Sequence>,
     /// Terminal sequence when known.
     pub terminal_at: Option<Sequence>,
     /// Number of host lifecycle items durably projected into the journal.
     #[serde(default)]
     pub observed_event_count: u64,
+    /// Exact bounded terminal payload needed to reconstruct provider context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_outcome: Option<ToolExecutionTerminalOutcome>,
+}
+
+/// Canonical terminal tool outcome retained for projection repair.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
+pub enum ToolExecutionTerminalOutcome {
+    /// Tool host completed with a bounded structured result.
+    Completed {
+        /// Bounded structured result.
+        result: serde_json::Value,
+        /// Optional immutable full-output artifact.
+        artifact: Option<String>,
+        /// Whether the host result was already truncated.
+        truncated: bool,
+    },
+    /// Tool execution or policy failed.
+    Failed {
+        /// Stable failure code.
+        code: String,
+        /// Redacted failure message.
+        message: String,
+        /// Whether retry may be legal.
+        retryable: bool,
+    },
 }
 
 /// Replay-derived process reconciliation record.
@@ -998,7 +1142,22 @@ fn apply_payload(
                     .checked_add(execution.output_tokens)
                     .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
             }
+            if let Some(phase) = &replaced.context_phase {
+                apply_context_phase_completed(state, phase, event.metadata.sequence)?;
+            }
             Ok(())
+        }
+        RuntimeCommittedEvent::ContextBoundaryStarted(started) => {
+            apply_context_boundary_started(state, started, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextPhaseStarted(started) => {
+            apply_context_phase_started(state, &started.identity, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextPhaseCompleted(completed) => {
+            apply_context_phase_completed(state, &completed.identity, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextBoundaryCompleted(completed) => {
+            apply_context_boundary_completed(state, completed, event.metadata.sequence)
         }
         RuntimeCommittedEvent::ModelRequestProposed(_)
         | RuntimeCommittedEvent::ModelRequestApproved(_)
@@ -1060,12 +1219,28 @@ fn apply_payload(
         RuntimeCommittedEvent::ToolOutputObserved(observed) => {
             increment_tool_event_count(state, &observed.call_id)
         }
-        RuntimeCommittedEvent::ToolExecutionCompleted(completed) => {
-            mark_tool_terminal(state, &completed.call_id, event.metadata.sequence)
-        }
-        RuntimeCommittedEvent::ToolExecutionFailed(failed) => {
-            mark_tool_terminal(state, &failed.call_id, event.metadata.sequence)
-        }
+        RuntimeCommittedEvent::ToolExecutionCompleted(completed) => mark_tool_terminal(
+            state,
+            &completed.call_id,
+            event.metadata.sequence,
+            None,
+            ToolExecutionTerminalOutcome::Completed {
+                result: completed.result.clone(),
+                artifact: completed.artifact.clone(),
+                truncated: completed.truncated,
+            },
+        ),
+        RuntimeCommittedEvent::ToolExecutionFailed(failed) => mark_tool_terminal(
+            state,
+            &failed.call_id,
+            event.metadata.sequence,
+            failed.action_digest,
+            ToolExecutionTerminalOutcome::Failed {
+                code: failed.code.clone(),
+                message: failed.message.clone(),
+                retryable: failed.retryable,
+            },
+        ),
         RuntimeCommittedEvent::ProcessReconciliationStarted(started) => {
             apply_process_reconciliation_started(state, started, event.metadata.sequence)
         }
@@ -1131,6 +1306,208 @@ fn apply_branch_ancestry(
     Ok(())
 }
 
+fn apply_context_boundary_started(
+    state: &mut SessionState,
+    started: &ContextBoundaryStartedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let execution = style_execution_mut(state)?;
+    let active = execution
+        .active_node
+        .as_ref()
+        .ok_or(SessionReducerError::InvalidContextBoundaryTransition)?;
+    if active.node_id != started.identity.node_id
+        || started.identity.run_id.trim().is_empty()
+        || !matches!(
+            started.identity.boundary.as_str(),
+            "turn_start" | "before_model_request"
+        )
+        || started
+            .identity
+            .source_head
+            .checked_next()
+            .map_err(|_| SessionReducerError::SequenceOverflow)?
+            != sequence
+        || execution
+            .context_boundaries
+            .iter()
+            .any(|boundary| boundary.completed_at.is_none())
+        || execution
+            .context_boundaries
+            .iter()
+            .any(|boundary| boundary.identity == started.identity)
+    {
+        return Err(SessionReducerError::InvalidContextBoundaryTransition);
+    }
+    match (started.identity.boundary.as_str(), started.identity.origin) {
+        ("turn_start", ContextBoundaryOrigin::UserTurn) => {}
+        ("before_model_request", ContextBoundaryOrigin::UserTurn) => {
+            let Some(previous) = execution.context_boundaries.last() else {
+                return Err(SessionReducerError::InvalidContextBoundaryTransition);
+            };
+            if previous.completed_at.is_none()
+                || previous.identity.boundary != "turn_start"
+                || previous.identity.origin != ContextBoundaryOrigin::UserTurn
+                || previous.identity.node_id != started.identity.node_id
+                || previous.identity.run_id != started.identity.run_id
+                || previous.identity.request_hash != started.identity.request_hash
+            {
+                return Err(SessionReducerError::InvalidContextBoundaryTransition);
+            }
+        }
+        (
+            "before_model_request",
+            ContextBoundaryOrigin::ToolContinuation | ContextBoundaryOrigin::ApprovalContinuation,
+        ) => {
+            let is_tool_node =
+                execution.graph.nodes.iter().any(|node| {
+                    node.id == active.node_id && node.kind == NodeKind::ToolExecutionGate
+                });
+            if !is_tool_node {
+                return Err(SessionReducerError::InvalidContextBoundaryTransition);
+            }
+        }
+        _ => return Err(SessionReducerError::InvalidContextBoundaryTransition),
+    }
+    execution
+        .context_boundaries
+        .push(ContextBoundaryExecutionState {
+            identity: started.identity.clone(),
+            completed_phases: Vec::new(),
+            started_phases: Vec::new(),
+            last_sequence: sequence,
+            completed_at: None,
+            estimated_tokens: None,
+            serialized_bytes: None,
+        });
+    Ok(())
+}
+
+fn apply_context_phase_completed(
+    state: &mut SessionState,
+    phase: &ContextPhaseIdentity,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if !matches!(phase.phase.as_str(), "memory" | "compaction") {
+        return Err(SessionReducerError::InvalidContextBoundaryTransition);
+    }
+    let execution = style_execution_mut(state)?;
+    let boundary = execution
+        .context_boundaries
+        .last_mut()
+        .filter(|candidate| candidate.identity == phase.boundary)
+        .ok_or(SessionReducerError::InvalidContextBoundaryTransition)?;
+    let exact_phase_order = match phase.phase.as_str() {
+        "memory" => {
+            boundary.started_phases.as_slice() == ["memory"] && boundary.completed_phases.is_empty()
+        }
+        "compaction" => {
+            boundary.identity.boundary == "before_model_request"
+                && boundary.started_phases.as_slice() == ["memory", "compaction"]
+                && boundary.completed_phases.as_slice() == ["memory"]
+        }
+        _ => false,
+    };
+    if boundary.completed_at.is_some()
+        || !exact_phase_order
+        || boundary
+            .last_sequence
+            .checked_next()
+            .map_err(|_| SessionReducerError::SequenceOverflow)?
+            != sequence
+    {
+        return Err(SessionReducerError::InvalidContextBoundaryTransition);
+    }
+    boundary.completed_phases.push(phase.phase.clone());
+    boundary.last_sequence = sequence;
+    Ok(())
+}
+
+fn apply_context_phase_started(
+    state: &mut SessionState,
+    phase: &ContextPhaseIdentity,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if !matches!(phase.phase.as_str(), "memory" | "compaction") {
+        return Err(SessionReducerError::InvalidContextBoundaryTransition);
+    }
+    let execution = style_execution_mut(state)?;
+    let boundary = execution
+        .context_boundaries
+        .last_mut()
+        .filter(|candidate| candidate.identity == phase.boundary)
+        .ok_or(SessionReducerError::InvalidContextBoundaryTransition)?;
+    let exact_phase_order = match phase.phase.as_str() {
+        "memory" => boundary.started_phases.is_empty() && boundary.completed_phases.is_empty(),
+        "compaction" => {
+            boundary.identity.boundary == "before_model_request"
+                && boundary.started_phases.as_slice() == ["memory"]
+                && boundary.completed_phases.as_slice() == ["memory"]
+        }
+        _ => false,
+    };
+    if boundary.completed_at.is_some()
+        || !exact_phase_order
+        || boundary
+            .last_sequence
+            .checked_next()
+            .map_err(|_| SessionReducerError::SequenceOverflow)?
+            != sequence
+    {
+        return Err(SessionReducerError::InvalidContextBoundaryTransition);
+    }
+    boundary.started_phases.push(phase.phase.clone());
+    boundary.last_sequence = sequence;
+    Ok(())
+}
+
+fn apply_context_boundary_completed(
+    state: &mut SessionState,
+    completed: &ContextBoundaryCompletedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let measurement = measure_projection(state.conversation.provider_projection())
+        .map_err(|_| SessionReducerError::InvalidContextBoundaryMeasurement)?;
+    if measurement.projection_hash != completed.projection_hash
+        || measurement.estimated_tokens != completed.estimated_tokens
+        || measurement.serialized_bytes != completed.serialized_bytes
+    {
+        return Err(SessionReducerError::InvalidContextBoundaryMeasurement);
+    }
+    let execution = style_execution_mut(state)?;
+    let boundary = execution
+        .context_boundaries
+        .last_mut()
+        .filter(|candidate| candidate.identity == completed.identity)
+        .ok_or(SessionReducerError::InvalidContextBoundaryTransition)?;
+    let exact_phases = match completed.identity.boundary.as_str() {
+        "turn_start" => {
+            boundary.started_phases.as_slice() == ["memory"]
+                && boundary.completed_phases.as_slice() == ["memory"]
+        }
+        "before_model_request" => {
+            boundary.started_phases.as_slice() == ["memory", "compaction"]
+                && boundary.completed_phases.as_slice() == ["memory", "compaction"]
+        }
+        _ => false,
+    };
+    if boundary.completed_at.is_some()
+        || !exact_phases
+        || boundary
+            .last_sequence
+            .checked_next()
+            .map_err(|_| SessionReducerError::SequenceOverflow)?
+            != sequence
+    {
+        return Err(SessionReducerError::InvalidContextBoundaryTransition);
+    }
+    boundary.last_sequence = sequence;
+    boundary.completed_at = Some(sequence);
+    boundary.estimated_tokens = Some(completed.estimated_tokens);
+    boundary.serialized_bytes = Some(completed.serialized_bytes);
+    Ok(())
+}
+
 fn apply_style_execution_initialized(
     state: &mut SessionState,
     initialized: &StyleExecutionInitializedEvent,
@@ -1159,6 +1536,7 @@ fn apply_style_execution_initialized(
         input_tokens: 0,
         output_tokens: 0,
         tokens_at_last_compaction: 0,
+        context_boundaries: Vec::new(),
     });
     Ok(())
 }
@@ -1473,13 +1851,14 @@ fn apply_tool_dispatch(
     state.tool_executions.insert(
         dispatched.call_id.clone(),
         ToolExecutionRecord {
-            execution_id: dispatched.execution_id.clone(),
+            execution_id: Some(dispatched.execution_id.clone()),
             call_id: dispatched.call_id.clone(),
-            action_digest: dispatched.action_digest,
+            action_digest: Some(dispatched.action_digest),
             state: ToolExecutionState::Dispatched,
-            dispatched_at: sequence,
+            dispatched_at: Some(sequence),
             terminal_at: None,
             observed_event_count: 0,
+            terminal_outcome: None,
         },
     );
     Ok(())
@@ -1489,17 +1868,43 @@ fn mark_tool_terminal(
     state: &mut SessionState,
     call_id: &str,
     sequence: Sequence,
+    action_digest: Option<ContentHash>,
+    outcome: ToolExecutionTerminalOutcome,
 ) -> Result<(), SessionReducerError> {
     if let Some(record) = state.tool_executions.get_mut(call_id) {
         if record.state == ToolExecutionState::Terminal {
             return Err(SessionReducerError::InvalidToolExecutionTransition);
         }
+        if let Some(action_digest) = action_digest {
+            if record
+                .action_digest
+                .is_some_and(|existing| existing != action_digest)
+            {
+                return Err(SessionReducerError::InvalidToolExecutionTransition);
+            }
+            record.action_digest = Some(action_digest);
+        }
         record.state = ToolExecutionState::Terminal;
         record.terminal_at = Some(sequence);
+        record.terminal_outcome = Some(outcome);
         record.observed_event_count = record
             .observed_event_count
             .checked_add(1)
             .ok_or(SessionReducerError::ToolEventCountOverflow)?;
+    } else {
+        state.tool_executions.insert(
+            call_id.to_owned(),
+            ToolExecutionRecord {
+                execution_id: None,
+                call_id: call_id.to_owned(),
+                action_digest,
+                state: ToolExecutionState::Terminal,
+                dispatched_at: None,
+                terminal_at: Some(sequence),
+                observed_event_count: 1,
+                terminal_outcome: Some(outcome),
+            },
+        );
     }
     Ok(())
 }
@@ -1676,6 +2081,12 @@ pub enum SessionReducerError {
     /// A style node lifecycle or graph transition is invalid.
     #[error("style execution state transition is invalid")]
     InvalidStyleExecutionTransition,
+    /// Context composition did not follow start, phase, completion ordering.
+    #[error("context boundary state transition is invalid")]
+    InvalidContextBoundaryTransition,
+    /// Context completion did not describe the exact replayed projection.
+    #[error("context boundary projection measurement is invalid")]
+    InvalidContextBoundaryMeasurement,
     /// Provider-reported usage exceeded the replay-safe integer bound.
     #[error("style provider token usage overflowed")]
     StyleTokenUsageOverflow,
@@ -1815,11 +2226,309 @@ to = "done"
             &GraphCacheInputs {
                 plugin_set_hash: ContentHash::digest(b"plugins"),
                 runtime_api_version: "1.0.0".into(),
-                capability_set: BTreeSet::default(),
+                capability_set: BTreeSet::from([String::from("model")]),
             },
             CompilerLimits::default(),
         )
         .expect("compiled graph")
+    }
+
+    fn context_graph() -> ExecutableGraph {
+        compile_graph(
+            r#"
+format_version = 1
+entry = "respond"
+[budget]
+max_steps = 10
+max_tokens = 100
+max_cost_micros = 100
+max_duration_ms = 1000
+[declarations]
+capabilities = ["model"]
+providers = ["mock"]
+[[nodes]]
+id = "respond"
+kind = "model_call"
+provider = "mock"
+[[nodes]]
+id = "done"
+kind = "complete_turn"
+[[edges]]
+from = "respond"
+to = "done"
+"#,
+            &GraphCacheInputs {
+                plugin_set_hash: ContentHash::digest(b"plugins"),
+                runtime_api_version: "1.0.0".into(),
+                capability_set: BTreeSet::from([String::from("model")]),
+            },
+            CompilerLimits::default(),
+        )
+        .expect("context graph")
+    }
+
+    fn context_identity(
+        boundary: &str,
+        source_head: u64,
+        origin: ContextBoundaryOrigin,
+    ) -> ContextBoundaryIdentity {
+        ContextBoundaryIdentity {
+            node_id: String::from("respond"),
+            boundary: boundary.into(),
+            run_id: String::from("run-1"),
+            origin,
+            request_hash: ContentHash::digest(b"request-1"),
+            source_head: Sequence::new(source_head).expect("source head"),
+        }
+    }
+
+    fn active_context_state() -> SessionState {
+        replay(&[
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(context_graph()),
+                    },
+                )),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("respond"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+        ])
+        .expect("active context state")
+    }
+
+    #[test]
+    fn context_reducer_rejects_overlapping_and_reversed_boundaries() {
+        let turn = context_identity("turn_start", 3, ContextBoundaryOrigin::UserTurn);
+        let state = reduce(
+            Some(active_context_state()),
+            &envelope(
+                4,
+                RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                    identity: turn.clone(),
+                }),
+            ),
+        )
+        .expect("turn boundary");
+        let overlap = ContextBoundaryIdentity {
+            source_head: Sequence::new(4).expect("source head"),
+            ..turn.clone()
+        };
+        assert!(matches!(
+            reduce(
+                Some(state.clone()),
+                &envelope(
+                    5,
+                    RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                        identity: overlap,
+                    })
+                )
+            ),
+            Err(SessionReducerError::InvalidContextBoundaryTransition)
+        ));
+        assert!(matches!(
+            reduce(
+                Some(state),
+                &envelope(
+                    5,
+                    RuntimeCommittedEvent::ContextPhaseStarted(ContextPhaseStartedEvent {
+                        identity: ContextPhaseIdentity {
+                            boundary: turn,
+                            phase: String::from("compaction"),
+                        },
+                    })
+                )
+            ),
+            Err(SessionReducerError::InvalidContextBoundaryTransition)
+        ));
+    }
+
+    #[test]
+    fn context_reducer_rejects_incomplete_phase_and_measurement_mismatch() {
+        let turn = context_identity("turn_start", 3, ContextBoundaryOrigin::UserTurn);
+        let phase = ContextPhaseIdentity {
+            boundary: turn.clone(),
+            phase: String::from("memory"),
+        };
+        let state = replay(&[
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(context_graph()),
+                    },
+                )),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("respond"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                    identity: turn.clone(),
+                }),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::ContextPhaseStarted(ContextPhaseStartedEvent {
+                    identity: phase.clone(),
+                }),
+            ),
+        ])
+        .expect("started phase");
+        let empty = measure_projection(&[]).expect("empty measurement");
+        assert!(matches!(
+            reduce(
+                Some(state.clone()),
+                &envelope(
+                    6,
+                    RuntimeCommittedEvent::ContextBoundaryCompleted(
+                        ContextBoundaryCompletedEvent {
+                            identity: turn.clone(),
+                            projection_hash: empty.projection_hash,
+                            estimated_tokens: empty.estimated_tokens,
+                            serialized_bytes: empty.serialized_bytes,
+                        },
+                    )
+                )
+            ),
+            Err(SessionReducerError::InvalidContextBoundaryTransition)
+        ));
+        let state = reduce(
+            Some(state),
+            &envelope(
+                6,
+                RuntimeCommittedEvent::ContextPhaseCompleted(ContextPhaseCompletedEvent {
+                    identity: phase,
+                }),
+            ),
+        )
+        .expect("completed phase");
+        assert!(matches!(
+            reduce(
+                Some(state),
+                &envelope(
+                    7,
+                    RuntimeCommittedEvent::ContextBoundaryCompleted(
+                        ContextBoundaryCompletedEvent {
+                            identity: turn,
+                            projection_hash: ContentHash::digest(b"wrong"),
+                            estimated_tokens: empty.estimated_tokens,
+                            serialized_bytes: empty.serialized_bytes,
+                        },
+                    )
+                )
+            ),
+            Err(SessionReducerError::InvalidContextBoundaryMeasurement)
+        ));
+    }
+
+    #[test]
+    fn context_reducer_requires_memory_before_model_compaction_and_latest_boundary() {
+        let turn = context_identity("turn_start", 3, ContextBoundaryOrigin::UserTurn);
+        let turn_phase = ContextPhaseIdentity {
+            boundary: turn.clone(),
+            phase: String::from("memory"),
+        };
+        let empty = measure_projection(&[]).expect("empty measurement");
+        let before = context_identity("before_model_request", 7, ContextBoundaryOrigin::UserTurn);
+        let state = replay(&[
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(context_graph()),
+                    },
+                )),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("respond"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                    identity: turn.clone(),
+                }),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::ContextPhaseStarted(ContextPhaseStartedEvent {
+                    identity: turn_phase.clone(),
+                }),
+            ),
+            envelope(
+                6,
+                RuntimeCommittedEvent::ContextPhaseCompleted(ContextPhaseCompletedEvent {
+                    identity: turn_phase.clone(),
+                }),
+            ),
+            envelope(
+                7,
+                RuntimeCommittedEvent::ContextBoundaryCompleted(ContextBoundaryCompletedEvent {
+                    identity: turn.clone(),
+                    projection_hash: empty.projection_hash,
+                    estimated_tokens: empty.estimated_tokens,
+                    serialized_bytes: empty.serialized_bytes,
+                }),
+            ),
+            envelope(
+                8,
+                RuntimeCommittedEvent::ContextBoundaryStarted(ContextBoundaryStartedEvent {
+                    identity: before.clone(),
+                }),
+            ),
+        ])
+        .expect("before-model boundary");
+        assert!(matches!(
+            reduce(
+                Some(state.clone()),
+                &envelope(
+                    9,
+                    RuntimeCommittedEvent::ContextPhaseStarted(ContextPhaseStartedEvent {
+                        identity: ContextPhaseIdentity {
+                            boundary: before,
+                            phase: String::from("compaction"),
+                        },
+                    })
+                )
+            ),
+            Err(SessionReducerError::InvalidContextBoundaryTransition)
+        ));
+        assert!(matches!(
+            reduce(
+                Some(state),
+                &envelope(
+                    9,
+                    RuntimeCommittedEvent::ContextPhaseStarted(ContextPhaseStartedEvent {
+                        identity: turn_phase,
+                    })
+                )
+            ),
+            Err(SessionReducerError::InvalidContextBoundaryTransition)
+        ));
     }
 
     #[test]
@@ -1858,6 +2567,7 @@ to = "done"
                         committed_at: Sequence::new(3).expect("sequence"),
                         artifact_id: None,
                     },
+                    context_phase: None,
                 }),
             ),
         ];
@@ -1937,14 +2647,18 @@ to = "done"
 
         let state = replay(&events).expect("replay");
         let execution = &state.tool_executions["call-1"];
-        assert_eq!(execution.execution_id, "execution-1");
-        assert_eq!(execution.action_digest, digest);
+        assert_eq!(execution.execution_id.as_deref(), Some("execution-1"));
+        assert_eq!(execution.action_digest, Some(digest));
         assert_eq!(execution.state, ToolExecutionState::Terminal);
         assert_eq!(execution.observed_event_count, 2);
         assert_eq!(
             execution.terminal_at,
             Some(Sequence::new(4).expect("sequence"))
         );
+        assert!(matches!(
+            execution.terminal_outcome,
+            Some(ToolExecutionTerminalOutcome::Completed { .. })
+        ));
     }
 
     #[test]
@@ -2273,6 +2987,7 @@ to = "done"
                         committed_at: Sequence::new(4).expect("sequence"),
                         artifact_id: None,
                     },
+                    context_phase: None,
                 }),
             ),
         ];

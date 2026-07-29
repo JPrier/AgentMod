@@ -40,11 +40,24 @@ and sequence as canonical provenance.
 Context construction, context replacement, and compaction are authorized
 through the existing blocking proposal pipeline. Approved projection
 replacement is recorded canonically and never changes immutable conversation
-history. Provider token counters and compaction checkpoints are replay-derived.
-No compaction, sliding-window compaction, and tool-output eviction execute live.
-Typed-summary, artifact-handoff, and context-artifact modes fail closed when no
-approved material is available.
+history. `context.boundary_started`, `context.phase_started`,
+`context.phase_completed`, and `context.boundary_completed` records make the
+memory-before-compaction lifecycle replayable. Boundary identity binds graph
+node, lifecycle point, turn/continuation origin, run ID, canonical request hash,
+and source head. The reducer rejects overlaps, reversed phases, incomplete
+phases, and supplied projection measurements that do not match the replayed
+provider projection. A retry may reuse a completed phase only when provider,
+model, canonical options, current input, and run identity still match; a crash
+after an interceptor starts but before its completion fails closed.
+
+Projection pressure uses a deterministic approximate-token estimator over the
+complete provider wire representation and a separate exact 16-MiB serialized
+safety cap. Provider token counters and compaction checkpoints are
+replay-derived. No compaction, sliding-window compaction, and tool-output
+eviction execute live. Typed-summary, artifact-handoff, and context-artifact
+modes fail closed when no approved material is available.
 
 Automatic style-selected memory writes, plugin-provided memory or compaction
-implementations, plugin-composed context transforms, and all cancellation/rebuild
-cases remain integration work.
+implementations, plugin-composed context transforms, and strategy-specific
+cancellation after an ambiguous external interceptor effect remain integration
+work.

@@ -14,7 +14,7 @@ use uuid::Uuid;
 
 const RECORD_LIMIT: usize = 1024 * 1024;
 const MAX_RESULTS: usize = 100;
-const MAX_QUERY_BYTES: usize = 8 * 1024;
+const MAX_QUERY_BYTES: usize = 1024 * 1024;
 
 /// Dependency-owned memory write request.
 #[derive(Clone, Debug, Eq, PartialEq)]

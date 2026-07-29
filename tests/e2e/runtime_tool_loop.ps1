@@ -50,9 +50,6 @@ try {
             --session $created.session_id `
             --option 'mock_scenario="one_tool_call"' --json | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw "tool turn failed" }
-        if ($turn.last_committed_sequence -ne 27) {
-            throw "tool turn committed unexpected sequence $($turn.last_committed_sequence)"
-        }
         $visible = ($turn.events | Where-Object event -eq "text" |
             ForEach-Object text) -join ""
         if ($visible -ne "continued after approved runtime decision") {
@@ -62,6 +59,12 @@ try {
             "sessions\" + $created.session_id + "\events.jsonl"
         )
         $journal = Get-Content $journalPath
+        $lastJournalSequence = (
+            ($journal[-1] | ConvertFrom-Json).event.metadata.sequence
+        )
+        if ($turn.last_committed_sequence -ne $lastJournalSequence) {
+            throw "tool turn result did not identify the canonical journal head"
+        }
         $eventTypes = @($journal | ForEach-Object {
             ($_ | ConvertFrom-Json).event.metadata.event_type
         })
@@ -71,7 +74,8 @@ try {
             "tool.call_approved",
             "tool.execution_dispatched",
             "tool.execution_started",
-            "tool.execution_completed"
+            "tool.execution_completed",
+            "context.boundary_completed"
         )) {
             if ($eventTypes -notcontains $required) {
                 $details = ($journal -join "`n")

@@ -51,6 +51,8 @@ pub enum ContinuationStateRecord {
 pub enum ContinuationPayloadRecord {
     /// An intercepted provider tool call waiting for user approval.
     ToolApproval(Box<ToolApprovalPayloadRecord>),
+    /// A compiled style `user_approval` node waiting for resolution.
+    StyleApproval(Box<StyleApprovalPayloadRecord>),
     /// A complete provider turn deferred until an authenticated scheduler claim.
     DeferredTurn(Box<DeferredTurnPayloadRecord>),
     /// Generic fixture payload used by storage-only callers.
@@ -58,6 +60,39 @@ pub enum ContinuationPayloadRecord {
         /// Stable non-secret label.
         label: String,
     },
+}
+
+/// Data-owned restart-safe compiled-style approval payload.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StyleApprovalPayloadRecord {
+    /// Session identifier used for defense-in-depth validation.
+    pub session_id: String,
+    /// Canonical workspace text.
+    pub workspace: String,
+    /// User-authored input owning the graph execution.
+    pub prompt: String,
+    /// Provider retained for exact command identity.
+    pub provider: String,
+    /// Model retained for exact command identity.
+    pub model: String,
+    /// Style-specific and provider options.
+    pub options: serde_json::Value,
+    /// Explicit session style.
+    pub style: String,
+    /// Stable cancellation identity for the graph execution.
+    pub cancellation_id: String,
+    /// Exact compiled-style cache key selected by the session.
+    pub compiled_style_cache_key: String,
+    /// Active graph node requesting the decision.
+    pub node_id: String,
+    /// One-based node attempt.
+    pub attempt: u32,
+    /// Zero-based loop iteration.
+    pub loop_iteration: u32,
+    /// One-based graph step.
+    pub step: u64,
+    /// Canonical hash of caller-controlled graph inputs.
+    pub request_reference: String,
 }
 
 /// Data-owned restart-safe deferred provider turn.

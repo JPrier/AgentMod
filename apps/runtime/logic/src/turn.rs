@@ -44,8 +44,8 @@ use crate::{
         ApprovalDisposition, ContinuationLogic, ContinuationLogicPort, ContinuationPayload,
         ContinuationState, ContinuationWakeCondition, ContinuationWakeProof,
         CreateContinuationCommand, DeferredTurnContinuation, LoadContinuationQuery,
-        PendingToolCallContinuation, ResolveApprovalCommand, ToolApprovalContinuation,
-        WakeContinuationCommand,
+        PendingToolCallContinuation, ResolveApprovalCommand, StyleApprovalContinuation,
+        ToolApprovalContinuation, WakeContinuationCommand,
     },
     conversation::{
         ConversationEntry, ConversationEntryId, ProjectionProvenance, RetrievedMemoryEntry,
@@ -673,6 +673,25 @@ where
                 )
                 .await;
         }
+        if preflight
+            .state
+            .style_binding
+            .as_ref()
+            .and_then(|binding| CompiledStyleExecutor::from_binding(binding).ok())
+            .and_then(|executor| executor.adapter_kind())
+            == Some(StyleAdapterKind::DeclarativeGraph)
+        {
+            return self
+                .run_declarative_graph(
+                    command,
+                    scheduled,
+                    session_id,
+                    session_directory,
+                    persistence,
+                    preflight,
+                )
+                .await;
+        }
         let (style_driven, resume_context) = match preflight.state.style_binding.as_ref() {
             Some(binding) => {
                 let executor = CompiledStyleExecutor::from_binding(binding)
@@ -868,6 +887,7 @@ where
                         )
                         .await
                     }
+                    StyleAdapterKind::DeclarativeGraph => Err(RunTurnError::StyleGraphMismatch),
                 }
             }
             .await;
@@ -1486,6 +1506,434 @@ where
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
+        reason = "the declarative adapter keeps branch, approval, exact tool recovery, bounded loop, and terminal lifecycle adjacent"
+    )]
+    async fn run_declarative_graph(
+        &self,
+        command: RunTurnCommand,
+        scheduled: Option<ScheduledTurnPrelude>,
+        session_id: SessionId,
+        session_directory: PathBuf,
+        persistence: SessionPersistenceLogic<D>,
+        preflight: LoadSessionResult,
+    ) -> Result<RunTurnResult, RunTurnError> {
+        let (requires_approval, iteration_limit, tool_arguments, request_reference) =
+            declarative_inputs(&command.options)?;
+        let (user_sequence, mut execution) =
+            if let Some(canonical) = preflight.state.style_execution.as_ref() {
+                if let Some(reason) = canonical.termination_reason.as_ref() {
+                    if reason == "complete_session"
+                        && preflight.state.lifecycle == crate::session::SessionLifecycle::Active
+                    {
+                        let user_sequence = current_run_user_sequence(&preflight.state, &command)?;
+                        let (sequence, _) = self.commit_next(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            preflight.state.last_sequence,
+                            preflight.last_event_id,
+                            RuntimeCommittedEvent::SessionLifecycleChanged(
+                                crate::session::SessionLifecycleChangedEvent {
+                                    lifecycle: crate::session::SessionLifecycle::Completed,
+                                    reason: Some(String::from("declarative graph completed")),
+                                },
+                            ),
+                        )?;
+                        return Ok(RunTurnResult {
+                            events: Vec::new(),
+                            first_committed_sequence: user_sequence,
+                            last_committed_sequence: sequence,
+                            awaiting_continuation: None,
+                        });
+                    }
+                    return Err(RunTurnError::StyleExecutionTerminalReason(reason.clone()));
+                }
+                validate_declarative_resume_request(&preflight.state, &request_reference)?;
+                let user_sequence = current_run_user_sequence(&preflight.state, &command)?;
+                let execution = Self::resume_active_style_turn(
+                    &preflight.state,
+                    JournalPosition {
+                        sequence: preflight.state.last_sequence,
+                        event_id: preflight.last_event_id,
+                    },
+                )?
+                .ok_or(RunTurnError::StyleGraphMismatch)?;
+                (user_sequence, execution)
+            } else {
+                if let Some(scheduled) = scheduled {
+                    self.commit_scheduler_fired(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        scheduled,
+                    )?;
+                }
+                let (state, user_sequence, user_event) =
+                    self.commit_user(&persistence, session_id, &session_directory, &command)?;
+                let execution = self.begin_style_turn_with_input(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &state,
+                    JournalPosition {
+                        sequence: user_sequence,
+                        event_id: user_event.metadata.event_id,
+                    },
+                    Some(request_reference.clone()),
+                )?;
+                (user_sequence, execution)
+            };
+        if execution.executor.adapter_kind() != Some(StyleAdapterKind::DeclarativeGraph) {
+            return Err(RunTurnError::StyleGraphMismatch);
+        }
+        let compiled_loop_limit = execution
+            .executor
+            .node("repeat")
+            .map_err(RunTurnError::StyleExecutor)?
+            .max_iterations
+            .ok_or(RunTurnError::StyleGraphMismatch)?;
+        if iteration_limit > compiled_loop_limit {
+            return Err(RunTurnError::InvalidDeclarativeInputs);
+        }
+
+        loop {
+            match execution.current.directive {
+                StyleNodeDirective::ConditionalBranch => {
+                    self.complete_and_enter_next_with(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(request_reference.clone()),
+                        None,
+                        &json!({"request":{"requires_approval":requires_approval}}),
+                        false,
+                    )?;
+                }
+                StyleNodeDirective::UserApproval => {
+                    let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                    let continuation_id =
+                        ContinuationId::from_uuid(execution.position.event_id.into_uuid());
+                    if state
+                        .approvals
+                        .get(&continuation_id)
+                        .is_some_and(|approval| approval.state == ApprovalState::Pending)
+                    {
+                        return Ok(RunTurnResult {
+                            events: Vec::new(),
+                            first_committed_sequence: user_sequence,
+                            last_committed_sequence: state.last_sequence,
+                            awaiting_continuation: Some(continuation_id.to_string()),
+                        });
+                    }
+                    let binding = state
+                        .style_binding
+                        .as_ref()
+                        .ok_or(RunTurnError::StyleMigrationRequired)?;
+                    ContinuationLogic::new(self.data.clone())
+                        .create_continuation(CreateContinuationCommand {
+                            session_id: command.session_id.clone(),
+                            id: continuation_id,
+                            wake_condition: ContinuationWakeCondition::Manual,
+                            payload: ContinuationPayload::StyleApproval(Box::new(
+                                StyleApprovalContinuation {
+                                    session_id: command.session_id.clone(),
+                                    workspace: state.workspace,
+                                    prompt: command.prompt.clone(),
+                                    provider: command.provider.clone(),
+                                    model: command.model.clone(),
+                                    options: command.options.clone(),
+                                    style: state.style,
+                                    cancellation_id: command.cancellation_id.clone(),
+                                    compiled_style_cache_key: binding
+                                        .compiled_cache_key
+                                        .to_string(),
+                                    node_id: execution.current.id.clone(),
+                                    attempt: execution.attempt,
+                                    loop_iteration: execution.loop_iteration,
+                                    step: execution.step,
+                                    request_reference: request_reference.clone(),
+                                },
+                            )),
+                            expires_at: None,
+                        })
+                        .map_err(RunTurnError::Continuation)?;
+                    (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        execution.position.sequence,
+                        execution.position.event_id,
+                        RuntimeCommittedEvent::ApprovalRequested(ApprovalRequestedEvent {
+                            continuation_id,
+                            action_summary: String::from(
+                                "declarative graph requested user approval",
+                            ),
+                        }),
+                    )?;
+                    return Ok(RunTurnResult {
+                        events: Vec::new(),
+                        first_committed_sequence: user_sequence,
+                        last_committed_sequence: execution.position.sequence,
+                        awaiting_continuation: Some(continuation_id.to_string()),
+                    });
+                }
+                StyleNodeDirective::ToolExecutionGate => {
+                    let tool = execution
+                        .current
+                        .tool
+                        .clone()
+                        .ok_or(RunTurnError::StyleGraphMismatch)?;
+                    let call_id = format!(
+                        "style:{}:{}:{}:{}",
+                        execution.current.id,
+                        execution.attempt,
+                        execution.loop_iteration,
+                        execution.step
+                    );
+                    let outcome = match self
+                        .execute_style_owned_tool(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            &command,
+                            execution.position,
+                            &call_id,
+                            &tool,
+                            tool_arguments.clone(),
+                        )
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(
+                            error @ (RunTurnError::StyleOwnedToolApprovalUnsupported
+                            | RunTurnError::StyleOwnedToolReplacementUnsupported),
+                        ) => {
+                            let loaded = persistence
+                                .load_session(LoadSessionCommand {
+                                    session_directory: session_directory.clone(),
+                                    expected_session_id: session_id,
+                                })
+                                .map_err(RunTurnError::Persistence)?;
+                            execution.position = JournalPosition {
+                                sequence: loaded.state.last_sequence,
+                                event_id: loaded.last_event_id,
+                            };
+                            self.fail_style_node_at_head(
+                                &persistence,
+                                session_id,
+                                &session_directory,
+                                &execution,
+                                "style_tool_policy_unsupported",
+                                Some("declarative_tool_policy_unsupported"),
+                            )?;
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    execution.position = match outcome {
+                        ToolCallOutcome::Complete(position) => position,
+                        ToolCallOutcome::Cancelled(position) => {
+                            execution.position = position;
+                            let position = self.fail_style_node_at_head(
+                                &persistence,
+                                session_id,
+                                &session_directory,
+                                &execution,
+                                "style_tool_cancelled",
+                                Some("declarative_tool_cancelled"),
+                            )?;
+                            return Ok(RunTurnResult {
+                                events: Vec::new(),
+                                first_committed_sequence: user_sequence,
+                                last_committed_sequence: position.sequence,
+                                awaiting_continuation: None,
+                            });
+                        }
+                        ToolCallOutcome::Awaiting {
+                            position,
+                            continuation_id,
+                        } => {
+                            return Ok(RunTurnResult {
+                                events: Vec::new(),
+                                first_committed_sequence: user_sequence,
+                                last_committed_sequence: position.sequence,
+                                awaiting_continuation: Some(continuation_id.to_string()),
+                            });
+                        }
+                    };
+                    if execution.current.directive == StyleNodeDirective::ToolExecutionGate {
+                        let loop_iteration = execution.loop_iteration;
+                        self.complete_and_enter_next(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            &mut execution,
+                            Some(format!(
+                                "declarative-tool:{call_id}:iteration:{loop_iteration}"
+                            )),
+                        )?;
+                    }
+                }
+                StyleNodeDirective::Loop => {
+                    let completed_iterations = execution
+                        .loop_iteration
+                        .checked_add(1)
+                        .ok_or(RunTurnError::SequenceOverflow)?;
+                    let remaining = completed_iterations < iteration_limit;
+                    self.complete_and_enter_next_with(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(format!("iteration:remaining:{remaining}")),
+                        None,
+                        &json!({"iteration":{"remaining":remaining}}),
+                        remaining,
+                    )?;
+                }
+                StyleNodeDirective::CompleteSession => {
+                    let completed_iterations = execution.loop_iteration.saturating_add(1);
+                    self.complete_terminal_style_node(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(format!("declarative:completed:{completed_iterations}")),
+                    )?;
+                    (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        execution.position.sequence,
+                        execution.position.event_id,
+                        RuntimeCommittedEvent::SessionLifecycleChanged(
+                            crate::session::SessionLifecycleChangedEvent {
+                                lifecycle: crate::session::SessionLifecycle::Completed,
+                                reason: Some(String::from("declarative graph completed")),
+                            },
+                        ),
+                    )?;
+                    return Ok(RunTurnResult {
+                        events: Vec::new(),
+                        first_committed_sequence: user_sequence,
+                        last_committed_sequence: execution.position.sequence,
+                        awaiting_continuation: None,
+                    });
+                }
+                _ => {
+                    return Err(RunTurnError::UnexpectedStyleNode {
+                        expected: "conditional_branch, user_approval, tool_execution_gate, loop, or complete_session",
+                        actual: execution.current.id,
+                    });
+                }
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "style-owned tool recovery binds the graph cursor, command, and canonical persistence head explicitly"
+    )]
+    async fn execute_style_owned_tool(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        command: &RunTurnCommand,
+        position: JournalPosition,
+        call_id: &str,
+        tool: &str,
+        arguments: Value,
+    ) -> Result<ToolCallOutcome, RunTurnError> {
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        let Some(record) = state.tool_executions.get(call_id) else {
+            return self
+                .execute_tool_call(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    command,
+                    position,
+                    call_id,
+                    tool,
+                    arguments,
+                    "style-owned",
+                    Vec::new(),
+                )
+                .await;
+        };
+        let prepared = self
+            .tools
+            .prepare(PrepareToolCommand {
+                session_id: command.session_id.clone(),
+                workspace: PathBuf::from(&state.workspace),
+                call_id: call_id.to_owned(),
+                tool: tool.to_owned(),
+                arguments,
+                cancellation_id: command.cancellation_id.clone(),
+                style: state.style.clone(),
+            })
+            .map_err(RunTurnError::Tool)?;
+        let action_digest = prepared
+            .original
+            .digest()
+            .map_err(|_| RunTurnError::Event)?;
+        if record.action_digest != Some(action_digest) {
+            return Err(RunTurnError::InvalidRecoveryReceipt(call_id.to_owned()));
+        }
+        let ConsequentialAction::ToolCall(action) = &prepared.original.action else {
+            return Err(RunTurnError::InvalidContinuationPayload);
+        };
+        if record.state == ToolExecutionState::Terminal {
+            let repaired = self.repair_terminal_tool_conversation(
+                persistence,
+                session_id,
+                session_directory,
+                &state,
+                position,
+                call_id,
+                action,
+                action_digest,
+                record,
+            )?;
+            return Ok(ToolCallOutcome::Complete(repaired));
+        }
+        let authorized = self
+            .tools
+            .approve_pending(PrepareToolCommand {
+                session_id: command.session_id.clone(),
+                workspace: PathBuf::from(&state.workspace),
+                call_id: call_id.to_owned(),
+                tool: tool.to_owned(),
+                arguments: action.arguments.clone(),
+                cancellation_id: command.cancellation_id.clone(),
+                style: state.style,
+            })
+            .map_err(RunTurnError::Tool)?;
+        let result = self
+            .execute_authorized_tool(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                call_id,
+                authorized,
+                ToolDispatchMode::Reconcile {
+                    observed_event_count: record.observed_event_count,
+                },
+            )
+            .await?;
+        Ok(if result.cancelled {
+            ToolCallOutcome::Cancelled(result.position)
+        } else {
+            ToolCallOutcome::Complete(result.position)
+        })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "artifact outbox recovery keeps proposal, approval, dispatch, exact-store reconciliation, and terminal evidence adjacent"
     )]
     async fn persist_research_finding(
@@ -1811,7 +2259,7 @@ where
             return Err(RunTurnError::Invalid);
         }
         let gate = self.session_gate(&command.session_id).await;
-        let session_guard = gate.lock().await;
+        let _session_guard = gate.lock().await;
         let session_directory = command.sessions_root.join(session_id.to_string());
         let persistence = SessionPersistenceLogic::new(self.data.clone());
         let continuation_logic = ContinuationLogic::new(self.data.clone());
@@ -1827,14 +2275,18 @@ where
                 ContinuationState::Pending | ContinuationState::Resumed
             )
         {
-            let ContinuationPayload::ToolApproval(payload) = &loaded_continuation.payload else {
-                return Err(RunTurnError::InvalidContinuationPayload);
+            let (workspace, style) = match &loaded_continuation.payload {
+                ContinuationPayload::ToolApproval(payload) => (&payload.workspace, &payload.style),
+                ContinuationPayload::StyleApproval(payload) => (&payload.workspace, &payload.style),
+                ContinuationPayload::DeferredTurn(_) | ContinuationPayload::Opaque(_) => {
+                    return Err(RunTurnError::InvalidContinuationPayload);
+                }
             };
             self.tools
                 .authorize_continuation_resume(
                     &command.session_id,
-                    &payload.workspace,
-                    &payload.style,
+                    workspace,
+                    style,
                     &command.continuation_id,
                 )
                 .await
@@ -1853,6 +2305,189 @@ where
                 expected_session_id: session_id,
             })
             .map_err(RunTurnError::Persistence)?;
+        if matches!(&resolved.payload, ContinuationPayload::StyleApproval(_)) {
+            let ContinuationPayload::StyleApproval(payload) = resolved.payload else {
+                unreachable!("style approval variant was checked")
+            };
+            if payload.session_id != command.session_id
+                || loaded.state.workspace != payload.workspace
+                || loaded.state.style != payload.style
+                || loaded.state.style_binding.as_ref().is_none_or(|binding| {
+                    binding.compiled_cache_key.to_string() != payload.compiled_style_cache_key
+                })
+                || loaded
+                    .state
+                    .style_execution
+                    .as_ref()
+                    .is_none_or(|execution| {
+                        execution.input_reference.as_deref()
+                            != Some(payload.request_reference.as_str())
+                    })
+            {
+                return Err(RunTurnError::InvalidContinuationPayload);
+            }
+            let approval = loaded
+                .state
+                .approvals
+                .get(&continuation_id)
+                .ok_or(RunTurnError::InvalidContinuationPayload)?;
+            let expected_state = if command.approved {
+                ApprovalState::Approved
+            } else {
+                ApprovalState::Denied
+            };
+            let mut position = JournalPosition {
+                sequence: loaded.state.last_sequence,
+                event_id: loaded.last_event_id,
+            };
+            if approval.state == ApprovalState::Pending {
+                (position.sequence, position.event_id) = self.commit_next(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    position.sequence,
+                    position.event_id,
+                    RuntimeCommittedEvent::ApprovalResolved(ApprovalResolvedEvent {
+                        continuation_id,
+                        approved: command.approved,
+                    }),
+                )?;
+            } else if approval.state != expected_state {
+                return Err(RunTurnError::InvalidContinuationPayload);
+            }
+            let loaded = persistence
+                .load_session(LoadSessionCommand {
+                    session_directory: session_directory.clone(),
+                    expected_session_id: session_id,
+                })
+                .map_err(RunTurnError::Persistence)?;
+            if loaded
+                .state
+                .style_execution
+                .as_ref()
+                .is_some_and(|execution| {
+                    execution.termination_reason.as_deref() == Some("complete_session")
+                })
+                && loaded.state.lifecycle == crate::session::SessionLifecycle::Completed
+                && command.approved
+            {
+                return Ok(ResolveTurnApprovalResult {
+                    transitioned: resolved.transitioned,
+                    events: Vec::new(),
+                    last_committed_sequence: loaded.state.last_sequence,
+                    awaiting_continuation: None,
+                });
+            }
+            if loaded
+                .state
+                .style_execution
+                .as_ref()
+                .is_some_and(|execution| {
+                    execution.termination_reason.as_deref() == Some("declarative_approval_denied")
+                })
+                && loaded.state.lifecycle == crate::session::SessionLifecycle::Failed
+                && !command.approved
+            {
+                return Ok(ResolveTurnApprovalResult {
+                    transitioned: resolved.transitioned,
+                    events: Vec::new(),
+                    last_committed_sequence: loaded.state.last_sequence,
+                    awaiting_continuation: None,
+                });
+            }
+            let loaded = self.recover_style_control_gaps(
+                &persistence,
+                session_id,
+                &session_directory,
+                loaded,
+            )?;
+            let mut execution = Self::resume_active_style_turn(
+                &loaded.state,
+                JournalPosition {
+                    sequence: loaded.state.last_sequence,
+                    event_id: loaded.last_event_id,
+                },
+            )?
+            .ok_or(RunTurnError::StyleGraphMismatch)?;
+            if execution.executor.adapter_kind() != Some(StyleAdapterKind::DeclarativeGraph) {
+                return Err(RunTurnError::InvalidContinuationPayload);
+            }
+            if !command.approved {
+                validate_style_approval_cursor(&execution, &payload, &continuation_id)?;
+                let position = self.fail_style_node_at_head(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &execution,
+                    "user_denied",
+                    Some("declarative_approval_denied"),
+                )?;
+                let (sequence, _) = self.commit_next(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    position.sequence,
+                    position.event_id,
+                    RuntimeCommittedEvent::SessionLifecycleChanged(
+                        crate::session::SessionLifecycleChangedEvent {
+                            lifecycle: crate::session::SessionLifecycle::Failed,
+                            reason: Some(String::from("declarative graph approval denied")),
+                        },
+                    ),
+                )?;
+                return Ok(ResolveTurnApprovalResult {
+                    transitioned: resolved.transitioned,
+                    events: Vec::new(),
+                    last_committed_sequence: sequence,
+                    awaiting_continuation: None,
+                });
+            }
+            if execution.current.directive == StyleNodeDirective::UserApproval {
+                validate_style_approval_cursor(&execution, &payload, &continuation_id)?;
+                execution.position = JournalPosition {
+                    sequence: loaded.state.last_sequence,
+                    event_id: loaded.last_event_id,
+                };
+                self.complete_and_enter_next(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &mut execution,
+                    Some(format!("declarative-approval:{continuation_id}")),
+                )?;
+            }
+            let preflight = persistence
+                .load_session(LoadSessionCommand {
+                    session_directory: session_directory.clone(),
+                    expected_session_id: session_id,
+                })
+                .map_err(RunTurnError::Persistence)?;
+            let resumed = RunTurnCommand {
+                sessions_root: command.sessions_root,
+                session_id: command.session_id,
+                prompt: payload.prompt,
+                provider: payload.provider,
+                model: payload.model,
+                options: payload.options,
+                cancellation_id: payload.cancellation_id,
+            };
+            let result = self
+                .run_declarative_graph(
+                    resumed,
+                    None,
+                    session_id,
+                    session_directory,
+                    persistence,
+                    preflight,
+                )
+                .await?;
+            return Ok(ResolveTurnApprovalResult {
+                transitioned: resolved.transitioned,
+                events: result.events,
+                last_committed_sequence: result.last_committed_sequence,
+                awaiting_continuation: result.awaiting_continuation,
+            });
+        }
         let ContinuationPayload::ToolApproval(payload_ref) = &resolved.payload else {
             return Err(RunTurnError::InvalidContinuationPayload);
         };
@@ -2263,7 +2898,6 @@ where
                             options: resumed_turn.options.clone(),
                             cancellation_id: base_cancellation_id.to_owned(),
                         };
-                        drop(session_guard);
                         let result = self
                             .run_research_loop(
                                 research_command,
@@ -2663,7 +3297,7 @@ where
             StyleAdapterKind::ResearchLoop => {
                 Some(("research-fresh-context", "research_fresh_context"))
             }
-            StyleAdapterKind::PersistentTurn => None,
+            StyleAdapterKind::PersistentTurn | StyleAdapterKind::DeclarativeGraph => None,
         };
         let fresh_isolated_context = fresh_context_kind.is_some()
             && boundary == ContextCompositionBoundary::TurnStart
@@ -3870,6 +4504,9 @@ where
         let authorized = match self.tools.authorize_prepared_outcome(prepared).await {
             Ok(ToolAuthorizationOutcome::Authorized(authorized)) => authorized,
             Ok(ToolAuthorizationOutcome::ApprovalRequired { pending, reason }) => {
+                if harness_continuation == "style-owned" {
+                    return Err(RunTurnError::StyleOwnedToolApprovalUnsupported);
+                }
                 let ConsequentialAction::ToolCall(executable) = &pending.executable.action else {
                     return Err(RunTurnError::Tool(ToolExecutionError::InvalidReplacement));
                 };
@@ -3940,6 +4577,15 @@ where
                 return Ok(ToolCallOutcome::Complete(position));
             }
         };
+        if harness_continuation == "style-owned"
+            && authorized
+                .executable
+                .digest()
+                .map_err(|_| RunTurnError::Event)?
+                != original_action_digest
+        {
+            return Err(RunTurnError::StyleOwnedToolReplacementUnsupported);
+        }
         let result = self
             .execute_authorized_tool(
                 persistence,
@@ -4534,7 +5180,26 @@ where
         session_id: SessionId,
         session_directory: &std::path::Path,
         state: &crate::session::SessionState,
+        position: JournalPosition,
+    ) -> Result<ActiveStyleTurn, RunTurnError> {
+        self.begin_style_turn_with_input(
+            persistence,
+            session_id,
+            session_directory,
+            state,
+            position,
+            None,
+        )
+    }
+
+    fn begin_style_turn_with_input(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        state: &crate::session::SessionState,
         mut position: JournalPosition,
+        input_reference: Option<String>,
     ) -> Result<ActiveStyleTurn, RunTurnError> {
         let binding = state
             .style_binding
@@ -4546,6 +5211,9 @@ where
         if let Some(execution) = &state.style_execution {
             if execution.graph.as_ref() != &executor.compiled().graph {
                 return Err(RunTurnError::StyleGraphMismatch);
+            }
+            if execution.input_reference != input_reference {
+                return Err(RunTurnError::ContextRecoveryIdentityMismatch);
             }
             if let Some(active) = &execution.active_node {
                 return Err(RunTurnError::StyleRecoveryRequired(active.node_id.clone()));
@@ -4563,6 +5231,7 @@ where
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(executor.compiled().graph.clone()),
+                        input_reference,
                     },
                 )),
             )?;
@@ -4573,6 +5242,7 @@ where
             Some(StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop) => {
                 StyleNodeDirective::ContextTransform
             }
+            Some(StyleAdapterKind::DeclarativeGraph) => StyleNodeDirective::ConditionalBranch,
             None => {
                 return Err(RunTurnError::UnsupportedStyleExecution(binding.id.clone()));
             }
@@ -4582,6 +5252,7 @@ where
                 expected: match expected_entry {
                     StyleNodeDirective::ModelCall => "model_call",
                     StyleNodeDirective::ContextTransform => "context_transform",
+                    StyleNodeDirective::ConditionalBranch => "conditional_branch",
                     _ => unreachable!("supported entry adapter is exhaustive"),
                 },
                 actual: current.id,
@@ -4711,7 +5382,10 @@ where
             && executor
                 .node(&selected.from_node_id)
                 .is_ok_and(|source| source.directive == StyleNodeDirective::ContextTransform);
-        let recoverable_research_entry = adapter_kind == StyleAdapterKind::ResearchLoop;
+        let recoverable_research_entry = matches!(
+            adapter_kind,
+            StyleAdapterKind::ResearchLoop | StyleAdapterKind::DeclarativeGraph
+        );
         if destination.directive.requires_effect_evidence()
             && !recoverable_fresh_model_entry
             && !recoverable_research_entry
@@ -6428,11 +7102,101 @@ fn style_transition_variables(completed: &StyleNodeCompletedEvent) -> Result<Val
     match completed.result_reference.as_deref() {
         Some("completion:criteria_met:true") => Ok(json!({"completion":{"criteria_met":true}})),
         Some("completion:criteria_met:false") => Ok(json!({"completion":{"criteria_met":false}})),
+        Some(value) if value.starts_with("declarative-request:approval:true:") => {
+            Ok(json!({"request":{"requires_approval":true}}))
+        }
+        Some(value) if value.starts_with("declarative-request:approval:false:") => {
+            Ok(json!({"request":{"requires_approval":false}}))
+        }
+        Some("iteration:remaining:true") => Ok(json!({"iteration":{"remaining":true}})),
+        Some("iteration:remaining:false") => Ok(json!({"iteration":{"remaining":false}})),
         Some(value) if value.starts_with("completion:criteria_met:") => {
+            Err(RunTurnError::StyleGraphMismatch)
+        }
+        Some(value)
+            if value.starts_with("declarative-request:")
+                || value.starts_with("iteration:remaining:") =>
+        {
             Err(RunTurnError::StyleGraphMismatch)
         }
         _ => Ok(json!({})),
     }
+}
+
+fn declarative_inputs(options: &Value) -> Result<(bool, u32, Value, String), RunTurnError> {
+    let requires_approval = options
+        .get("graph_requires_approval")
+        .map_or(Some(false), Value::as_bool)
+        .ok_or(RunTurnError::InvalidDeclarativeInputs)?;
+    let iteration_limit = options
+        .get("graph_iterations")
+        .map_or(Some(1), |value| {
+            value.as_u64().and_then(|value| u32::try_from(value).ok())
+        })
+        .filter(|value| *value > 0)
+        .ok_or(RunTurnError::InvalidDeclarativeInputs)?;
+    let tool_arguments = options
+        .get("graph_tool_arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({"path":"README.md"}));
+    if !tool_arguments.is_object() {
+        return Err(RunTurnError::InvalidDeclarativeInputs);
+    }
+    let identity = canonical_json_bytes(&json!({
+        "requires_approval": requires_approval,
+        "iteration_limit": iteration_limit,
+        "tool_arguments": tool_arguments,
+    }))
+    .map_err(map_projection_measure_error)?;
+    let reference = format!(
+        "declarative-request:approval:{requires_approval}:{}",
+        ContentHash::digest(&identity)
+    );
+    Ok((
+        requires_approval,
+        iteration_limit,
+        tool_arguments,
+        reference,
+    ))
+}
+
+fn validate_declarative_resume_request(
+    state: &crate::session::SessionState,
+    expected_reference: &str,
+) -> Result<(), RunTurnError> {
+    let Some(execution) = state.style_execution.as_ref() else {
+        return Err(RunTurnError::StyleGraphMismatch);
+    };
+    if execution.input_reference.as_deref() != Some(expected_reference) {
+        return Err(RunTurnError::ContextRecoveryIdentityMismatch);
+    }
+    if let Some(branch) = execution
+        .completed_nodes
+        .iter()
+        .find(|node| node.node_id == "branch")
+        && branch.result_reference.as_deref() != Some(expected_reference)
+    {
+        return Err(RunTurnError::ContextRecoveryIdentityMismatch);
+    }
+    Ok(())
+}
+
+fn validate_style_approval_cursor(
+    execution: &ActiveStyleTurn,
+    approval: &StyleApprovalContinuation,
+    continuation_id: &ContinuationId,
+) -> Result<(), RunTurnError> {
+    if execution.current.directive != StyleNodeDirective::UserApproval
+        || execution.current.id != approval.node_id
+        || execution.attempt != approval.attempt
+        || execution.loop_iteration != approval.loop_iteration
+        || execution.step != approval.step
+        || approval.request_reference.trim().is_empty()
+        || continuation_id.to_string().trim().is_empty()
+    {
+        return Err(RunTurnError::InvalidContinuationPayload);
+    }
+    Ok(())
 }
 
 fn research_finding_bytes(
@@ -6711,6 +7475,12 @@ pub enum RunTurnError {
     InvalidArtifact,
     #[error("research completion criterion is invalid or exceeds the compiled loop bound")]
     InvalidResearchCompletionCriterion,
+    #[error("declarative graph inputs are invalid or exceed the compiled loop bound")]
+    InvalidDeclarativeInputs,
+    #[error("style-owned tool approval is not supported by this graph adapter")]
+    StyleOwnedToolApprovalUnsupported,
+    #[error("style-owned tool replacement is not supported by this graph adapter")]
+    StyleOwnedToolReplacementUnsupported,
     #[error("research finding artifact could not be encoded")]
     ResearchArtifactEncoding,
     #[error("research artifact persistence failed: {0}")]
@@ -6750,7 +7520,7 @@ mod tests {
             ContinuationDataError, ContinuationDataPort, ContinuationPayloadRecord,
             ContinuationRecord, ContinuationStateRecord, ContinuationWakeRecord,
             CreateContinuationDataRequest, ResolveContinuationDataRecord,
-            ResolveContinuationDataRequest, ToolApprovalPayloadRecord,
+            ResolveContinuationDataRequest, StyleApprovalPayloadRecord, ToolApprovalPayloadRecord,
         },
         harness::{
             HarnessDataCommand, HarnessDataError, HarnessDataEvent, HarnessDataPort,
@@ -7084,9 +7854,37 @@ mod tests {
     impl ToolDataPort for MockTurnData {
         async fn execute_tool(
             &self,
-            _request: ExecuteToolDataRequest,
+            request: ExecuteToolDataRequest,
         ) -> Result<Vec<ToolDataEvent>, ToolDataError> {
-            self.state.tool_reply.lock().expect("tool reply").clone()
+            self.state
+                .tool_reply
+                .lock()
+                .expect("tool reply")
+                .clone()
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .map(|event| match event {
+                            ToolDataEvent::Started { call_id } if call_id == "__request__" => {
+                                ToolDataEvent::Started {
+                                    call_id: request.call_id.clone(),
+                                }
+                            }
+                            ToolDataEvent::Completed {
+                                call_id,
+                                result,
+                                artifact,
+                                truncated,
+                            } if call_id == "__request__" => ToolDataEvent::Completed {
+                                call_id: request.call_id.clone(),
+                                result,
+                                artifact,
+                                truncated,
+                            },
+                            other => other,
+                        })
+                        .collect()
+                })
         }
     }
 
@@ -7318,6 +8116,73 @@ mod tests {
         )]
     }
 
+    fn declarative_created_events() -> Vec<EventEnvelope<Value>> {
+        let binding = binding(BuiltInStyle::DeclarativeGraph);
+        vec![data_event(
+            1,
+            RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                workspace: String::from("fixture-workspace"),
+                style: binding.id.clone(),
+                style_binding: Some(Box::new(binding)),
+            }),
+        )]
+    }
+
+    fn style_tool_reply() -> Vec<ToolDataEvent> {
+        vec![
+            ToolDataEvent::Started {
+                call_id: String::from("__request__"),
+            },
+            ToolDataEvent::Completed {
+                call_id: String::from("__request__"),
+                result: json!({"content":"fixture"}),
+                artifact: None,
+                truncated: false,
+            },
+        ]
+    }
+
+    fn install_style_approval_continuation(
+        data: &MockTurnData,
+        request: &RunTurnCommand,
+        continuation_id: &str,
+    ) {
+        let pending_state = load_mock_state(data);
+        let binding = pending_state.style_binding.as_ref().expect("style binding");
+        let active = pending_state
+            .style_execution
+            .as_ref()
+            .and_then(|execution| execution.active_node.as_ref())
+            .expect("active approval");
+        let (_, _, _, request_reference) =
+            declarative_inputs(&request.options).expect("declarative inputs");
+        *data.state.continuation.lock().expect("continuation") = Some(ContinuationRecord {
+            session_id: session_id().to_string(),
+            id: continuation_id.to_owned(),
+            state: ContinuationStateRecord::Pending,
+            wake_condition: ContinuationWakeRecord::Manual,
+            payload: ContinuationPayloadRecord::StyleApproval(Box::new(
+                StyleApprovalPayloadRecord {
+                    session_id: session_id().to_string(),
+                    workspace: String::from("fixture-workspace"),
+                    prompt: request.prompt.clone(),
+                    provider: request.provider.clone(),
+                    model: request.model.clone(),
+                    options: request.options.clone(),
+                    style: String::from("declarative-graph"),
+                    cancellation_id: request.cancellation_id.clone(),
+                    compiled_style_cache_key: binding.compiled_cache_key.to_string(),
+                    node_id: active.node_id.clone(),
+                    attempt: active.attempt,
+                    loop_iteration: active.loop_iteration,
+                    step: active.step,
+                    request_reference,
+                },
+            )),
+            expires_at_millis: None,
+        });
+    }
+
     fn successful_harness_reply(text: &str) -> HarnessDataReply {
         HarnessDataReply::Events(vec![
             HarnessDataEvent::Started,
@@ -7387,6 +8252,198 @@ mod tests {
             3
         );
         assert_eq!(result.events.len(), 9);
+    }
+
+    #[tokio::test]
+    async fn declarative_graph_executes_branch_three_tools_loop_and_terminal() {
+        let data = MockTurnData::with_scenario(
+            declarative_created_events(),
+            Vec::new(),
+            Ok(style_tool_reply()),
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+        let mut request = command();
+        request.options = json!({
+            "graph_requires_approval": false,
+            "graph_iterations": 3,
+            "graph_tool_arguments": {"path":"README.md"}
+        });
+
+        logic.run_turn(request).await.expect("declarative graph");
+        let state = load_mock_state(&data);
+        let execution = state.style_execution.expect("style execution");
+
+        assert_eq!(state.lifecycle, crate::session::SessionLifecycle::Completed);
+        assert_eq!(state.tool_executions.len(), 3);
+        assert_eq!(
+            execution
+                .completed_nodes
+                .iter()
+                .filter(|node| node.node_id == "repeat")
+                .map(|node| node.loop_iteration)
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert_eq!(
+            execution.termination_reason.as_deref(),
+            Some("complete_session")
+        );
+        assert!(
+            data.state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty(),
+            "declarative graph does not invent provider calls"
+        );
+    }
+
+    #[tokio::test]
+    async fn declarative_graph_user_approval_resumes_once_into_tool_and_terminal() {
+        let data = MockTurnData::with_scenario(
+            declarative_created_events(),
+            Vec::new(),
+            Ok(style_tool_reply()),
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+        let mut request = command();
+        request.options = json!({
+            "graph_requires_approval": true,
+            "graph_iterations": 1,
+            "graph_tool_arguments": {"path":"README.md"}
+        });
+        let awaiting = logic
+            .run_turn(request.clone())
+            .await
+            .expect("request graph approval");
+        let continuation_id = awaiting
+            .awaiting_continuation
+            .expect("approval continuation");
+        install_style_approval_continuation(&data, &request, &continuation_id);
+
+        let resolved = logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id: continuation_id.clone(),
+                approved: true,
+                resume_after_resolution: true,
+            })
+            .await
+            .expect("resume graph approval");
+        assert!(resolved.transitioned);
+        assert!(resolved.awaiting_continuation.is_none());
+        let state = load_mock_state(&data);
+        assert_eq!(state.lifecycle, crate::session::SessionLifecycle::Completed);
+        assert_eq!(state.tool_executions.len(), 1);
+        assert_eq!(
+            state.approvals[&ContinuationId::from_str(&continuation_id).expect("id")].state,
+            ApprovalState::Approved
+        );
+
+        let repeated = logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id,
+                approved: true,
+                resume_after_resolution: true,
+            })
+            .await
+            .expect("idempotent approval");
+        assert!(!repeated.transitioned);
+        assert_eq!(load_mock_state(&data).tool_executions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn declarative_graph_rejects_changed_inputs_while_approval_is_pending() {
+        let data = MockTurnData::with_scenario(
+            declarative_created_events(),
+            Vec::new(),
+            Ok(style_tool_reply()),
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+        let mut request = command();
+        request.options = json!({
+            "graph_requires_approval": true,
+            "graph_iterations": 1
+        });
+        logic
+            .run_turn(request.clone())
+            .await
+            .expect("request graph approval");
+        let before = data.event_types();
+        request.options = json!({
+            "graph_requires_approval": true,
+            "graph_iterations": 2
+        });
+
+        let error = logic.run_turn(request).await.expect_err("changed inputs");
+
+        assert!(matches!(
+            error,
+            RunTurnError::ContextRecoveryIdentityMismatch
+        ));
+        assert_eq!(data.event_types(), before);
+        assert!(load_mock_state(&data).tool_executions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn declarative_graph_denial_fails_session_without_tool_dispatch() {
+        let data = MockTurnData::with_scenario(
+            declarative_created_events(),
+            Vec::new(),
+            Ok(style_tool_reply()),
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+        let mut request = command();
+        request.options = json!({
+            "graph_requires_approval": true,
+            "graph_iterations": 1
+        });
+        let awaiting = logic
+            .run_turn(request.clone())
+            .await
+            .expect("request graph approval");
+        let continuation_id = awaiting
+            .awaiting_continuation
+            .expect("approval continuation");
+        install_style_approval_continuation(&data, &request, &continuation_id);
+
+        let denied = logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id: continuation_id.clone(),
+                approved: false,
+                resume_after_resolution: false,
+            })
+            .await
+            .expect("deny graph approval");
+
+        assert!(denied.transitioned);
+        let state = load_mock_state(&data);
+        assert_eq!(state.lifecycle, crate::session::SessionLifecycle::Failed);
+        assert!(state.tool_executions.is_empty());
+        assert_eq!(
+            state
+                .style_execution
+                .as_ref()
+                .and_then(|execution| execution.termination_reason.as_deref()),
+            Some("declarative_approval_denied")
+        );
+        let repeated = logic
+            .resolve_turn_approval(ResolveTurnApprovalCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id: session_id().to_string(),
+                continuation_id,
+                approved: false,
+                resume_after_resolution: false,
+            })
+            .await
+            .expect("idempotent graph denial");
+        assert!(!repeated.transitioned);
+        assert!(load_mock_state(&data).tool_executions.is_empty());
     }
 
     #[tokio::test]
@@ -8012,6 +9069,7 @@ mod tests {
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(graph),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -8119,6 +9177,7 @@ mod tests {
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(graph),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -8428,6 +9487,7 @@ mod tests {
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(graph),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -9138,7 +10198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsupported_bound_graph_fails_preflight_without_mutation() {
+    async fn declarative_bound_graph_uses_generic_adapter_without_harness_calls() {
         let binding = binding(BuiltInStyle::DeclarativeGraph);
         let data = MockTurnData::with_events(
             Ok(HarnessDataReply::Events(Vec::new())),
@@ -9151,16 +10211,18 @@ mod tests {
                 }),
             )],
         );
-        let before = data.event_types();
         let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
 
-        let error = logic.run_turn(command()).await.expect_err("unsupported");
+        let result = logic
+            .run_turn(command())
+            .await
+            .expect("declarative adapter");
 
-        assert!(matches!(
-            error,
-            RunTurnError::UnsupportedStyleExecution(ref style) if style == "declarative-graph"
-        ));
-        assert_eq!(data.event_types(), before);
+        assert!(result.awaiting_continuation.is_none());
+        assert_eq!(
+            load_mock_state(&data).lifecycle,
+            crate::session::SessionLifecycle::Completed
+        );
         assert!(
             data.state
                 .harness_commands

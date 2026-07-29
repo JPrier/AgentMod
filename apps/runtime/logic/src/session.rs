@@ -1,6 +1,6 @@
 //! Pure runtime session reducers and typed committed payloads.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, str::FromStr};
 
 use agentmod_event_model::{EventClassification, EventEnvelope, EventModelError, EventScope};
 use agentmod_graph_engine::{ExecutableGraph, GRAPH_FORMAT_VERSION, NodeKind};
@@ -597,6 +597,9 @@ pub struct SchedulerDeliveryReconciledEvent {
 pub struct StyleExecutionInitializedEvent {
     /// Exact compiled graph selected for this session execution.
     pub graph: Box<ExecutableGraph>,
+    /// Canonical identity of caller-controlled inputs bound before entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_reference: Option<String>,
 }
 
 /// Records entry into one compiled graph node.
@@ -1022,6 +1025,9 @@ pub struct SessionAncestry {
 pub struct StyleExecutionState {
     /// Exact compiled graph selected by the initialization event.
     pub graph: Box<ExecutableGraph>,
+    /// Canonical identity of caller-controlled inputs bound before entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_reference: Option<String>,
     /// Explicit replay control position. This makes control-only crash gaps
     /// distinguishable without inferring intent from unrelated effect events.
     pub control: StyleExecutionControlState,
@@ -1878,6 +1884,7 @@ fn apply_style_execution_initialized(
     }
     state.style_execution = Some(StyleExecutionState {
         graph: initialized.graph.clone(),
+        input_reference: initialized.input_reference.clone(),
         control: StyleExecutionControlState::ReadyForEntry(StyleExecutionCursor {
             node_id: initialized.graph.nodes[initialized.graph.entry_index]
                 .id
@@ -2129,6 +2136,8 @@ fn apply_style_node_completed(
         &state.conversation,
         state.style_binding.as_ref(),
         &state.artifact_persistences,
+        &state.approvals,
+        &state.tool_executions,
         completed,
         state.last_sequence,
     ) {
@@ -2390,11 +2399,17 @@ fn artifact_persistence_effect_evidence_complete(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "replay validation keeps every independent canonical evidence projection explicit"
+)]
 fn style_node_effect_evidence_complete(
     execution: &StyleExecutionState,
     conversation: &ConversationState,
     binding: Option<&SessionStyleBinding>,
     artifact_persistences: &BTreeMap<String, ArtifactPersistenceRecord>,
+    approvals: &BTreeMap<ContinuationId, ApprovalRecord>,
+    tool_executions: &BTreeMap<String, ToolExecutionRecord>,
     completed: &StyleNodeCompletedEvent,
     journal_head: Sequence,
 ) -> bool {
@@ -2404,6 +2419,44 @@ fn style_node_effect_evidence_complete(
             completed,
             journal_head,
         );
+    }
+    if is_declarative_graph(&execution.graph)
+        && graph_node_kind(&execution.graph, &completed.node_id) == Some(NodeKind::UserApproval)
+    {
+        let Some(continuation_id) = completed
+            .result_reference
+            .as_deref()
+            .and_then(|reference| reference.strip_prefix("declarative-approval:"))
+            .and_then(|value| ContinuationId::from_str(value).ok())
+        else {
+            return false;
+        };
+        return approvals.get(&continuation_id).is_some_and(|approval| {
+            approval.state == ApprovalState::Approved && approval.resolved_at == Some(journal_head)
+        });
+    }
+    if is_declarative_graph(&execution.graph)
+        && graph_node_kind(&execution.graph, &completed.node_id)
+            == Some(NodeKind::ToolExecutionGate)
+    {
+        let Some(call_id) = completed
+            .result_reference
+            .as_deref()
+            .and_then(|reference| reference.strip_prefix("declarative-tool:"))
+            .and_then(|reference| {
+                reference
+                    .split_once(":iteration:")
+                    .map(|(call_id, _)| call_id)
+            })
+        else {
+            return false;
+        };
+        return tool_executions.get(call_id).is_some_and(|record| {
+            record.state == ToolExecutionState::Terminal
+                && record
+                    .terminal_at
+                    .is_some_and(|sequence| sequence <= journal_head)
+        });
     }
     let fresh_context_method = if is_ephemeral_turn_graph(&execution.graph) {
         Some("ephemeral_fresh_context")
@@ -2584,6 +2637,36 @@ fn is_research_loop_graph(graph: &ExecutableGraph) -> bool {
         && graph_has_transition(graph, "tool", "persist")
         && graph_has_transition(graph, "persist", "repeat")
         && graph_has_transition(graph, "repeat", "fresh-context")
+        && graph_has_transition(graph, "repeat", "done")
+}
+
+fn is_declarative_graph(graph: &ExecutableGraph) -> bool {
+    let expected = [
+        ("branch", NodeKind::ConditionalBranch),
+        ("approval", NodeKind::UserApproval),
+        ("tool", NodeKind::ToolExecutionGate),
+        ("repeat", NodeKind::Loop),
+        ("done", NodeKind::CompleteSession),
+    ];
+    graph.nodes.len() == expected.len()
+        && graph.edges.len() == 6
+        && expected.iter().all(|(id, kind)| {
+            graph
+                .nodes
+                .iter()
+                .find(|node| node.id == *id)
+                .map(|node| node.kind)
+                == Some(*kind)
+        })
+        && graph
+            .nodes
+            .get(graph.entry_index)
+            .is_some_and(|node| node.id == "branch")
+        && graph_has_transition(graph, "branch", "approval")
+        && graph_has_transition(graph, "branch", "tool")
+        && graph_has_transition(graph, "approval", "tool")
+        && graph_has_transition(graph, "tool", "repeat")
+        && graph_has_transition(graph, "repeat", "tool")
         && graph_has_transition(graph, "repeat", "done")
 }
 
@@ -3150,6 +3233,7 @@ to = "done"
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(artifact_graph()),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -3188,6 +3272,7 @@ to = "done"
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(context_graph()),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -3305,6 +3390,7 @@ to = "done"
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(context_graph()),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -3394,6 +3480,7 @@ to = "done"
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(context_graph()),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -3497,6 +3584,7 @@ to = "done"
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(ephemeral_context_graph()),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -3680,6 +3768,7 @@ to = "done"
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(compiled.graph),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -3970,6 +4059,7 @@ to = "done"
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(graph.clone()),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -4064,6 +4154,7 @@ to = "done"
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(compiled_graph()),
+                        input_reference: None,
                     },
                 )),
             ),
@@ -4117,6 +4208,7 @@ to = "done"
             RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                 StyleExecutionInitializedEvent {
                     graph: Box::new(graph.clone()),
+                    input_reference: None,
                 },
             )),
         )
@@ -4518,6 +4610,7 @@ to = "done"
                 RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
                     StyleExecutionInitializedEvent {
                         graph: Box::new(compiled_graph()),
+                        input_reference: None,
                     },
                 )),
             ),

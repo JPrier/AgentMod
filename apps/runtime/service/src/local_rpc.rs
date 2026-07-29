@@ -14,7 +14,7 @@ use agentmod_protocol_support::{
 use agentmod_runtime_logic::{
     RuntimeLogicPort, history::SessionHistoryLogicPort, registry::SessionRegistryLogicPort,
 };
-use agentmod_runtime_protocol::RuntimeRequest;
+use agentmod_runtime_protocol::{RuntimeRequest, RuntimeResponse};
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -184,7 +184,7 @@ where
         &handshake.payload,
     )?;
     let credit_windows = negotiated.capabilities.contains("credit_windows");
-    let handshake_response_header = response_header(&handshake.header, true, 1);
+    let handshake_response_header = response_header(&handshake.header, true, 1, false);
     write_frame(
         stream,
         &WireFrame {
@@ -223,10 +223,19 @@ where
             stream_sequence = stream_sequence
                 .checked_add(1)
                 .ok_or(LocalRpcError::StreamSequenceOverflow)?;
+            let force_stream_end = matches!(
+                &frame.response,
+                RuntimeResponse::TurnComplete { .. } | RuntimeResponse::SubscriptionComplete { .. }
+            );
             write_frame(
                 stream,
                 &WireFrame {
-                    header: response_header(&request.header, frame.terminal, stream_sequence),
+                    header: response_header(
+                        &request.header,
+                        frame.terminal,
+                        stream_sequence,
+                        force_stream_end,
+                    ),
                     payload: frame.response,
                 },
                 config.maximum_frame_bytes,
@@ -377,12 +386,17 @@ fn validate_request_header(header: &FrameHeader) -> Result<(), LocalRpcError> {
     Ok(())
 }
 
-fn response_header(request: &FrameHeader, terminal: bool, stream_sequence: u64) -> FrameHeader {
+fn response_header(
+    request: &FrameHeader,
+    terminal: bool,
+    stream_sequence: u64,
+    force_stream_end: bool,
+) -> FrameHeader {
     FrameHeader {
         family: String::from("runtime"),
         version: RUNTIME_PROTOCOL_VERSION,
         kind: if terminal {
-            if stream_sequence == 1 {
+            if stream_sequence == 1 && !force_stream_end {
                 FrameKind::Response
             } else {
                 FrameKind::StreamEnd
@@ -471,6 +485,32 @@ mod tests {
 
     #[derive(Clone)]
     struct CreditEndpoint;
+
+    #[derive(Clone)]
+    struct EmptyTurnEndpoint;
+
+    #[async_trait]
+    impl RuntimeWireEndpoint for EmptyTurnEndpoint {
+        async fn handle_runtime_request(
+            &self,
+            _request: &RuntimeRequest,
+        ) -> Result<RuntimeResponse, String> {
+            Err(String::from("stream path required"))
+        }
+
+        async fn handle_runtime_stream(
+            &self,
+            _request: &RuntimeRequest,
+        ) -> Result<RuntimeEndpointStream, String> {
+            Ok(RuntimeEndpointStream::single(
+                RuntimeResponse::TurnComplete {
+                    first_committed_sequence: Sequence::FIRST,
+                    last_committed_sequence: Sequence::FIRST,
+                    awaiting_continuation: None,
+                },
+            ))
+        }
+    }
 
     #[async_trait]
     impl RuntimeWireEndpoint for StreamingEndpoint {
@@ -752,6 +792,51 @@ mod tests {
                 version: String::from("test")
             }
         );
+        drop(client);
+        server_task.await.expect("task").expect("connection");
+    }
+
+    #[tokio::test]
+    async fn zero_event_turn_uses_stream_end_even_as_the_first_frame() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let (mut client, mut server) = tokio::io::duplex(16 * 1024);
+        let server_task = tokio::spawn(async move {
+            serve_connection(&mut server, &EmptyTurnEndpoint, &config(token)).await
+        });
+        write_frame(
+            &mut client,
+            &WireFrame {
+                header: header(FrameKind::Handshake, 30),
+                payload: Handshake {
+                    supported_versions: vec![RUNTIME_PROTOCOL_VERSION],
+                    capabilities: BTreeSet::from([String::from("streaming")]),
+                    authorization_token: String::from(token),
+                },
+            },
+            4096,
+        )
+        .await
+        .expect("handshake");
+        let _: WireFrame<Negotiated> = read_frame(&mut client, 4096).await.expect("negotiated");
+        write_frame(
+            &mut client,
+            &WireFrame {
+                header: header(FrameKind::Request, 31),
+                payload: RuntimeRequest::Health,
+            },
+            4096,
+        )
+        .await
+        .expect("request");
+
+        let terminal: WireFrame<RuntimeResponse> =
+            read_frame(&mut client, 4096).await.expect("terminal");
+        assert_eq!(terminal.header.kind, FrameKind::StreamEnd);
+        assert_eq!(terminal.header.stream_sequence, Some(1));
+        assert!(matches!(
+            terminal.payload,
+            RuntimeResponse::TurnComplete { .. }
+        ));
         drop(client);
         server_task.await.expect("task").expect("connection");
     }

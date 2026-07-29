@@ -5,7 +5,7 @@ use agentmod_runtime_data::continuation::{
     ContinuationDataError, ContinuationDataPort, ContinuationPayloadRecord, ContinuationRecord,
     ContinuationStateRecord, ContinuationWakeRecord, CreateContinuationDataRequest,
     DeferredTurnPayloadRecord, PendingToolCallPayloadRecord, ResolveContinuationDataRequest,
-    ToolApprovalPayloadRecord,
+    StyleApprovalPayloadRecord, ToolApprovalPayloadRecord,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -155,10 +155,45 @@ pub struct WakeContinuationResult {
 pub enum ContinuationPayload {
     /// Final intercepted tool call plus the turn state needed to continue.
     ToolApproval(Box<ToolApprovalContinuation>),
+    /// A compiled style `user_approval` node plus exact command identity.
+    StyleApproval(Box<StyleApprovalContinuation>),
     /// Complete provider turn deferred behind a scheduler-owned trigger.
     DeferredTurn(Box<DeferredTurnContinuation>),
     /// Storage-only marker for callers without an executable action.
     Opaque(String),
+}
+
+/// Logic-owned restart-safe compiled-style approval payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleApprovalContinuation {
+    /// Session identifier used for defense-in-depth validation.
+    pub session_id: String,
+    /// Canonical workspace text.
+    pub workspace: String,
+    /// User-authored input owning the graph execution.
+    pub prompt: String,
+    /// Provider retained for exact command identity.
+    pub provider: String,
+    /// Model retained for exact command identity.
+    pub model: String,
+    /// Style-specific and provider options.
+    pub options: Value,
+    /// Explicit session style.
+    pub style: String,
+    /// Stable cancellation identity for the graph execution.
+    pub cancellation_id: String,
+    /// Exact compiled-style cache key selected by the session.
+    pub compiled_style_cache_key: String,
+    /// Active graph node requesting the decision.
+    pub node_id: String,
+    /// One-based node attempt.
+    pub attempt: u32,
+    /// Zero-based loop iteration.
+    pub loop_iteration: u32,
+    /// One-based graph step.
+    pub step: u64,
+    /// Canonical hash of caller-controlled graph inputs.
+    pub request_reference: String,
 }
 
 /// Logic-owned restart-safe deferred provider turn.
@@ -592,6 +627,23 @@ fn validate_payload(
         {
             Err(ContinuationLogicError::InvalidPayload)
         }
+        ContinuationPayload::StyleApproval(approval)
+            if approval.session_id != session_id
+                || approval.workspace.trim().is_empty()
+                || approval.prompt.trim().is_empty()
+                || approval.provider.trim().is_empty()
+                || approval.model.trim().is_empty()
+                || !approval.options.is_object()
+                || approval.style.trim().is_empty()
+                || approval.cancellation_id.trim().is_empty()
+                || approval.compiled_style_cache_key.trim().is_empty()
+                || approval.node_id.trim().is_empty()
+                || approval.attempt == 0
+                || approval.step == 0
+                || approval.request_reference.trim().is_empty() =>
+        {
+            Err(ContinuationLogicError::InvalidPayload)
+        }
         ContinuationPayload::DeferredTurn(turn)
             if turn.session_id != session_id
                 || turn.schedule_id.trim().is_empty()
@@ -639,6 +691,24 @@ fn to_data_payload(payload: ContinuationPayload) -> ContinuationPayloadRecord {
                     .collect(),
             }))
         }
+        ContinuationPayload::StyleApproval(approval) => {
+            ContinuationPayloadRecord::StyleApproval(Box::new(StyleApprovalPayloadRecord {
+                session_id: approval.session_id,
+                workspace: approval.workspace,
+                prompt: approval.prompt,
+                provider: approval.provider,
+                model: approval.model,
+                options: approval.options,
+                style: approval.style,
+                cancellation_id: approval.cancellation_id,
+                compiled_style_cache_key: approval.compiled_style_cache_key,
+                node_id: approval.node_id,
+                attempt: approval.attempt,
+                loop_iteration: approval.loop_iteration,
+                step: approval.step,
+                request_reference: approval.request_reference,
+            }))
+        }
         ContinuationPayload::DeferredTurn(turn) => {
             ContinuationPayloadRecord::DeferredTurn(Box::new(DeferredTurnPayloadRecord {
                 session_id: turn.session_id,
@@ -681,6 +751,24 @@ fn from_data_payload(payload: ContinuationPayloadRecord) -> ContinuationPayload 
                         arguments: pending.arguments,
                     })
                     .collect(),
+            }))
+        }
+        ContinuationPayloadRecord::StyleApproval(approval) => {
+            ContinuationPayload::StyleApproval(Box::new(StyleApprovalContinuation {
+                session_id: approval.session_id,
+                workspace: approval.workspace,
+                prompt: approval.prompt,
+                provider: approval.provider,
+                model: approval.model,
+                options: approval.options,
+                style: approval.style,
+                cancellation_id: approval.cancellation_id,
+                compiled_style_cache_key: approval.compiled_style_cache_key,
+                node_id: approval.node_id,
+                attempt: approval.attempt,
+                loop_iteration: approval.loop_iteration,
+                step: approval.step,
+                request_reference: approval.request_reference,
             }))
         }
         ContinuationPayloadRecord::DeferredTurn(turn) => {

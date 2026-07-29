@@ -42,6 +42,7 @@ pub(crate) enum StyleAdapterKind {
     PersistentTurn,
     EphemeralTurn,
     ResearchLoop,
+    DeclarativeGraph,
 }
 
 impl StyleNodeDirective {
@@ -69,6 +70,7 @@ pub(crate) struct StyleNodeCursor {
     pub directive: StyleNodeDirective,
     pub retry_limit: u32,
     pub max_iterations: Option<u32>,
+    pub tool: Option<String>,
 }
 
 /// Pure transition selected after a node completes.
@@ -224,8 +226,11 @@ impl CompiledStyleExecutor {
         if self.supports_ephemeral_turn() {
             return Some(StyleAdapterKind::EphemeralTurn);
         }
-        self.supports_research_loop()
-            .then_some(StyleAdapterKind::ResearchLoop)
+        if self.supports_research_loop() {
+            return Some(StyleAdapterKind::ResearchLoop);
+        }
+        self.supports_declarative_graph()
+            .then_some(StyleAdapterKind::DeclarativeGraph)
     }
 
     /// Returns whether this graph is the exact fresh-context turn lifecycle.
@@ -321,6 +326,68 @@ impl CompiledStyleExecutor {
                 .is_ok_and(|transition| transition.is_none())
     }
 
+    fn supports_declarative_graph(&self) -> bool {
+        if self.compiled.graph.nodes.len() != 5 || self.compiled.graph.edges.len() != 6 {
+            return false;
+        }
+        let Ok(branch) = self.entry() else {
+            return false;
+        };
+        if branch.directive != StyleNodeDirective::ConditionalBranch {
+            return false;
+        }
+        let Ok(Some(approval)) = self.transition(
+            branch.index,
+            &serde_json::json!({"request":{"requires_approval":true}}),
+        ) else {
+            return false;
+        };
+        let Ok(Some(tool)) = self.transition(
+            branch.index,
+            &serde_json::json!({"request":{"requires_approval":false}}),
+        ) else {
+            return false;
+        };
+        if approval.to.directive != StyleNodeDirective::UserApproval
+            || tool.to.directive != StyleNodeDirective::ToolExecutionGate
+            || tool.to.tool.as_deref() != Some("filesystem.read")
+        {
+            return false;
+        }
+        let Ok(Some(approved_tool)) = self.transition(approval.to.index, &serde_json::json!({}))
+        else {
+            return false;
+        };
+        if approved_tool.to.index != tool.to.index {
+            return false;
+        }
+        let Ok(Some(loop_node)) = self.transition(tool.to.index, &serde_json::json!({})) else {
+            return false;
+        };
+        if loop_node.to.directive != StyleNodeDirective::Loop
+            || loop_node.to.max_iterations.is_none()
+        {
+            return false;
+        }
+        let Ok(Some(repeat)) = self.transition(
+            loop_node.to.index,
+            &serde_json::json!({"iteration":{"remaining":true}}),
+        ) else {
+            return false;
+        };
+        let Ok(Some(done)) = self.transition(
+            loop_node.to.index,
+            &serde_json::json!({"iteration":{"remaining":false}}),
+        ) else {
+            return false;
+        };
+        repeat.to.index == tool.to.index
+            && done.to.directive == StyleNodeDirective::CompleteSession
+            && self
+                .transition(done.to.index, &serde_json::json!({}))
+                .is_ok_and(|transition| transition.is_none())
+    }
+
     fn cursor(&self, index: usize) -> Result<StyleNodeCursor, StyleExecutorError> {
         self.compiled
             .graph
@@ -363,6 +430,7 @@ fn cursor(node: &ExecutableNode) -> StyleNodeCursor {
         directive: directive(node.kind),
         retry_limit: node.retry_limit,
         max_iterations: node.max_iterations,
+        tool: node.tool.clone(),
     }
 }
 
@@ -587,6 +655,40 @@ pub(crate) mod tests {
                 node: String::from("repeat")
             })
         );
+    }
+
+    #[test]
+    fn declarative_graph_uses_compiled_branch_tool_loop_and_terminal_nodes() {
+        let executor =
+            CompiledStyleExecutor::from_binding(&binding(BuiltInStyle::DeclarativeGraph))
+                .expect("executor");
+        assert_eq!(
+            executor.adapter_kind(),
+            Some(super::StyleAdapterKind::DeclarativeGraph)
+        );
+        let branch = executor.entry().expect("branch");
+        let approval = executor
+            .transition(branch.index, &json!({"request":{"requires_approval":true}}))
+            .expect("approval transition")
+            .expect("approval");
+        assert_eq!(approval.to.directive, StyleNodeDirective::UserApproval);
+        let tool = executor
+            .transition(
+                branch.index,
+                &json!({"request":{"requires_approval":false}}),
+            )
+            .expect("tool transition")
+            .expect("tool");
+        assert_eq!(tool.to.tool.as_deref(), Some("filesystem.read"));
+        let repeat = executor
+            .node("repeat")
+            .and_then(|node| {
+                executor
+                    .transition(node.index, &json!({"iteration":{"remaining":true}}))
+                    .map(|transition| transition.expect("repeat"))
+            })
+            .expect("repeat transition");
+        assert_eq!(repeat.to.id, "tool");
     }
 
     #[test]

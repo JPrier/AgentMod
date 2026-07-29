@@ -104,9 +104,9 @@ This is Windows evidence only. Existing Unix scripts are not execution evidence.
 ### Frontends
 
 - CLI: add `style list`, `style inspect`, `style validate`, and `style compile`;
-  session creation selects style, harness, memory, and compaction through the
+  session creation selects style, harness, memory, compaction, and hard budgets through the
   runtime, and inspection renders the full binding.
-- TUI: explicit style/harness/memory/compaction selection, branch-with-style,
+- TUI: explicit style/harness/memory/compaction/budget selection, branch-with-style,
   catalog/details/compatibility, and replay-derived Graph inspection use the
   four-layer frontend path.
 - ACP remains protocol-driven and must not import runtime internals.
@@ -192,8 +192,9 @@ owns override selection and exact restart comparison, and delegates profile
 normalization to the session-style SDK. Runtime data recompiles the transformed
 manifest through the ordinary validator; the resulting manifest, compiled
 descriptor, content hash, and cache key are retained in the immutable session
-binding. CLI `session create --memory/--compaction` and the TUI
-`/memory`, `/compaction`, and extended `/new` path carry layer-owned values.
+binding. CLI `session create --memory/--compaction` plus five hard-budget flags
+and the TUI `/memory`, `/compaction`, `/budget`, and extended `/new` path carry
+layer-owned values.
 
 `runtime_style_registry.ps1` proves a SQLite/sliding binding remains compatible
 and executable after daemon restart. `runtime_tui_smoke.ps1` proves both CLI

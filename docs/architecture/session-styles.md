@@ -16,14 +16,20 @@ diagnostics; and stores compiled styles in memory and in a persistent cache.
 Validation and graph compilation remain owned by `agentmod-session-style-sdk`
 and `agentmod-graph-engine`.
 
-Session creation may explicitly select a memory provider or compaction strategy.
+Session creation may explicitly select a memory provider, compaction strategy,
+or any subset of the five hard execution budgets.
 The SDK owns the manifest transform, including safe disabled/enabled lifecycle
 controls; runtime data recompiles the transformed manifest through the ordinary
 SDK validator. Logic restores the original source identity and binds the new
 manifest, compiled descriptor, content hash, and cache key. Restart resolves
-the exact base style, reapplies only the retained memory/compaction selections,
+the exact base style, reapplies only the retained memory/compaction/budget selections,
 recompiles, and compares the complete binding. Invalid or unavailable
 components return SDK-derived diagnostics and are never silently replaced.
+
+Budget transforms are SDK-owned. They update the style-wide ceilings and narrow
+subordinate inline-graph, compaction, retry, and child-agent declarations before
+normal compilation. Referenced graphs are not rewritten: a selected ceiling
+below a referenced graph's declared budget is an explicit incompatibility.
 
 The generic style executor consumes the compiled SDK graph. It records
 initialization, node entry, node completion or failure, and selected transitions

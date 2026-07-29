@@ -20,7 +20,10 @@ pub use model::{
     TerminationPolicy, TopLevelSelection,
 };
 pub use parsing::{ManifestFormat, ManifestParseError, parse_json, parse_toml, to_json, to_toml};
-pub use selection::{ComponentSelectionError, select_compaction_strategy, select_memory_provider};
+pub use selection::{
+    ComponentSelectionError, ExecutionBudgetOverrides, select_compaction_strategy,
+    select_execution_budgets, select_memory_provider,
+};
 pub use validation::{
     CURRENT_STYLE_SCHEMA_VERSION, CompileContext, CompiledSessionStyle, Diagnostic,
     DiagnosticSeverity, StyleCacheKey, StyleCompileError, StyleCompilerLimits, compile_style,

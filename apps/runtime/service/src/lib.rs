@@ -30,10 +30,10 @@ use agentmod_runtime_logic::{
     },
     style::{
         InspectStyleCommand, ListStyleComponentsCommand, ListStylesCommand,
-        SelectStyleComponentsCommand, SelectStyleHarnessCommand, SessionStyleLogicError,
-        SessionStyleLogicPort, StyleAvailability, StyleDecisionCapability, StyleEnvironment,
-        StyleHarnessDescriptor, StyleInspection, StyleManifestFormat, StyleSource, StyleSummary,
-        ValidateStyleBindingCommand, ValidateStyleCommand,
+        SelectStyleBudgetsCommand, SelectStyleComponentsCommand, SelectStyleHarnessCommand,
+        SessionStyleLogicError, SessionStyleLogicPort, StyleAvailability, StyleDecisionCapability,
+        StyleEnvironment, StyleHarnessDescriptor, StyleInspection, StyleManifestFormat,
+        StyleSource, StyleSummary, ValidateStyleBindingCommand, ValidateStyleCommand,
     },
 };
 use agentmod_runtime_protocol::{
@@ -415,6 +415,7 @@ where
                 harness,
                 memory,
                 compaction,
+                budgets,
             } => {
                 let service_request = ServiceCreateSessionRequest {
                     workspace: workspace.clone(),
@@ -422,6 +423,13 @@ where
                     harness: harness.clone(),
                     memory: memory.clone(),
                     compaction: compaction.clone(),
+                    budgets: budgets.map(|budgets| ServiceExecutionBudgetOverrides {
+                        max_iterations: budgets.max_iterations,
+                        max_steps: budgets.max_steps,
+                        max_tokens: budgets.max_tokens,
+                        max_cost_micros: budgets.max_cost_micros,
+                        max_duration_ms: budgets.max_duration_ms,
+                    }),
                 };
                 let created = self.create_session(service_request)?;
                 Ok(RuntimeResponse::SessionCreated {
@@ -774,6 +782,20 @@ where
                     binding: resolved.binding,
                     memory: request.memory,
                     compaction: request.compaction,
+                    environment: self.style_environment(Some(&request.workspace)),
+                })
+                .map_err(ServiceError::SessionStyle)?;
+        }
+        if let Some(budgets) = request.budgets {
+            resolved = self
+                .logic
+                .select_style_budgets(SelectStyleBudgetsCommand {
+                    binding: resolved.binding,
+                    max_iterations: budgets.max_iterations,
+                    max_steps: budgets.max_steps,
+                    max_tokens: budgets.max_tokens,
+                    max_cost_micros: budgets.max_cost_micros,
+                    max_duration_ms: budgets.max_duration_ms,
                     environment: self.style_environment(Some(&request.workspace)),
                 })
                 .map_err(ServiceError::SessionStyle)?;
@@ -1149,6 +1171,23 @@ pub struct ServiceCreateSessionRequest {
     pub memory: Option<String>,
     /// Optional per-session compaction-strategy override.
     pub compaction: Option<String>,
+    /// Optional per-session hard execution-budget overrides.
+    pub budgets: Option<ServiceExecutionBudgetOverrides>,
+}
+
+/// Service-owned optional hard execution-budget overrides.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceExecutionBudgetOverrides {
+    /// Maximum loop/research iterations.
+    pub max_iterations: Option<u32>,
+    /// Maximum graph transitions.
+    pub max_steps: Option<u64>,
+    /// Maximum provider tokens.
+    pub max_tokens: Option<u64>,
+    /// Maximum cost in configured currency micros.
+    pub max_cost_micros: Option<u64>,
+    /// Maximum wall-clock duration.
+    pub max_duration_ms: Option<u64>,
 }
 
 /// Service-owned create-session response.

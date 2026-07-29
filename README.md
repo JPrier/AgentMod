@@ -46,7 +46,9 @@ cargo run -p agentmod-cli -- style list
 cargo run -p agentmod-cli -- harness list
 cargo run -p agentmod-cli -- session create --workspace . \
   --style persistent-chat --harness native \
-  --memory sqlite-fts --compaction sliding_window --json
+  --memory sqlite-fts --compaction sliding_window \
+  --max-iterations 8 --max-steps 250 --max-tokens 500000 \
+  --max-cost-micros 50000000 --max-duration-ms 1800000 --json
 cargo run -p agentmod-cli -- run "hello" --session <id> --json
 ```
 

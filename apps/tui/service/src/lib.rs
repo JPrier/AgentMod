@@ -606,12 +606,28 @@ fn render_styles(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
             ),
             Style::new().fg(Color::Green),
         )),
+        Line::from(Span::styled(
+            state.selected_budgets.map_or_else(
+                || String::from("Budgets    selected=style-default"),
+                |value| {
+                    format!(
+                        "Budgets    selected={}/{}/{}/{}/{}",
+                        value.max_iterations,
+                        value.max_steps,
+                        value.max_tokens,
+                        value.max_cost_micros,
+                        value.max_duration_ms
+                    )
+                },
+            ),
+            Style::new().fg(Color::Green),
+        )),
     ]);
     frame.render_widget(
         Paragraph::new(lines)
             .block(
                 Block::bordered()
-                    .title(" Style catalog/components · /style · /memory · /compaction "),
+                    .title(" Style catalog/components · /style · /memory · /compaction · /budget "),
             )
             .wrap(Wrap { trim: true }),
         area,
@@ -669,13 +685,12 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Line::from("Enter send · Shift+Enter newline · ↑/↓ prompt history"),
             Line::from("Ctrl+C cancel active generation · Ctrl+Q or Esc quit"),
             Line::default(),
-            Line::from(
-                "/new [workspace] [style] [harness] [memory] [compaction]  /sessions  /styles",
-            ),
-            Line::from("/harnesses  /harness <id>  /branch <sequence> [style]"),
+            Line::from("/new [workspace] [style] [harness] [memory] [compaction] [five budgets]"),
+            Line::from("/sessions  /styles  /harnesses  /harness <id>  /branch <sequence> [style]"),
             Line::from(
                 "/style <id[@version]>  /memory <id|style-default>  /compaction <id|style-default>",
             ),
+            Line::from("/budget <style-default|iterations steps tokens cost-micros duration-ms>"),
             Line::from(
                 "/model <id>  /provider <id>  /chat  /events  /context  /graph  /help  /cancel",
             ),
@@ -893,6 +908,13 @@ mod tests {
         state.selected_memory = Some(String::from("sqlite-fts"));
         state.compaction_strategies = vec![String::from("none"), String::from("sliding_window")];
         state.selected_compaction = Some(String::from("sliding_window"));
+        state.selected_budgets = Some(agentmod_tui_logic::SessionBudgetSelection {
+            max_iterations: 3,
+            max_steps: 40,
+            max_tokens: 100_000,
+            max_cost_micros: 1_000_000,
+            max_duration_ms: 60_000,
+        });
         state.styles.push(StyleSummary {
             id: String::from("focused"),
             version: String::from("1.0.0"),
@@ -918,6 +940,7 @@ mod tests {
         assert!(screen.contains("content-hash"));
         assert!(screen.contains("selected=sqlite-fts"));
         assert!(screen.contains("selected=sliding_window"));
+        assert!(screen.contains("selected=3/40/100000/1000000/60000"));
     }
 
     #[test]

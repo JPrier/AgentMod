@@ -55,6 +55,9 @@ pub enum RuntimeRequest {
         /// Optional per-session compaction-strategy override.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         compaction: Option<String>,
+        /// Optional per-session hard execution-budget overrides.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budgets: Option<RuntimeExecutionBudgetOverrides>,
     },
     /// List sessions without loading their conversations.
     ListSessions {
@@ -204,6 +207,27 @@ pub enum RuntimeRequest {
         /// Highest contiguous stream sequence already accepted.
         last_received_sequence: u64,
     },
+}
+
+/// Wire-owned optional hard execution-budget overrides.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeExecutionBudgetOverrides {
+    /// Maximum loop/research iterations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_iterations: Option<u32>,
+    /// Maximum graph transitions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<u64>,
+    /// Maximum provider tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
+    /// Maximum cost in configured currency micros.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_micros: Option<u64>,
+    /// Maximum wall-clock duration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_duration_ms: Option<u64>,
 }
 
 const fn default_true() -> bool {
@@ -756,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn session_component_selections_are_optional_and_round_trip_when_present() {
+    fn session_configuration_selections_are_optional_and_round_trip_when_present() {
         let legacy: RuntimeRequest = serde_json::from_value(serde_json::json!({
             "operation": "create_session",
             "arguments": {
@@ -780,10 +804,18 @@ mod tests {
             harness: Some(String::from("native")),
             memory: Some(String::from("sqlite-fts")),
             compaction: Some(String::from("sliding_window")),
+            budgets: Some(RuntimeExecutionBudgetOverrides {
+                max_iterations: Some(3),
+                max_steps: Some(40),
+                max_tokens: Some(100_000),
+                max_cost_micros: Some(1_000_000),
+                max_duration_ms: Some(60_000),
+            }),
         };
         let encoded = serde_json::to_value(&selected).expect("encode");
         assert_eq!(encoded["arguments"]["memory"], "sqlite-fts");
         assert_eq!(encoded["arguments"]["compaction"], "sliding_window");
+        assert_eq!(encoded["arguments"]["budgets"]["max_iterations"], 3);
         assert_eq!(
             serde_json::from_value::<RuntimeRequest>(encoded).expect("decode"),
             selected

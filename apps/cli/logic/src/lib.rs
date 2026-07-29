@@ -10,12 +10,12 @@
 
 use agentmod_cli_data::{
     BranchSessionDataRequest, CancelTurnDataRequest, CliDataPort, CreateDeferredTurnDataRequest,
-    CreateSessionDataRequest, HarnessDescriptorDataRecord, InspectSessionDataRequest,
-    InspectStyleDataRequest, ListSessionsDataRequest, ResolveApprovalDataRequest,
-    RunTurnDataRequest, RunTurnDataStream, RunTurnDataStreamItem, RuntimeHealthDataAvailability,
-    RuntimeHealthDataRequest, ScheduleDataPayload, ScheduleDataRecord, ScheduleDataTrigger,
-    ScheduledExecutionDataRecord, ScheduledRunDataRecord, StyleDataAvailability,
-    StyleDataSourceKind, StyleDiagnosticDataRecord, StyleFileDataRequest,
+    CreateSessionBudgetDataRequest, CreateSessionDataRequest, HarnessDescriptorDataRecord,
+    InspectSessionDataRequest, InspectStyleDataRequest, ListSessionsDataRequest,
+    ResolveApprovalDataRequest, RunTurnDataRequest, RunTurnDataStream, RunTurnDataStreamItem,
+    RuntimeHealthDataAvailability, RuntimeHealthDataRequest, ScheduleDataPayload,
+    ScheduleDataRecord, ScheduleDataTrigger, ScheduledExecutionDataRecord, ScheduledRunDataRecord,
+    StyleDataAvailability, StyleDataSourceKind, StyleDiagnosticDataRecord, StyleFileDataRequest,
     StyleInspectionDataRecord, StyleSummaryDataRecord, SubscribeSessionDataRequest, TurnDataEvent,
 };
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
@@ -157,6 +157,18 @@ pub struct CreateSessionCommand {
     pub memory: Option<String>,
     /// Optional compaction-strategy override.
     pub compaction: Option<String>,
+    /// Optional hard execution-budget overrides.
+    pub budgets: Option<CreateSessionBudgetCommand>,
+}
+
+/// Logic-owned optional hard execution-budget overrides.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CreateSessionBudgetCommand {
+    pub max_iterations: Option<u32>,
+    pub max_steps: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub max_cost_micros: Option<u64>,
+    pub max_duration_ms: Option<u64>,
 }
 
 /// Logic-owned create result.
@@ -749,6 +761,15 @@ where
                 harness: command.harness,
                 memory: command.memory,
                 compaction: command.compaction,
+                budgets: command
+                    .budgets
+                    .map(|budgets| CreateSessionBudgetDataRequest {
+                        max_iterations: budgets.max_iterations,
+                        max_steps: budgets.max_steps,
+                        max_tokens: budgets.max_tokens,
+                        max_cost_micros: budgets.max_cost_micros,
+                        max_duration_ms: budgets.max_duration_ms,
+                    }),
             })
             .map(|record| CreateSessionResult {
                 session_id: record.session_id,

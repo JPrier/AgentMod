@@ -32,7 +32,9 @@ mod tests {
         ContinuationLogic, ContinuationLogicPort, ContinuationPayload, ContinuationWakeCondition,
         CreateContinuationCommand,
     };
-    use agentmod_runtime_protocol::{RuntimeRequest, RuntimeResponse};
+    use agentmod_runtime_protocol::{
+        RuntimeExecutionBudgetOverrides, RuntimeRequest, RuntimeResponse,
+    };
     use agentmod_runtime_service::{
         RuntimeService, RuntimeServiceConfig, continuation::ContinuationService,
     };
@@ -69,6 +71,7 @@ mod tests {
                 harness: Some(String::from("native")),
                 memory: None,
                 compaction: None,
+                budgets: None,
             })
             .expect("create through complete layer chain")
         else {
@@ -134,6 +137,7 @@ mod tests {
                     harness: None,
                     memory: None,
                     compaction: None,
+                    budgets: None,
                 })
                 .expect("create style-bound session")
             else {
@@ -269,6 +273,7 @@ mod tests {
                 harness: Some(String::from("fixture")),
                 memory: None,
                 compaction: None,
+                budgets: None,
             })
             .expect("select compatible fixture harness")
         else {
@@ -298,6 +303,7 @@ mod tests {
                 harness: None,
                 memory: None,
                 compaction: None,
+                budgets: None,
             })
             .expect_err("fixture cannot satisfy the style's image requirement");
         assert!(error.to_string().contains("images"), "{error}");
@@ -351,6 +357,7 @@ mod tests {
                 harness: None,
                 memory: None,
                 compaction: None,
+                budgets: None,
             })
             .expect("create parent")
         else {
@@ -409,6 +416,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one vertical acceptance test proves component and budget binding plus restart failures"
+    )]
     fn session_component_overrides_recompile_and_validate_the_exact_binding() {
         let storage = tempfile::tempdir().expect("storage");
         let workspace = tempfile::tempdir().expect("workspace");
@@ -442,6 +453,7 @@ mod tests {
                     harness: None,
                     memory,
                     compaction,
+                    budgets: None,
                 })
                 .expect("create component-selected session")
             else {
@@ -454,6 +466,27 @@ mod tests {
             Some(String::from("sqlite-fts")),
             Some(String::from("sliding_window")),
         );
+        let RuntimeResponse::SessionCreated {
+            session_id: budget_id,
+        } = service
+            .handle_wire(&RuntimeRequest::CreateSession {
+                workspace: workspace.path().display().to_string(),
+                style: String::from("ephemeral-turn"),
+                harness: None,
+                memory: Some(String::from("sqlite-fts")),
+                compaction: Some(String::from("sliding_window")),
+                budgets: Some(RuntimeExecutionBudgetOverrides {
+                    max_iterations: Some(3),
+                    max_steps: Some(40),
+                    max_tokens: Some(100_000),
+                    max_cost_micros: Some(1_000_000),
+                    max_duration_ms: Some(60_000),
+                }),
+            })
+            .expect("create budget-selected session")
+        else {
+            panic!("created response")
+        };
         let inspect = |session_id| {
             let RuntimeResponse::SessionInspected { state, .. } = service
                 .handle_wire(&RuntimeRequest::InspectSession {
@@ -468,6 +501,7 @@ mod tests {
         };
         let default = inspect(default_id);
         let selected = inspect(selected_id);
+        let budgeted = inspect(budget_id);
         assert_eq!(default["style_binding"]["memory"]["provider"], "none");
         assert_eq!(
             selected["style_binding"]["memory"]["provider"],
@@ -481,6 +515,27 @@ mod tests {
             selected["style_binding"]["compiled_cache_key"],
             default["style_binding"]["compiled_cache_key"]
         );
+        assert_eq!(
+            budgeted["style_binding"]["budgets"],
+            serde_json::json!({
+                "max_iterations": 3,
+                "max_steps": 40,
+                "max_tokens": 100_000,
+                "max_cost_micros": 1_000_000,
+                "max_duration_ms": 60_000,
+            })
+        );
+        let compiled: serde_json::Value = serde_json::from_str(
+            budgeted["style_binding"]["compiled_style_json"]
+                .as_str()
+                .expect("compiled JSON"),
+        )
+        .expect("parse compiled JSON");
+        assert_eq!(compiled["graph"]["budget"]["max_tokens"], 100_000);
+        assert_ne!(
+            budgeted["style_binding"]["compiled_cache_key"],
+            selected["style_binding"]["compiled_cache_key"]
+        );
 
         let restarted = RuntimeService::new(
             RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
@@ -489,6 +544,9 @@ mod tests {
         restarted
             .validate_session_style_compatibility(selected_id)
             .expect("exact selected binding survives restart");
+        restarted
+            .validate_session_style_compatibility(budget_id)
+            .expect("exact budget-selected binding survives restart");
         let error = restarted
             .handle_wire(&RuntimeRequest::CreateSession {
                 workspace: workspace.path().display().to_string(),
@@ -496,9 +554,27 @@ mod tests {
                 harness: None,
                 memory: Some(String::from("missing-memory")),
                 compaction: None,
+                budgets: None,
             })
             .expect_err("unavailable memory must fail");
         assert!(error.to_string().contains("STYLE017"), "{error}");
+        let error = restarted
+            .handle_wire(&RuntimeRequest::CreateSession {
+                workspace: workspace.path().display().to_string(),
+                style: String::from("ephemeral-turn"),
+                harness: None,
+                memory: None,
+                compaction: None,
+                budgets: Some(RuntimeExecutionBudgetOverrides {
+                    max_iterations: None,
+                    max_steps: Some(0),
+                    max_tokens: None,
+                    max_cost_micros: None,
+                    max_duration_ms: None,
+                }),
+            })
+            .expect_err("zero budget must fail");
+        assert!(error.to_string().contains("STYLE020"), "{error}");
     }
 
     #[test]

@@ -10,7 +10,8 @@
 
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use agentmod_tui_dependency::{
-    DependencyBranchSessionRequest, DependencyStyleAvailability, DependencyStyleSourceKind,
+    DependencyBranchSessionRequest, DependencyCreateSessionRequest,
+    DependencySessionBudgetSelection, DependencyStyleAvailability, DependencyStyleSourceKind,
     DependencyTurnEvent, DependencyTurnStream, DependencyTurnStreamItem, TuiDependencyError,
     TuiRuntimeDependencyPort,
 };
@@ -21,6 +22,27 @@ use thiserror::Error;
 pub struct RuntimeHealthDataRecord {
     pub ready: bool,
     pub version: String,
+}
+
+/// Data-owned optional session budget selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SessionBudgetDataRequest {
+    pub max_iterations: Option<u32>,
+    pub max_steps: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub max_cost_micros: Option<u64>,
+    pub max_duration_ms: Option<u64>,
+}
+
+/// Data-owned complete session creation request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateSessionDataRequest {
+    pub workspace: String,
+    pub style: String,
+    pub harness: Option<String>,
+    pub memory: Option<String>,
+    pub compaction: Option<String>,
+    pub budgets: Option<SessionBudgetDataRequest>,
 }
 
 /// Data-owned style provenance.
@@ -206,6 +228,19 @@ pub trait TuiDataPort {
         let _ = (memory, compaction);
         self.create_session_with_harness(workspace, style, harness)
     }
+    fn create_session_with_configuration(
+        &self,
+        request: CreateSessionDataRequest,
+    ) -> Result<SessionId, TuiDataError> {
+        let _ = request.budgets;
+        self.create_session_with_components(
+            request.workspace,
+            request.style,
+            request.harness,
+            request.memory,
+            request.compaction,
+        )
+    }
     fn branch_session(
         &self,
         request: BranchSessionDataRequest,
@@ -376,6 +411,30 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
     ) -> Result<SessionId, TuiDataError> {
         self.dependency
             .create_session_with_components(workspace, style, harness, memory, compaction)
+            .map_err(map_error)
+    }
+
+    fn create_session_with_configuration(
+        &self,
+        request: CreateSessionDataRequest,
+    ) -> Result<SessionId, TuiDataError> {
+        self.dependency
+            .create_session_with_configuration(DependencyCreateSessionRequest {
+                workspace: request.workspace,
+                style: request.style,
+                harness: request.harness,
+                memory: request.memory,
+                compaction: request.compaction,
+                budgets: request
+                    .budgets
+                    .map(|budgets| DependencySessionBudgetSelection {
+                        max_iterations: budgets.max_iterations,
+                        max_steps: budgets.max_steps,
+                        max_tokens: budgets.max_tokens,
+                        max_cost_micros: budgets.max_cost_micros,
+                        max_duration_ms: budgets.max_duration_ms,
+                    }),
+            })
             .map_err(map_error)
     }
 

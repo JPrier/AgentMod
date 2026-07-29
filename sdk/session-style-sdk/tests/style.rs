@@ -6,10 +6,10 @@ use agentmod_graph_engine::{GRAPH_FORMAT_VERSION, NodeKind};
 use agentmod_primitives::ContentHash;
 use agentmod_session_style_sdk::{
     BuiltInStyle, CompactionStrategy, CompileContext, CompiledSessionStyle, DecisionCapability,
-    GraphSource, MemoryInjectionLocation, MemoryRetrievalTiming, MemoryWritePolicy,
-    StyleCompilerLimits, built_in_manifest, built_in_manifest_for_version, compile_style,
-    compile_style_set, declarative_graph_manifest, parse_json, parse_toml,
-    select_compaction_strategy, select_memory_provider, to_json, to_toml,
+    ExecutionBudgetOverrides, GraphSource, MemoryInjectionLocation, MemoryRetrievalTiming,
+    MemoryWritePolicy, StyleCompilerLimits, built_in_manifest, built_in_manifest_for_version,
+    compile_style, compile_style_set, declarative_graph_manifest, parse_json, parse_toml,
+    select_compaction_strategy, select_execution_budgets, select_memory_provider, to_json, to_toml,
 };
 use proptest::prelude::*;
 
@@ -128,6 +128,43 @@ fn component_overrides_normalize_disabled_profiles_and_recompile_through_the_sdk
     assert_eq!(disabled.memory.max_items, 0);
     assert_eq!(disabled.compaction.strategy, CompactionStrategy::None);
     assert_eq!(disabled.compaction.trigger_tokens, None);
+}
+
+#[test]
+fn budget_overrides_narrow_all_subordinate_bounds_and_recompile() {
+    let mut manifest = built_in_manifest(BuiltInStyle::PlannerWorker);
+    select_execution_budgets(
+        &mut manifest,
+        ExecutionBudgetOverrides {
+            max_iterations: Some(2),
+            max_steps: Some(40),
+            max_tokens: Some(1_000),
+            max_cost_micros: Some(1_000),
+            max_duration_ms: Some(10_000),
+        },
+    )
+    .expect("valid inline graph");
+
+    let compiled = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("narrowed budgets compile");
+
+    assert_eq!(compiled.budgets.max_iterations, 2);
+    assert_eq!(compiled.budgets.max_steps, 40);
+    assert_eq!(compiled.budgets.max_tokens, 1_000);
+    assert_eq!(compiled.budgets.max_cost_micros, 1_000);
+    assert_eq!(compiled.budgets.max_duration_ms, 10_000);
+    assert!(compiled.graph.budget.max_steps <= 40);
+    assert!(compiled.graph.budget.max_tokens <= 1_000);
+    assert!(compiled.graph.budget.max_cost_micros <= 1_000);
+    assert!(compiled.graph.budget.max_duration_ms <= 10_000);
+    assert!(compiled.child_agents.per_child_token_budget <= 1_000);
+    assert!(
+        compiled
+            .child_agents
+            .per_child_cost_budget_micros
+            .is_some_and(|value| value <= 1_000)
+    );
+    assert!(compiled.retry.max_backoff_ms < 10_000);
 }
 
 #[test]

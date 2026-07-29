@@ -87,7 +87,7 @@ try {
         throw "TUI branch did not preserve the parent and select the child style"
     }
     $componentSmoke = & $tui --smoke-command (
-        "/new . ephemeral-turn native sqlite-fts sliding_window"
+        "/new . ephemeral-turn native sqlite-fts sliding_window 3 40 100000 1000000 60000"
     )
     if ($LASTEXITCODE -ne 0 -or
         $componentSmoke -notmatch "selected=([0-9a-f-]+)") {
@@ -97,20 +97,26 @@ try {
         ConvertFrom-Json
     if ($componentSession.state.style_binding.memory.provider -ne "sqlite-fts" -or
         $componentSession.state.style_binding.compaction.strategy -ne
-            "sliding_window") {
-        throw "TUI component selections did not reach the immutable binding"
+            "sliding_window" -or
+        $componentSession.state.style_binding.budgets.max_iterations -ne 3 -or
+        $componentSession.state.style_binding.budgets.max_tokens -ne 100000) {
+        throw "TUI component/budget selections did not reach the immutable binding"
     }
     $cliSelected = & $cli session create --workspace $runRoot `
         --style ephemeral-turn --memory file `
-        --compaction tool_output_eviction --json | ConvertFrom-Json
+        --compaction tool_output_eviction --max-iterations 4 `
+        --max-steps 50 --max-tokens 120000 --max-cost-micros 1200000 `
+        --max-duration-ms 70000 --json | ConvertFrom-Json
     $cliInspection = & $cli session inspect $cliSelected.session_id --json |
         ConvertFrom-Json
     if ($cliInspection.state.style_binding.memory.provider -ne "file" -or
         $cliInspection.state.style_binding.compaction.strategy -ne
-            "tool_output_eviction") {
-        throw "CLI component selections did not reach the immutable binding"
+            "tool_output_eviction" -or
+        $cliInspection.state.style_binding.budgets.max_iterations -ne 4 -or
+        $cliInspection.state.style_binding.budgets.max_tokens -ne 120000) {
+        throw "CLI component/budget selections did not reach the immutable binding"
     }
-    Write-Output "runtime TUI smoke/branch/component-selection E2E passed"
+    Write-Output "runtime TUI smoke/branch/component/budget-selection E2E passed"
 }
 finally {
     if ($null -ne $daemon -and -not $daemon.HasExited) {

@@ -22,20 +22,41 @@ use agentmod_protocol_support::{
     write_frame,
 };
 use agentmod_runtime_protocol::{
-    RuntimeProviderEvent, RuntimeRequest, RuntimeResponse, RuntimeSessionEvent,
-    RuntimeStyleAvailability, RuntimeStyleSourceKind,
+    RuntimeExecutionBudgetOverrides, RuntimeProviderEvent, RuntimeRequest, RuntimeResponse,
+    RuntimeSessionEvent, RuntimeStyleAvailability, RuntimeStyleSourceKind,
 };
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
-const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 3);
+const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 4);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyRuntimeHealth {
     pub status: String,
     pub version: String,
+}
+
+/// Dependency-owned optional session budget selection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DependencySessionBudgetSelection {
+    pub max_iterations: Option<u32>,
+    pub max_steps: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub max_cost_micros: Option<u64>,
+    pub max_duration_ms: Option<u64>,
+}
+
+/// Dependency-owned complete session creation request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyCreateSessionRequest {
+    pub workspace: String,
+    pub style: String,
+    pub harness: Option<String>,
+    pub memory: Option<String>,
+    pub compaction: Option<String>,
+    pub budgets: Option<DependencySessionBudgetSelection>,
 }
 
 /// Dependency-owned provenance for one registry style.
@@ -228,6 +249,19 @@ pub trait TuiRuntimeDependencyPort: Send + Sync {
     ) -> Result<SessionId, TuiDependencyError> {
         let _ = (memory, compaction);
         self.create_session_with_harness(workspace, style, harness)
+    }
+    fn create_session_with_configuration(
+        &self,
+        request: DependencyCreateSessionRequest,
+    ) -> Result<SessionId, TuiDependencyError> {
+        let _ = request.budgets;
+        self.create_session_with_components(
+            request.workspace,
+            request.style,
+            request.harness,
+            request.memory,
+            request.compaction,
+        )
     }
     fn branch_session(
         &self,
@@ -659,6 +693,7 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
                 harness: None,
                 memory: None,
                 compaction: None,
+                budgets: None,
             })?
         else {
             return Err(TuiDependencyError::UnexpectedResponse);
@@ -679,6 +714,7 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
                 harness,
                 memory: None,
                 compaction: None,
+                budgets: None,
             })?
         else {
             return Err(TuiDependencyError::UnexpectedResponse);
@@ -701,6 +737,34 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
                 harness,
                 memory,
                 compaction,
+                budgets: None,
+            })?
+        else {
+            return Err(TuiDependencyError::UnexpectedResponse);
+        };
+        Ok(session_id)
+    }
+
+    fn create_session_with_configuration(
+        &self,
+        request: DependencyCreateSessionRequest,
+    ) -> Result<SessionId, TuiDependencyError> {
+        let RuntimeResponse::SessionCreated { session_id } =
+            self.send(RuntimeRequest::CreateSession {
+                workspace: request.workspace,
+                style: request.style,
+                harness: request.harness,
+                memory: request.memory,
+                compaction: request.compaction,
+                budgets: request
+                    .budgets
+                    .map(|budgets| RuntimeExecutionBudgetOverrides {
+                        max_iterations: budgets.max_iterations,
+                        max_steps: budgets.max_steps,
+                        max_tokens: budgets.max_tokens,
+                        max_cost_micros: budgets.max_cost_micros,
+                        max_duration_ms: budgets.max_duration_ms,
+                    }),
             })?
         else {
             return Err(TuiDependencyError::UnexpectedResponse);

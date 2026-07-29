@@ -234,11 +234,21 @@ limitation = "The Windows process E2E proves the four-layer TUI command path cre
 id = "E2E-23"
 capability = "per-session-memory-compaction-selection"
 owner = "sdk/runtime/cli/tui"
-tests = ["component_overrides_normalize_disabled_profiles_and_recompile_through_the_sdk", "component_selection_is_transformed_and_compiled_inside_data", "session_component_selections_are_optional_and_round_trip_when_present", "session_component_overrides_recompile_and_validate_the_exact_binding", "selected_style_and_harness_reach_create_session", "style_catalog_renders_selected_style_and_hashes", "runtime_style_registry", "runtime_tui_smoke"]
+tests = ["component_overrides_normalize_disabled_profiles_and_recompile_through_the_sdk", "component_selection_is_transformed_and_compiled_inside_data", "session_configuration_selections_are_optional_and_round_trip_when_present", "session_component_overrides_recompile_and_validate_the_exact_binding", "selected_style_and_harness_reach_create_session", "style_catalog_renders_selected_style_and_hashes", "runtime_style_registry", "runtime_tui_smoke"]
 platforms = ["windows", "linux", "macos"]
 evidence = ["sdk/session-style-sdk/src/selection.rs", "apps/runtime/logic/src/style.rs", "apps/runtime/service/src/lib.rs", "protocols/runtime-protocol/src/lib.rs", "apps/cli/dependency/src/lib.rs", "apps/cli/data/src/lib.rs", "apps/cli/logic/src/lib.rs", "apps/cli/service/src/lib.rs", "apps/tui/dependency/src/lib.rs", "apps/tui/data/src/lib.rs", "apps/tui/logic/src/lib.rs", "apps/tui/service/src/lib.rs", "tests/integration/src/lib.rs", "tests/e2e/runtime_style_registry.ps1", "tests/e2e/runtime_style_registry.sh", "tests/e2e/runtime_tui_smoke.ps1", "tests/e2e/runtime_tui_smoke.sh"]
 status = "partial"
 limitation = "Windows process E2Es prove CLI and TUI selection, distinct immutable bindings, exact restart validation, and post-restart execution. Unix scripts are syntax-checked but have not been process-executed. The typed SDK strategy enum does not yet represent future plugin-provided compaction implementations."
+
+[[requirement]]
+id = "E2E-24"
+capability = "per-session-execution-budget-selection"
+owner = "sdk/runtime/cli/tui"
+tests = ["budget_overrides_narrow_all_subordinate_bounds_and_recompile", "budget_selection_is_transformed_and_compiled_inside_data", "session_configuration_selections_are_optional_and_round_trip_when_present", "session_component_overrides_recompile_and_validate_the_exact_binding", "session_create_and_list_render_stable_json", "selected_style_and_harness_reach_create_session", "style_catalog_renders_selected_style_and_hashes", "runtime_style_registry", "runtime_tui_smoke"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["sdk/session-style-sdk/src/selection.rs", "apps/runtime/data/src/style.rs", "apps/runtime/logic/src/style.rs", "apps/runtime/service/src/lib.rs", "protocols/runtime-protocol/src/lib.rs", "apps/cli/dependency/src/lib.rs", "apps/cli/data/src/lib.rs", "apps/cli/logic/src/lib.rs", "apps/cli/service/src/lib.rs", "apps/tui/dependency/src/lib.rs", "apps/tui/data/src/lib.rs", "apps/tui/logic/src/lib.rs", "apps/tui/service/src/lib.rs", "tests/integration/src/lib.rs", "tests/e2e/runtime_style_registry.ps1", "tests/e2e/runtime_style_registry.sh", "tests/e2e/runtime_tui_smoke.ps1", "tests/e2e/runtime_tui_smoke.sh"]
+status = "partial"
+limitation = "Windows process E2Es prove CLI and TUI budget selection, content-addressed binding changes, exact restart validation, and post-restart execution. Unix scripts are syntax-checked but have not been process-executed. Referenced graphs are not rewritten; a selected ceiling below their declared graph budget fails explicitly during SDK compilation."
 
 [[requirement]]
 id = "SCHED-01"

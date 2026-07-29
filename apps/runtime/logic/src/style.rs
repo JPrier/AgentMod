@@ -7,7 +7,8 @@ use std::{
 
 use agentmod_primitives::ContentHash;
 use agentmod_runtime_data::style::{
-    SessionStyleCatalogDataRequest, SessionStyleCatalogRecord, SessionStyleCatalogStatus,
+    SessionStyleBudgetSelectionDataRequest, SessionStyleCatalogDataRequest,
+    SessionStyleCatalogRecord, SessionStyleCatalogStatus,
     SessionStyleComponentSelectionDataRequest, SessionStyleDataError, SessionStyleDataPort,
     SessionStyleDecisionCapability, SessionStyleDiagnostic as DataDiagnostic,
     SessionStyleEnvironment as DataEnvironment, SessionStyleManifestFormat as DataManifestFormat,
@@ -256,6 +257,25 @@ pub struct SelectStyleComponentsCommand {
     pub environment: StyleEnvironment,
 }
 
+/// Explicit per-session execution-budget selection command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectStyleBudgetsCommand {
+    /// Fully compiled base style binding.
+    pub binding: SessionStyleBinding,
+    /// Optional maximum loop/research iterations.
+    pub max_iterations: Option<u32>,
+    /// Optional maximum graph transitions.
+    pub max_steps: Option<u64>,
+    /// Optional maximum provider tokens.
+    pub max_tokens: Option<u64>,
+    /// Optional maximum cost in configured currency micros.
+    pub max_cost_micros: Option<u64>,
+    /// Optional maximum wall-clock duration.
+    pub max_duration_ms: Option<u64>,
+    /// Current runtime compatibility environment.
+    pub environment: StyleEnvironment,
+}
+
 /// Narrow session-style logic boundary.
 pub trait SessionStyleLogicPort {
     /// Lists the live style catalog.
@@ -333,6 +353,19 @@ pub trait SessionStyleLogicPort {
     fn select_style_components(
         &self,
         _command: SelectStyleComponentsCommand,
+    ) -> Result<ResolvedStyle, SessionStyleLogicError> {
+        Err(SessionStyleLogicError::InvalidData)
+    }
+
+    /// Recompiles a style after SDK-owned budget selection transforms.
+    ///
+    /// # Errors
+    ///
+    /// Returns structured style diagnostics when the selected hard limits
+    /// cannot produce a valid compiled style in the current environment.
+    fn select_style_budgets(
+        &self,
+        _command: SelectStyleBudgetsCommand,
     ) -> Result<ResolvedStyle, SessionStyleLogicError> {
         Err(SessionStyleLogicError::InvalidData)
     }
@@ -473,6 +506,24 @@ where
                 environment: command.environment.clone(),
             })?;
         }
+        let base_budgets = resolved.binding.budgets;
+        let retained_budgets = command.binding.budgets;
+        if base_budgets != retained_budgets {
+            resolved = self.select_style_budgets(SelectStyleBudgetsCommand {
+                binding: resolved.binding,
+                max_iterations: (base_budgets.max_iterations != retained_budgets.max_iterations)
+                    .then_some(retained_budgets.max_iterations),
+                max_steps: (base_budgets.max_steps != retained_budgets.max_steps)
+                    .then_some(retained_budgets.max_steps),
+                max_tokens: (base_budgets.max_tokens != retained_budgets.max_tokens)
+                    .then_some(retained_budgets.max_tokens),
+                max_cost_micros: (base_budgets.max_cost_micros != retained_budgets.max_cost_micros)
+                    .then_some(retained_budgets.max_cost_micros),
+                max_duration_ms: (base_budgets.max_duration_ms != retained_budgets.max_duration_ms)
+                    .then_some(retained_budgets.max_duration_ms),
+                environment: command.environment.clone(),
+            })?;
+        }
         let resolved = self.select_style_harness(SelectStyleHarnessCommand {
             binding: resolved.binding,
             harness: command.binding.harness.clone(),
@@ -524,6 +575,43 @@ where
                 }
                 error => SessionStyleLogicError::Data(error),
             })?;
+        if availability(&record) != StyleAvailability::Available {
+            return Err(SessionStyleLogicError::ComponentSelectionIncompatible {
+                diagnostics: record.diagnostics.iter().map(diagnostic).collect(),
+            });
+        }
+        let mut selected = binding(&record, &command.environment)?;
+        selected.source = command.binding.source;
+        selected.source_locator = command.binding.source_locator;
+        Ok(ResolvedStyle { binding: selected })
+    }
+
+    fn select_style_budgets(
+        &self,
+        command: SelectStyleBudgetsCommand,
+    ) -> Result<ResolvedStyle, SessionStyleLogicError> {
+        if command.max_iterations.is_none()
+            && command.max_steps.is_none()
+            && command.max_tokens.is_none()
+            && command.max_cost_micros.is_none()
+            && command.max_duration_ms.is_none()
+        {
+            return Ok(ResolvedStyle {
+                binding: command.binding,
+            });
+        }
+        let record = self
+            .data
+            .select_session_style_budgets(SessionStyleBudgetSelectionDataRequest {
+                environment: data_environment(&command.environment),
+                manifest: command.binding.configuration_json.clone(),
+                max_iterations: command.max_iterations,
+                max_steps: command.max_steps,
+                max_tokens: command.max_tokens,
+                max_cost_micros: command.max_cost_micros,
+                max_duration_ms: command.max_duration_ms,
+            })
+            .map_err(SessionStyleLogicError::Data)?;
         if availability(&record) != StyleAvailability::Available {
             return Err(SessionStyleLogicError::ComponentSelectionIncompatible {
                 diagnostics: record.diagnostics.iter().map(diagnostic).collect(),

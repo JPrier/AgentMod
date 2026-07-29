@@ -4,13 +4,14 @@ use std::ffi::OsString;
 
 use agentmod_cli_logic::{
     BranchSessionCommand, BranchSessionResult, CancelTurnCommand, CliLogicPort,
-    CreateSessionCommand, DeferredScheduleCommand, DoctorResult, DoctorState,
-    HarnessDescriptorResult, InspectSessionCommand, InspectSessionResult, ListSessionsCommand,
-    ResolveApprovalCommand, ResolveApprovalResult, RunDoctorCommand, RunTurnCommand, RunTurnResult,
-    RunTurnStream, RunTurnStreamItem, ScheduleCommand as LogicScheduleCommand, SchedulePayload,
-    ScheduleResult, ScheduleTrigger, SessionEventPageResult, SessionSummaryResult,
-    StyleAvailability, StyleDiagnostic, StyleFileCommand, StyleInspectionResult, StyleSourceKind,
-    StyleSummaryResult, StyleValidationResult, SubscribeSessionCommand, TurnEvent,
+    CreateSessionBudgetCommand, CreateSessionCommand, DeferredScheduleCommand, DoctorResult,
+    DoctorState, HarnessDescriptorResult, InspectSessionCommand, InspectSessionResult,
+    ListSessionsCommand, ResolveApprovalCommand, ResolveApprovalResult, RunDoctorCommand,
+    RunTurnCommand, RunTurnResult, RunTurnStream, RunTurnStreamItem,
+    ScheduleCommand as LogicScheduleCommand, SchedulePayload, ScheduleResult, ScheduleTrigger,
+    SessionEventPageResult, SessionSummaryResult, StyleAvailability, StyleDiagnostic,
+    StyleFileCommand, StyleInspectionResult, StyleSourceKind, StyleSummaryResult,
+    StyleValidationResult, SubscribeSessionCommand, TurnEvent,
 };
 use clap::{Parser, Subcommand, ValueEnum};
 use thiserror::Error;
@@ -323,6 +324,21 @@ pub enum SessionCommand {
         /// Explicit compaction strategy ID.
         #[arg(long)]
         compaction: Option<String>,
+        /// Maximum loop/research iterations.
+        #[arg(long)]
+        max_iterations: Option<u32>,
+        /// Maximum graph transitions.
+        #[arg(long)]
+        max_steps: Option<u64>,
+        /// Maximum provider tokens.
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Maximum cost in configured currency micros.
+        #[arg(long)]
+        max_cost_micros: Option<u64>,
+        /// Maximum wall-clock duration in milliseconds.
+        #[arg(long)]
+        max_duration_ms: Option<u64>,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -499,6 +515,55 @@ pub struct ServiceCommandResponse {
     pub exit_code: u8,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ServiceCreateSessionInput {
+    workspace: String,
+    style: String,
+    harness: Option<String>,
+    memory: Option<String>,
+    compaction: Option<String>,
+    budgets: Option<ServiceBudgetOverrides>,
+    json: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "explicit budget names preserve unambiguous service-to-logic mapping"
+)]
+struct ServiceBudgetOverrides {
+    max_iterations: Option<u32>,
+    max_steps: Option<u64>,
+    max_tokens: Option<u64>,
+    max_cost_micros: Option<u64>,
+    max_duration_ms: Option<u64>,
+}
+
+const fn budget_input(
+    max_iterations: Option<u32>,
+    max_steps: Option<u64>,
+    max_tokens: Option<u64>,
+    max_cost_micros: Option<u64>,
+    max_duration_ms: Option<u64>,
+) -> Option<ServiceBudgetOverrides> {
+    if max_iterations.is_none()
+        && max_steps.is_none()
+        && max_tokens.is_none()
+        && max_cost_micros.is_none()
+        && max_duration_ms.is_none()
+    {
+        None
+    } else {
+        Some(ServiceBudgetOverrides {
+            max_iterations,
+            max_steps,
+            max_tokens,
+            max_cost_micros,
+            max_duration_ms,
+        })
+    }
+}
+
 /// Parsed endpoint invocation, either complete or incrementally rendered.
 pub enum ServiceInvocation {
     /// A complete command response.
@@ -666,8 +731,27 @@ where
                     harness,
                     memory,
                     compaction,
+                    max_iterations,
+                    max_steps,
+                    max_tokens,
+                    max_cost_micros,
+                    max_duration_ms,
                     json,
-                } => self.create_session(workspace, style, harness, memory, compaction, json),
+                } => self.create_session(ServiceCreateSessionInput {
+                    workspace,
+                    style,
+                    harness,
+                    memory,
+                    compaction,
+                    budgets: budget_input(
+                        max_iterations,
+                        max_steps,
+                        max_tokens,
+                        max_cost_micros,
+                        max_duration_ms,
+                    ),
+                    json,
+                }),
                 SessionCommand::List { limit, json } => self.list_sessions(limit, json),
                 SessionCommand::Inspect { session, at, json } => {
                     self.inspect_session(&session, at, false, json)
@@ -1340,26 +1424,28 @@ where
 
     fn create_session(
         &self,
-        workspace: String,
-        style: String,
-        harness: Option<String>,
-        memory: Option<String>,
-        compaction: Option<String>,
-        json: bool,
+        request: ServiceCreateSessionInput,
     ) -> Result<ServiceCommandResponse, ServiceError> {
         let result = self
             .logic
             .create_session(CreateSessionCommand {
-                workspace,
-                style,
-                harness,
-                memory,
-                compaction,
+                workspace: request.workspace,
+                style: request.style,
+                harness: request.harness,
+                memory: request.memory,
+                compaction: request.compaction,
+                budgets: request.budgets.map(|budgets| CreateSessionBudgetCommand {
+                    max_iterations: budgets.max_iterations,
+                    max_steps: budgets.max_steps,
+                    max_tokens: budgets.max_tokens,
+                    max_cost_micros: budgets.max_cost_micros,
+                    max_duration_ms: budgets.max_duration_ms,
+                }),
             })
             .map_err(|error| ServiceError::Logic {
                 detail: error.to_string(),
             })?;
-        let output = if json {
+        let output = if request.json {
             serde_json::to_string(&serde_json::json!({
                 "command": "session_create",
                 "session_id": result.session_id.to_string(),
@@ -2387,6 +2473,16 @@ mod tests {
                 "sqlite-fts",
                 "--compaction",
                 "sliding_window",
+                "--max-iterations",
+                "3",
+                "--max-steps",
+                "40",
+                "--max-tokens",
+                "100000",
+                "--max-cost-micros",
+                "1000000",
+                "--max-duration-ms",
+                "60000",
                 "--json",
             ])
             .expect("create");
@@ -2399,6 +2495,13 @@ mod tests {
                 harness: None,
                 memory: Some(String::from("sqlite-fts")),
                 compaction: Some(String::from("sliding_window")),
+                budgets: Some(CreateSessionBudgetCommand {
+                    max_iterations: Some(3),
+                    max_steps: Some(40),
+                    max_tokens: Some(100_000),
+                    max_cost_micros: Some(1_000_000),
+                    max_duration_ms: Some(60_000),
+                }),
             }
         );
         let listed = service

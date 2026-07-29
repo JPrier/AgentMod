@@ -8,14 +8,15 @@
 use agentmod_cli_dependency::{
     CliDependencyPort, DependencyBranchSessionRequest, DependencyCancelTurnRequest,
     DependencyCreateDeferredTurnRequest, DependencyCreateSessionRequest,
-    DependencyHarnessDescriptor, DependencyInspectSessionRequest, DependencyInspectStyleRequest,
-    DependencyListSessionsRequest, DependencyResolveApprovalRequest, DependencyRunTurnRequest,
-    DependencyRunTurnStream, DependencyRunTurnStreamItem, DependencyRuntimeAvailability,
-    DependencyRuntimeHealthRequest, DependencySchedule, DependencySchedulePayload,
-    DependencyScheduleTrigger, DependencyScheduledExecution, DependencyScheduledRun,
-    DependencyStyleAvailability, DependencyStyleDiagnostic, DependencyStyleFileRequest,
-    DependencyStyleInspection, DependencyStyleSourceKind, DependencyStyleSummary,
-    DependencySubscribeSessionRequest, DependencyTurnEvent,
+    DependencyExecutionBudgetOverrides, DependencyHarnessDescriptor,
+    DependencyInspectSessionRequest, DependencyInspectStyleRequest, DependencyListSessionsRequest,
+    DependencyResolveApprovalRequest, DependencyRunTurnRequest, DependencyRunTurnStream,
+    DependencyRunTurnStreamItem, DependencyRuntimeAvailability, DependencyRuntimeHealthRequest,
+    DependencySchedule, DependencySchedulePayload, DependencyScheduleTrigger,
+    DependencyScheduledExecution, DependencyScheduledRun, DependencyStyleAvailability,
+    DependencyStyleDiagnostic, DependencyStyleFileRequest, DependencyStyleInspection,
+    DependencyStyleSourceKind, DependencyStyleSummary, DependencySubscribeSessionRequest,
+    DependencyTurnEvent,
 };
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use serde_json::Value;
@@ -141,6 +142,18 @@ pub struct CreateSessionDataRequest {
     pub memory: Option<String>,
     /// Optional compaction-strategy override.
     pub compaction: Option<String>,
+    /// Optional hard execution-budget overrides.
+    pub budgets: Option<CreateSessionBudgetDataRequest>,
+}
+
+/// Data-owned optional hard execution-budget overrides.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CreateSessionBudgetDataRequest {
+    pub max_iterations: Option<u32>,
+    pub max_steps: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub max_cost_micros: Option<u64>,
+    pub max_duration_ms: Option<u64>,
 }
 
 /// Data-owned create result.
@@ -710,6 +723,15 @@ where
                 harness: request.harness,
                 memory: request.memory,
                 compaction: request.compaction,
+                budgets: request
+                    .budgets
+                    .map(|budgets| DependencyExecutionBudgetOverrides {
+                        max_iterations: budgets.max_iterations,
+                        max_steps: budgets.max_steps,
+                        max_tokens: budgets.max_tokens,
+                        max_cost_micros: budgets.max_cost_micros,
+                        max_duration_ms: budgets.max_duration_ms,
+                    }),
             })
             .map(|response| CreateSessionDataRecord {
                 session_id: response.session_id,

@@ -28,6 +28,9 @@ storage itself.
 
 The Styles view also reads the runtime component catalog and exposes
 `/memory <id|style-default>` and `/compaction <id|style-default>` selectors.
+`/budget <style-default|iterations steps tokens cost-micros duration-ms>` selects
+SDK-validated hard limits for the next session; the same five values may follow
+the component arguments in `/new` for one-shot creation.
 `/new` sends those selections with style and harness through layer-owned
 requests; the runtime performs SDK compilation and compatibility checks. The
 frontend does not synthesize component profiles.

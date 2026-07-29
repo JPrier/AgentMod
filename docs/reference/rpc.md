@@ -29,8 +29,9 @@ errors.
 
 Served endpoints include health, style/harness/component discovery, durable
 session create/list/inspect/replay/branch, provider turns, cancellation,
-approval resolution, and bounded session event catch-up. Runtime protocol 2.3
-adds optional memory and compaction selections to session creation plus the
+approval resolution, and bounded session event catch-up. Runtime protocol 2.4
+adds optional memory, compaction, and hard execution-budget selections to
+session creation plus the
 component catalog used by frontends. Receiving service types translate runtime
 wire contracts before calling logic; logic reaches external state only through
 data and dependency.

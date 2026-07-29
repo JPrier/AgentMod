@@ -23,17 +23,18 @@ use agentmod_protocol_support::{
     write_frame,
 };
 use agentmod_runtime_protocol::{
-    RuntimeHarnessDescriptor, RuntimeProviderEvent, RuntimeRequest, RuntimeResponse,
-    RuntimeSchedulePayload, RuntimeScheduleSpec, RuntimeScheduleTrigger, RuntimeSessionEvent,
-    RuntimeStyleAvailability, RuntimeStyleDiagnostic, RuntimeStyleInspection,
-    RuntimeStyleManifestFormat, RuntimeStyleSourceKind, RuntimeStyleSummary,
+    RuntimeExecutionBudgetOverrides, RuntimeHarnessDescriptor, RuntimeProviderEvent,
+    RuntimeRequest, RuntimeResponse, RuntimeSchedulePayload, RuntimeScheduleSpec,
+    RuntimeScheduleTrigger, RuntimeSessionEvent, RuntimeStyleAvailability, RuntimeStyleDiagnostic,
+    RuntimeStyleInspection, RuntimeStyleManifestFormat, RuntimeStyleSourceKind,
+    RuntimeStyleSummary,
 };
 use serde_json::Value;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
-const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 3);
+const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 4);
 const MAX_STYLE_MANIFEST_BYTES: u64 = 1_048_576;
 
 /// Dependency-owned style manifest format.
@@ -152,6 +153,18 @@ pub struct DependencyCreateSessionRequest {
     pub memory: Option<String>,
     /// Optional compaction-strategy override.
     pub compaction: Option<String>,
+    /// Optional hard execution-budget overrides.
+    pub budgets: Option<DependencyExecutionBudgetOverrides>,
+}
+
+/// Dependency-owned optional hard execution-budget overrides.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DependencyExecutionBudgetOverrides {
+    pub max_iterations: Option<u32>,
+    pub max_steps: Option<u64>,
+    pub max_tokens: Option<u64>,
+    pub max_cost_micros: Option<u64>,
+    pub max_duration_ms: Option<u64>,
 }
 
 /// Dependency-owned create-session response.
@@ -685,6 +698,15 @@ impl CliDependencyPort for DeterministicRuntimeClient {
             harness: request.harness,
             memory: request.memory,
             compaction: request.compaction,
+            budgets: request
+                .budgets
+                .map(|budgets| RuntimeExecutionBudgetOverrides {
+                    max_iterations: budgets.max_iterations,
+                    max_steps: budgets.max_steps,
+                    max_tokens: budgets.max_tokens,
+                    max_cost_micros: budgets.max_cost_micros,
+                    max_duration_ms: budgets.max_duration_ms,
+                }),
         })?;
         let RuntimeResponse::SessionCreated { session_id } = response else {
             return Err(DependencyError::UnexpectedRuntimeResponse);
@@ -1189,6 +1211,15 @@ impl CliDependencyPort for LocalRuntimeClient {
                 harness: request.harness,
                 memory: request.memory,
                 compaction: request.compaction,
+                budgets: request
+                    .budgets
+                    .map(|budgets| RuntimeExecutionBudgetOverrides {
+                        max_iterations: budgets.max_iterations,
+                        max_steps: budgets.max_steps,
+                        max_tokens: budgets.max_tokens,
+                        max_cost_micros: budgets.max_cost_micros,
+                        max_duration_ms: budgets.max_duration_ms,
+                    }),
             })?
         else {
             return Err(DependencyError::UnexpectedRuntimeResponse);

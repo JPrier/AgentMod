@@ -10,9 +10,10 @@
 
 use agentmod_primitives::{CancellationId, Sequence};
 use agentmod_tui_data::{
-    BranchSessionDataRecord, BranchSessionDataRequest, HarnessDataRecord, SessionDataRecord,
-    SessionEventDataRecord, StyleDataAvailability, StyleDataRecord, StyleDataSourceKind,
-    TuiDataError, TuiDataPort, TurnDataEvent, TurnDataStream, TurnDataStreamItem,
+    BranchSessionDataRecord, BranchSessionDataRequest, CreateSessionDataRequest, HarnessDataRecord,
+    SessionBudgetDataRequest, SessionDataRecord, SessionEventDataRecord, StyleDataAvailability,
+    StyleDataRecord, StyleDataSourceKind, TuiDataError, TuiDataPort, TurnDataEvent, TurnDataStream,
+    TurnDataStreamItem,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -125,6 +126,16 @@ pub struct BranchSessionResult {
     pub child_head_sequence: Sequence,
 }
 
+/// Logic-owned optional hard execution-budget selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionBudgetSelection {
+    pub max_iterations: u32,
+    pub max_steps: u64,
+    pub max_tokens: u64,
+    pub max_cost_micros: u64,
+    pub max_duration_ms: u64,
+}
+
 pub struct TuiState {
     pub runtime_ready: bool,
     pub runtime_version: String,
@@ -137,6 +148,7 @@ pub struct TuiState {
     pub selected_memory: Option<String>,
     pub compaction_strategies: Vec<String>,
     pub selected_compaction: Option<String>,
+    pub selected_budgets: Option<SessionBudgetSelection>,
     pub default_style: String,
     pub selected_session: Option<usize>,
     pub transcript: Vec<TranscriptEntry>,
@@ -172,6 +184,7 @@ impl Default for TuiState {
             selected_memory: None,
             compaction_strategies: Vec::new(),
             selected_compaction: None,
+            selected_budgets: None,
             default_style: String::from("persistent-chat"),
             selected_session: None,
             transcript: Vec::new(),
@@ -679,28 +692,105 @@ impl<D: TuiDataPort> TuiLogic<D> {
             .next()
             .map(ToOwned::to_owned)
             .or_else(|| self.state.selected_compaction.clone());
-        if parts.next().is_some() {
-            return Err(TuiLogicError::InvalidCommand(String::from(
-                "/new [workspace] [style] [harness] [memory] [compaction]",
-            )));
-        }
+        let budgets = if let Some(max_iterations) = parts.next() {
+            const USAGE: &str = "/new [workspace] [style] [harness] [memory] [compaction] [iterations steps tokens cost-micros duration-ms]";
+            let max_iterations = max_iterations
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| TuiLogicError::InvalidCommand(String::from(USAGE)))?;
+            let max_steps = required_positive_u64(parts.next(), USAGE)?;
+            let max_tokens = required_positive_u64(parts.next(), USAGE)?;
+            let max_cost_micros = required_positive_u64(parts.next(), USAGE)?;
+            let max_duration_ms = required_positive_u64(parts.next(), USAGE)?;
+            if parts.next().is_some() {
+                return Err(TuiLogicError::InvalidCommand(String::from(USAGE)));
+            }
+            Some(SessionBudgetSelection {
+                max_iterations,
+                max_steps,
+                max_tokens,
+                max_cost_micros,
+                max_duration_ms,
+            })
+        } else {
+            self.state.selected_budgets
+        };
         let id = self
             .data
-            .create_session_with_components(
+            .create_session_with_configuration(CreateSessionDataRequest {
                 workspace,
-                style.clone(),
-                Some(harness.clone()),
-                memory.clone(),
-                compaction.clone(),
-            )
+                style: style.clone(),
+                harness: Some(harness.clone()),
+                memory: memory.clone(),
+                compaction: compaction.clone(),
+                budgets: budgets.map(|budgets| SessionBudgetDataRequest {
+                    max_iterations: Some(budgets.max_iterations),
+                    max_steps: Some(budgets.max_steps),
+                    max_tokens: Some(budgets.max_tokens),
+                    max_cost_micros: Some(budgets.max_cost_micros),
+                    max_duration_ms: Some(budgets.max_duration_ms),
+                }),
+            })
             .map_err(map_error)?;
         self.refresh_sessions()?;
         self.state.selected_session = self.state.sessions.iter().position(|value| value.id == id);
         self.reload_selected_history()?;
         self.state.status = format!(
-            "created session {id} with {style} on {harness}; memory={}; compaction={}",
+            "created session {id} with {style} on {harness}; memory={}; compaction={}; budgets={}",
             memory.as_deref().unwrap_or("style-default"),
-            compaction.as_deref().unwrap_or("style-default")
+            compaction.as_deref().unwrap_or("style-default"),
+            budgets.map_or_else(
+                || String::from("style-default"),
+                |value| format!(
+                    "{}/{}/{}/{}/{}",
+                    value.max_iterations,
+                    value.max_steps,
+                    value.max_tokens,
+                    value.max_cost_micros,
+                    value.max_duration_ms
+                )
+            )
+        );
+        Ok(())
+    }
+
+    fn execute_budget_command(
+        &mut self,
+        parts: &mut std::str::SplitWhitespace<'_>,
+    ) -> Result<(), TuiLogicError> {
+        const USAGE: &str =
+            "/budget <style-default|iterations steps tokens cost-micros duration-ms>";
+        let first = required_argument(parts.next(), USAGE)?;
+        if first == "style-default" {
+            if parts.next().is_some() {
+                return Err(TuiLogicError::InvalidCommand(String::from(USAGE)));
+            }
+            self.state.selected_budgets = None;
+            self.state.status = String::from("budgets: style-default");
+            return Ok(());
+        }
+        let max_iterations = first
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| TuiLogicError::InvalidCommand(String::from(USAGE)))?;
+        let max_steps = required_positive_u64(parts.next(), USAGE)?;
+        let max_tokens = required_positive_u64(parts.next(), USAGE)?;
+        let max_cost_micros = required_positive_u64(parts.next(), USAGE)?;
+        let max_duration_ms = required_positive_u64(parts.next(), USAGE)?;
+        if parts.next().is_some() {
+            return Err(TuiLogicError::InvalidCommand(String::from(USAGE)));
+        }
+        self.state.selected_budgets = Some(SessionBudgetSelection {
+            max_iterations,
+            max_steps,
+            max_tokens,
+            max_cost_micros,
+            max_duration_ms,
+        });
+        self.state.status = format!(
+            "budgets: {max_iterations}/{max_steps}/{max_tokens}/{max_cost_micros}/{max_duration_ms}"
         );
         Ok(())
     }
@@ -802,6 +892,7 @@ impl<D: TuiDataPort> TuiLogic<D> {
             }
             "/memory" => self.execute_memory_command(&mut parts)?,
             "/compaction" => self.execute_compaction_command(&mut parts)?,
+            "/budget" => self.execute_budget_command(&mut parts)?,
             "/style" => {
                 let selector = required_argument(parts.next(), "/style <id[@version]>")?;
                 if parts.next().is_some() {
@@ -987,6 +1078,13 @@ fn required_sequence(value: Option<&str>, usage: &str) -> Result<Sequence, TuiLo
         .ok_or_else(|| TuiLogicError::InvalidCommand(usage.to_owned()))
 }
 
+fn required_positive_u64(value: Option<&str>, usage: &str) -> Result<u64, TuiLogicError> {
+    value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| TuiLogicError::InvalidCommand(usage.to_owned()))
+}
+
 fn map_branch_result(record: &BranchSessionDataRecord) -> BranchSessionResult {
     BranchSessionResult {
         session_id: record.session_id,
@@ -1093,6 +1191,7 @@ mod tests {
         harness: Option<String>,
         memory: Option<String>,
         compaction: Option<String>,
+        budgets: Option<SessionBudgetDataRequest>,
     }
 
     #[derive(Default)]
@@ -1176,6 +1275,7 @@ mod tests {
                 harness: None,
                 memory: None,
                 compaction: None,
+                budgets: None,
             });
             Ok(SessionId::from_uuid(Uuid::from_u128(2)))
         }
@@ -1192,6 +1292,7 @@ mod tests {
                 harness,
                 memory: None,
                 compaction: None,
+                budgets: None,
             });
             Ok(SessionId::from_uuid(Uuid::from_u128(2)))
         }
@@ -1210,6 +1311,22 @@ mod tests {
                 harness,
                 memory,
                 compaction,
+                budgets: None,
+            });
+            Ok(SessionId::from_uuid(Uuid::from_u128(2)))
+        }
+
+        fn create_session_with_configuration(
+            &self,
+            request: CreateSessionDataRequest,
+        ) -> Result<SessionId, TuiDataError> {
+            self.created.borrow_mut().push(CreatedSessionSelection {
+                workspace: request.workspace,
+                style: request.style,
+                harness: request.harness,
+                memory: request.memory,
+                compaction: request.compaction,
+                budgets: request.budgets,
             });
             Ok(SessionId::from_uuid(Uuid::from_u128(2)))
         }
@@ -1330,6 +1447,8 @@ mod tests {
         logic.submit_editor().expect("select memory");
         logic.insert_text("/compaction sliding_window");
         logic.submit_editor().expect("select compaction");
+        logic.insert_text("/budget 3 40 100000 1000000 60000");
+        logic.submit_editor().expect("select budgets");
         logic.insert_text("/new workspace");
         logic.submit_editor().expect("create session");
 
@@ -1345,6 +1464,13 @@ mod tests {
                 harness: Some(String::from("fixture")),
                 memory: Some(String::from("sqlite-fts")),
                 compaction: Some(String::from("sliding_window")),
+                budgets: Some(SessionBudgetDataRequest {
+                    max_iterations: Some(3),
+                    max_steps: Some(40),
+                    max_tokens: Some(100_000),
+                    max_cost_micros: Some(1_000_000),
+                    max_duration_ms: Some(60_000),
+                }),
             }]
         );
     }

@@ -63,7 +63,9 @@ try {
             --style ephemeral-turn@1.1.0 --json | ConvertFrom-Json
         $selected = & $cli session create --workspace $repository `
             --style ephemeral-turn@1.1.0 --memory sqlite-fts `
-            --compaction sliding_window --json | ConvertFrom-Json
+            --compaction sliding_window --max-iterations 3 --max-steps 40 `
+            --max-tokens 100000 --max-cost-micros 1000000 `
+            --max-duration-ms 60000 --json | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw "style-bound session creation failed" }
 
         foreach ($entry in @(
@@ -90,8 +92,10 @@ try {
         if ($selectedInspection.state.style_binding.memory.provider -ne
                 "sqlite-fts" -or
             $selectedInspection.state.style_binding.compaction.strategy -ne
-                "sliding_window") {
-            throw "component-selected binding was not persisted"
+                "sliding_window" -or
+            $selectedInspection.state.style_binding.budgets.max_iterations -ne 3 -or
+            $selectedInspection.state.style_binding.budgets.max_tokens -ne 100000) {
+            throw "component/budget-selected binding was not persisted"
         }
 
         $persistentTurn = & $cli run "persistent before restart" `
@@ -131,8 +135,10 @@ try {
         if ($selectedAfterRestart.state.style_binding.memory.provider -ne
                 "sqlite-fts" -or
             $selectedAfterRestart.state.style_binding.compaction.strategy -ne
-                "sliding_window") {
-            throw "component-selected binding changed after restart"
+                "sliding_window" -or
+            $selectedAfterRestart.state.style_binding.budgets.max_iterations -ne 3 -or
+            $selectedAfterRestart.state.style_binding.budgets.max_tokens -ne 100000) {
+            throw "component/budget-selected binding changed after restart"
         }
         & $cli run "selected components after restart" `
             --session $selected.session_id `

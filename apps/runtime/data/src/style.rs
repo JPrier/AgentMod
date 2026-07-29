@@ -12,9 +12,10 @@ use agentmod_runtime_dependency::style::{
     SessionStyleDependencyError, SessionStyleDependencyPort,
 };
 use agentmod_session_style_sdk::{
-    ApprovalDecision, BuiltInStyle, CompileContext, DecisionCapability, ManifestFormat,
-    SessionStyleManifest, StyleCompilerLimits, compile_style, parse_json, parse_toml,
-    select_compaction_strategy, select_memory_provider, to_json,
+    ApprovalDecision, BuiltInStyle, CompileContext, DecisionCapability, ExecutionBudgetOverrides,
+    ManifestFormat, SessionStyleManifest, StyleCompilerLimits, compile_style, parse_json,
+    parse_toml, select_compaction_strategy, select_execution_budgets, select_memory_provider,
+    to_json,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -111,6 +112,25 @@ pub struct SessionStyleComponentSelectionDataRequest {
     pub memory: Option<String>,
     /// Optional compaction-strategy selection.
     pub compaction: Option<String>,
+}
+
+/// Request to apply SDK-owned per-session budget transforms and compile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionStyleBudgetSelectionDataRequest {
+    /// Authoritative runtime availability inputs.
+    pub environment: SessionStyleEnvironment,
+    /// Canonical base manifest JSON.
+    pub manifest: String,
+    /// Optional maximum loop/research iterations.
+    pub max_iterations: Option<u32>,
+    /// Optional maximum graph transitions.
+    pub max_steps: Option<u64>,
+    /// Optional maximum provider tokens.
+    pub max_tokens: Option<u64>,
+    /// Optional maximum cost in configured currency micros.
+    pub max_cost_micros: Option<u64>,
+    /// Optional maximum wall-clock duration.
+    pub max_duration_ms: Option<u64>,
 }
 
 /// Source category exposed to runtime logic and endpoints.
@@ -299,6 +319,16 @@ pub trait SessionStyleDataPort {
         &self,
         request: SessionStyleComponentSelectionDataRequest,
     ) -> Result<SessionStyleCatalogRecord, SessionStyleDataError>;
+
+    /// Applies SDK-owned budget transforms and recompiles the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid manifest or environment.
+    fn select_session_style_budgets(
+        &self,
+        request: SessionStyleBudgetSelectionDataRequest,
+    ) -> Result<SessionStyleCatalogRecord, SessionStyleDataError>;
 }
 
 /// Session-style data construction failure.
@@ -429,6 +459,31 @@ where
                 SessionStyleDataError::InvalidComponentSelection(compaction.to_owned())
             })?;
         }
+        self.validate_session_style(SessionStyleValidationDataRequest {
+            environment: request.environment,
+            manifest: to_json(&manifest)
+                .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?,
+            format: SessionStyleManifestFormat::Json,
+        })
+    }
+
+    fn select_session_style_budgets(
+        &self,
+        request: SessionStyleBudgetSelectionDataRequest,
+    ) -> Result<SessionStyleCatalogRecord, SessionStyleDataError> {
+        let mut manifest = parse_json(&request.manifest)
+            .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?;
+        select_execution_budgets(
+            &mut manifest,
+            ExecutionBudgetOverrides {
+                max_iterations: request.max_iterations,
+                max_steps: request.max_steps,
+                max_tokens: request.max_tokens,
+                max_cost_micros: request.max_cost_micros,
+                max_duration_ms: request.max_duration_ms,
+            },
+        )
+        .map_err(|error| SessionStyleDataError::InvalidComponentSelection(error.to_string()))?;
         self.validate_session_style(SessionStyleValidationDataRequest {
             environment: request.environment,
             manifest: to_json(&manifest)
@@ -983,6 +1038,36 @@ mod tests {
         let selections = record.selections.expect("compiled selections");
         assert_eq!(selections.memory_provider, "file");
         assert_eq!(selections.compaction_strategy, "artifact_handoff");
+        assert!(record.compiled_hash.is_some());
+        assert!(record.cache_key.is_some());
+    }
+
+    #[test]
+    fn budget_selection_is_transformed_and_compiled_inside_data() {
+        let data = super::super::RuntimeData::new(MockDependency::default());
+        let manifest = agentmod_session_style_sdk::to_json(
+            &agentmod_session_style_sdk::built_in_manifest(BuiltInStyle::EphemeralTurn),
+        )
+        .expect("manifest");
+        let record = data
+            .select_session_style_budgets(SessionStyleBudgetSelectionDataRequest {
+                environment: environment(),
+                manifest,
+                max_iterations: Some(3),
+                max_steps: Some(40),
+                max_tokens: Some(100_000),
+                max_cost_micros: Some(1_000_000),
+                max_duration_ms: Some(60_000),
+            })
+            .expect("selection");
+
+        assert_eq!(record.status, SessionStyleCatalogStatus::Available);
+        let budgets = record.selections.expect("compiled selections");
+        assert_eq!(budgets.max_iterations, 3);
+        assert_eq!(budgets.max_steps, 40);
+        assert_eq!(budgets.max_tokens, 100_000);
+        assert_eq!(budgets.max_cost_micros, 1_000_000);
+        assert_eq!(budgets.max_duration_ms, 60_000);
         assert!(record.compiled_hash.is_some());
         assert!(record.cache_key.is_some());
     }

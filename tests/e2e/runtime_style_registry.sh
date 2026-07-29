@@ -57,7 +57,8 @@ ephemeral_id=$(printf '%s' "$ephemeral" |
     sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
 selected=$("$cli" session create --workspace "$repository" \
     --style ephemeral-turn@1.1.0 --memory sqlite-fts \
-    --compaction sliding_window --json)
+    --compaction sliding_window --max-iterations 3 --max-steps 40 \
+    --max-tokens 100000 --max-cost-micros 1000000 --max-duration-ms 60000 --json)
 selected_id=$(printf '%s' "$selected" |
     sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
 test -n "$persistent_id"
@@ -82,6 +83,8 @@ done
 selected_inspection=$("$cli" session inspect "$selected_id" --json)
 printf '%s' "$selected_inspection" | grep -F '"provider":"sqlite-fts"' >/dev/null
 printf '%s' "$selected_inspection" | grep -F '"strategy":"sliding_window"' >/dev/null
+printf '%s' "$selected_inspection" | grep -F '"max_iterations":3' >/dev/null
+printf '%s' "$selected_inspection" | grep -F '"max_tokens":100000' >/dev/null
 
 persistent_before=$("$cli" run "persistent before restart" --session "$persistent_id" \
     --option 'mock_scenario="streaming_text"' \
@@ -110,6 +113,8 @@ done
 selected_after_restart=$("$cli" session inspect "$selected_id" --json)
 printf '%s' "$selected_after_restart" | grep -F '"provider":"sqlite-fts"' >/dev/null
 printf '%s' "$selected_after_restart" | grep -F '"strategy":"sliding_window"' >/dev/null
+printf '%s' "$selected_after_restart" | grep -F '"max_iterations":3' >/dev/null
+printf '%s' "$selected_after_restart" | grep -F '"max_tokens":100000' >/dev/null
 "$cli" run "selected components after restart" --session "$selected_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="selected-after"' --json >/dev/null

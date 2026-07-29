@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use agentmod_event_model::{EventClassification, EventEnvelope, EventModelError, EventScope};
-use agentmod_graph_engine::{ExecutableGraph, GRAPH_FORMAT_VERSION};
+use agentmod_graph_engine::{ExecutableGraph, GRAPH_FORMAT_VERSION, NodeKind};
 use agentmod_primitives::{ContentHash, ContinuationId, Sequence, SessionId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -586,6 +586,22 @@ pub struct StyleTransitionSelectedEvent {
     pub step: u64,
 }
 
+/// Records a control-plane termination before a node may legally be entered.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StyleExecutionTerminatedEvent {
+    /// Stable redacted terminal reason.
+    pub reason: String,
+    /// Node whose entry was refused, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_node_id: Option<String>,
+    /// Refused one-based graph step, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused_step: Option<u64>,
+    /// Effective configured limit, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
 /// Typed committed events consumed by the pure session reducer.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "event", content = "payload", rename_all = "snake_case")]
@@ -654,6 +670,8 @@ pub enum RuntimeCommittedEvent {
     StyleNodeFailed(StyleNodeFailedEvent),
     /// Records the compiled edge selected for the next node.
     StyleTransitionSelected(StyleTransitionSelectedEvent),
+    /// Records a terminal control outcome without entering another node.
+    StyleExecutionTerminated(StyleExecutionTerminatedEvent),
 }
 
 impl RuntimeCommittedEvent {
@@ -693,6 +711,7 @@ impl RuntimeCommittedEvent {
             Self::StyleNodeCompleted(_) => "style.node_completed",
             Self::StyleNodeFailed(_) => "style.node_failed",
             Self::StyleTransitionSelected(_) => "style.transition_selected",
+            Self::StyleExecutionTerminated(_) => "style.execution_terminated",
         }
     }
 }
@@ -747,6 +766,9 @@ pub struct SessionAncestry {
 pub struct StyleExecutionState {
     /// Exact compiled graph selected by the initialization event.
     pub graph: Box<ExecutableGraph>,
+    /// Explicit replay control position. This makes control-only crash gaps
+    /// distinguishable without inferring intent from unrelated effect events.
+    pub control: StyleExecutionControlState,
     /// Node currently executing, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_node: Option<StyleNodeEnteredEvent>,
@@ -771,6 +793,38 @@ pub struct StyleExecutionState {
     /// Cumulative provider tokens observed when compaction last committed.
     #[serde(default)]
     pub tokens_at_last_compaction: u64,
+}
+
+/// Exact replay-derived control position for a compiled style graph.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", content = "detail", rename_all = "snake_case")]
+pub enum StyleExecutionControlState {
+    /// The next legal event is entry into this node.
+    ReadyForEntry(StyleExecutionCursor),
+    /// A node has been entered and has not produced a canonical outcome.
+    Active(StyleNodeEnteredEvent),
+    /// A node completed and its deterministic transition is not yet selected.
+    AwaitingTransition(StyleNodeCompletedEvent),
+    /// A transition was selected and its destination has not yet been entered.
+    AwaitingDestinationEntry(StyleTransitionSelectedEvent),
+    /// Style execution ended and cannot accept another node.
+    Terminal {
+        /// Stable terminal reason.
+        reason: String,
+    },
+}
+
+/// Expected identity and counters for the next node-entry event.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct StyleExecutionCursor {
+    /// Stable compiled graph node ID.
+    pub node_id: String,
+    /// One-based execution attempt.
+    pub attempt: u32,
+    /// Zero-based loop iteration.
+    pub loop_iteration: u32,
+    /// One-based, session-monotonic graph step.
+    pub step: u64,
 }
 
 /// Durable tool-dispatch reconciliation state.
@@ -984,6 +1038,9 @@ fn apply_payload(
         RuntimeCommittedEvent::StyleTransitionSelected(selected) => {
             apply_style_transition_selected(state, selected)
         }
+        RuntimeCommittedEvent::StyleExecutionTerminated(terminated) => {
+            apply_style_execution_terminated(state, terminated)
+        }
         RuntimeCommittedEvent::ToolExecutionDispatched(dispatched) => {
             apply_tool_dispatch(state, dispatched, event.metadata.sequence)
         }
@@ -1086,6 +1143,14 @@ fn apply_style_execution_initialized(
     }
     state.style_execution = Some(StyleExecutionState {
         graph: initialized.graph.clone(),
+        control: StyleExecutionControlState::ReadyForEntry(StyleExecutionCursor {
+            node_id: initialized.graph.nodes[initialized.graph.entry_index]
+                .id
+                .clone(),
+            attempt: 1,
+            loop_iteration: 0,
+            step: 1,
+        }),
         active_node: None,
         completed_nodes: Vec::new(),
         failed_nodes: Vec::new(),
@@ -1103,14 +1168,31 @@ fn apply_style_node_entered(
     entered: &StyleNodeEnteredEvent,
 ) -> Result<(), SessionReducerError> {
     let execution = style_execution_mut(state)?;
+    let expected = match &execution.control {
+        StyleExecutionControlState::ReadyForEntry(expected) => expected.clone(),
+        StyleExecutionControlState::AwaitingDestinationEntry(selected) => StyleExecutionCursor {
+            node_id: selected.to_node_id.clone(),
+            attempt: selected.attempt,
+            loop_iteration: selected.loop_iteration,
+            step: selected
+                .step
+                .checked_add(1)
+                .ok_or(SessionReducerError::StyleStepOverflow)?,
+        },
+        StyleExecutionControlState::Active(_)
+        | StyleExecutionControlState::AwaitingTransition(_)
+        | StyleExecutionControlState::Terminal { .. } => {
+            return Err(SessionReducerError::InvalidStyleExecutionTransition);
+        }
+    };
     if execution.active_node.is_some()
         || execution.termination_reason.is_some()
-        || !valid_style_counters(entered.attempt, entered.step)
-        || !graph_has_node(&execution.graph, &entered.node_id)
+        || !entry_matches(&expected, entered)
     {
         return Err(SessionReducerError::InvalidStyleExecutionTransition);
     }
     execution.active_node = Some(entered.clone());
+    execution.control = StyleExecutionControlState::Active(entered.clone());
     Ok(())
 }
 
@@ -1120,7 +1202,6 @@ fn apply_style_node_completed(
 ) -> Result<(), SessionReducerError> {
     let execution = style_execution_mut(state)?;
     if !valid_style_counters(completed.attempt, completed.step)
-        || !graph_has_node(&execution.graph, &completed.node_id)
         || !active_node_matches(
             execution.active_node.as_ref(),
             &completed.node_id,
@@ -1128,11 +1209,52 @@ fn apply_style_node_completed(
             completed.loop_iteration,
             completed.step,
         )
+        || !matches!(
+            &execution.control,
+            StyleExecutionControlState::Active(active)
+                if active_node_matches(
+                    Some(active),
+                    &completed.node_id,
+                    completed.attempt,
+                    completed.loop_iteration,
+                    completed.step
+                )
+        )
     {
         return Err(SessionReducerError::InvalidStyleExecutionTransition);
     }
     execution.active_node = None;
     execution.completed_nodes.push(completed.clone());
+    execution.control = match graph_node_kind(&execution.graph, &completed.node_id) {
+        Some(NodeKind::CompleteTurn) => {
+            StyleExecutionControlState::ReadyForEntry(StyleExecutionCursor {
+                node_id: execution.graph.nodes[execution.graph.entry_index]
+                    .id
+                    .clone(),
+                attempt: 1,
+                loop_iteration: 0,
+                step: completed
+                    .step
+                    .checked_add(1)
+                    .ok_or(SessionReducerError::StyleStepOverflow)?,
+            })
+        }
+        Some(NodeKind::CompleteSession | NodeKind::Fail) => {
+            let reason = if graph_node_kind(&execution.graph, &completed.node_id)
+                == Some(NodeKind::CompleteSession)
+            {
+                "complete_session"
+            } else {
+                "style_failed"
+            };
+            execution.termination_reason = Some(reason.to_owned());
+            StyleExecutionControlState::Terminal {
+                reason: reason.to_owned(),
+            }
+        }
+        Some(_) => StyleExecutionControlState::AwaitingTransition(completed.clone()),
+        None => return Err(SessionReducerError::InvalidStyleExecutionTransition),
+    };
     Ok(())
 }
 
@@ -1163,6 +1285,23 @@ fn apply_style_node_failed(
         .termination_reason
         .clone_from(&failed.termination_reason);
     execution.failed_nodes.push(failed.clone());
+    execution.control = if let Some(reason) = &failed.termination_reason {
+        StyleExecutionControlState::Terminal {
+            reason: reason.clone(),
+        }
+    } else {
+        StyleExecutionControlState::ReadyForEntry(StyleExecutionCursor {
+            node_id: execution.graph.nodes[execution.graph.entry_index]
+                .id
+                .clone(),
+            attempt: 1,
+            loop_iteration: 0,
+            step: failed
+                .step
+                .checked_add(1)
+                .ok_or(SessionReducerError::StyleStepOverflow)?,
+        })
+    };
     Ok(())
 }
 
@@ -1171,9 +1310,16 @@ fn apply_style_transition_selected(
     selected: &StyleTransitionSelectedEvent,
 ) -> Result<(), SessionReducerError> {
     let execution = style_execution_mut(state)?;
+    let StyleExecutionControlState::AwaitingTransition(completed) = &execution.control else {
+        return Err(SessionReducerError::InvalidStyleExecutionTransition);
+    };
     if execution.active_node.is_some()
         || execution.termination_reason.is_some()
         || !valid_style_counters(selected.attempt, selected.step)
+        || completed.node_id != selected.from_node_id
+        || completed.attempt != selected.attempt
+        || completed.loop_iteration != selected.loop_iteration
+        || completed.step != selected.step
         || !graph_has_transition(
             &execution.graph,
             &selected.from_node_id,
@@ -1183,6 +1329,61 @@ fn apply_style_transition_selected(
         return Err(SessionReducerError::InvalidStyleExecutionTransition);
     }
     execution.transitions.push(selected.clone());
+    execution.control = StyleExecutionControlState::AwaitingDestinationEntry(selected.clone());
+    Ok(())
+}
+
+fn apply_style_execution_terminated(
+    state: &mut SessionState,
+    terminated: &StyleExecutionTerminatedEvent,
+) -> Result<(), SessionReducerError> {
+    let execution = style_execution_mut(state)?;
+    if terminated.reason.trim().is_empty()
+        || terminated
+            .refused_node_id
+            .as_deref()
+            .is_some_and(str::is_empty)
+        || matches!(
+            execution.control,
+            StyleExecutionControlState::Active(_)
+                | StyleExecutionControlState::AwaitingTransition(_)
+                | StyleExecutionControlState::Terminal { .. }
+        )
+    {
+        return Err(SessionReducerError::InvalidStyleExecutionTransition);
+    }
+    let expected = match &execution.control {
+        StyleExecutionControlState::ReadyForEntry(cursor) => cursor,
+        StyleExecutionControlState::AwaitingDestinationEntry(selected) => {
+            if terminated.refused_node_id.as_deref() != Some(selected.to_node_id.as_str())
+                || terminated.refused_step
+                    != selected
+                        .step
+                        .checked_add(1)
+                        .map(Some)
+                        .ok_or(SessionReducerError::StyleStepOverflow)?
+            {
+                return Err(SessionReducerError::InvalidStyleExecutionTransition);
+            }
+            execution.termination_reason = Some(terminated.reason.clone());
+            execution.control = StyleExecutionControlState::Terminal {
+                reason: terminated.reason.clone(),
+            };
+            return Ok(());
+        }
+        StyleExecutionControlState::Active(_)
+        | StyleExecutionControlState::AwaitingTransition(_)
+        | StyleExecutionControlState::Terminal { .. } => unreachable!(),
+    };
+    if terminated.refused_node_id.as_deref() != Some(expected.node_id.as_str())
+        || terminated.refused_step != Some(expected.step)
+    {
+        return Err(SessionReducerError::InvalidStyleExecutionTransition);
+    }
+    execution.termination_reason = Some(terminated.reason.clone());
+    execution.control = StyleExecutionControlState::Terminal {
+        reason: terminated.reason.clone(),
+    };
     Ok(())
 }
 
@@ -1220,6 +1421,14 @@ fn graph_has_node(graph: &ExecutableGraph, node_id: &str) -> bool {
     graph.nodes.iter().any(|node| node.id == node_id)
 }
 
+fn graph_node_kind(graph: &ExecutableGraph, node_id: &str) -> Option<NodeKind> {
+    graph
+        .nodes
+        .iter()
+        .find(|node| node.id == node_id)
+        .map(|node| node.kind)
+}
+
 fn graph_has_transition(graph: &ExecutableGraph, from_node_id: &str, to_node_id: &str) -> bool {
     graph.edges.iter().any(|edge| {
         graph.nodes[edge.from].id == from_node_id && graph.nodes[edge.to].id == to_node_id
@@ -1228,6 +1437,14 @@ fn graph_has_transition(graph: &ExecutableGraph, from_node_id: &str, to_node_id:
 
 const fn valid_style_counters(attempt: u32, step: u64) -> bool {
     attempt > 0 && step > 0
+}
+
+fn entry_matches(expected: &StyleExecutionCursor, entered: &StyleNodeEnteredEvent) -> bool {
+    valid_style_counters(entered.attempt, entered.step)
+        && entered.node_id == expected.node_id
+        && entered.attempt == expected.attempt
+        && entered.loop_iteration == expected.loop_iteration
+        && entered.step == expected.step
 }
 
 fn active_node_matches(
@@ -1462,6 +1679,9 @@ pub enum SessionReducerError {
     /// Provider-reported usage exceeded the replay-safe integer bound.
     #[error("style provider token usage overflowed")]
     StyleTokenUsageOverflow,
+    /// Style graph step arithmetic overflowed.
+    #[error("style graph step counter overflowed")]
+    StyleStepOverflow,
     /// Conversation state invariant failed.
     #[error("conversation state failed: {0}")]
     Conversation(ConversationError),
@@ -1796,6 +2016,14 @@ to = "done"
                 step: 2,
             })
         );
+        assert!(matches!(
+            execution.control,
+            StyleExecutionControlState::Active(StyleNodeEnteredEvent {
+                ref node_id,
+                step: 2,
+                ..
+            }) if node_id == "done"
+        ));
         assert_eq!(execution.completed_nodes.len(), 1);
         assert_eq!(
             execution.completed_nodes[0].result_reference.as_deref(),
@@ -1830,18 +2058,18 @@ to = "done"
                 3,
                 RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
                     node_id: "start".into(),
-                    attempt: 2,
-                    loop_iteration: 3,
-                    step: 7,
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
                 }),
             ),
             envelope(
                 4,
                 RuntimeCommittedEvent::StyleNodeFailed(StyleNodeFailedEvent {
                     node_id: "start".into(),
-                    attempt: 2,
-                    loop_iteration: 3,
-                    step: 7,
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
                     reason: "provider_unavailable".into(),
                     artifact_reference: Some("artifact:failure-1".into()),
                     termination_reason: Some("retry_budget_exhausted".into()),
@@ -1863,6 +2091,154 @@ to = "done"
             execution.failed_nodes[0].artifact_reference.as_deref(),
             Some("artifact:failure-1")
         );
+        assert!(matches!(
+            execution.control,
+            StyleExecutionControlState::Terminal { ref reason }
+                if reason == "retry_budget_exhausted"
+        ));
+    }
+
+    fn style_initialized(graph: &ExecutableGraph) -> EventEnvelope<RuntimeCommittedEvent> {
+        envelope(
+            2,
+            RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                StyleExecutionInitializedEvent {
+                    graph: Box::new(graph.clone()),
+                },
+            )),
+        )
+    }
+
+    fn style_entered(
+        sequence: u64,
+        node_id: &str,
+        step: u64,
+    ) -> EventEnvelope<RuntimeCommittedEvent> {
+        envelope(
+            sequence,
+            RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                node_id: node_id.into(),
+                attempt: 1,
+                loop_iteration: 0,
+                step,
+            }),
+        )
+    }
+
+    fn style_completed(
+        sequence: u64,
+        node_id: &str,
+        step: u64,
+    ) -> EventEnvelope<RuntimeCommittedEvent> {
+        envelope(
+            sequence,
+            RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                node_id: node_id.into(),
+                attempt: 1,
+                loop_iteration: 0,
+                step,
+                result_reference: None,
+                artifact_reference: None,
+            }),
+        )
+    }
+
+    fn style_transition(
+        sequence: u64,
+        from: &str,
+        to: &str,
+        step: u64,
+    ) -> EventEnvelope<RuntimeCommittedEvent> {
+        envelope(
+            sequence,
+            RuntimeCommittedEvent::StyleTransitionSelected(StyleTransitionSelectedEvent {
+                from_node_id: from.into(),
+                to_node_id: to.into(),
+                attempt: 1,
+                loop_iteration: 0,
+                step,
+            }),
+        )
+    }
+
+    #[test]
+    fn style_replay_rejects_skipped_entry_node() {
+        let graph = compiled_graph();
+        let events = vec![
+            created(),
+            style_initialized(&graph),
+            style_entered(3, "done", 1),
+        ];
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidStyleExecutionTransition)
+        ));
+    }
+
+    #[test]
+    fn style_replay_rejects_transition_from_unexecuted_node() {
+        let graph = compiled_graph();
+        let events = vec![
+            created(),
+            style_initialized(&graph),
+            style_transition(3, "start", "done", 1),
+        ];
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidStyleExecutionTransition)
+        ));
+    }
+
+    #[test]
+    fn style_replay_rejects_duplicate_transition() {
+        let graph = compiled_graph();
+        let events = vec![
+            created(),
+            style_initialized(&graph),
+            style_entered(3, "start", 1),
+            style_completed(4, "start", 1),
+            style_transition(5, "start", "done", 1),
+            style_transition(6, "start", "done", 1),
+        ];
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidStyleExecutionTransition)
+        ));
+    }
+
+    #[test]
+    fn style_replay_rejects_wrong_transition_destination() {
+        let graph = compiled_graph();
+        let events = vec![
+            created(),
+            style_initialized(&graph),
+            style_entered(3, "start", 1),
+            style_completed(4, "start", 1),
+            style_transition(5, "start", "start", 1),
+        ];
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidStyleExecutionTransition)
+        ));
+    }
+
+    #[test]
+    fn style_replay_rejects_decreasing_or_skipped_counters() {
+        let graph = compiled_graph();
+        for destination_step in [1, 3] {
+            let events = vec![
+                created(),
+                style_initialized(&graph),
+                style_entered(3, "start", 1),
+                style_completed(4, "start", 1),
+                style_transition(5, "start", "done", 1),
+                style_entered(6, "done", destination_step),
+            ];
+            assert!(matches!(
+                replay(&events),
+                Err(SessionReducerError::InvalidStyleExecutionTransition)
+            ));
+        }
     }
 
     #[test]

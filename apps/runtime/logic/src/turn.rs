@@ -55,8 +55,8 @@ use crate::{
     interception::{InterceptionOutcome, intercept_action},
     memory::{MemoryLogic, MemoryLogicError, MemoryLogicPort, MemoryScope, RetrieveMemoryCommand},
     persistence::{
-        CommitDurability, CommitSessionEventCommand, LoadSessionCommand, SessionPersistenceLogic,
-        SessionPersistenceLogicError, SessionPersistenceLogicPort,
+        CommitDurability, CommitSessionEventCommand, LoadSessionCommand, LoadSessionResult,
+        SessionPersistenceLogic, SessionPersistenceLogicError, SessionPersistenceLogicPort,
     },
     session::{
         ApprovalRequestedEvent, ApprovalResolvedEvent, ApprovalState,
@@ -66,11 +66,12 @@ use crate::{
         ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent, ModelToolCallProposedEvent,
         ProcessReconciliationCompletedEvent, ProcessReconciliationStartedEvent,
         ProcessReconciliationStatus, RuntimeCommittedEvent, SchedulerDeliveryReconciledEvent,
-        SchedulerFiredEvent, SessionReducerError, StyleExecutionInitializedEvent,
-        StyleNodeCompletedEvent, StyleNodeEnteredEvent, StyleNodeFailedEvent,
-        StyleTransitionSelectedEvent, ToolCallApprovedEvent, ToolCallProposedEvent,
-        ToolExecutionCompletedEvent, ToolExecutionDispatchedEvent, ToolExecutionFailedEvent,
-        ToolExecutionStartedEvent, ToolExecutionState, ToolOutputObservedEvent, reduce,
+        SchedulerFiredEvent, SessionReducerError, StyleExecutionControlState,
+        StyleExecutionInitializedEvent, StyleExecutionTerminatedEvent, StyleNodeCompletedEvent,
+        StyleNodeEnteredEvent, StyleNodeFailedEvent, StyleTransitionSelectedEvent,
+        ToolCallApprovedEvent, ToolCallProposedEvent, ToolExecutionCompletedEvent,
+        ToolExecutionDispatchedEvent, ToolExecutionFailedEvent, ToolExecutionStartedEvent,
+        ToolExecutionState, ToolOutputObservedEvent, reduce,
     },
     style_executor::{
         CompiledStyleExecutor, StyleExecutorError, StyleNodeCursor, StyleNodeDirective,
@@ -128,6 +129,7 @@ struct ActiveStyleTurn {
     current: StyleNodeCursor,
     position: JournalPosition,
     step: u64,
+    max_steps: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -522,6 +524,12 @@ where
                 expected_session_id: session_id,
             })
             .map_err(RunTurnError::Persistence)?;
+        let preflight = self.recover_style_control_gaps(
+            &persistence,
+            session_id,
+            &session_directory,
+            preflight,
+        )?;
         let style_driven = match preflight.state.style_binding.as_ref() {
             Some(binding) => {
                 let executor = CompiledStyleExecutor::from_binding(binding)
@@ -735,6 +743,22 @@ where
         };
         if let Some(execution) = style_turn.as_mut() {
             execution.position = observed;
+            if let Some(reason) = provider_node_failure(&events) {
+                execution.position = self.fail_style_node_at_head(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    execution,
+                    reason,
+                    None,
+                )?;
+                return Ok(RunTurnResult {
+                    events,
+                    first_committed_sequence: user_sequence,
+                    last_committed_sequence: execution.position.sequence,
+                    awaiting_continuation: None,
+                });
+            }
             self.complete_and_enter_next(
                 &persistence,
                 session_id,
@@ -1016,6 +1040,14 @@ where
                     &resumed_turn.cancellation_id,
                     &events,
                 )?;
+                let last_committed_sequence = self
+                    .fail_active_bound_style_at_head(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        "model_request_cancelled",
+                    )?
+                    .map_or(last_committed_sequence, |position| position.sequence);
                 return Ok(ResolveTurnApprovalResult {
                     transitioned: true,
                     events,
@@ -1057,6 +1089,14 @@ where
                 &resumed_turn.cancellation_id,
                 &events,
             )?;
+            let last_committed_sequence = self
+                .fail_active_bound_style_at_head(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    "model_request_cancelled",
+                )?
+                .map_or(last_committed_sequence, |position| position.sequence);
             return Ok(ResolveTurnApprovalResult {
                 transitioned: true,
                 events,
@@ -1093,6 +1133,14 @@ where
                         &resumed_turn.cancellation_id,
                         &events,
                     )?;
+                    let last_committed_sequence = self
+                        .fail_active_bound_style_at_head(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            "model_request_cancelled",
+                        )?
+                        .map_or(last_committed_sequence, |position| position.sequence);
                     return Ok(ResolveTurnApprovalResult {
                         transitioned: true,
                         events,
@@ -1172,6 +1220,22 @@ where
                         });
                     }
                     execution.position = position;
+                    if let Some(reason) = provider_node_failure(&events) {
+                        execution.position = self.fail_style_node_at_head(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            execution,
+                            reason,
+                            None,
+                        )?;
+                        return Ok(ResolveTurnApprovalResult {
+                            transitioned: true,
+                            events,
+                            last_committed_sequence: execution.position.sequence,
+                            awaiting_continuation: None,
+                        });
+                    }
                     self.complete_and_enter_next(
                         &persistence,
                         session_id,
@@ -2886,6 +2950,18 @@ where
             .budgets
             .max_steps
             .min(executor.compiled().graph.budget.max_steps);
+        if step > max_steps {
+            self.commit_style_budget_termination(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                &current.id,
+                step,
+                max_steps,
+            )?;
+            return Err(RunTurnError::StyleStepBudgetExceeded { limit: max_steps });
+        }
         (position.sequence, position.event_id) = self.commit_next(
             persistence,
             session_id,
@@ -2899,31 +2975,132 @@ where
                 step,
             }),
         )?;
-        if step > max_steps {
-            self.commit_next(
-                persistence,
-                session_id,
-                session_directory,
-                position.sequence,
-                position.event_id,
-                RuntimeCommittedEvent::StyleNodeFailed(StyleNodeFailedEvent {
-                    node_id: current.id,
-                    attempt: 1,
-                    loop_iteration: 0,
-                    step,
-                    reason: String::from("step_budget_exhausted"),
-                    artifact_reference: None,
-                    termination_reason: Some(String::from("step_budget_exhausted")),
-                }),
-            )?;
-            return Err(RunTurnError::StyleStepBudgetExceeded { limit: max_steps });
-        }
         Ok(ActiveStyleTurn {
             executor,
             current,
             position,
             step,
+            max_steps,
         })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "control-gap recovery keeps graph validation, deterministic repair, effect fail-closed handling, and budget enforcement in one auditable path"
+    )]
+    fn recover_style_control_gaps(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        mut loaded: LoadSessionResult,
+    ) -> Result<LoadSessionResult, RunTurnError> {
+        let Some(binding) = loaded.state.style_binding.as_ref() else {
+            return Ok(loaded);
+        };
+        let executor =
+            CompiledStyleExecutor::from_binding(binding).map_err(RunTurnError::StyleExecutor)?;
+        // Unsupported graphs must remain mutation-free until their runtime
+        // adapter exists.
+        if !executor.supports_persistent_turn() {
+            return Ok(loaded);
+        }
+        let max_steps = binding
+            .budgets
+            .max_steps
+            .min(executor.compiled().graph.budget.max_steps);
+        let Some(execution) = loaded.state.style_execution.as_ref() else {
+            return Ok(loaded);
+        };
+        if execution.graph.as_ref() != &executor.compiled().graph {
+            return Err(RunTurnError::StyleGraphMismatch);
+        }
+        if let StyleExecutionControlState::AwaitingTransition(completed) = &execution.control {
+            let from = executor
+                .node(&completed.node_id)
+                .map_err(RunTurnError::StyleExecutor)?;
+            let transition = executor
+                .transition(from.index, &json!({}))
+                .map_err(RunTurnError::StyleExecutor)?
+                .ok_or_else(|| RunTurnError::UnexpectedStyleNode {
+                    expected: "nonterminal graph transition",
+                    actual: completed.node_id.clone(),
+                })?;
+            self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                loaded.state.last_sequence,
+                loaded.last_event_id,
+                RuntimeCommittedEvent::StyleTransitionSelected(StyleTransitionSelectedEvent {
+                    from_node_id: completed.node_id.clone(),
+                    to_node_id: transition.to.id,
+                    attempt: completed.attempt,
+                    loop_iteration: completed.loop_iteration,
+                    step: completed.step,
+                }),
+            )?;
+            loaded = persistence
+                .load_session(LoadSessionCommand {
+                    session_directory: session_directory.to_owned(),
+                    expected_session_id: session_id,
+                })
+                .map_err(RunTurnError::Persistence)?;
+        }
+        let Some(execution) = loaded.state.style_execution.as_ref() else {
+            return Ok(loaded);
+        };
+        let StyleExecutionControlState::AwaitingDestinationEntry(selected) = &execution.control
+        else {
+            return Ok(loaded);
+        };
+        let destination = executor
+            .node(&selected.to_node_id)
+            .map_err(RunTurnError::StyleExecutor)?;
+        if destination.directive.requires_effect_evidence() {
+            return Err(RunTurnError::StyleControlRecoveryRequired {
+                node: destination.id,
+                phase: "awaiting_destination_entry",
+            });
+        }
+        let step = selected
+            .step
+            .checked_add(1)
+            .ok_or(RunTurnError::SequenceOverflow)?;
+        if step > max_steps {
+            self.commit_style_budget_termination(
+                persistence,
+                session_id,
+                session_directory,
+                JournalPosition {
+                    sequence: loaded.state.last_sequence,
+                    event_id: loaded.last_event_id,
+                },
+                &destination.id,
+                step,
+                max_steps,
+            )?;
+            return Err(RunTurnError::StyleStepBudgetExceeded { limit: max_steps });
+        }
+        self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            loaded.state.last_sequence,
+            loaded.last_event_id,
+            RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                node_id: destination.id,
+                attempt: selected.attempt,
+                loop_iteration: selected.loop_iteration,
+                step,
+            }),
+        )?;
+        persistence
+            .load_session(LoadSessionCommand {
+                session_directory: session_directory.to_owned(),
+                expected_session_id: session_id,
+            })
+            .map_err(RunTurnError::Persistence)
     }
 
     fn resume_active_style_turn(
@@ -2957,6 +3134,10 @@ where
             current,
             position,
             step: entered.step,
+            max_steps: binding
+                .budgets
+                .max_steps
+                .min(canonical.graph.budget.max_steps),
         }))
     }
 
@@ -3010,6 +3191,20 @@ where
             .checked_add(1)
             .ok_or(RunTurnError::SequenceOverflow)?;
         execution.current = transition.to;
+        if execution.step > execution.max_steps {
+            execution.position = self.commit_style_budget_termination(
+                persistence,
+                session_id,
+                session_directory,
+                execution.position,
+                &execution.current.id,
+                execution.step,
+                execution.max_steps,
+            )?;
+            return Err(RunTurnError::StyleStepBudgetExceeded {
+                limit: execution.max_steps,
+            });
+        }
         (execution.position.sequence, execution.position.event_id) = self.commit_next(
             persistence,
             session_id,
@@ -3024,6 +3219,36 @@ where
             }),
         )?;
         Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "canonical termination explicitly binds journal position, refused node, and effective budget"
+    )]
+    fn commit_style_budget_termination(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        position: JournalPosition,
+        refused_node_id: &str,
+        refused_step: u64,
+        limit: u64,
+    ) -> Result<JournalPosition, RunTurnError> {
+        let (sequence, event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::StyleExecutionTerminated(StyleExecutionTerminatedEvent {
+                reason: String::from("step_budget_exhausted"),
+                refused_node_id: Some(refused_node_id.to_owned()),
+                refused_step: Some(refused_step),
+                limit: Some(limit),
+            }),
+        )?;
+        Ok(JournalPosition { sequence, event_id })
     }
 
     fn complete_terminal_style_node(
@@ -3102,6 +3327,37 @@ where
             }),
         )?;
         Ok(JournalPosition { sequence, event_id })
+    }
+
+    fn fail_active_bound_style_at_head(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        reason: &str,
+    ) -> Result<Option<JournalPosition>, RunTurnError> {
+        let loaded = persistence
+            .load_session(LoadSessionCommand {
+                session_directory: session_directory.to_owned(),
+                expected_session_id: session_id,
+            })
+            .map_err(RunTurnError::Persistence)?;
+        let position = JournalPosition {
+            sequence: loaded.state.last_sequence,
+            event_id: loaded.last_event_id,
+        };
+        let Some(execution) = Self::resume_active_style_turn(&loaded.state, position)? else {
+            return Ok(None);
+        };
+        self.fail_style_node_at_head(
+            persistence,
+            session_id,
+            session_directory,
+            &execution,
+            reason,
+            None,
+        )
+        .map(Some)
     }
 
     fn commit_user(
@@ -3675,6 +3931,10 @@ pub enum RunTurnError {
     StyleGraphMismatch,
     #[error("style node `{0}` requires explicit recovery before execution may continue")]
     StyleRecoveryRequired(String),
+    #[error(
+        "style node `{node}` requires explicit recovery from control state `{phase}` before execution may continue"
+    )]
+    StyleControlRecoveryRequired { node: String, phase: &'static str },
     #[error("style execution is terminal")]
     StyleExecutionTerminal,
     #[error("session style `{0}` is not supported by the live turn executor")]
@@ -3768,9 +4028,12 @@ pub enum RunTurnError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc, Mutex as StdMutex,
+            atomic::{AtomicU64, Ordering},
+        },
     };
 
     use agentmod_event_model::{EventClassification, EventMetadata, EventOrigin, EventScope};
@@ -3804,12 +4067,18 @@ mod tests {
         },
         tool::{ExecuteToolDataRequest, ToolDataError, ToolDataEvent, ToolDataPort},
     };
+    use agentmod_session_style_sdk::BuiltInStyle;
     use serde_json::Value;
     use uuid::Uuid;
 
     use crate::{
         permission::{PermissionEffect, PermissionPolicy},
-        session::{RuntimeCommittedEvent, SessionCreatedEvent},
+        session::{
+            ApprovalRequestedEvent, ApprovalResolvedEvent, ModelRequestCancelledEvent,
+            RuntimeCommittedEvent, SessionCreatedEvent, StyleExecutionInitializedEvent,
+            StyleNodeCompletedEvent, StyleNodeEnteredEvent, StyleTransitionSelectedEvent,
+        },
+        style_executor::tests::binding,
     };
 
     use super::*;
@@ -3822,7 +4091,8 @@ mod tests {
     struct MockTurnState {
         events: StdMutex<Vec<EventEnvelope<Value>>>,
         harness_commands: StdMutex<Vec<HarnessDataCommand>>,
-        harness_reply: StdMutex<Result<HarnessDataReply, HarnessDataError>>,
+        harness_replies: StdMutex<VecDeque<Result<HarnessDataReply, HarnessDataError>>>,
+        tool_reply: StdMutex<Result<Vec<ToolDataEvent>, ToolDataError>>,
         next_identity: AtomicU64,
     }
 
@@ -3832,10 +4102,32 @@ mod tests {
                 state: Arc::new(MockTurnState {
                     events: StdMutex::new(vec![created_event()]),
                     harness_commands: StdMutex::new(Vec::new()),
-                    harness_reply: StdMutex::new(reply),
+                    harness_replies: StdMutex::new(VecDeque::from([reply])),
+                    tool_reply: StdMutex::new(Err(ToolDataError::Unavailable)),
                     next_identity: AtomicU64::new(100),
                 }),
             }
+        }
+
+        fn with_events(
+            reply: Result<HarnessDataReply, HarnessDataError>,
+            events: Vec<EventEnvelope<Value>>,
+        ) -> Self {
+            let data = Self::new(reply);
+            *data.state.events.lock().expect("events") = events;
+            data
+        }
+
+        fn with_scenario(
+            events: Vec<EventEnvelope<Value>>,
+            harness_replies: Vec<Result<HarnessDataReply, HarnessDataError>>,
+            tool_reply: Result<Vec<ToolDataEvent>, ToolDataError>,
+        ) -> Self {
+            let data = Self::new(Err(HarnessDataError::Unavailable));
+            *data.state.events.lock().expect("events") = events;
+            *data.state.harness_replies.lock().expect("replies") = harness_replies.into();
+            *data.state.tool_reply.lock().expect("tool reply") = tool_reply;
+            data
         }
 
         fn event_types(&self) -> Vec<String> {
@@ -3989,7 +4281,7 @@ mod tests {
             &self,
             _request: ExecuteToolDataRequest,
         ) -> Result<Vec<ToolDataEvent>, ToolDataError> {
-            Err(ToolDataError::Unavailable)
+            self.state.tool_reply.lock().expect("tool reply").clone()
         }
     }
 
@@ -4004,7 +4296,12 @@ mod tests {
                 .lock()
                 .expect("commands")
                 .push(command);
-            self.state.harness_reply.lock().expect("reply").clone()
+            self.state
+                .harness_replies
+                .lock()
+                .expect("replies")
+                .pop_front()
+                .unwrap_or(Err(HarnessDataError::Unavailable))
         }
 
         async fn exchange_events(
@@ -4023,18 +4320,14 @@ mod tests {
         SessionId::from_uuid(Uuid::from_u128(1))
     }
 
-    fn created_event() -> EventEnvelope<Value> {
-        let payload = RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
-            workspace: "fixture-workspace".into(),
-            style: "persistent-chat".into(),
-            style_binding: None,
-        });
+    fn data_event(sequence: u64, payload: RuntimeCommittedEvent) -> EventEnvelope<Value> {
+        let event_id = EventId::from_uuid(Uuid::from_u128(u128::from(sequence) + 1));
         let typed = EventEnvelope::seal(
             EventMetadata {
-                event_id: EventId::from_uuid(Uuid::from_u128(2)),
+                event_id,
                 scope: EventScope::Session(session_id()),
-                sequence: Sequence::FIRST,
-                timestamp: TimestampMillis::new(1),
+                sequence: Sequence::new(sequence).expect("sequence"),
+                timestamp: TimestampMillis::new(i64::try_from(sequence).expect("timestamp")),
                 event_type: payload.event_type().into(),
                 event_version: Version::new(1, 0),
                 correlation_id: CorrelationId::from_uuid(Uuid::from_u128(3)),
@@ -4056,6 +4349,17 @@ mod tests {
             serde_json::to_value(typed.payload).expect("payload"),
         )
         .expect("data event")
+    }
+
+    fn created_event() -> EventEnvelope<Value> {
+        data_event(
+            1,
+            RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                workspace: "fixture-workspace".into(),
+                style: "persistent-chat".into(),
+                style_binding: None,
+            }),
+        )
     }
 
     fn policy(effect: PermissionEffect) -> ProviderExecutionPolicy {
@@ -4091,6 +4395,77 @@ mod tests {
         }
     }
 
+    fn persistent_binding(max_steps: u64) -> crate::session::SessionStyleBinding {
+        let mut value = binding(BuiltInStyle::PersistentChat);
+        value.budgets.max_steps = max_steps;
+        value.memory.provider = String::from("none");
+        value.memory.retrieval_timing = String::from("never");
+        value.memory.injection_location = String::from("none");
+        value.compaction.strategy = String::from("none");
+        value.compaction.trigger_tokens = None;
+        value
+    }
+
+    fn bound_control_events(include_transition: bool, max_steps: u64) -> Vec<EventEnvelope<Value>> {
+        let binding = persistent_binding(max_steps);
+        let graph = CompiledStyleExecutor::from_binding(&binding)
+            .expect("executor")
+            .compiled()
+            .graph
+            .clone();
+        let mut events = vec![
+            data_event(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture-workspace"),
+                    style: String::from("persistent-chat"),
+                    style_binding: Some(Box::new(binding)),
+                }),
+            ),
+            data_event(
+                2,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(graph),
+                    },
+                )),
+            ),
+            data_event(
+                3,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("respond"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+            data_event(
+                4,
+                RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                    node_id: String::from("respond"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                    result_reference: None,
+                    artifact_reference: None,
+                }),
+            ),
+        ];
+        if include_transition {
+            events.push(data_event(
+                5,
+                RuntimeCommittedEvent::StyleTransitionSelected(StyleTransitionSelectedEvent {
+                    from_node_id: String::from("respond"),
+                    to_node_id: String::from("tool"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ));
+        }
+        events
+    }
+
     #[test]
     fn provider_terminal_failures_are_classified_as_failed_style_nodes() {
         assert_eq!(
@@ -4116,6 +4491,344 @@ mod tests {
             ]),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn completed_node_gap_recovers_transition_then_fails_closed_at_effect_destination() {
+        let data = MockTurnData::with_events(
+            Ok(HarnessDataReply::Events(Vec::new())),
+            bound_control_events(false, 3),
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        let error = logic
+            .run_turn(command())
+            .await
+            .expect_err("recovery required");
+
+        assert!(matches!(
+            error,
+            RunTurnError::StyleControlRecoveryRequired {
+                ref node,
+                phase: "awaiting_destination_entry"
+            } if node == "tool"
+        ));
+        assert_eq!(
+            data.event_types(),
+            vec![
+                "session.created",
+                "style.execution_initialized",
+                "style.node_entered",
+                "style.node_completed",
+                "style.transition_selected",
+            ]
+        );
+        assert!(
+            data.state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn selected_transition_gap_fails_closed_without_mutating_or_dispatching() {
+        let data = MockTurnData::with_events(
+            Ok(HarnessDataReply::Events(Vec::new())),
+            bound_control_events(true, 3),
+        );
+        let before = data.event_types();
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        let error = logic
+            .run_turn(command())
+            .await
+            .expect_err("recovery required");
+
+        assert!(matches!(
+            error,
+            RunTurnError::StyleControlRecoveryRequired {
+                ref node,
+                phase: "awaiting_destination_entry"
+            } if node == "tool"
+        ));
+        assert_eq!(data.event_types(), before);
+        assert!(
+            data.state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn unsupported_bound_graph_fails_preflight_without_mutation() {
+        let binding = binding(BuiltInStyle::ResearchLoop);
+        let data = MockTurnData::with_events(
+            Ok(HarnessDataReply::Events(Vec::new())),
+            vec![data_event(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture-workspace"),
+                    style: String::from("research-loop"),
+                    style_binding: Some(Box::new(binding)),
+                }),
+            )],
+        );
+        let before = data.event_types();
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        let error = logic.run_turn(command()).await.expect_err("unsupported");
+
+        assert!(matches!(
+            error,
+            RunTurnError::UnsupportedStyleExecution(ref style) if style == "research-loop"
+        ));
+        assert_eq!(data.event_types(), before);
+        assert!(
+            data.state
+                .harness_commands
+                .lock()
+                .expect("commands")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn style_step_budget_succeeds_at_exact_limit() {
+        let binding = persistent_binding(3);
+        let data = MockTurnData::with_events(
+            Ok(HarnessDataReply::Events(vec![
+                HarnessDataEvent::Started,
+                HarnessDataEvent::Text(String::from("done")),
+                HarnessDataEvent::Completed {
+                    reason: String::from("stop"),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ])),
+            vec![data_event(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture-workspace"),
+                    style: String::from("persistent-chat"),
+                    style_binding: Some(Box::new(binding)),
+                }),
+            )],
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        logic.run_turn(command()).await.expect("exact-limit turn");
+
+        let types = data.event_types();
+        assert_eq!(
+            types
+                .iter()
+                .filter(|event_type| event_type.as_str() == "style.node_entered")
+                .count(),
+            3
+        );
+        assert!(
+            !types
+                .iter()
+                .any(|event_type| event_type == "style.execution_terminated")
+        );
+    }
+
+    #[tokio::test]
+    async fn style_step_budget_terminates_before_first_over_limit_entry() {
+        let binding = persistent_binding(1);
+        let data = MockTurnData::with_events(
+            Ok(HarnessDataReply::Events(vec![
+                HarnessDataEvent::Started,
+                HarnessDataEvent::Completed {
+                    reason: String::from("stop"),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ])),
+            vec![data_event(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture-workspace"),
+                    style: String::from("persistent-chat"),
+                    style_binding: Some(Box::new(binding)),
+                }),
+            )],
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+        let error = logic.run_turn(command()).await.expect_err("step limit");
+
+        assert!(matches!(
+            error,
+            RunTurnError::StyleStepBudgetExceeded { limit: 1 }
+        ));
+        let types = data.event_types();
+        assert_eq!(
+            types
+                .iter()
+                .filter(|event_type| event_type.as_str() == "style.node_entered")
+                .count(),
+            1
+        );
+        assert_eq!(
+            types.last().map(String::as_str),
+            Some("style.execution_terminated")
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_provider_cancellation_and_failure_fail_the_active_style_node() {
+        for terminal in [
+            HarnessDataEvent::Cancelled,
+            HarnessDataEvent::Failed {
+                code: String::from("fixture"),
+                message: String::from("continuation failed"),
+                retryable: false,
+            },
+        ] {
+            let binding = persistent_binding(3);
+            let data = MockTurnData::with_scenario(
+                vec![data_event(
+                    1,
+                    RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                        workspace: String::from("fixture-workspace"),
+                        style: String::from("persistent-chat"),
+                        style_binding: Some(Box::new(binding)),
+                    }),
+                )],
+                vec![
+                    Ok(HarnessDataReply::Events(vec![
+                        HarnessDataEvent::Started,
+                        HarnessDataEvent::ToolProposed {
+                            continuation_id: String::from("continue-1"),
+                            call_id: String::from("call-1"),
+                            tool: String::from("filesystem.read"),
+                            arguments: json!({"path":"README.md"}),
+                        },
+                    ])),
+                    Ok(HarnessDataReply::Events(vec![
+                        HarnessDataEvent::Started,
+                        terminal,
+                    ])),
+                ],
+                Ok(vec![
+                    ToolDataEvent::Started {
+                        call_id: String::from("call-1"),
+                    },
+                    ToolDataEvent::Completed {
+                        call_id: String::from("call-1"),
+                        result: json!({"content":"fixture"}),
+                        artifact: None,
+                        truncated: false,
+                    },
+                ]),
+            );
+            let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+
+            let result = logic.run_turn(command()).await.expect("classified result");
+
+            assert_eq!(
+                data.event_types().last().map(String::as_str),
+                Some("style.node_failed")
+            );
+            assert_eq!(
+                data.event_types()
+                    .iter()
+                    .filter(|event_type| event_type.as_str() == "style.node_completed")
+                    .count(),
+                1,
+                "tool and terminal graph nodes must not complete after provider failure"
+            );
+            assert_eq!(
+                result.last_committed_sequence.get(),
+                u64::try_from(data.event_types().len()).expect("event count")
+            );
+            let loaded = SessionPersistenceLogic::new(data.clone())
+                .load_session(LoadSessionCommand {
+                    session_directory: PathBuf::from("sessions").join(session_id().to_string()),
+                    expected_session_id: session_id(),
+                })
+                .expect("replay");
+            let execution = loaded.state.style_execution.expect("style execution");
+            assert!(execution.active_node.is_none());
+            assert!(matches!(
+                execution.control,
+                StyleExecutionControlState::ReadyForEntry(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn cancellation_after_approval_reload_fails_tool_node_without_completing_graph() {
+        let continuation_id = ContinuationId::from_uuid(Uuid::from_u128(99));
+        let mut events = bound_control_events(true, 3);
+        events.extend([
+            data_event(
+                6,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("tool"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 2,
+                }),
+            ),
+            data_event(
+                7,
+                RuntimeCommittedEvent::ApprovalRequested(ApprovalRequestedEvent {
+                    continuation_id,
+                    action_summary: String::from("fixture approval"),
+                }),
+            ),
+            data_event(
+                8,
+                RuntimeCommittedEvent::ApprovalResolved(ApprovalResolvedEvent {
+                    continuation_id,
+                    approved: true,
+                }),
+            ),
+            data_event(
+                9,
+                RuntimeCommittedEvent::ModelRequestCancelled(ModelRequestCancelledEvent {
+                    cancellation_id: String::from("cancel-1"),
+                }),
+            ),
+        ]);
+        let data = MockTurnData::with_events(Ok(HarnessDataReply::Events(Vec::new())), events);
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+        let persistence = SessionPersistenceLogic::new(data.clone());
+
+        let position = logic
+            .fail_active_bound_style_at_head(
+                &persistence,
+                session_id(),
+                &PathBuf::from("sessions").join(session_id().to_string()),
+                "model_request_cancelled",
+            )
+            .expect("classification")
+            .expect("bound style");
+
+        assert_eq!(position.sequence.get(), 10);
+        assert_eq!(
+            data.event_types().last().map(String::as_str),
+            Some("style.node_failed")
+        );
+        let loaded = persistence
+            .load_session(LoadSessionCommand {
+                session_directory: PathBuf::from("sessions").join(session_id().to_string()),
+                expected_session_id: session_id(),
+            })
+            .expect("replay");
+        let execution = loaded.state.style_execution.expect("style execution");
+        assert!(execution.active_node.is_none());
+        assert_eq!(execution.completed_nodes.len(), 1);
+        assert!(matches!(
+            execution.control,
+            StyleExecutionControlState::ReadyForEntry(_)
+        ));
     }
 
     #[test]

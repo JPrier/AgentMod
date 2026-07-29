@@ -36,6 +36,23 @@ pub(crate) enum StyleNodeDirective {
     Fail,
 }
 
+impl StyleNodeDirective {
+    /// Returns whether restart recovery must not infer that this node's
+    /// externally observable work has or has not happened from graph control
+    /// events alone.
+    pub(crate) const fn requires_effect_evidence(self) -> bool {
+        !matches!(
+            self,
+            Self::Loop
+                | Self::ConditionalBranch
+                | Self::ParallelBranch
+                | Self::CompleteTurn
+                | Self::CompleteSession
+                | Self::Fail
+        )
+    }
+}
+
 /// Stable cursor into one immutable compiled graph.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StyleNodeCursor {
@@ -258,7 +275,7 @@ pub enum StyleExecutorError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use agentmod_primitives::ContentHash;
@@ -280,7 +297,7 @@ mod tests {
         clippy::too_many_lines,
         reason = "the fixture explicitly binds every immutable session-style selection"
     )]
-    fn binding(style: BuiltInStyle) -> SessionStyleBinding {
+    pub(crate) fn binding(style: BuiltInStyle) -> SessionStyleBinding {
         let manifest = built_in_manifest(style);
         let manifest_json = to_json(&manifest).expect("manifest json");
         let plugin_set_hash = ContentHash::digest(b"plugins");

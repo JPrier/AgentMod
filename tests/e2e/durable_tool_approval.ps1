@@ -94,6 +94,25 @@ try {
         }
         if (-not $ready) { throw "restarted runtime did not become ready" }
 
+        $sequenceBeforeBlockedTurn = $beforeRestart[-1].metadata.sequence
+        $savedErrorPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        & $cli run "must remain blocked while approval is pending" `
+            --session $created.session_id `
+            --option 'mock_scenario="streaming_text"' --json 2>$null | Out-Null
+        $blockedExit = $LASTEXITCODE
+        $ErrorActionPreference = $savedErrorPreference
+        if ($blockedExit -eq 0) {
+            throw "a second turn was accepted while durable approval was pending"
+        }
+        $afterBlockedTurn = @(Get-Content $journalPath | ForEach-Object {
+            ($_ | ConvertFrom-Json).event
+        })
+        if ($afterBlockedTurn[-1].metadata.sequence -ne $sequenceBeforeBlockedTurn -or
+            $afterBlockedTurn.Count -ne $beforeRestart.Count) {
+            throw "rejected pending-approval turn mutated canonical state"
+        }
+
         $resolved = & $cli approval resolve $created.session_id `
             $continuation approve --json | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0 -or $resolved.transitioned -ne $true) {

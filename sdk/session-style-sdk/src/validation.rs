@@ -194,6 +194,9 @@ pub struct CompiledSessionStyle {
     pub graph: ExecutableGraph,
     /// Interceptor IDs in execution order.
     pub interceptor_order: Vec<String>,
+    /// Complete interceptor declarations retained for runtime composition.
+    #[serde(default)]
+    pub interceptors: Vec<InterceptorDeclaration>,
     /// Runtime capabilities required by the style.
     pub required_capabilities: Vec<String>,
     /// Allowed tool groups.
@@ -301,6 +304,7 @@ pub fn compile_style(
         kind: manifest.kind,
         built_in_semantic: manifest.built_in_semantic,
         graph,
+        interceptors: ordered_interceptors(manifest, &interceptor_order),
         interceptor_order,
         required_capabilities: sorted(&manifest.required_capabilities),
         allowed_tool_groups: sorted(&manifest.allowed_tool_groups),
@@ -316,6 +320,21 @@ pub fn compile_style(
         selection: manifest.selection,
         cache_key,
     })
+}
+
+fn ordered_interceptors(
+    manifest: &SessionStyleManifest,
+    order: &[String],
+) -> Vec<InterceptorDeclaration> {
+    let declarations: BTreeMap<_, _> = manifest
+        .interceptors
+        .iter()
+        .map(|declaration| (declaration.id.as_str(), declaration))
+        .collect();
+    order
+        .iter()
+        .filter_map(|id| declarations.get(id.as_str()).map(|value| (*value).clone()))
+        .collect()
 }
 
 /// Validates and compiles a catalog while enforcing unique style IDs.

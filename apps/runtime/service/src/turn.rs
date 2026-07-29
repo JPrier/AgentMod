@@ -10,8 +10,9 @@ use agentmod_runtime_logic::{
     continuation::{ContinuationWakeCondition, ContinuationWakeProof},
     harness::ProviderEvent,
     turn::{
-        ApprovalTurnLogicPort, CancelTurnCommand, CancelTurnLogicPort, CreateDeferredTurnCommand,
-        DeferredTurnLogicPort, RecordScheduledRecoveryCommand, RecoverStartupToolsCommand,
+        ApprovalTurnLogicPort, CancelTurnCommand, CancelTurnLogicPort,
+        CommittedEventObserverLogicPort, CreateDeferredTurnCommand, DeferredTurnLogicPort,
+        ObserveCommittedEventsCommand, RecordScheduledRecoveryCommand, RecoverStartupToolsCommand,
         ResolveTurnApprovalCommand, RunScheduledTurnCommand, RunTurnCommand, RunTurnError,
         RunTurnStream, RunTurnStreamItem, ScheduledRecoveryLogicPort, StartupToolRecoveryLogicPort,
         TurnLogicPort, WakeScheduledTurnCommand,
@@ -319,6 +320,33 @@ impl<L: TurnLogicPort> TurnService<L> {
     }
 }
 
+impl<L: CommittedEventObserverLogicPort> TurnService<L> {
+    async fn observe_committed_events(
+        &self,
+        session_id: agentmod_primitives::SessionId,
+        events: Vec<crate::ServiceSessionEvent>,
+    ) -> Result<agentmod_runtime_logic::plugin::PluginObservationSummary, TurnServiceError> {
+        self.logic
+            .observe_committed_events(ObserveCommittedEventsCommand {
+                sessions_root: self.sessions_root.clone(),
+                session_id: session_id.to_string(),
+                events: events
+                    .into_iter()
+                    .map(
+                        |event| agentmod_runtime_logic::plugin::CommittedPluginEvent {
+                            event_id: event.event_id.to_string(),
+                            sequence: event.sequence.get(),
+                            event_type: event.event_type,
+                            payload: event.payload,
+                        },
+                    )
+                    .collect(),
+            })
+            .await
+            .map_err(TurnServiceError::Logic)
+    }
+}
+
 impl<L: ApprovalTurnLogicPort> TurnService<L> {
     /// Resolves a durable approval and maps resumed lifecycle events.
     ///
@@ -552,7 +580,10 @@ where
         + agentmod_runtime_logic::history::SessionHistoryLogicPort
         + agentmod_runtime_logic::style::SessionStyleLogicPort
         + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort,
-    T: TurnLogicPort + DeferredTurnLogicPort + ScheduledRecoveryLogicPort,
+    T: TurnLogicPort
+        + CommittedEventObserverLogicPort
+        + DeferredTurnLogicPort
+        + ScheduledRecoveryLogicPort,
 {
     /// Reconciles durable scheduler claims before the runtime accepts clients.
     ///
@@ -1024,6 +1055,7 @@ where
             .and_then(|value| (value > 0).then_some(value))
             .and_then(|value| agentmod_primitives::Sequence::new(value).ok());
         let mut executions = std::collections::BTreeMap::new();
+        let mut committed_events = Vec::new();
         loop {
             let page = self
                 .core
@@ -1051,6 +1083,7 @@ where
             {
                 after = Some(event.sequence);
                 self.collect_scheduled_matches(&event, &mut executions);
+                committed_events.push(event);
             }
             if after.is_some_and(|sequence| sequence >= last) {
                 break;
@@ -1072,6 +1105,20 @@ where
         let _ = self
             .execute_scheduled_claims(executions.into_values().collect(), false)
             .await;
+        if let Err(error) = self
+            .turns
+            .observe_committed_events(session_id, committed_events)
+            .await
+        {
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "runtime.plugin_observation_failed",
+                    "session_id": session_id,
+                    "reason": error.to_string(),
+                })
+            );
+        }
     }
 }
 
@@ -1090,6 +1137,7 @@ where
     T: TurnLogicPort
         + ApprovalTurnLogicPort
         + CancelTurnLogicPort
+        + CommittedEventObserverLogicPort
         + DeferredTurnLogicPort
         + ScheduledRecoveryLogicPort
         + Clone

@@ -7,6 +7,7 @@ pub mod identity;
 pub mod journal;
 pub mod local_rpc;
 pub mod memory;
+pub mod plugin;
 pub mod process_tool;
 pub mod receipt;
 pub mod registry;

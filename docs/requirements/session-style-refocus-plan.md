@@ -1,6 +1,6 @@
 # Session-Style Refocus Implementation Map
 
-Status: Phases 1-2 complete; Phase 3 hardening active; Phase 4 mapped
+Status: Phases 1-4 executable; Phase 5 interceptor/observer vertical slice live
 
 Branch: `feature/session-style-registry`
 
@@ -25,24 +25,19 @@ the selected manifest, persist the full immutable binding, and validate that
 binding before execution resumes. The CLI and TUI expose style discovery and
 selection through the runtime protocol.
 
-The generic style executor consumes the retained compiled graph and persistent
-chat runs through its model -> tool gate -> complete-turn path. Style-selected
-memory retrieval, context composition, projection replacement, and live
-compaction run before the provider request with canonical provenance. Other
-built-in styles remain non-executable and fail before journal mutation until
-their node adapters and recovery paths are implemented.
+The generic style executor consumes the retained compiled graph.
+Persistent-chat, ephemeral-turn, research-loop, the deterministic declarative
+graph, and planner-worker-reviewer execute through runtime-owned node adapters.
+Style-selected memory retrieval, context composition, projection replacement,
+and live compaction run before provider requests with canonical provenance.
+Plugin-sourced styles can activate process blocking interceptors and
+committed-event observers; activation and blocking invocation state is
+canonical and replay-inspectable.
 
 The following documents contradict the implementation and require reconciliation:
 
-- `docs/architecture/n-tier.md` and `docs/architecture/overview.md` describe a
-  health-only runtime, harness, and CLI.
-- `docs/architecture/plugin-system.md` and `docs/reference/plugin-sdk.md` say the
-  plugin SDK and isolated plugin host do not exist.
-- `docs/guides/creating-a-session-style.md` still requires reconciliation with
-  the live registry and executable-node subset. The session-style architecture
-  and format references were updated with Phase 3.
-- `docs/architecture/event-pipeline.md` understates the live runtime
-  interception path, although style/plugin pipeline assembly is still empty.
+- Remaining reconciliation work is tracked in `STATUS.md`; architecture and
+  plugin references now distinguish the live slices from planned extensions.
 
 There is no `core/conversation-projection` crate. The live equivalent is
 `apps/runtime/logic/src/conversation.rs`.
@@ -55,10 +50,10 @@ There is no `core/conversation-projection` crate. The live equivalent is
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | passed |
 | `cargo test --workspace --all-targets --all-features --locked` | passed; 351 tests enumerated |
 | `cargo test --workspace --doc --all-features --locked` | passed; no doctests |
-| `cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml` | passed; 88 packages, no violations |
+| `cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml` | passed; 89 packages, no violations |
 | `cargo test --locked -p xtask --test architecture` | passed; 2 tests |
-| `cargo deny check` | pending; command not installed |
-| `cargo audit` | pending; command not installed |
+| `cargo deny check` | fails on existing workspace dependency/license policy configuration; see `STATUS.md` |
+| `cargo audit` | passed; zero known vulnerabilities and one allowed unmaintained `fxhash 0.2.1` warning |
 
 This is Windows evidence only. Existing Unix scripts are not execution evidence.
 

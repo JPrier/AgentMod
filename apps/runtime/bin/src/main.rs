@@ -1,14 +1,21 @@
 //! Runtime composition root.
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc};
 
 use agentmod_event_pipeline::BlockingPipelineBuilder;
-use agentmod_runtime_data::{RuntimeData, memory::RuntimeMemoryData};
+use agentmod_runtime_data::{
+    RuntimeData,
+    memory::RuntimeMemoryData,
+    plugin::{RuntimePluginData, compile_plugin_catalog},
+};
 use agentmod_runtime_dependency::{
     LocalRuntimeDependencies,
     continuation::FileContinuationDependency,
     harness::{HarnessDependencyConfig, HarnessDependencyPort, ProcessHarnessDependency},
     local_rpc::{cleanup_local_endpoint, prepare_local_endpoint},
+    plugin::{
+        ProcessPluginDependency, ProcessPluginDependencyConfig, read_plugin_manifest_sources,
+    },
     process_tool::{ProcessCapabilityDependency, ProcessCapabilityDependencyConfig},
     receipt::ToolReceiptDependency,
     scheduler::{ProcessSchedulerDependency, ProcessSchedulerDependencyConfig},
@@ -21,6 +28,7 @@ use agentmod_runtime_logic::{
     child_session::RuntimeChildSessionLogic,
     harness::{ProviderExecutionLogic, ProviderExecutionPolicy},
     permission::{PermissionEffect, PermissionMatcher, PermissionPolicy, PermissionRule},
+    plugin::PluginCompositionLogic,
     turn::TurnLogic,
 };
 use agentmod_runtime_protocol::RuntimeRequest;
@@ -56,6 +64,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             configured_sessions_root
         } else {
             std::env::current_dir()?.join(configured_sessions_root)
+        };
+        let plugin_manifest_paths = std::env::var_os("AGENTMOD_PLUGIN_MANIFESTS")
+            .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let plugin_catalog = if plugin_manifest_paths.is_empty() {
+            None
+        } else {
+            let sources = read_plugin_manifest_sources(&plugin_manifest_paths).await?;
+            Some(compile_plugin_catalog(
+                &sources,
+                "0.1.0",
+                vec![
+                    String::from("events"),
+                    String::from("plugin_state"),
+                    String::from("tools"),
+                ],
+            )?)
+        };
+        let plugin_dependency = if plugin_catalog.is_some() {
+            let executable_roots = std::env::var_os("AGENTMOD_PLUGIN_EXECUTABLE_ROOTS")
+                .map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+                .unwrap_or_default();
+            Some(Arc::new(ProcessPluginDependency::new(
+                ProcessPluginDependencyConfig {
+                    program: std::env::var("AGENTMOD_PLUGIN_HOST_PROGRAM")
+                        .map_or_else(|_| sibling_binary("agentmod-plugin-host"), PathBuf::from)
+                        .to_string_lossy()
+                        .into_owned(),
+                    arguments: Vec::new(),
+                    owner_id: String::from("agentmod-runtime"),
+                    sessions_root: sessions_root.clone(),
+                    executable_roots,
+                    authorization_key: ProcessPluginDependency::derive_authorization_key(
+                        authorization_token.as_bytes(),
+                    ),
+                    maximum_frame_bytes: 1024 * 1024,
+                    request_timeout: std::time::Duration::from_secs(30),
+                },
+            )?))
+        } else {
+            None
         };
         let harness = ProcessHarnessDependency::new(HarnessDependencyConfig {
             program: std::env::var("AGENTMOD_HARNESS_PROGRAM")
@@ -199,7 +248,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             authentication_token: ProcessSchedulerDependency::generate_authentication_token(),
             maximum_frame_bytes: 1024 * 1024,
         })?;
-        let data = RuntimeData::new(SupervisedRuntimeDependencies::new(
+        let mut data = RuntimeData::new(SupervisedRuntimeDependencies::new(
             harness,
             browser,
             filesystem,
@@ -226,7 +275,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .join("memory"),
         ))
         .with_artifacts(agentmod_runtime_data::artifact::RuntimeArtifactData::first_party());
-        let style_config = RuntimeStyleServiceConfig::native(&sessions_root);
+        if let (Some(dependency), Some(catalog)) = (&plugin_dependency, &plugin_catalog) {
+            data = data.with_plugins(RuntimePluginData::new(
+                dependency.clone(),
+                catalog.manifests.clone(),
+            ));
+        }
+        let mut style_config = RuntimeStyleServiceConfig::native(&sessions_root);
+        if let Some(catalog) = &plugin_catalog {
+            style_config.plugin_set_hash = catalog.plugin_set_hash.to_hex();
+            style_config.plugins = catalog
+                .manifests
+                .iter()
+                .map(|manifest| manifest.id.clone())
+                .collect::<BTreeSet<_>>();
+        }
         let child_sessions =
             RuntimeChildSessionLogic::new(data.clone(), style_config.logic_environment(None));
         let core = RuntimeService::new(
@@ -237,10 +300,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 styles: style_config,
             },
         );
-        let turns = TurnService::new(
-            TurnLogic::new(data, provider_policy()).with_child_sessions(child_sessions),
-            sessions_root,
-        );
+        let mut turn_logic =
+            TurnLogic::new(data.clone(), provider_policy()).with_child_sessions(child_sessions);
+        if plugin_dependency.is_some() {
+            turn_logic =
+                turn_logic.with_plugins(Arc::new(PluginCompositionLogic::new(data.clone())));
+        }
+        let turns = TurnService::new(turn_logic, sessions_root);
         let recovery = turns.recover_startup_tools().await?;
         eprintln!(
             "{}",

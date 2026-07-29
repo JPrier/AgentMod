@@ -14,11 +14,11 @@ limitation = "The real CLI/runtime/harness/filesystem/process path performs a mo
 id = "E2E-02"
 capability = "pre-tool-modification"
 owner = "runtime-logic"
-tests = ["tests::pre_tool_modification_executes_only_modified_filesystem_action"]
+tests = ["tests::pre_tool_modification_executes_only_modified_filesystem_action", "runtime_plugin_composition"]
 platforms = ["windows", "linux", "macos"]
-evidence = ["tests/integration/src/lib.rs"]
+evidence = ["tests/integration/src/lib.rs", "apps/runtime/logic/src/plugin.rs", "tests/e2e/runtime_plugin_composition.ps1", "tests/e2e/runtime_plugin_composition.sh"]
 status = "partial"
-limitation = "Runtime now commits original and final tool proposal lifecycle records before isolated execution, while in-process interception proves only modified arguments execute; a real subprocess scenario with a modifying interceptor and replay comparison remains incomplete."
+limitation = "The Windows process E2E loads a plugin-sourced style, invokes a supervised process interceptor, records canonical activation/invocation audit, and proves only its modified filesystem path reaches isolated tool execution. Unix/macOS process execution and a rejected-plugin replay comparison remain incomplete."
 
 [[requirement]]
 id = "E2E-03"
@@ -154,11 +154,11 @@ limitation = "The deterministic Windows process E2E proves two initial runtime-m
 id = "E2E-15"
 capability = "plugin-authority"
 owner = "runtime/plugin-host"
-tests = ["authorized_blocking_interceptor_is_accepted", "observer_requesting_canonical_write_is_rejected_at_stable_path", "ordering_cycle_is_rejected_by_event_pipeline_compiler", "missing_capability_prevents_activation"]
+tests = ["authorized_blocking_interceptor_is_accepted", "observer_requesting_canonical_write_is_rejected_at_stable_path", "ordering_cycle_is_rejected_by_event_pipeline_compiler", "missing_capability_prevents_activation", "catalog_compiles_observer_without_canonical_write_authority", "catalog_rejects_observer_canonical_write_request", "style_selected_plugin_rewrites_typed_proposal_in_compiled_order", "observer_receives_only_matching_committed_events", "plugin_activation_and_invocation_replay_into_inspectable_state", "runtime_plugin_composition"]
 platforms = ["windows", "linux", "macos"]
-evidence = ["sdk/plugin-sdk/tests/manifest.rs"]
+evidence = ["sdk/plugin-sdk/tests/manifest.rs", "apps/runtime/dependency/src/plugin.rs", "apps/runtime/data/src/plugin.rs", "apps/runtime/logic/src/plugin.rs", "apps/runtime/logic/src/session.rs", "apps/runtime/service/src/turn.rs", "apps/plugin-host/fixture-worker/src/main.rs", "tests/fixtures/plugins/plugin-composed-style.toml", "tests/e2e/runtime_plugin_composition.ps1", "tests/e2e/runtime_plugin_composition.sh"]
 status = "partial"
-limitation = "Manifest authority, capabilities, and ordering are executable SDK tests; runtime activation and plugin-host isolation are not implemented."
+limitation = "The SDK and host reject observer canonical-write authority and invalid ordering. A Windows process E2E proves plugin-style discovery, keyed host activation, typed interceptor replacement, post-commit observer delivery, canonical activation/successful-invocation replay, retained binding inspection after restart, and post-restart reactivation. Plugin memory/compaction/context transforms, runtime disable/quarantine management, failed/rejected invocation audit, observer completion receipts, same-session in-flight recovery, idle host teardown, and Unix/macOS process execution remain incomplete."
 
 [[requirement]]
 id = "E2E-16"

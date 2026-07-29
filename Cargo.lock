@@ -647,6 +647,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentmod-plugin-fixture-worker"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "agentmod-plugin-host"
 version = "0.1.0"
 dependencies = [
@@ -844,6 +851,7 @@ name = "agentmod-runtime-data"
 version = "0.1.0"
 dependencies = [
  "agentmod-event-model",
+ "agentmod-plugin-sdk",
  "agentmod-primitives",
  "agentmod-runtime-dependency",
  "agentmod-session-style-sdk",
@@ -861,6 +869,7 @@ name = "agentmod-runtime-dependency"
 version = "0.1.0"
 dependencies = [
  "agentmod-harness-protocol",
+ "agentmod-plugin-protocol",
  "agentmod-primitives",
  "agentmod-protocol-support",
  "agentmod-scheduler-protocol",

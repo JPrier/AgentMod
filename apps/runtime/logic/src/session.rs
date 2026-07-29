@@ -1,6 +1,9 @@
 //! Pure runtime session reducers and typed committed payloads.
 
-use std::{collections::BTreeMap, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    str::FromStr,
+};
 
 use agentmod_event_model::{EventClassification, EventEnvelope, EventModelError, EventScope};
 use agentmod_graph_engine::{ExecutableGraph, GRAPH_FORMAT_VERSION, NodeKind};
@@ -459,6 +462,34 @@ pub struct ToolCallApprovedEvent {
     pub call_id: String,
     /// Digest of the final intercepted action.
     pub action_digest: ContentHash,
+}
+
+/// Exact external plugin set activated for style execution.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginSetActivatedEvent {
+    /// Deterministically ordered plugin identities accepted by the host.
+    pub plugin_ids: Vec<String>,
+    /// Plugin-set hash bound into the immutable session style.
+    pub plugin_set_hash: ContentHash,
+}
+
+/// Canonical result of one blocking plugin invocation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginInvocationCompletedEvent {
+    /// Plugin selected by the compiled style declaration.
+    pub plugin_id: String,
+    /// Stable interceptor declaration ID.
+    pub handler: String,
+    /// Consequential action boundary observed by the interceptor.
+    pub action_kind: String,
+    /// Stable proposal identity.
+    pub proposal_id: String,
+    /// Digest of the exact interceptor input.
+    pub input_digest: ContentHash,
+    /// Digest of a returned proposal, when present.
+    pub output_digest: Option<ContentHash>,
+    /// Normalized decision or failure classification.
+    pub outcome: String,
 }
 
 /// Isolated tool-host execution began.
@@ -949,6 +980,10 @@ pub enum RuntimeCommittedEvent {
     ToolCallProposed(ToolCallProposedEvent),
     /// Records the final authorized tool action.
     ToolCallApproved(ToolCallApprovedEvent),
+    /// Records the exact external plugin set activated for this session.
+    PluginSetActivated(PluginSetActivatedEvent),
+    /// Records one completed blocking plugin invocation.
+    PluginInvocationCompleted(PluginInvocationCompletedEvent),
     /// Records durable dispatch intent before the external call.
     ToolExecutionDispatched(ToolExecutionDispatchedEvent),
     /// Records isolated host dispatch.
@@ -1034,6 +1069,8 @@ impl RuntimeCommittedEvent {
             Self::ModelRequestFailed(_) => "model.request_failed",
             Self::ToolCallProposed(_) => "tool.call_proposed",
             Self::ToolCallApproved(_) => "tool.call_approved",
+            Self::PluginSetActivated(_) => "plugin.set_activated",
+            Self::PluginInvocationCompleted(_) => "plugin.invocation_completed",
             Self::ToolExecutionDispatched(_) => "tool.execution_dispatched",
             Self::ToolExecutionStarted(_) => "tool.execution_started",
             Self::ToolOutputObserved(_) => "tool.output_observed",
@@ -1273,6 +1310,9 @@ pub struct SessionState {
     /// Planner/worker/reviewer task, join, and review projection.
     #[serde(default)]
     pub planner_worker: PlannerWorkerState,
+    /// Replay-owned plugin activation and blocking invocation projection.
+    #[serde(default)]
+    pub plugins: PluginExecutionState,
     /// Restart/reconnect reconciliation state keyed by provider call ID.
     #[serde(default)]
     pub process_reconciliations: BTreeMap<String, ProcessReconciliationRecord>,
@@ -1280,6 +1320,34 @@ pub struct SessionState {
     pub last_sequence: Sequence,
     /// Integrity checksum of the last applied event.
     pub last_event_checksum: ContentHash,
+}
+
+/// Replay-owned plugin composition projection.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginExecutionState {
+    /// Exact currently activated plugin set.
+    pub activated_plugin_ids: Vec<String>,
+    /// Latest activation sequence.
+    pub activated_at: Option<Sequence>,
+    /// Canonical blocking invocation records in execution order.
+    pub invocations: Vec<PluginInvocationRecord>,
+}
+
+/// Replay-owned blocking plugin invocation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginInvocationRecord {
+    /// Plugin identity.
+    pub plugin_id: String,
+    /// Interceptor declaration ID.
+    pub handler: String,
+    /// Consequential action boundary.
+    pub action_kind: String,
+    /// Stable proposal identity.
+    pub proposal_id: String,
+    /// Normalized outcome.
+    pub outcome: String,
+    /// Canonical event sequence.
+    pub committed_at: Sequence,
 }
 
 /// Replay-derived branch ancestry.
@@ -1606,6 +1674,7 @@ fn initialize(
         artifact_persistences: BTreeMap::new(),
         child_agents: BTreeMap::new(),
         planner_worker: PlannerWorkerState::default(),
+        plugins: PluginExecutionState::default(),
         process_reconciliations: BTreeMap::new(),
         last_sequence: event.metadata.sequence,
         last_event_checksum: event.integrity_checksum,
@@ -1683,6 +1752,47 @@ fn apply_payload(
         | RuntimeCommittedEvent::ToolCallApproved(_)
         | RuntimeCommittedEvent::SchedulerFired(_)
         | RuntimeCommittedEvent::SchedulerDeliveryReconciled(_) => Ok(()),
+        RuntimeCommittedEvent::PluginSetActivated(activated) => {
+            if activated.plugin_set_hash
+                != state
+                    .style_binding
+                    .as_ref()
+                    .ok_or(SessionReducerError::MissingStyleBinding)?
+                    .plugin_set_hash
+                || activated.plugin_ids.iter().collect::<BTreeSet<_>>().len()
+                    != activated.plugin_ids.len()
+            {
+                return Err(SessionReducerError::InvalidPluginActivation);
+            }
+            state
+                .plugins
+                .activated_plugin_ids
+                .clone_from(&activated.plugin_ids);
+            state.plugins.activated_at = Some(event.metadata.sequence);
+            Ok(())
+        }
+        RuntimeCommittedEvent::PluginInvocationCompleted(completed) => {
+            if !state
+                .plugins
+                .activated_plugin_ids
+                .contains(&completed.plugin_id)
+                || completed.handler.trim().is_empty()
+                || completed.action_kind.trim().is_empty()
+                || completed.proposal_id.trim().is_empty()
+                || completed.outcome.trim().is_empty()
+            {
+                return Err(SessionReducerError::InvalidPluginInvocation);
+            }
+            state.plugins.invocations.push(PluginInvocationRecord {
+                plugin_id: completed.plugin_id.clone(),
+                handler: completed.handler.clone(),
+                action_kind: completed.action_kind.clone(),
+                proposal_id: completed.proposal_id.clone(),
+                outcome: completed.outcome.clone(),
+                committed_at: event.metadata.sequence,
+            });
+            Ok(())
+        }
         RuntimeCommittedEvent::ModelRequestStarted(started) => {
             let user_sequence = state
                 .conversation
@@ -3857,6 +3967,15 @@ pub enum SessionReducerError {
     /// Planner tasks, joins, or reviewer findings violated canonical ordering.
     #[error("planner-worker-reviewer state transition is invalid")]
     InvalidPlannerWorkerTransition,
+    /// Plugin activation requires an immutable style binding.
+    #[error("plugin activation requires a session style binding")]
+    MissingStyleBinding,
+    /// Activated plugin identity or plugin-set hash was invalid.
+    #[error("plugin activation state is invalid")]
+    InvalidPluginActivation,
+    /// A plugin invocation did not match the active plugin set or typed boundary.
+    #[error("plugin invocation state is invalid")]
+    InvalidPluginInvocation,
     /// Context composition did not follow start, phase, completion ordering.
     #[error("context boundary state transition is invalid")]
     InvalidContextBoundaryTransition,
@@ -3988,6 +4107,52 @@ mod tests {
                 style_binding: None,
             }),
         )
+    }
+
+    #[test]
+    fn plugin_activation_and_invocation_replay_into_inspectable_state() {
+        let style_binding = binding(BuiltInStyle::PersistentChat);
+        let plugin_set_hash = style_binding.plugin_set_hash;
+        let events = vec![
+            envelope(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture"),
+                    style: style_binding.id.clone(),
+                    style_binding: Some(Box::new(style_binding)),
+                }),
+            ),
+            envelope(
+                2,
+                RuntimeCommittedEvent::PluginSetActivated(PluginSetActivatedEvent {
+                    plugin_ids: vec![String::from("fixture.rewriter")],
+                    plugin_set_hash,
+                }),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::PluginInvocationCompleted(PluginInvocationCompletedEvent {
+                    plugin_id: String::from("fixture.rewriter"),
+                    handler: String::from("rewrite-tool"),
+                    action_kind: String::from("tool_call"),
+                    proposal_id: String::from("tool-call:fixture"),
+                    input_digest: ContentHash::digest(b"input"),
+                    output_digest: Some(ContentHash::digest(b"output")),
+                    outcome: String::from("replace"),
+                }),
+            ),
+        ];
+        let state = replay(&events).expect("plugin replay");
+        assert_eq!(
+            state.plugins.activated_plugin_ids,
+            vec![String::from("fixture.rewriter")]
+        );
+        assert_eq!(
+            state.plugins.activated_at,
+            Some(Sequence::new(2).expect("sequence"))
+        );
+        assert_eq!(state.plugins.invocations.len(), 1);
+        assert_eq!(state.plugins.invocations[0].outcome, "replace");
     }
 
     #[allow(

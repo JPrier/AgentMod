@@ -158,7 +158,9 @@ pub struct DependencyInvocationRequest {
     pub invocation_id: String,
     /// Handler/tool.
     pub handler: String,
-    /// Kind.
+    /// Invocation operation.
+    pub operation: String,
+    /// Proposal/tool payload kind.
     pub kind: String,
     /// Payload.
     pub payload: Value,
@@ -789,11 +791,12 @@ impl PluginDependencyPort for IsolatedPluginDependency {
         request: DependencyInvocationRequest,
     ) -> Result<(DependencyDecision, u8), PluginDependencyError> {
         self.authorize(
-            &format!("plugin.{}", request.kind),
+            &format!("plugin.{}", request.operation),
             &(
                 &request.plugin_id,
                 &request.invocation_id,
                 &request.handler,
+                &request.operation,
                 &request.kind,
                 &request.payload,
                 &request.readable_state,
@@ -802,7 +805,7 @@ impl PluginDependencyPort for IsolatedPluginDependency {
         )
         .await?;
         let plugin = self.entry(&request.plugin_id).await?;
-        let worker_request = if request.kind == "intercept" {
+        let worker_request = if request.operation == "intercept" {
             WorkerRequest::Intercept {
                 handler: &request.handler,
                 proposal_type: &request.kind,
@@ -829,7 +832,7 @@ impl PluginDependencyPort for IsolatedPluginDependency {
         self.audit(DependencyAudit {
             plugin_id: request.plugin_id,
             invocation_id: Some(request.invocation_id),
-            operation: request.kind,
+            operation: request.operation,
             outcome: "completed".to_owned(),
             attempts,
         })

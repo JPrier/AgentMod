@@ -7,7 +7,7 @@ implementation state; planned interfaces and scaffolds do not count as implement
 
 ## Current phase
 
-Session-style refocus, Phase 4 — additional built-in execution modes. The
+Session-style refocus, Phase 5 — plugin composition. The
 registry, immutable session binding, generic persistent/ephemeral/research/declarative executor,
 and style-selected context composition are live. No/file/SQLite memory and
 none/sliding-window/tool-output-eviction compaction run through recoverable
@@ -16,9 +16,11 @@ bounded fresh-context iterations with immutable findings, and the compiled
 declarative fixture executes branch, approval, native-tool, loop, and terminal
 nodes. Planner-worker-reviewer now runs its compiled plan, spawn, wait, join,
 integrate, review, reject, revision, and terminal graph through runtime-managed
-child sessions with canonical replay state.
+child sessions with canonical replay state. Plugin-sourced styles now activate
+style-selected process interceptors and asynchronous committed-event observers;
+activation and blocking invocation state is canonical and replay-inspectable.
 Summary/artifact compaction, automatic memory
-writes, plugin composition, harness selection, concurrent child dispatch,
+writes, plugin memory/compaction/context transforms, harness selection, concurrent child dispatch,
 workspace isolation enforcement, and artifact-backed planner results remain
 incomplete.
 
@@ -30,7 +32,7 @@ incomplete.
 | Product/acceptance plan | Implemented and unit tested | `.omx/plans/prd-agentmod.md` |
 | Verification contract | Implemented and unit tested | `.omx/plans/test-spec-agentmod.md` |
 | Initial architecture/process/dependency maps | Implemented and unit tested | `docs/architecture/initial-maps.md` |
-| Cargo architecture enforcement | Integration tested | `cargo run -p xtask -- architecture --manifest-path Cargo.toml`: 88 packages, no violations; intentional negative fixture tests pass |
+| Cargo architecture enforcement | Integration tested | `cargo run -p xtask -- architecture --manifest-path Cargo.toml`: 89 packages, no violations; intentional negative fixture tests pass |
 | Versioned protocol framing/negotiation | Implemented and unit tested | Bounded CBOR frame and capability/version tests in `agentmod-protocol-support` |
 | Runtime N-tier health slice | Integration tested | Real dependency → data → logic → service → composition-root path; layer tests and runnable binary |
 | Harness N-tier health/capability slice | Integration tested | Separate harness binary and four layer test suites |
@@ -55,6 +57,7 @@ incomplete.
 | Native process host | End-to-end validated | Authenticated foreground/background execution plus native PTY start/run, interactive input, resize, detach/reattach, merged durable terminal output, restart-persistent replay denial, strict owner/session scope, secret references, executable policy, and bounded concurrency/waiters pass. Recovery records commit before dispatch, bind PID + OS start time + resolved executable, reject PID reuse, preserve completed output, classify exact surviving children without redispatch, and quarantine malformed records. The host exposes authenticated versioned Unix-socket/Windows-pipe transport, survives runtime-client replacement in a separate process group, retains live PTY handles across reconnect, and exits after its last live child and request. A real Windows daemon E2E starts one PTY, kills and replaces the runtime, reattaches through the surviving host, exchanges canonical input/output, commits exit, and proves no redispatch; equivalent Unix automation is present. Typed `process.reconciliation_started/completed` events form one reducer-enforced pair around reattachment and precede terminal tool state. A separate forced host-crash test proves no redispatch and fail-closed inherited-handle recovery |
 | Native filesystem host | Integration tested | Separate N-tier host with bounded read/list/glob/grep, atomic write/edit, prevalidated multi-file patch, encoding/binary handling, lazy schemas and path/symlink/device/sensitive-file controls; 13 tests |
 | Plugin manifest SDK | Implemented and unit tested | Strict TOML/JSON model, PLUG001–PLUG024 validation, authority/trust/capability/version checks and cross-plugin ordering diagnostics; 12 tests |
+| Runtime plugin composition | End-to-end validated on Windows for interceptor/observer slice | Runtime dependency supervises one keyed plugin-host process per activated plugin session; data compiles exact configured manifests through the SDK, owns catalog normalization/activation, and computes the plugin-set hash; logic composes immutable style declarations into typed blocking pipelines and delivers only committed service event projections to asynchronous observers. Canonical `plugin.set_activated` and successful `plugin.invocation_completed` events reconstruct inspectable activation/invocation state. The packaged process fixture and plugin-sourced style prove a replacement reaches a real filesystem call, observer delivery occurs after commit, canonical-write authority is rejected, retained style/plugin state survives restart inspection, and a post-restart session reactivates the host. `runtime_plugin_composition.ps1` passes on Windows; the Unix equivalent passes `bash -n` but has not been process-executed. Plugin memory, compaction, context transforms, live management disable/quarantine endpoints, observer completion receipts, failed/rejected invocation audit, same-session in-flight restart recovery, and idle plugin-host teardown remain incomplete |
 | Harness continuation gate | Integration tested | Tool-call generation stops at a proposal; explicit runtime continuation issues a fresh provider request exactly once, with replacement structured context |
 | Native Git host | End-to-end validated | Discovery/status/diff, detached worktrees, commit-free integrity-checked checkpoints and guarded restore have 9 host tests; runtime routing uses keyed grants and `tests/e2e/runtime_git_loop.ps1` validates a real repository status round trip |
 | Native LSP host | End-to-end validated | Separate five-crate host implements LSP 3.17 lifecycle, all required query/edit-proposal operations, cancellation, timeout, restart, workspace containment, keyed authorization and deterministic fixture coverage; runtime project-root routing passes a process E2E |
@@ -102,11 +105,13 @@ incomplete.
 
 No test failures. `cargo test --workspace --all-targets --all-features --locked`,
 `cargo test --workspace --doc --all-features --locked`, strict workspace
-Clippy, formatting, and the 88-package architecture command and fixture tests
+Clippy, formatting, and the 89-package architecture command and fixture tests
 pass locally on Windows for the current tree. The style-registry, ephemeral,
-research-loop, and declarative-graph process E2Es pass on Windows; their Unix
+research-loop, declarative-graph, planner-worker, and plugin-composition process
+E2Es pass on Windows; their Unix
 scripts have been syntax-checked but not process-executed.
-`cargo audit` reports zero known vulnerabilities. `cargo deny check` does not
+`cargo audit` reports zero known vulnerabilities and one allowed unmaintained
+warning for `fxhash 0.2.1`. `cargo deny check` does not
 yet pass with cargo-deny 0.20.2: the repository's publishable package manifests
 use unversioned internal path dependencies, `xtask` does not declare a license,
 and the current license policy has no scoped allowance for
@@ -122,8 +127,8 @@ None.
 
 1. Finish planner-worker result artifacts, workspace enforcement, concurrency,
    and crash-cut recovery coverage.
-2. Finish summary/artifact/write context paths, then connect plugin composition
-   and the harness capability registry.
+2. Finish summary/artifact/write context paths and plugin-provided context
+   components, then implement the harness capability registry.
 
 ## Performance results
 
@@ -224,7 +229,7 @@ execution. The equivalent Unix script is present but was not run here.
 
 ## N-tier compliance status
 
-Locally integration tested across 88 packages, including runtime, harness, CLI,
+Locally integration tested across 89 packages, including runtime, harness, CLI,
 TUI, ACP, scheduler, filesystem, process, Git, and LSP processes. The metadata/source validator reports no
 violations and its intentional violation fixtures emit stable diagnostics. Other
 required deployable systems remain incomplete.

@@ -57,11 +57,18 @@ use crate::{
         ProviderExecutionError, ProviderExecutionLogic, ProviderExecutionPolicy,
         ProviderExecutionPort,
     },
-    interception::{InterceptionOutcome, intercept_action},
+    interception::{
+        InterceptionOutcome, InterceptorAuditResult, InterceptorAuditStep, InterceptorScope,
+        intercept_action,
+    },
     memory::{MemoryLogic, MemoryLogicError, MemoryLogicPort, MemoryScope, RetrieveMemoryCommand},
     persistence::{
         CommitDurability, CommitSessionEventCommand, LoadSessionCommand, LoadSessionResult,
         SessionPersistenceLogic, SessionPersistenceLogicError, SessionPersistenceLogicPort,
+    },
+    plugin::{
+        CommittedPluginEvent, ComposePluginPipelineCommand, ObserveCommittedPluginEventsCommand,
+        PluginCompositionError, PluginCompositionLogicPort, PluginObservationSummary,
     },
     projection::{
         ProjectionMeasure, ProjectionMeasureError, canonical_json_bytes, measure_projection,
@@ -80,7 +87,8 @@ use crate::{
         ConversationEntryCommittedEvent, ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent,
         ModelRequestCancelledEvent, ModelRequestFailedEvent, ModelRequestProposedEvent,
         ModelRequestStartedEvent, ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent,
-        ModelToolCallProposedEvent, PlannedTask, ProcessReconciliationCompletedEvent,
+        ModelToolCallProposedEvent, PlannedTask, PluginInvocationCompletedEvent,
+        PluginSetActivatedEvent, ProcessReconciliationCompletedEvent,
         ProcessReconciliationStartedEvent, ProcessReconciliationStatus,
         ReviewerFindingsCommittedEvent, RuntimeCommittedEvent, SchedulerDeliveryReconciledEvent,
         SchedulerFiredEvent, SessionReducerError, StyleExecutionControlState,
@@ -105,6 +113,7 @@ const MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const MAX_TOOL_STEPS: usize = 16;
 const MAX_TOOL_RESULT_BYTES: usize = 64 * 1024;
 const MAX_MEMORY_QUERY_BYTES: usize = 1024 * 1024;
+const RUNTIME_PLUGIN_API_VERSION: &str = "0.1.0";
 const DEFAULT_SLIDING_WINDOW_ENTRIES: usize = 32;
 const MAX_PROVIDER_PROJECTION_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -163,6 +172,11 @@ struct JournalPosition {
 struct AuthorizedTurn {
     request: AuthorizedProviderRequest,
     position: JournalPosition,
+}
+
+struct SessionPluginPolicy {
+    execution: ProviderExecutionPolicy,
+    activated_plugin_ids: Vec<String>,
 }
 
 struct ActiveStyleTurn {
@@ -228,6 +242,21 @@ pub trait TurnLogicPort: Send + Sync {
     }
     async fn run_turn_stream(&self, command: RunTurnCommand)
     -> Result<RunTurnStream, RunTurnError>;
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObserveCommittedEventsCommand {
+    pub sessions_root: PathBuf,
+    pub session_id: String,
+    pub events: Vec<CommittedPluginEvent>,
+}
+
+#[async_trait]
+pub trait CommittedEventObserverLogicPort: Send + Sync {
+    async fn observe_committed_events(
+        &self,
+        command: ObserveCommittedEventsCommand,
+    ) -> Result<PluginObservationSummary, RunTurnError>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -430,6 +459,66 @@ pub struct TurnLogic<D> {
     policy: ProviderExecutionPolicy,
     session_gates: Arc<Mutex<BTreeMap<String, Weak<Mutex<()>>>>>,
     child_sessions: Option<Arc<dyn ChildSessionLogicPort>>,
+    plugins: Option<Arc<dyn PluginCompositionLogicPort>>,
+}
+
+impl<D> TurnLogic<D> {
+    #[must_use]
+    pub fn with_plugins(mut self, plugins: Arc<dyn PluginCompositionLogicPort>) -> Self {
+        self.plugins = Some(plugins);
+        self
+    }
+
+    async fn policy_for_state(
+        &self,
+        state: &crate::session::SessionState,
+        cancellation_id: &str,
+    ) -> Result<SessionPluginPolicy, RunTurnError> {
+        let Some(binding) = state.style_binding.as_ref() else {
+            if self.plugins.is_none() {
+                return Ok(SessionPluginPolicy {
+                    execution: self.policy.clone(),
+                    activated_plugin_ids: Vec::new(),
+                });
+            }
+            return Err(RunTurnError::StyleMigrationRequired);
+        };
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle =
+            serde_json::from_str(&binding.compiled_style_json)
+                .map_err(|_| RunTurnError::StyleBindingInvalid)?;
+        let has_external_interceptor = compiled.interceptors.iter().any(|declaration| {
+            declaration.owner != "runtime" && !declaration.owner.starts_with("runtime.")
+        });
+        let has_external_plugin = compiled
+            .allowed_plugins
+            .iter()
+            .any(|plugin| plugin != "runtime" && !plugin.starts_with("runtime."));
+        if !has_external_interceptor && !has_external_plugin {
+            return Ok(SessionPluginPolicy {
+                execution: self.policy.clone(),
+                activated_plugin_ids: Vec::new(),
+            });
+        }
+        let plugins = self
+            .plugins
+            .as_ref()
+            .ok_or(RunTurnError::PluginCompositionUnavailable)?;
+        let composed = plugins
+            .compose_pipeline(ComposePluginPipelineCommand {
+                session_id: state.id.to_string(),
+                cancellation_id: cancellation_id.to_owned(),
+                compiled_style: compiled,
+                runtime_api_version: String::from(RUNTIME_PLUGIN_API_VERSION),
+            })
+            .await
+            .map_err(RunTurnError::PluginComposition)?;
+        let mut policy = self.policy.clone();
+        policy.plugin_pipeline = composed.pipeline;
+        Ok(SessionPluginPolicy {
+            execution: policy,
+            activated_plugin_ids: composed.activated_plugin_ids,
+        })
+    }
 }
 
 impl<D> TurnLogic<D>
@@ -462,6 +551,7 @@ where
             data,
             session_gates: Arc::new(Mutex::new(BTreeMap::new())),
             child_sessions: None,
+            plugins: None,
         }
     }
 
@@ -1392,6 +1482,67 @@ where
             }
         });
         Ok(RunTurnStream { receiver })
+    }
+}
+
+#[async_trait]
+impl<D> CommittedEventObserverLogicPort for TurnLogic<D>
+where
+    D: Clone
+        + Send
+        + Sync
+        + EventIdentityDataPort
+        + JournalEventDataPort
+        + HarnessDataPort
+        + ContinuationDataPort
+        + MemoryDataPort
+        + ArtifactDataPort
+        + agentmod_runtime_data::tool::ToolDataPort
+        + 'static,
+{
+    async fn observe_committed_events(
+        &self,
+        command: ObserveCommittedEventsCommand,
+    ) -> Result<PluginObservationSummary, RunTurnError> {
+        if command.events.is_empty() {
+            return Ok(PluginObservationSummary::default());
+        }
+        let session_id =
+            SessionId::from_str(&command.session_id).map_err(|_| RunTurnError::InvalidSession)?;
+        let session_directory = command.sessions_root.join(session_id.to_string());
+        let state = Self::load_state(
+            &SessionPersistenceLogic::new(self.data.clone()),
+            session_id,
+            &session_directory,
+        )?;
+        let binding = state
+            .style_binding
+            .ok_or(RunTurnError::StyleMigrationRequired)?;
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle =
+            serde_json::from_str(&binding.compiled_style_json)
+                .map_err(|_| RunTurnError::StyleBindingInvalid)?;
+        if compiled
+            .allowed_plugins
+            .iter()
+            .all(|plugin| plugin == "runtime" || plugin.starts_with("runtime."))
+        {
+            return Ok(PluginObservationSummary::default());
+        }
+        let plugins = self
+            .plugins
+            .as_ref()
+            .ok_or(RunTurnError::PluginCompositionUnavailable)?;
+        let last_sequence = command.events.last().map_or(0, |event| event.sequence);
+        plugins
+            .observe_committed_events(ObserveCommittedPluginEventsCommand {
+                session_id: command.session_id,
+                cancellation_id: format!("observer-range-{last_sequence}"),
+                compiled_style: compiled,
+                runtime_api_version: String::from(RUNTIME_PLUGIN_API_VERSION),
+                events: command.events,
+            })
+            .await
+            .map_err(RunTurnError::PluginComposition)
     }
 }
 
@@ -4997,17 +5148,109 @@ where
             .map_err(RunTurnError::Persistence)
     }
 
+    fn commit_plugin_invocations(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        mut position: JournalPosition,
+        state: &crate::session::SessionState,
+        audit: &[InterceptorAuditStep],
+    ) -> Result<JournalPosition, RunTurnError> {
+        if !audit
+            .iter()
+            .any(|step| step.scope == InterceptorScope::Plugin)
+        {
+            return Ok(position);
+        }
+        let binding = state
+            .style_binding
+            .as_ref()
+            .ok_or(RunTurnError::StyleMigrationRequired)?;
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle =
+            serde_json::from_str(&binding.compiled_style_json)
+                .map_err(|_| RunTurnError::StyleBindingInvalid)?;
+        for step in audit
+            .iter()
+            .filter(|step| step.scope == InterceptorScope::Plugin)
+        {
+            let plugin_id = compiled
+                .interceptors
+                .iter()
+                .find(|declaration| declaration.id == step.handler)
+                .map(|declaration| declaration.owner.clone())
+                .ok_or(RunTurnError::StyleBindingInvalid)?;
+            let input_digest = step.input.digest().map_err(|_| RunTurnError::Event)?;
+            let (outcome, output_digest) = match &step.result {
+                InterceptorAuditResult::Continue { output, replaced } => (
+                    if *replaced { "replace" } else { "continue" },
+                    Some(output.digest().map_err(|_| RunTurnError::Event)?),
+                ),
+                InterceptorAuditResult::Reject { .. } => ("reject", None),
+                InterceptorAuditResult::RequireApproval { .. } => ("require_approval", None),
+                InterceptorAuditResult::Defer { .. } => ("defer", None),
+                InterceptorAuditResult::Cancel { .. } => ("cancel", None),
+                InterceptorAuditResult::Fork { .. } => ("fork", None),
+                InterceptorAuditResult::Failure { .. } => ("failure", None),
+            };
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::PluginInvocationCompleted(PluginInvocationCompletedEvent {
+                    plugin_id,
+                    handler: step.handler.clone(),
+                    action_kind: step.input.action.kind().to_owned(),
+                    proposal_id: step.input.id.0.clone(),
+                    input_digest,
+                    output_digest,
+                    outcome: outcome.to_owned(),
+                }),
+            )?;
+        }
+        Ok(position)
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "authorization keeps activation, proposal, plugin audit, and approval commits adjacent"
+    )]
     async fn authorize_and_commit(
         &self,
         persistence: &SessionPersistenceLogic<D>,
         session_id: SessionId,
         session_directory: &std::path::Path,
-        position: JournalPosition,
+        mut position: JournalPosition,
         state: crate::session::SessionState,
         command: &RunTurnCommand,
     ) -> Result<AuthorizedTurn, RunTurnError> {
-        let prepared = self
-            .provider
+        let session_policy = self
+            .policy_for_state(&state, &command.cancellation_id)
+            .await?;
+        if !session_policy.activated_plugin_ids.is_empty()
+            && state.plugins.activated_plugin_ids != session_policy.activated_plugin_ids
+        {
+            let plugin_set_hash = state
+                .style_binding
+                .as_ref()
+                .ok_or(RunTurnError::StyleMigrationRequired)?
+                .plugin_set_hash;
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::PluginSetActivated(PluginSetActivatedEvent {
+                    plugin_ids: session_policy.activated_plugin_ids.clone(),
+                    plugin_set_hash,
+                }),
+            )?;
+        }
+        let provider = ProviderExecutionLogic::new(self.data.clone(), session_policy.execution);
+        let prepared = provider
             .prepare(ExecuteProviderCommand {
                 session_id: command.session_id.clone(),
                 provider: command.provider.clone(),
@@ -5015,8 +5258,8 @@ where
                 entries: project(state.conversation.provider_projection()),
                 options: command.options.clone(),
                 cancellation_id: command.cancellation_id.clone(),
-                style: state.style,
-                workspace: state.workspace,
+                style: state.style.clone(),
+                workspace: state.workspace.clone(),
             })
             .map_err(RunTurnError::Provider)?;
         let ConsequentialAction::ModelRequest(original) = &prepared.original.action else {
@@ -5035,7 +5278,7 @@ where
                 projection_hash: original.projection_hash,
             }),
         )?;
-        let request = match self.provider.authorize_prepared(prepared).await {
+        let request = match provider.authorize_prepared(prepared).await {
             Ok(request) => request,
             Err(error) => {
                 if let Err(audit_error) = self.commit_next(
@@ -5061,6 +5304,14 @@ where
         let ConsequentialAction::ModelRequest(executable) = &request.executable.action else {
             return Err(invalid_replacement());
         };
+        let invocation_position = self.commit_plugin_invocations(
+            persistence,
+            session_id,
+            session_directory,
+            JournalPosition { sequence, event_id },
+            &state,
+            &request.interceptor_audit,
+        )?;
         let action_digest = request
             .executable
             .digest()
@@ -5069,8 +5320,8 @@ where
             persistence,
             session_id,
             session_directory,
-            sequence,
-            event_id,
+            invocation_position.sequence,
+            invocation_position.event_id,
             RuntimeCommittedEvent::ModelRequestApproved(ModelRequestApprovedEvent {
                 proposal_id: request.original.id.0.clone(),
                 provider: executable.provider.clone(),
@@ -5411,16 +5662,28 @@ where
             })
             .map_err(RunTurnError::Persistence)?
             .state;
-        let prepared = self
-            .tools
+        let tools = ToolExecutionLogic::new(
+            self.data.clone(),
+            ToolExecutionPolicy {
+                style_pipeline: self.policy.style_pipeline.clone(),
+                plugin_pipeline: self
+                    .policy_for_state(&state, &command.cancellation_id)
+                    .await?
+                    .execution
+                    .plugin_pipeline,
+                user_policy: self.policy.user_policy.clone(),
+                mandatory_policy: self.policy.mandatory_policy.clone(),
+            },
+        );
+        let prepared = tools
             .prepare(PrepareToolCommand {
                 session_id: command.session_id.clone(),
-                workspace: PathBuf::from(state.workspace),
+                workspace: PathBuf::from(state.workspace.clone()),
                 call_id: call_id.to_owned(),
                 tool: tool.to_owned(),
                 arguments,
                 cancellation_id: command.cancellation_id.clone(),
-                style: state.style,
+                style: state.style.clone(),
             })
             .map_err(RunTurnError::Tool)?;
         let ConsequentialAction::ToolCall(original_action) = &prepared.original.action else {
@@ -5444,9 +5707,17 @@ where
                 arguments: original_action.arguments.clone(),
             }),
         )?;
-        let authorized = match self.tools.authorize_prepared_outcome(prepared).await {
+        let authorized = match tools.authorize_prepared_outcome(prepared).await {
             Ok(ToolAuthorizationOutcome::Authorized(authorized)) => authorized,
             Ok(ToolAuthorizationOutcome::ApprovalRequired { pending, reason }) => {
+                position = self.commit_plugin_invocations(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position,
+                    &state,
+                    &pending.interceptor_audit,
+                )?;
                 if harness_continuation == "style-owned" {
                     return Err(RunTurnError::StyleOwnedToolApprovalUnsupported);
                 }
@@ -5520,6 +5791,14 @@ where
                 return Ok(ToolCallOutcome::Complete(position));
             }
         };
+        position = self.commit_plugin_invocations(
+            persistence,
+            session_id,
+            session_directory,
+            position,
+            &state,
+            &authorized.interceptor_audit,
+        )?;
         if harness_continuation == "style-owned"
             && authorized
                 .executable
@@ -8671,6 +8950,12 @@ pub enum RunTurnError {
     InvalidSession,
     #[error("the session predates immutable style execution and requires migration")]
     StyleMigrationRequired,
+    #[error("the immutable compiled style binding is invalid")]
+    StyleBindingInvalid,
+    #[error("the style selects plugins but no runtime plugin composer is configured")]
+    PluginCompositionUnavailable,
+    #[error("style-selected plugin composition failed: {0}")]
+    PluginComposition(PluginCompositionError),
     #[error("compiled session-style execution failed: {0}")]
     StyleExecutor(StyleExecutorError),
     #[error("the compiled session graph does not match canonical execution state")]

@@ -13,7 +13,7 @@ use thiserror::Error;
 
 use crate::{
     action::{ActionProposal, ConsequentialAction, ProposalId, ToolCallAction},
-    interception::{InterceptionOutcome, intercept_action},
+    interception::{InterceptionOutcome, InterceptorAuditStep, intercept_action},
     permission::{PermissionEffect, PermissionPolicy, revalidate_mandatory_after_approval},
 };
 
@@ -49,6 +49,7 @@ pub struct PreparedToolRequest {
 pub struct AuthorizedToolRequest {
     pub original: ActionProposal,
     pub executable: ActionProposal,
+    pub interceptor_audit: Vec<InterceptorAuditStep>,
     session_id: String,
     workspace: PathBuf,
     call_id: String,
@@ -221,6 +222,7 @@ impl<D> ToolExecutionLogic<D> {
         let authorized = AuthorizedToolRequest {
             original: prepared.original,
             executable,
+            interceptor_audit: result.audit,
             session_id: prepared.session_id,
             workspace: prepared.workspace,
             call_id: prepared.call_id,
@@ -254,6 +256,7 @@ impl<D> ToolExecutionLogic<D> {
         Ok(AuthorizedToolRequest {
             executable: prepared.original.clone(),
             original: prepared.original,
+            interceptor_audit: Vec::new(),
             session_id: prepared.session_id,
             workspace: prepared.workspace,
             call_id: prepared.call_id,

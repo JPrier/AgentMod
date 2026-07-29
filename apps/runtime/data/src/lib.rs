@@ -6,6 +6,7 @@ pub mod harness;
 pub mod identity;
 pub mod journal;
 pub mod memory;
+pub mod plugin;
 pub mod registry;
 pub mod scheduler;
 pub mod snapshot;
@@ -59,6 +60,7 @@ pub struct RuntimeData<D> {
     style_cache: Arc<Mutex<BTreeMap<String, style::CachedSessionStyle>>>,
     memory: Option<memory::RuntimeMemoryData>,
     artifacts: Option<artifact::RuntimeArtifactData>,
+    plugins: Option<plugin::RuntimePluginData>,
 }
 
 impl<D> RuntimeData<D> {
@@ -70,6 +72,7 @@ impl<D> RuntimeData<D> {
             style_cache: Arc::new(Mutex::new(BTreeMap::new())),
             memory: None,
             artifacts: None,
+            plugins: None,
         }
     }
 
@@ -85,6 +88,49 @@ impl<D> RuntimeData<D> {
     pub fn with_artifacts(mut self, artifacts: artifact::RuntimeArtifactData) -> Self {
         self.artifacts = Some(artifacts);
         self
+    }
+
+    /// Adds the isolated plugin-host router used by live style composition.
+    #[must_use]
+    pub fn with_plugins(mut self, plugins: plugin::RuntimePluginData) -> Self {
+        self.plugins = Some(plugins);
+        self
+    }
+}
+
+#[async_trait::async_trait]
+impl<D: Send + Sync> plugin::PluginDataPort for RuntimeData<D> {
+    async fn activate_plugins(
+        &self,
+        request: plugin::ActivatePluginsDataRequest,
+    ) -> Result<plugin::ActivatedPluginsDataRecord, plugin::PluginDataError> {
+        self.plugins
+            .as_ref()
+            .ok_or(plugin::PluginDataError::Unavailable)?
+            .activate_plugins(request)
+            .await
+    }
+
+    async fn invoke_plugin(
+        &self,
+        request: plugin::InvokePluginDataRequest,
+    ) -> Result<plugin::PluginDecisionDataRecord, plugin::PluginDataError> {
+        self.plugins
+            .as_ref()
+            .ok_or(plugin::PluginDataError::Unavailable)?
+            .invoke_plugin(request)
+            .await
+    }
+
+    async fn observe_event(
+        &self,
+        request: plugin::ObservePluginDataRequest,
+    ) -> Result<plugin::PluginObservationDataRecord, plugin::PluginDataError> {
+        self.plugins
+            .as_ref()
+            .ok_or(plugin::PluginDataError::Unavailable)?
+            .observe_event(request)
+            .await
     }
 }
 

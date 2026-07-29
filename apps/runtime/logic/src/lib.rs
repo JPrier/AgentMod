@@ -12,6 +12,7 @@ pub mod interception;
 pub mod memory;
 pub mod permission;
 pub mod persistence;
+pub mod plugin;
 pub(crate) mod projection;
 pub mod registry;
 pub mod scheduler;

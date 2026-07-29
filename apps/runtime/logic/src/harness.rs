@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::{
     action::{ActionProposal, ConsequentialAction, ModelRequestAction, ProposalId},
-    interception::{InterceptionOutcome, intercept_action},
+    interception::{InterceptionOutcome, InterceptorAuditStep, intercept_action},
     permission::PermissionPolicy,
 };
 
@@ -136,6 +136,7 @@ pub struct ProviderExecutionPolicy {
 pub struct AuthorizedProviderRequest {
     pub original: ActionProposal,
     pub executable: ActionProposal,
+    pub interceptor_audit: Vec<InterceptorAuditStep>,
     pub session_id: String,
     pub entries: Vec<ProviderEntry>,
     pub cancellation_id: String,
@@ -253,6 +254,7 @@ impl<D> ProviderExecutionLogic<D> {
         Ok(AuthorizedProviderRequest {
             original,
             executable,
+            interceptor_audit: result.audit,
             session_id,
             entries,
             cancellation_id,

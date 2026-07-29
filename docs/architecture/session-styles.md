@@ -46,8 +46,17 @@ rather than immutable result/diff/test artifacts. Those limits keep the
 deterministic adapter short of the complete product scenario. Arbitrary
 declarative graphs are limited to graph shapes whose runtime node adapters are
 implemented; compilation success alone does not make an unsupported node
-combination executable. Plugin-selected pipelines remain planned integration
-work.
+combination executable.
+
+Style-selected blocking plugin pipelines are now live for `action.proposed`
+boundaries. The runtime activates only external plugins named by the immutable
+compiled style, preserves compiled interceptor order, and routes typed
+continue/replace/reject decisions back through mandatory policy and the normal
+effect path. Style-allowed observer plugins receive matching committed events
+asynchronously after durability. Activation and blocking invocation results are
+canonical and replay-inspectable. Additional lifecycle-specific interceptor
+boundaries and plugin-provided memory, compaction, and context transforms remain
+incomplete.
 
 Enabled child-agent policies are complete execution contracts rather than only
 numeric limits. They select an exact `style-id@semver`, workspace mode,

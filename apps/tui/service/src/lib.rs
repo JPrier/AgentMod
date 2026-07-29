@@ -67,12 +67,16 @@ impl<L: TuiLogicPort> TuiService<L> {
         self.logic.submit_editor().map_err(map_logic)?;
         let state = self.logic.state();
         Ok(format!(
-            "status={} selected={} sessions={}",
+            "status={} selected={} sessions={} style_details={}",
             state.status,
             state
                 .selected()
                 .map_or_else(|| String::from("none"), |session| session.id.to_string()),
-            state.sessions.len()
+            state.sessions.len(),
+            state.selected_style_inspection.as_ref().map_or_else(
+                || String::from("none"),
+                |inspection| format!("{}@{}", inspection.summary.id, inspection.summary.version)
+            )
         ))
     }
 
@@ -623,6 +627,7 @@ fn render_styles(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
             Style::new().fg(Color::Green),
         )),
     ]);
+    lines.extend(style_inspection_lines(state));
     frame.render_widget(
         Paragraph::new(lines)
             .block(
@@ -632,6 +637,49 @@ fn render_styles(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
             .wrap(Wrap { trim: true }),
         area,
     );
+}
+
+fn style_inspection_lines(state: &TuiState) -> Vec<Line<'static>> {
+    let Some(inspection) = &state.selected_style_inspection else {
+        return Vec::new();
+    };
+    let mut lines = vec![
+        Line::default(),
+        Line::from(Span::styled(
+            format!(
+                "Details    {}@{} · source={}",
+                inspection.summary.id, inspection.summary.version, inspection.source_locator
+            ),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(format!(
+            "Harness={} · memory={} · compaction={}",
+            inspection.manifest["harness"]["id"]
+                .as_str()
+                .unwrap_or("unknown"),
+            inspection.manifest["memory"]["provider"]
+                .as_str()
+                .unwrap_or("unknown"),
+            inspection.manifest["compaction"]["strategy"]
+                .as_str()
+                .unwrap_or("unknown")
+        )),
+        Line::from(format!(
+            "Compiled={} · diagnostics={}",
+            inspection.compiled.is_some(),
+            inspection.diagnostics.len()
+        )),
+    ];
+    lines.extend(inspection.diagnostics.iter().map(|diagnostic| {
+        Line::from(Span::styled(
+            format!(
+                "{} {}: {} · {}",
+                diagnostic.code, diagnostic.path, diagnostic.message, diagnostic.help
+            ),
+            Style::new().fg(Color::Red),
+        ))
+    }));
+    lines
 }
 
 fn render_harnesses(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
@@ -924,6 +972,22 @@ mod tests {
             compiled_cache_key: String::from("cache-key"),
             required_capabilities: vec![String::from("tools")],
         });
+        state.selected_style_inspection = Some(agentmod_tui_logic::StyleInspectionDetail {
+            summary: state.styles[0].clone(),
+            source_locator: String::from("project/.agentmod/styles/focused.toml"),
+            manifest: serde_json::json!({
+                "harness": {"id": "native"},
+                "memory": {"provider": "sqlite-fts"},
+                "compaction": {"strategy": "sliding_window"}
+            }),
+            compiled: Some(serde_json::json!({"graph": {"entry": "respond"}})),
+            diagnostics: vec![agentmod_tui_logic::StyleInspectionDiagnostic {
+                code: String::from("STYLE999"),
+                path: String::from("$.fixture"),
+                message: String::from("fixture diagnostic"),
+                help: String::from("fixture help"),
+            }],
+        });
 
         terminal
             .draw(|frame| render(frame, &state))
@@ -941,6 +1005,8 @@ mod tests {
         assert!(screen.contains("selected=sqlite-fts"));
         assert!(screen.contains("selected=sliding_window"));
         assert!(screen.contains("selected=3/40/100000/1000000/60000"));
+        assert!(screen.contains("project/.agentmod/styles/focused.toml"));
+        assert!(screen.contains("STYLE999"));
     }
 
     #[test]

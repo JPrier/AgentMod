@@ -57,6 +57,9 @@ selected hard ceilings before ordinary validation. Zero, over-policy, or
 otherwise incompatible limits fail before session creation.
 
 The TUI Styles view lists runtime-advertised memory and compaction components.
+`/style <id[@version]>` selects and inspects the exact registry entry, displaying
+source, compiled state, harness/memory/compaction choices, and validation
+diagnostics.
 Use `/memory <id|style-default>` and
 `/compaction <id|style-default>` before `/new`, or pass both after the harness
 in `/new [workspace] [style] [harness] [memory] [compaction]`. Use

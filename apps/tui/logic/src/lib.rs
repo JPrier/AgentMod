@@ -12,8 +12,8 @@ use agentmod_primitives::{CancellationId, Sequence};
 use agentmod_tui_data::{
     BranchSessionDataRecord, BranchSessionDataRequest, CreateSessionDataRequest, HarnessDataRecord,
     SessionBudgetDataRequest, SessionDataRecord, SessionEventDataRecord, StyleDataAvailability,
-    StyleDataRecord, StyleDataSourceKind, TuiDataError, TuiDataPort, TurnDataEvent, TurnDataStream,
-    TurnDataStreamItem,
+    StyleDataRecord, StyleDataSourceKind, StyleInspectionDataRecord, TuiDataError, TuiDataPort,
+    TurnDataEvent, TurnDataStream, TurnDataStreamItem,
 };
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -60,6 +60,25 @@ pub struct StyleSummary {
     pub style_content_hash: String,
     pub compiled_cache_key: String,
     pub required_capabilities: Vec<String>,
+}
+
+/// Logic-owned selected style details.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleInspectionDetail {
+    pub summary: StyleSummary,
+    pub source_locator: String,
+    pub manifest: Value,
+    pub compiled: Option<Value>,
+    pub diagnostics: Vec<StyleInspectionDiagnostic>,
+}
+
+/// Logic-owned style validation diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleInspectionDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+    pub help: String,
 }
 
 impl StyleSummary {
@@ -142,6 +161,7 @@ pub struct TuiState {
     pub sessions: Vec<SessionDataRecord>,
     pub styles: Vec<StyleSummary>,
     pub selected_style: Option<String>,
+    pub selected_style_inspection: Option<StyleInspectionDetail>,
     pub harnesses: Vec<HarnessSummary>,
     pub selected_harness: String,
     pub memory_providers: Vec<String>,
@@ -178,6 +198,7 @@ impl Default for TuiState {
             sessions: Vec::new(),
             styles: Vec::new(),
             selected_style: None,
+            selected_style_inspection: None,
             harnesses: Vec::new(),
             selected_harness: String::from("native"),
             memory_providers: Vec::new(),
@@ -900,8 +921,13 @@ impl<D: TuiDataPort> TuiLogic<D> {
                         "/style <id[@version]>",
                     )));
                 }
-                self.state.selected_style = Some(self.resolve_style_selector(&selector)?);
+                let selector = self.resolve_style_selector(&selector)?;
+                self.state.selected_style = Some(selector.clone());
+                self.state.selected_style_inspection = Some(map_style_inspection(
+                    self.data.inspect_style(selector).map_err(map_error)?,
+                ));
                 self.state.status = format!("style: {}", self.state.active_style());
+                self.state.view = View::Styles;
             }
             "/branch" => self.execute_branch_command(&mut parts)?,
             "/model" => {
@@ -1135,6 +1161,25 @@ fn map_style(style: StyleDataRecord) -> StyleSummary {
     }
 }
 
+fn map_style_inspection(value: StyleInspectionDataRecord) -> StyleInspectionDetail {
+    StyleInspectionDetail {
+        summary: map_style(value.summary),
+        source_locator: value.source_locator,
+        manifest: value.manifest,
+        compiled: value.compiled,
+        diagnostics: value
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| StyleInspectionDiagnostic {
+                code: diagnostic.code,
+                path: diagnostic.path,
+                message: diagnostic.message,
+                help: diagnostic.help,
+            })
+            .collect(),
+    }
+}
+
 fn map_harness(harness: HarnessDataRecord) -> HarnessSummary {
     HarnessSummary {
         id: harness.id,
@@ -1221,6 +1266,26 @@ mod tests {
                     required_capabilities: vec![],
                 })
                 .collect())
+        }
+
+        fn inspect_style(
+            &self,
+            selector: String,
+        ) -> Result<StyleInspectionDataRecord, TuiDataError> {
+            let summary = self
+                .list_styles()?
+                .into_iter()
+                .find(|style| {
+                    style.id == selector || format!("{}@{}", style.id, style.version) == selector
+                })
+                .expect("fixture style");
+            Ok(StyleInspectionDataRecord {
+                summary,
+                source_locator: String::from("fixture/styles/focused.toml"),
+                manifest: json!({"identity": {"id": "focused"}}),
+                compiled: Some(json!({"graph": {"entry": "respond"}})),
+                diagnostics: Vec::new(),
+            })
         }
 
         fn list_harnesses(&self) -> Result<Vec<HarnessDataRecord>, TuiDataError> {

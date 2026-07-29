@@ -91,6 +91,25 @@ pub struct DependencyStyleSummary {
     pub required_capabilities: Vec<String>,
 }
 
+/// Dependency-owned style diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyStyleDiagnostic {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+    pub help: String,
+}
+
+/// Dependency-owned complete style inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DependencyStyleInspection {
+    pub summary: DependencyStyleSummary,
+    pub source_locator: String,
+    pub manifest: Value,
+    pub compiled: Option<Value>,
+    pub diagnostics: Vec<DependencyStyleDiagnostic>,
+}
+
 /// Dependency-owned harness descriptor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyHarnessDescriptor {
@@ -208,6 +227,12 @@ impl DependencyTurnStream {
 pub trait TuiRuntimeDependencyPort: Send + Sync {
     fn health(&self) -> Result<DependencyRuntimeHealth, TuiDependencyError>;
     fn list_styles(&self) -> Result<Vec<DependencyStyleSummary>, TuiDependencyError>;
+    fn inspect_style(
+        &self,
+        _selector: String,
+    ) -> Result<DependencyStyleInspection, TuiDependencyError> {
+        Err(TuiDependencyError::UnexpectedResponse)
+    }
     fn list_harnesses(&self) -> Result<Vec<DependencyHarnessDescriptor>, TuiDependencyError> {
         Ok(Vec::new())
     }
@@ -613,6 +638,55 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
                 required_capabilities: style.required_capabilities,
             })
             .collect())
+    }
+
+    fn inspect_style(
+        &self,
+        selector: String,
+    ) -> Result<DependencyStyleInspection, TuiDependencyError> {
+        let RuntimeResponse::StyleInspected { inspection } =
+            self.send(RuntimeRequest::InspectStyle { selector })?
+        else {
+            return Err(TuiDependencyError::UnexpectedResponse);
+        };
+        Ok(DependencyStyleInspection {
+            summary: DependencyStyleSummary {
+                id: inspection.summary.id,
+                version: inspection.summary.version,
+                source: match inspection.summary.source {
+                    RuntimeStyleSourceKind::BuiltIn => DependencyStyleSourceKind::BuiltIn,
+                    RuntimeStyleSourceKind::User => DependencyStyleSourceKind::User,
+                    RuntimeStyleSourceKind::Project => DependencyStyleSourceKind::Project,
+                    RuntimeStyleSourceKind::Plugin => DependencyStyleSourceKind::Plugin,
+                    RuntimeStyleSourceKind::Inline => DependencyStyleSourceKind::Inline,
+                },
+                availability: match inspection.summary.availability {
+                    RuntimeStyleAvailability::Available => DependencyStyleAvailability::Available,
+                    RuntimeStyleAvailability::Disabled => DependencyStyleAvailability::Disabled,
+                    RuntimeStyleAvailability::Invalid => DependencyStyleAvailability::Invalid,
+                    RuntimeStyleAvailability::Incompatible => {
+                        DependencyStyleAvailability::Incompatible
+                    }
+                    RuntimeStyleAvailability::Conflict => DependencyStyleAvailability::Conflict,
+                },
+                style_content_hash: inspection.summary.style_content_hash,
+                compiled_cache_key: inspection.summary.compiled_cache_key,
+                required_capabilities: inspection.summary.required_capabilities,
+            },
+            source_locator: inspection.source_locator,
+            manifest: inspection.manifest,
+            compiled: inspection.compiled,
+            diagnostics: inspection
+                .diagnostics
+                .into_iter()
+                .map(|diagnostic| DependencyStyleDiagnostic {
+                    code: diagnostic.code,
+                    path: diagnostic.path,
+                    message: diagnostic.message,
+                    help: diagnostic.help,
+                })
+                .collect(),
+        })
     }
 
     fn list_harnesses(&self) -> Result<Vec<DependencyHarnessDescriptor>, TuiDependencyError> {

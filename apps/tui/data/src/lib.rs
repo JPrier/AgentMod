@@ -11,9 +11,9 @@
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use agentmod_tui_dependency::{
     DependencyBranchSessionRequest, DependencyCreateSessionRequest,
-    DependencySessionBudgetSelection, DependencyStyleAvailability, DependencyStyleSourceKind,
-    DependencyTurnEvent, DependencyTurnStream, DependencyTurnStreamItem, TuiDependencyError,
-    TuiRuntimeDependencyPort,
+    DependencySessionBudgetSelection, DependencyStyleAvailability, DependencyStyleInspection,
+    DependencyStyleSourceKind, DependencyTurnEvent, DependencyTurnStream, DependencyTurnStreamItem,
+    TuiDependencyError, TuiRuntimeDependencyPort,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -75,6 +75,25 @@ pub struct StyleDataRecord {
     pub style_content_hash: String,
     pub compiled_cache_key: String,
     pub required_capabilities: Vec<String>,
+}
+
+/// Data-owned style diagnostic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleDiagnosticDataRecord {
+    pub code: String,
+    pub path: String,
+    pub message: String,
+    pub help: String,
+}
+
+/// Data-owned complete style inspection.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleInspectionDataRecord {
+    pub summary: StyleDataRecord,
+    pub source_locator: String,
+    pub manifest: Value,
+    pub compiled: Option<Value>,
+    pub diagnostics: Vec<StyleDiagnosticDataRecord>,
 }
 
 /// Data-owned harness descriptor.
@@ -194,6 +213,11 @@ impl TurnDataStream {
 pub trait TuiDataPort {
     fn runtime_health(&self) -> Result<RuntimeHealthDataRecord, TuiDataError>;
     fn list_styles(&self) -> Result<Vec<StyleDataRecord>, TuiDataError>;
+    fn inspect_style(&self, _selector: String) -> Result<StyleInspectionDataRecord, TuiDataError> {
+        Err(TuiDataError::Dependency(String::from(
+            "style inspection unavailable",
+        )))
+    }
     fn list_harnesses(&self) -> Result<Vec<HarnessDataRecord>, TuiDataError> {
         Ok(Vec::new())
     }
@@ -329,6 +353,13 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
                     })
                     .collect()
             })
+            .map_err(map_error)
+    }
+
+    fn inspect_style(&self, selector: String) -> Result<StyleInspectionDataRecord, TuiDataError> {
+        self.dependency
+            .inspect_style(selector)
+            .map(map_style_inspection)
             .map_err(map_error)
     }
 
@@ -541,6 +572,45 @@ fn map_stream_item(value: DependencyTurnStreamItem) -> TurnDataStreamItem {
             last_sequence: last_committed_sequence,
             awaiting_continuation,
         },
+    }
+}
+
+fn map_style_inspection(value: DependencyStyleInspection) -> StyleInspectionDataRecord {
+    StyleInspectionDataRecord {
+        summary: StyleDataRecord {
+            id: value.summary.id,
+            version: value.summary.version,
+            source: match value.summary.source {
+                DependencyStyleSourceKind::BuiltIn => StyleDataSourceKind::BuiltIn,
+                DependencyStyleSourceKind::User => StyleDataSourceKind::User,
+                DependencyStyleSourceKind::Project => StyleDataSourceKind::Project,
+                DependencyStyleSourceKind::Plugin => StyleDataSourceKind::Plugin,
+                DependencyStyleSourceKind::Inline => StyleDataSourceKind::Inline,
+            },
+            availability: match value.summary.availability {
+                DependencyStyleAvailability::Available => StyleDataAvailability::Available,
+                DependencyStyleAvailability::Disabled => StyleDataAvailability::Disabled,
+                DependencyStyleAvailability::Invalid => StyleDataAvailability::Invalid,
+                DependencyStyleAvailability::Incompatible => StyleDataAvailability::Incompatible,
+                DependencyStyleAvailability::Conflict => StyleDataAvailability::Conflict,
+            },
+            style_content_hash: value.summary.style_content_hash,
+            compiled_cache_key: value.summary.compiled_cache_key,
+            required_capabilities: value.summary.required_capabilities,
+        },
+        source_locator: value.source_locator,
+        manifest: value.manifest,
+        compiled: value.compiled,
+        diagnostics: value
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| StyleDiagnosticDataRecord {
+                code: diagnostic.code,
+                path: diagnostic.path,
+                message: diagnostic.message,
+                help: diagnostic.help,
+            })
+            .collect(),
     }
 }
 

@@ -46,6 +46,11 @@ try {
     if ($smoke -notmatch "ready=true" -or $smoke -notmatch "sessions=1") {
         throw "TUI did not map runtime health and sessions: $smoke"
     }
+    $styleSmoke = & $tui --smoke-command "/style ephemeral-turn"
+    if ($LASTEXITCODE -ne 0 -or
+        $styleSmoke -notmatch "style_details=ephemeral-turn@1.1.0") {
+        throw "TUI style inspection did not traverse the runtime: $styleSmoke"
+    }
     $turn = & $tui --smoke-turn "verify committed TUI streaming"
     if ($LASTEXITCODE -ne 0) { throw "TUI streamed turn failed" }
     if ($turn -notmatch "deterministic response" -or

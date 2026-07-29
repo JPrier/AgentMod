@@ -107,7 +107,7 @@ This is Windows evidence only. Existing Unix scripts are not execution evidence.
   session creation selects style, harness, memory, compaction, and hard budgets through the
   runtime, and inspection renders the full binding.
 - TUI: explicit style/harness/memory/compaction/budget selection, branch-with-style,
-  catalog/details/compatibility, and replay-derived Graph inspection use the
+  live registry details/diagnostics, compatibility, and replay-derived Graph inspection use the
   four-layer frontend path.
 - ACP remains protocol-driven and must not import runtime internals.
 

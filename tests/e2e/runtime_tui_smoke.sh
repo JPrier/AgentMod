@@ -36,6 +36,9 @@ test -n "$session_id"
 smoke="$("$repository/target/debug/agentmod-tui" --smoke)"
 grep -q "ready=true" <<<"$smoke"
 grep -q "sessions=1" <<<"$smoke"
+style_smoke="$("$repository/target/debug/agentmod-tui" --smoke-command \
+  "/style ephemeral-turn")"
+grep -q "style_details=ephemeral-turn@1.1.0" <<<"$style_smoke"
 turn="$("$repository/target/debug/agentmod-tui" --smoke-turn \
   "verify committed TUI streaming")"
 grep -q "deterministic response" <<<"$turn"

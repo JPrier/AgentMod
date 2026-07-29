@@ -251,6 +251,16 @@ status = "partial"
 limitation = "Windows process E2Es prove CLI and TUI budget selection, content-addressed binding changes, exact restart validation, and post-restart execution. Unix scripts are syntax-checked but have not been process-executed. Referenced graphs are not rewritten; a selected ceiling below their declared graph budget fails explicitly during SDK compilation."
 
 [[requirement]]
+id = "E2E-25"
+capability = "tui-style-details"
+owner = "tui/runtime"
+tests = ["selected_style_and_harness_reach_create_session", "style_catalog_renders_selected_style_and_hashes", "runtime_tui_smoke"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/tui/dependency/src/lib.rs", "apps/tui/data/src/lib.rs", "apps/tui/logic/src/lib.rs", "apps/tui/service/src/lib.rs", "tests/e2e/runtime_tui_smoke.ps1", "tests/e2e/runtime_tui_smoke.sh"]
+status = "partial"
+limitation = "The Windows named-pipe E2E proves /style performs live runtime inspection through all four TUI layers. The Styles view renders source, compiled availability, selected harness/memory/compaction, and structured diagnostics. Unix syntax is checked but the process script is not executed; manifest browsing remains a concise summary rather than a full editor."
+
+[[requirement]]
 id = "SCHED-01"
 capability = "durable-scheduling"
 owner = "scheduler/runtime"

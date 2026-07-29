@@ -61,11 +61,15 @@ try {
             --style persistent-chat --json | ConvertFrom-Json
         $ephemeral = & $cli session create --workspace $repository `
             --style ephemeral-turn@1.1.0 --json | ConvertFrom-Json
+        $selected = & $cli session create --workspace $repository `
+            --style ephemeral-turn@1.1.0 --memory sqlite-fts `
+            --compaction sliding_window --json | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw "style-bound session creation failed" }
 
         foreach ($entry in @(
             @($persistent.session_id, "persistent-chat", "1.1.0"),
-            @($ephemeral.session_id, "ephemeral-turn", "1.1.0")
+            @($ephemeral.session_id, "ephemeral-turn", "1.1.0"),
+            @($selected.session_id, "ephemeral-turn", "1.1.0")
         )) {
             $inspection = & $cli session inspect $entry[0] --json | ConvertFrom-Json
             if ($inspection.state.style_binding.id -ne $entry[1]) {
@@ -80,6 +84,14 @@ try {
             if ($inspection.state.style_compatibility.status -ne "compatible") {
                 throw "new style binding is not compatible"
             }
+        }
+        $selectedInspection = & $cli session inspect $selected.session_id --json |
+            ConvertFrom-Json
+        if ($selectedInspection.state.style_binding.memory.provider -ne
+                "sqlite-fts" -or
+            $selectedInspection.state.style_binding.compaction.strategy -ne
+                "sliding_window") {
+            throw "component-selected binding was not persisted"
         }
 
         $persistentTurn = & $cli run "persistent before restart" `
@@ -106,11 +118,28 @@ try {
         Stop-TestRuntime $daemon
         $daemon = Start-TestRuntime
 
-        foreach ($sessionId in @($persistent.session_id, $ephemeral.session_id)) {
+        foreach ($sessionId in @(
+            $persistent.session_id, $ephemeral.session_id, $selected.session_id
+        )) {
             $inspection = & $cli session inspect $sessionId --json | ConvertFrom-Json
             if ($inspection.state.style_compatibility.status -ne "compatible") {
                 throw "style binding did not survive restart"
             }
+        }
+        $selectedAfterRestart = & $cli session inspect $selected.session_id --json |
+            ConvertFrom-Json
+        if ($selectedAfterRestart.state.style_binding.memory.provider -ne
+                "sqlite-fts" -or
+            $selectedAfterRestart.state.style_binding.compaction.strategy -ne
+                "sliding_window") {
+            throw "component-selected binding changed after restart"
+        }
+        & $cli run "selected components after restart" `
+            --session $selected.session_id `
+            --option 'mock_scenario="streaming_text"' `
+            --option 'mock_text="selected-after"' --json | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "component-selected session failed after restart"
         }
         $persistentAfter = & $cli run "persistent after restart" `
             --session $persistent.session_id `

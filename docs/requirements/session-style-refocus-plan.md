@@ -1,6 +1,6 @@
 # Session-Style Refocus Implementation Map
 
-Status: Phases 1-6 executable; Phase 7 introspection vertical slice live
+Status: Phases 1-6 executable; Phase 7 product surfaces and introspection live
 
 Branch: `feature/session-style-registry`
 
@@ -104,10 +104,11 @@ This is Windows evidence only. Existing Unix scripts are not execution evidence.
 ### Frontends
 
 - CLI: add `style list`, `style inspect`, `style validate`, and `style compile`;
-  keep `session create --style`, add style-file/selection overrides as the
-  runtime contracts become available, and render full session binding details.
-- TUI: replace hard-coded `/new` behavior with explicit style selection and
-  expose catalog/details/compatibility in the initial style-focused flow.
+  session creation selects style, harness, memory, and compaction through the
+  runtime, and inspection renders the full binding.
+- TUI: explicit style/harness/memory/compaction selection, branch-with-style,
+  catalog/details/compatibility, and replay-derived Graph inspection use the
+  four-layer frontend path.
 - ACP remains protocol-driven and must not import runtime internals.
 
 ## Durable binding
@@ -183,6 +184,22 @@ and pure replay assertions, and `runtime_tui_smoke.ps1` remained green. Unix
 automation is syntax-checked only. Cost/duration accounting, observer-order
 receipts, and a canonical conditional-variable environment remain incomplete
 and are reported as unknown rather than inferred.
+
+## Phase 7 component-selection result
+
+Completed 2026-07-28 on Windows. Runtime logic exposes the component catalog,
+owns override selection and exact restart comparison, and delegates profile
+normalization to the session-style SDK. Runtime data recompiles the transformed
+manifest through the ordinary validator; the resulting manifest, compiled
+descriptor, content hash, and cache key are retained in the immutable session
+binding. CLI `session create --memory/--compaction` and the TUI
+`/memory`, `/compaction`, and extended `/new` path carry layer-owned values.
+
+`runtime_style_registry.ps1` proves a SQLite/sliding binding remains compatible
+and executable after daemon restart. `runtime_tui_smoke.ps1` proves both CLI
+and four-layer TUI selection reach durable bindings. SDK, integration, CLI, TUI,
+strict Clippy, and Unix syntax checks pass. Unix process scripts remain
+unexecuted evidence.
 
 ## Phase 1 proof obligations
 

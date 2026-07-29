@@ -6,6 +6,7 @@
 mod builtins;
 mod model;
 mod parsing;
+mod selection;
 mod validation;
 
 pub use builtins::{built_in_manifest, built_in_manifest_for_version, declarative_graph_manifest};
@@ -19,6 +20,7 @@ pub use model::{
     TerminationPolicy, TopLevelSelection,
 };
 pub use parsing::{ManifestFormat, ManifestParseError, parse_json, parse_toml, to_json, to_toml};
+pub use selection::{ComponentSelectionError, select_compaction_strategy, select_memory_provider};
 pub use validation::{
     CURRENT_STYLE_SCHEMA_VERSION, CompileContext, CompiledSessionStyle, Diagnostic,
     DiagnosticSeverity, StyleCacheKey, StyleCompileError, StyleCompilerLimits, compile_style,

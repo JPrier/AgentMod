@@ -38,6 +38,8 @@ pub enum RuntimeRequest {
         /// Stable harness registry ID.
         id: String,
     },
+    /// List memory and compaction components available for session binding.
+    ListSessionComponents,
     /// Create a durable session.
     CreateSession {
         /// User-supplied workspace text, validated by service and logic.
@@ -47,6 +49,12 @@ pub enum RuntimeRequest {
         /// Optional per-session harness override.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         harness: Option<String>,
+        /// Optional per-session memory-provider override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory: Option<String>,
+        /// Optional per-session compaction-strategy override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction: Option<String>,
     },
     /// List sessions without loading their conversations.
     ListSessions {
@@ -244,6 +252,13 @@ pub enum RuntimeResponse {
     HarnessInspected {
         /// Selected harness.
         harness: RuntimeHarnessDescriptor,
+    },
+    /// Available style-selectable runtime components.
+    SessionComponents {
+        /// Memory provider IDs.
+        memory_providers: Vec<String>,
+        /// Compaction strategy IDs.
+        compaction_strategies: Vec<String>,
     },
     /// Session was durably created.
     SessionCreated {
@@ -738,6 +753,41 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn session_component_selections_are_optional_and_round_trip_when_present() {
+        let legacy: RuntimeRequest = serde_json::from_value(serde_json::json!({
+            "operation": "create_session",
+            "arguments": {
+                "workspace": ".",
+                "style": "persistent-chat"
+            }
+        }))
+        .expect("legacy create request");
+        assert!(matches!(
+            legacy,
+            RuntimeRequest::CreateSession {
+                memory: None,
+                compaction: None,
+                ..
+            }
+        ));
+
+        let selected = RuntimeRequest::CreateSession {
+            workspace: String::from("."),
+            style: String::from("ephemeral-turn"),
+            harness: Some(String::from("native")),
+            memory: Some(String::from("sqlite-fts")),
+            compaction: Some(String::from("sliding_window")),
+        };
+        let encoded = serde_json::to_value(&selected).expect("encode");
+        assert_eq!(encoded["arguments"]["memory"], "sqlite-fts");
+        assert_eq!(encoded["arguments"]["compaction"], "sliding_window");
+        assert_eq!(
+            serde_json::from_value::<RuntimeRequest>(encoded).expect("decode"),
+            selected
+        );
     }
 
     #[test]

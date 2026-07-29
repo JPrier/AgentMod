@@ -65,6 +65,13 @@ pub struct HarnessDataRecord {
     pub availability: String,
 }
 
+/// Data-owned style-selectable component catalog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionComponentDataRecord {
+    pub memory_providers: Vec<String>,
+    pub compaction_strategies: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionDataRecord {
     pub id: SessionId,
@@ -168,6 +175,12 @@ pub trait TuiDataPort {
     fn list_harnesses(&self) -> Result<Vec<HarnessDataRecord>, TuiDataError> {
         Ok(Vec::new())
     }
+    fn list_session_components(&self) -> Result<SessionComponentDataRecord, TuiDataError> {
+        Ok(SessionComponentDataRecord {
+            memory_providers: Vec::new(),
+            compaction_strategies: Vec::new(),
+        })
+    }
     fn list_sessions(&self, limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError>;
     fn inspect_session(&self, _session_id: SessionId) -> Result<Value, TuiDataError> {
         Ok(Value::Null)
@@ -181,6 +194,17 @@ pub trait TuiDataPort {
     ) -> Result<SessionId, TuiDataError> {
         let _ = harness;
         self.create_session(workspace, style)
+    }
+    fn create_session_with_components(
+        &self,
+        workspace: String,
+        style: String,
+        harness: Option<String>,
+        memory: Option<String>,
+        compaction: Option<String>,
+    ) -> Result<SessionId, TuiDataError> {
+        let _ = (memory, compaction);
+        self.create_session_with_harness(workspace, style, harness)
     }
     fn branch_session(
         &self,
@@ -291,6 +315,16 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
             .map_err(map_error)
     }
 
+    fn list_session_components(&self) -> Result<SessionComponentDataRecord, TuiDataError> {
+        self.dependency
+            .list_session_components()
+            .map(|value| SessionComponentDataRecord {
+                memory_providers: value.memory_providers,
+                compaction_strategies: value.compaction_strategies,
+            })
+            .map_err(map_error)
+    }
+
     fn list_sessions(&self, limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError> {
         self.dependency
             .list_sessions(limit)
@@ -329,6 +363,19 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
     ) -> Result<SessionId, TuiDataError> {
         self.dependency
             .create_session_with_harness(workspace, style, harness)
+            .map_err(map_error)
+    }
+
+    fn create_session_with_components(
+        &self,
+        workspace: String,
+        style: String,
+        harness: Option<String>,
+        memory: Option<String>,
+        compaction: Option<String>,
+    ) -> Result<SessionId, TuiDataError> {
+        self.dependency
+            .create_session_with_components(workspace, style, harness, memory, compaction)
             .map_err(map_error)
     }
 

@@ -30,7 +30,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
-const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 2);
+const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 3);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyRuntimeHealth {
@@ -78,6 +78,13 @@ pub struct DependencyHarnessDescriptor {
     pub capabilities: Vec<String>,
     pub capability_set_hash: String,
     pub availability: String,
+}
+
+/// Dependency-owned style-selectable component catalog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencySessionComponentCatalog {
+    pub memory_providers: Vec<String>,
+    pub compaction_strategies: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -183,6 +190,14 @@ pub trait TuiRuntimeDependencyPort: Send + Sync {
     fn list_harnesses(&self) -> Result<Vec<DependencyHarnessDescriptor>, TuiDependencyError> {
         Ok(Vec::new())
     }
+    fn list_session_components(
+        &self,
+    ) -> Result<DependencySessionComponentCatalog, TuiDependencyError> {
+        Ok(DependencySessionComponentCatalog {
+            memory_providers: Vec::new(),
+            compaction_strategies: Vec::new(),
+        })
+    }
     fn list_sessions(
         &self,
         limit: u32,
@@ -202,6 +217,17 @@ pub trait TuiRuntimeDependencyPort: Send + Sync {
         _harness: Option<String>,
     ) -> Result<SessionId, TuiDependencyError> {
         self.create_session(workspace, style)
+    }
+    fn create_session_with_components(
+        &self,
+        workspace: String,
+        style: String,
+        harness: Option<String>,
+        memory: Option<String>,
+        compaction: Option<String>,
+    ) -> Result<SessionId, TuiDependencyError> {
+        let _ = (memory, compaction);
+        self.create_session_with_harness(workspace, style, harness)
     }
     fn branch_session(
         &self,
@@ -572,6 +598,22 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
             .collect())
     }
 
+    fn list_session_components(
+        &self,
+    ) -> Result<DependencySessionComponentCatalog, TuiDependencyError> {
+        let RuntimeResponse::SessionComponents {
+            memory_providers,
+            compaction_strategies,
+        } = self.send(RuntimeRequest::ListSessionComponents)?
+        else {
+            return Err(TuiDependencyError::UnexpectedResponse);
+        };
+        Ok(DependencySessionComponentCatalog {
+            memory_providers,
+            compaction_strategies,
+        })
+    }
+
     fn list_sessions(
         &self,
         limit: u32,
@@ -615,6 +657,8 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
                 workspace,
                 style,
                 harness: None,
+                memory: None,
+                compaction: None,
             })?
         else {
             return Err(TuiDependencyError::UnexpectedResponse);
@@ -633,6 +677,30 @@ impl TuiRuntimeDependencyPort for LocalRuntimeDependency {
                 workspace,
                 style,
                 harness,
+                memory: None,
+                compaction: None,
+            })?
+        else {
+            return Err(TuiDependencyError::UnexpectedResponse);
+        };
+        Ok(session_id)
+    }
+
+    fn create_session_with_components(
+        &self,
+        workspace: String,
+        style: String,
+        harness: Option<String>,
+        memory: Option<String>,
+        compaction: Option<String>,
+    ) -> Result<SessionId, TuiDependencyError> {
+        let RuntimeResponse::SessionCreated { session_id } =
+            self.send(RuntimeRequest::CreateSession {
+                workspace,
+                style,
+                harness,
+                memory,
+                compaction,
             })?
         else {
             return Err(TuiDependencyError::UnexpectedResponse);

@@ -547,7 +547,7 @@ fn graph_line(label: &str, value: String) -> Line<'static> {
 
 fn render_styles(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
     let selected = state.active_style();
-    let lines = if state.styles.is_empty() {
+    let mut lines = if state.styles.is_empty() {
         vec![Line::from("No styles returned by the runtime.")]
     } else {
         state
@@ -585,9 +585,34 @@ fn render_styles(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
             })
             .collect()
     };
+    lines.extend([
+        Line::default(),
+        Line::from(Span::styled(
+            format!(
+                "Memory     selected={} · available={}",
+                state.selected_memory.as_deref().unwrap_or("style-default"),
+                state.memory_providers.join(",")
+            ),
+            Style::new().fg(Color::Green),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "Compaction selected={} · available={}",
+                state
+                    .selected_compaction
+                    .as_deref()
+                    .unwrap_or("style-default"),
+                state.compaction_strategies.join(",")
+            ),
+            Style::new().fg(Color::Green),
+        )),
+    ]);
     frame.render_widget(
         Paragraph::new(lines)
-            .block(Block::bordered().title(" Style catalog · /style <id[@version]> "))
+            .block(
+                Block::bordered()
+                    .title(" Style catalog/components · /style · /memory · /compaction "),
+            )
             .wrap(Wrap { trim: true }),
         area,
     );
@@ -645,9 +670,12 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Line::from("Ctrl+C cancel active generation · Ctrl+Q or Esc quit"),
             Line::default(),
             Line::from(
-                "/new [workspace] [style] [harness]  /sessions  /styles  /style <id[@version]>",
+                "/new [workspace] [style] [harness] [memory] [compaction]  /sessions  /styles",
             ),
             Line::from("/harnesses  /harness <id>  /branch <sequence> [style]"),
+            Line::from(
+                "/style <id[@version]>  /memory <id|style-default>  /compaction <id|style-default>",
+            ),
             Line::from(
                 "/model <id>  /provider <id>  /chat  /events  /context  /graph  /help  /cancel",
             ),
@@ -861,6 +889,10 @@ mod tests {
         let mut state = TuiState::default();
         state.view = View::Styles;
         state.selected_style = Some(String::from("focused@1.0.0"));
+        state.memory_providers = vec![String::from("none"), String::from("sqlite-fts")];
+        state.selected_memory = Some(String::from("sqlite-fts"));
+        state.compaction_strategies = vec![String::from("none"), String::from("sliding_window")];
+        state.selected_compaction = Some(String::from("sliding_window"));
         state.styles.push(StyleSummary {
             id: String::from("focused"),
             version: String::from("1.0.0"),
@@ -884,6 +916,8 @@ mod tests {
         assert!(screen.contains("Style catalog"));
         assert!(screen.contains("focused@1.0.0"));
         assert!(screen.contains("content-hash"));
+        assert!(screen.contains("selected=sqlite-fts"));
+        assert!(screen.contains("selected=sliding_window"));
     }
 
     #[test]

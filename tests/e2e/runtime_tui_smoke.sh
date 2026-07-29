@@ -60,4 +60,22 @@ grep -q '"id":"ephemeral-turn"' <<<"$branch_inspection"
 grep -q "\"parent_session_id\":\"$session_id\"" <<<"$branch_inspection"
 grep -q "\"head_sequence\":$parent_head" <<<"$parent_after"
 grep -q '"id":"persistent-chat"' <<<"$parent_after"
-echo "runtime TUI smoke/branch E2E passed"
+component_smoke="$("$repository/target/debug/agentmod-tui" --smoke-command \
+  "/new . ephemeral-turn native sqlite-fts sliding_window")"
+component_id="$(printf '%s' "$component_smoke" |
+  sed -n 's/.*selected=\([0-9a-f-]*\).*/\1/p')"
+test -n "$component_id"
+component_inspection="$("$repository/target/debug/agentmod" session inspect \
+  "$component_id" --json)"
+grep -q '"provider":"sqlite-fts"' <<<"$component_inspection"
+grep -q '"strategy":"sliding_window"' <<<"$component_inspection"
+cli_selected="$("$repository/target/debug/agentmod" session create \
+  --workspace "$run_root" --style ephemeral-turn --memory file \
+  --compaction tool_output_eviction --json)"
+cli_selected_id="$(printf '%s' "$cli_selected" |
+  sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')"
+cli_inspection="$("$repository/target/debug/agentmod" session inspect \
+  "$cli_selected_id" --json)"
+grep -q '"provider":"file"' <<<"$cli_inspection"
+grep -q '"strategy":"tool_output_eviction"' <<<"$cli_inspection"
+echo "runtime TUI smoke/branch/component-selection E2E passed"

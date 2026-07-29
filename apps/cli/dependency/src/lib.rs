@@ -33,7 +33,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
-const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 2);
+const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 3);
 const MAX_STYLE_MANIFEST_BYTES: u64 = 1_048_576;
 
 /// Dependency-owned style manifest format.
@@ -148,6 +148,10 @@ pub struct DependencyCreateSessionRequest {
     pub style: String,
     /// Optional harness override.
     pub harness: Option<String>,
+    /// Optional memory-provider override.
+    pub memory: Option<String>,
+    /// Optional compaction-strategy override.
+    pub compaction: Option<String>,
 }
 
 /// Dependency-owned create-session response.
@@ -679,6 +683,8 @@ impl CliDependencyPort for DeterministicRuntimeClient {
             workspace: request.workspace,
             style: request.style,
             harness: request.harness,
+            memory: request.memory,
+            compaction: request.compaction,
         })?;
         let RuntimeResponse::SessionCreated { session_id } = response else {
             return Err(DependencyError::UnexpectedRuntimeResponse);
@@ -1181,6 +1187,8 @@ impl CliDependencyPort for LocalRuntimeClient {
                 workspace: request.workspace,
                 style: request.style,
                 harness: request.harness,
+                memory: request.memory,
+                compaction: request.compaction,
             })?
         else {
             return Err(DependencyError::UnexpectedRuntimeResponse);

@@ -26,6 +26,12 @@ termination. Refreshes occur at selection and material turn lifecycle
 boundaries; the frontend never interprets the compiled graph or opens runtime
 storage itself.
 
+The Styles view also reads the runtime component catalog and exposes
+`/memory <id|style-default>` and `/compaction <id|style-default>` selectors.
+`/new` sends those selections with style and harness through layer-owned
+requests; the runtime performs SDK compilation and compatibility checks. The
+frontend does not synthesize component profiles.
+
 `ratatui::run` owns raw-mode setup and restoration. Crossterm polling and reads
 remain on the terminal thread. Runtime streaming uses a bounded worker channel
 so terminal input remains responsive and runtime credit is returned only after
@@ -35,8 +41,9 @@ each bounded frame is accepted.
 listing without entering raw-terminal mode. `--smoke-turn <prompt>` additionally
 proves committed streaming and credit-window handling.
 `--smoke-command "/branch <sequence> [style]"` traverses the same command
-palette and atomic branch path. These modes exist for installation and CI
-transport diagnostics.
+palette and atomic branch path. It also covers component-selected `/new`
+commands in process E2Es. These modes exist for installation and CI transport
+diagnostics.
 
 Current limitations:
 

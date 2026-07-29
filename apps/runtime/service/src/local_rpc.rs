@@ -104,7 +104,7 @@ where
 }
 
 /// Runtime protocol version accepted by this service.
-pub const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 2);
+pub const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 3);
 
 /// Local endpoint configuration supplied by the composition root.
 #[derive(Clone, Debug)]

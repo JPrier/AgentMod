@@ -317,6 +317,12 @@ pub enum SessionCommand {
         /// Explicit harness registry ID.
         #[arg(long)]
         harness: Option<String>,
+        /// Explicit memory provider ID.
+        #[arg(long)]
+        memory: Option<String>,
+        /// Explicit compaction strategy ID.
+        #[arg(long)]
+        compaction: Option<String>,
         /// Emit JSON.
         #[arg(long)]
         json: bool,
@@ -658,8 +664,10 @@ where
                     workspace,
                     style,
                     harness,
+                    memory,
+                    compaction,
                     json,
-                } => self.create_session(workspace, style, harness, json),
+                } => self.create_session(workspace, style, harness, memory, compaction, json),
                 SessionCommand::List { limit, json } => self.list_sessions(limit, json),
                 SessionCommand::Inspect { session, at, json } => {
                     self.inspect_session(&session, at, false, json)
@@ -1335,6 +1343,8 @@ where
         workspace: String,
         style: String,
         harness: Option<String>,
+        memory: Option<String>,
+        compaction: Option<String>,
         json: bool,
     ) -> Result<ServiceCommandResponse, ServiceError> {
         let result = self
@@ -1343,6 +1353,8 @@ where
                 workspace,
                 style,
                 harness,
+                memory,
+                compaction,
             })
             .map_err(|error| ServiceError::Logic {
                 detail: error.to_string(),
@@ -2162,6 +2174,7 @@ mod tests {
         state: DoctorState,
         successful: bool,
         observed: RefCell<Vec<RunDoctorCommand>>,
+        observed_create: RefCell<Vec<CreateSessionCommand>>,
         observed_schedules: RefCell<Vec<LogicScheduleCommand>>,
         observed_deferred: RefCell<Vec<DeferredScheduleCommand>>,
     }
@@ -2182,8 +2195,9 @@ mod tests {
 
         fn create_session(
             &self,
-            _command: CreateSessionCommand,
+            command: CreateSessionCommand,
         ) -> Result<CreateSessionResult, LogicError> {
+            self.observed_create.borrow_mut().push(command);
             Ok(CreateSessionResult {
                 session_id: SessionId::from_uuid(Uuid::from_u128(1)),
             })
@@ -2307,6 +2321,7 @@ mod tests {
                 state,
                 successful,
                 observed: RefCell::new(Vec::new()),
+                observed_create: RefCell::new(Vec::new()),
                 observed_schedules: RefCell::new(Vec::new()),
                 observed_deferred: RefCell::new(Vec::new()),
             },
@@ -2364,9 +2379,28 @@ mod tests {
     fn session_create_and_list_render_stable_json() {
         let service = service(DoctorState::Ready, true);
         let created = service
-            .run_from(["agentmod", "session", "create", "--json"])
+            .run_from([
+                "agentmod",
+                "session",
+                "create",
+                "--memory",
+                "sqlite-fts",
+                "--compaction",
+                "sliding_window",
+                "--json",
+            ])
             .expect("create");
         assert!(created.output.contains("session_create"));
+        assert_eq!(
+            service.logic.observed_create.borrow()[0],
+            CreateSessionCommand {
+                workspace: String::from("."),
+                style: String::from("persistent-chat"),
+                harness: None,
+                memory: Some(String::from("sqlite-fts")),
+                compaction: Some(String::from("sliding_window")),
+            }
+        );
         let listed = service
             .run_from(["agentmod", "session", "list", "--json"])
             .expect("list");

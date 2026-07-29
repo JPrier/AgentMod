@@ -133,6 +133,10 @@ pub struct TuiState {
     pub selected_style: Option<String>,
     pub harnesses: Vec<HarnessSummary>,
     pub selected_harness: String,
+    pub memory_providers: Vec<String>,
+    pub selected_memory: Option<String>,
+    pub compaction_strategies: Vec<String>,
+    pub selected_compaction: Option<String>,
     pub default_style: String,
     pub selected_session: Option<usize>,
     pub transcript: Vec<TranscriptEntry>,
@@ -164,6 +168,10 @@ impl Default for TuiState {
             selected_style: None,
             harnesses: Vec::new(),
             selected_harness: String::from("native"),
+            memory_providers: Vec::new(),
+            selected_memory: None,
+            compaction_strategies: Vec::new(),
+            selected_compaction: None,
             default_style: String::from("persistent-chat"),
             selected_session: None,
             transcript: Vec::new(),
@@ -213,6 +221,7 @@ pub trait TuiLogicPort {
     fn refresh_sessions(&mut self) -> Result<(), TuiLogicError>;
     fn refresh_styles(&mut self) -> Result<(), TuiLogicError>;
     fn refresh_harnesses(&mut self) -> Result<(), TuiLogicError>;
+    fn refresh_session_components(&mut self) -> Result<(), TuiLogicError>;
     fn select_relative(&mut self, delta: i32) -> Result<(), TuiLogicError>;
     fn submit_editor(&mut self) -> Result<(), TuiLogicError>;
     fn poll_runtime(&mut self) -> Result<(), TuiLogicError>;
@@ -260,6 +269,7 @@ impl<D: TuiDataPort> TuiLogicPort for TuiLogic<D> {
         };
         self.refresh_styles()?;
         self.refresh_harnesses()?;
+        self.refresh_session_components()?;
         self.refresh_sessions()
     }
 
@@ -308,6 +318,29 @@ impl<D: TuiDataPort> TuiLogicPort for TuiLogic<D> {
                 .any(|harness| harness.id == self.state.selected_harness)
         {
             self.state.selected_harness = self.state.harnesses[0].id.clone();
+        }
+        Ok(())
+    }
+
+    fn refresh_session_components(&mut self) -> Result<(), TuiLogicError> {
+        let catalog = self.data.list_session_components().map_err(map_error)?;
+        self.state.memory_providers = catalog.memory_providers;
+        self.state.compaction_strategies = catalog.compaction_strategies;
+        if self
+            .state
+            .selected_memory
+            .as_ref()
+            .is_some_and(|id| !self.state.memory_providers.contains(id))
+        {
+            self.state.selected_memory = None;
+        }
+        if self
+            .state
+            .selected_compaction
+            .as_ref()
+            .is_some_and(|id| !self.state.compaction_strategies.contains(id))
+        {
+            self.state.selected_compaction = None;
         }
         Ok(())
     }
@@ -627,32 +660,113 @@ impl<D: TuiDataPort> TuiLogic<D> {
         Ok(())
     }
 
+    fn execute_new_command(
+        &mut self,
+        parts: &mut std::str::SplitWhitespace<'_>,
+    ) -> Result<(), TuiLogicError> {
+        let workspace = parts.next().unwrap_or(".").to_owned();
+        let style = parts
+            .next()
+            .map_or_else(|| self.state.active_style().to_owned(), ToOwned::to_owned);
+        let harness = parts
+            .next()
+            .map_or_else(|| self.state.selected_harness.clone(), ToOwned::to_owned);
+        let memory = parts
+            .next()
+            .map(ToOwned::to_owned)
+            .or_else(|| self.state.selected_memory.clone());
+        let compaction = parts
+            .next()
+            .map(ToOwned::to_owned)
+            .or_else(|| self.state.selected_compaction.clone());
+        if parts.next().is_some() {
+            return Err(TuiLogicError::InvalidCommand(String::from(
+                "/new [workspace] [style] [harness] [memory] [compaction]",
+            )));
+        }
+        let id = self
+            .data
+            .create_session_with_components(
+                workspace,
+                style.clone(),
+                Some(harness.clone()),
+                memory.clone(),
+                compaction.clone(),
+            )
+            .map_err(map_error)?;
+        self.refresh_sessions()?;
+        self.state.selected_session = self.state.sessions.iter().position(|value| value.id == id);
+        self.reload_selected_history()?;
+        self.state.status = format!(
+            "created session {id} with {style} on {harness}; memory={}; compaction={}",
+            memory.as_deref().unwrap_or("style-default"),
+            compaction.as_deref().unwrap_or("style-default")
+        );
+        Ok(())
+    }
+
+    fn execute_memory_command(
+        &mut self,
+        parts: &mut std::str::SplitWhitespace<'_>,
+    ) -> Result<(), TuiLogicError> {
+        let id = required_argument(parts.next(), "/memory <id|style-default>")?;
+        if parts.next().is_some() {
+            return Err(TuiLogicError::InvalidCommand(String::from(
+                "/memory <id|style-default>",
+            )));
+        }
+        if id == "style-default" {
+            self.state.selected_memory = None;
+        } else if self.state.memory_providers.contains(&id) {
+            self.state.selected_memory = Some(id);
+        } else {
+            return Err(TuiLogicError::InvalidCommand(format!(
+                "unknown memory provider {id}"
+            )));
+        }
+        self.state.status = format!(
+            "memory: {}",
+            self.state
+                .selected_memory
+                .as_deref()
+                .unwrap_or("style-default")
+        );
+        Ok(())
+    }
+
+    fn execute_compaction_command(
+        &mut self,
+        parts: &mut std::str::SplitWhitespace<'_>,
+    ) -> Result<(), TuiLogicError> {
+        let id = required_argument(parts.next(), "/compaction <id|style-default>")?;
+        if parts.next().is_some() {
+            return Err(TuiLogicError::InvalidCommand(String::from(
+                "/compaction <id|style-default>",
+            )));
+        }
+        if id == "style-default" {
+            self.state.selected_compaction = None;
+        } else if self.state.compaction_strategies.contains(&id) {
+            self.state.selected_compaction = Some(id);
+        } else {
+            return Err(TuiLogicError::InvalidCommand(format!(
+                "unknown compaction strategy {id}"
+            )));
+        }
+        self.state.status = format!(
+            "compaction: {}",
+            self.state
+                .selected_compaction
+                .as_deref()
+                .unwrap_or("style-default")
+        );
+        Ok(())
+    }
+
     fn execute_command(&mut self, input: &str) -> Result<(), TuiLogicError> {
         let mut parts = input.split_whitespace();
         match parts.next().unwrap_or_default() {
-            "/new" => {
-                let workspace = parts.next().unwrap_or(".").to_owned();
-                let style = parts
-                    .next()
-                    .map_or_else(|| self.state.active_style().to_owned(), ToOwned::to_owned);
-                let harness = parts
-                    .next()
-                    .map_or_else(|| self.state.selected_harness.clone(), ToOwned::to_owned);
-                if parts.next().is_some() {
-                    return Err(TuiLogicError::InvalidCommand(String::from(
-                        "/new [workspace] [style] [harness]",
-                    )));
-                }
-                let id = self
-                    .data
-                    .create_session_with_harness(workspace, style.clone(), Some(harness.clone()))
-                    .map_err(map_error)?;
-                self.refresh_sessions()?;
-                self.state.selected_session =
-                    self.state.sessions.iter().position(|value| value.id == id);
-                self.reload_selected_history()?;
-                self.state.status = format!("created session {id} with {style} on {harness}");
-            }
+            "/new" => self.execute_new_command(&mut parts)?,
             "/sessions" => self.refresh_sessions()?,
             "/styles" => {
                 self.refresh_styles()?;
@@ -686,6 +800,8 @@ impl<D: TuiDataPort> TuiLogic<D> {
                 self.state.selected_harness.clone_from(&id);
                 self.state.status = format!("harness: {id}");
             }
+            "/memory" => self.execute_memory_command(&mut parts)?,
+            "/compaction" => self.execute_compaction_command(&mut parts)?,
             "/style" => {
                 let selector = required_argument(parts.next(), "/style <id[@version]>")?;
                 if parts.next().is_some() {
@@ -962,17 +1078,26 @@ mod tests {
     use agentmod_primitives::{CancellationId, SessionId};
     use agentmod_tui_data::{
         BranchSessionDataRecord, BranchSessionDataRequest, HarnessDataRecord,
-        RuntimeHealthDataRecord, SessionDataRecord, SessionEventDataRecord,
-        SessionEventPageDataRecord, TurnDataEvent, TurnDataStream,
+        RuntimeHealthDataRecord, SessionComponentDataRecord, SessionDataRecord,
+        SessionEventDataRecord, SessionEventPageDataRecord, TurnDataEvent, TurnDataStream,
     };
     use serde_json::json;
     use uuid::Uuid;
 
     use super::*;
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct CreatedSessionSelection {
+        workspace: String,
+        style: String,
+        harness: Option<String>,
+        memory: Option<String>,
+        compaction: Option<String>,
+    }
+
     #[derive(Default)]
     struct FixtureData {
-        created: RefCell<Vec<(String, String, Option<String>)>>,
+        created: RefCell<Vec<CreatedSessionSelection>>,
         branched: RefCell<Vec<BranchSessionDataRequest>>,
     }
 
@@ -1009,6 +1134,17 @@ mod tests {
             }])
         }
 
+        fn list_session_components(&self) -> Result<SessionComponentDataRecord, TuiDataError> {
+            Ok(SessionComponentDataRecord {
+                memory_providers: vec![
+                    String::from("none"),
+                    String::from("file"),
+                    String::from("sqlite-fts"),
+                ],
+                compaction_strategies: vec![String::from("none"), String::from("sliding_window")],
+            })
+        }
+
         fn list_sessions(&self, _limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError> {
             let mut sessions = vec![SessionDataRecord {
                 id: SessionId::from_uuid(Uuid::nil()),
@@ -1034,7 +1170,13 @@ mod tests {
             workspace: String,
             style: String,
         ) -> Result<SessionId, TuiDataError> {
-            self.created.borrow_mut().push((workspace, style, None));
+            self.created.borrow_mut().push(CreatedSessionSelection {
+                workspace,
+                style,
+                harness: None,
+                memory: None,
+                compaction: None,
+            });
             Ok(SessionId::from_uuid(Uuid::from_u128(2)))
         }
 
@@ -1044,7 +1186,31 @@ mod tests {
             style: String,
             harness: Option<String>,
         ) -> Result<SessionId, TuiDataError> {
-            self.created.borrow_mut().push((workspace, style, harness));
+            self.created.borrow_mut().push(CreatedSessionSelection {
+                workspace,
+                style,
+                harness,
+                memory: None,
+                compaction: None,
+            });
+            Ok(SessionId::from_uuid(Uuid::from_u128(2)))
+        }
+
+        fn create_session_with_components(
+            &self,
+            workspace: String,
+            style: String,
+            harness: Option<String>,
+            memory: Option<String>,
+            compaction: Option<String>,
+        ) -> Result<SessionId, TuiDataError> {
+            self.created.borrow_mut().push(CreatedSessionSelection {
+                workspace,
+                style,
+                harness,
+                memory,
+                compaction,
+            });
             Ok(SessionId::from_uuid(Uuid::from_u128(2)))
         }
 
@@ -1160,6 +1326,10 @@ mod tests {
         logic.submit_editor().expect("select style");
         logic.insert_text("/harness fixture");
         logic.submit_editor().expect("select harness");
+        logic.insert_text("/memory sqlite-fts");
+        logic.submit_editor().expect("select memory");
+        logic.insert_text("/compaction sliding_window");
+        logic.submit_editor().expect("select compaction");
         logic.insert_text("/new workspace");
         logic.submit_editor().expect("create session");
 
@@ -1169,11 +1339,13 @@ mod tests {
         );
         assert_eq!(
             logic.data.created.into_inner(),
-            vec![(
-                String::from("workspace"),
-                String::from("focused@1.0.0"),
-                Some(String::from("fixture"))
-            )]
+            vec![CreatedSessionSelection {
+                workspace: String::from("workspace"),
+                style: String::from("focused@1.0.0"),
+                harness: Some(String::from("fixture")),
+                memory: Some(String::from("sqlite-fts")),
+                compaction: Some(String::from("sliding_window")),
+            }]
         );
     }
 

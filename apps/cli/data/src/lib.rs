@@ -137,6 +137,10 @@ pub struct CreateSessionDataRequest {
     pub style: String,
     /// Optional harness override.
     pub harness: Option<String>,
+    /// Optional memory-provider override.
+    pub memory: Option<String>,
+    /// Optional compaction-strategy override.
+    pub compaction: Option<String>,
 }
 
 /// Data-owned create result.
@@ -704,6 +708,8 @@ where
                 workspace: request.workspace,
                 style: request.style,
                 harness: request.harness,
+                memory: request.memory,
+                compaction: request.compaction,
             })
             .map(|response| CreateSessionDataRecord {
                 session_id: response.session_id,

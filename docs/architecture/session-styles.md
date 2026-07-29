@@ -16,6 +16,15 @@ diagnostics; and stores compiled styles in memory and in a persistent cache.
 Validation and graph compilation remain owned by `agentmod-session-style-sdk`
 and `agentmod-graph-engine`.
 
+Session creation may explicitly select a memory provider or compaction strategy.
+The SDK owns the manifest transform, including safe disabled/enabled lifecycle
+controls; runtime data recompiles the transformed manifest through the ordinary
+SDK validator. Logic restores the original source identity and binds the new
+manifest, compiled descriptor, content hash, and cache key. Restart resolves
+the exact base style, reapplies only the retained memory/compaction selections,
+recompiles, and compares the complete binding. Invalid or unavailable
+components return SDK-derived diagnostics and are never silently replaced.
+
 The generic style executor consumes the compiled SDK graph. It records
 initialization, node entry, node completion or failure, and selected transitions
 as canonical events and reconstructs its active node from replay.

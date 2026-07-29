@@ -86,7 +86,31 @@ try {
         $parentAfterBranch.state.style_binding.id -ne "persistent-chat") {
         throw "TUI branch did not preserve the parent and select the child style"
     }
-    Write-Output "runtime TUI smoke/branch E2E passed"
+    $componentSmoke = & $tui --smoke-command (
+        "/new . ephemeral-turn native sqlite-fts sliding_window"
+    )
+    if ($LASTEXITCODE -ne 0 -or
+        $componentSmoke -notmatch "selected=([0-9a-f-]+)") {
+        throw "TUI component-selected creation failed: $componentSmoke"
+    }
+    $componentSession = & $cli session inspect $Matches[1] --json |
+        ConvertFrom-Json
+    if ($componentSession.state.style_binding.memory.provider -ne "sqlite-fts" -or
+        $componentSession.state.style_binding.compaction.strategy -ne
+            "sliding_window") {
+        throw "TUI component selections did not reach the immutable binding"
+    }
+    $cliSelected = & $cli session create --workspace $runRoot `
+        --style ephemeral-turn --memory file `
+        --compaction tool_output_eviction --json | ConvertFrom-Json
+    $cliInspection = & $cli session inspect $cliSelected.session_id --json |
+        ConvertFrom-Json
+    if ($cliInspection.state.style_binding.memory.provider -ne "file" -or
+        $cliInspection.state.style_binding.compaction.strategy -ne
+            "tool_output_eviction") {
+        throw "CLI component selections did not reach the immutable binding"
+    }
+    Write-Output "runtime TUI smoke/branch/component-selection E2E passed"
 }
 finally {
     if ($null -ne $daemon -and -not $daemon.HasExited) {

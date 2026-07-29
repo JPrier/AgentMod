@@ -55,12 +55,19 @@ ephemeral=$("$cli" session create --workspace "$repository" \
     --style ephemeral-turn@1.1.0 --json)
 ephemeral_id=$(printf '%s' "$ephemeral" |
     sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
+selected=$("$cli" session create --workspace "$repository" \
+    --style ephemeral-turn@1.1.0 --memory sqlite-fts \
+    --compaction sliding_window --json)
+selected_id=$(printf '%s' "$selected" |
+    sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')
 test -n "$persistent_id"
 test -n "$ephemeral_id"
+test -n "$selected_id"
 
 for pair in \
     "$persistent_id:persistent-chat:1.1.0" \
-    "$ephemeral_id:ephemeral-turn:1.1.0"
+    "$ephemeral_id:ephemeral-turn:1.1.0" \
+    "$selected_id:ephemeral-turn:1.1.0"
 do
     session_id=${pair%%:*}
     remainder=${pair#*:}
@@ -72,6 +79,9 @@ do
     printf '%s' "$inspected" | grep -F '"harness":"native"' >/dev/null
     printf '%s' "$inspected" | grep -F '"style_compatibility":{"status":"compatible"}' >/dev/null
 done
+selected_inspection=$("$cli" session inspect "$selected_id" --json)
+printf '%s' "$selected_inspection" | grep -F '"provider":"sqlite-fts"' >/dev/null
+printf '%s' "$selected_inspection" | grep -F '"strategy":"sliding_window"' >/dev/null
 
 persistent_before=$("$cli" run "persistent before restart" --session "$persistent_id" \
     --option 'mock_scenario="streaming_text"' \
@@ -93,10 +103,16 @@ test "$ephemeral_before_sequence" -eq \
 
 stop_runtime
 start_runtime
-for session_id in "$persistent_id" "$ephemeral_id"; do
+for session_id in "$persistent_id" "$ephemeral_id" "$selected_id"; do
     "$cli" session inspect "$session_id" --json |
         grep -F '"style_compatibility":{"status":"compatible"}' >/dev/null
 done
+selected_after_restart=$("$cli" session inspect "$selected_id" --json)
+printf '%s' "$selected_after_restart" | grep -F '"provider":"sqlite-fts"' >/dev/null
+printf '%s' "$selected_after_restart" | grep -F '"strategy":"sliding_window"' >/dev/null
+"$cli" run "selected components after restart" --session "$selected_id" \
+    --option 'mock_scenario="streaming_text"' \
+    --option 'mock_text="selected-after"' --json >/dev/null
 persistent_after=$("$cli" run "persistent after restart" --session "$persistent_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="persistent-after"' --json)

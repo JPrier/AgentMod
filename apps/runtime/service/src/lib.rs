@@ -29,7 +29,8 @@ use agentmod_runtime_logic::{
         ScheduledExecution, UpsertScheduleCommand,
     },
     style::{
-        InspectStyleCommand, ListStylesCommand, SelectStyleHarnessCommand, SessionStyleLogicError,
+        InspectStyleCommand, ListStyleComponentsCommand, ListStylesCommand,
+        SelectStyleComponentsCommand, SelectStyleHarnessCommand, SessionStyleLogicError,
         SessionStyleLogicPort, StyleAvailability, StyleDecisionCapability, StyleEnvironment,
         StyleHarnessDescriptor, StyleInspection, StyleManifestFormat, StyleSource, StyleSummary,
         ValidateStyleBindingCommand, ValidateStyleCommand,
@@ -396,15 +397,31 @@ where
                         .map_err(ServiceError::HarnessRegistry)?,
                 ),
             }),
+            RuntimeRequest::ListSessionComponents => {
+                let catalog = self
+                    .logic
+                    .list_style_components(ListStyleComponentsCommand {
+                        environment: self.style_environment(None),
+                    })
+                    .map_err(ServiceError::SessionStyle)?;
+                Ok(RuntimeResponse::SessionComponents {
+                    memory_providers: catalog.memory_providers,
+                    compaction_strategies: catalog.compaction_strategies,
+                })
+            }
             RuntimeRequest::CreateSession {
                 workspace,
                 style,
                 harness,
+                memory,
+                compaction,
             } => {
                 let service_request = ServiceCreateSessionRequest {
                     workspace: workspace.clone(),
                     style: style.clone(),
                     harness: harness.clone(),
+                    memory: memory.clone(),
+                    compaction: compaction.clone(),
                 };
                 let created = self.create_session(service_request)?;
                 Ok(RuntimeResponse::SessionCreated {
@@ -750,6 +767,17 @@ where
                 environment: self.style_environment(Some(&request.workspace)),
             })
             .map_err(ServiceError::SessionStyle)?;
+        if request.memory.is_some() || request.compaction.is_some() {
+            resolved = self
+                .logic
+                .select_style_components(SelectStyleComponentsCommand {
+                    binding: resolved.binding,
+                    memory: request.memory,
+                    compaction: request.compaction,
+                    environment: self.style_environment(Some(&request.workspace)),
+                })
+                .map_err(ServiceError::SessionStyle)?;
+        }
         if let Some(harness) = request.harness {
             resolved = self
                 .logic
@@ -1117,6 +1145,10 @@ pub struct ServiceCreateSessionRequest {
     pub style: String,
     /// Optional per-session harness override.
     pub harness: Option<String>,
+    /// Optional per-session memory-provider override.
+    pub memory: Option<String>,
+    /// Optional per-session compaction-strategy override.
+    pub compaction: Option<String>,
 }
 
 /// Service-owned create-session response.

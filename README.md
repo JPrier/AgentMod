@@ -44,7 +44,9 @@ cargo run -p agentmod-runtime -- serve
 # then, from another terminal:
 cargo run -p agentmod-cli -- style list
 cargo run -p agentmod-cli -- harness list
-cargo run -p agentmod-cli -- session create --workspace . --style persistent-chat --harness native --json
+cargo run -p agentmod-cli -- session create --workspace . \
+  --style persistent-chat --harness native \
+  --memory sqlite-fts --compaction sliding_window --json
 cargo run -p agentmod-cli -- run "hello" --session <id> --json
 ```
 

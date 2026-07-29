@@ -67,6 +67,8 @@ mod tests {
                 workspace: workspace.path().display().to_string(),
                 style: String::from("persistent-chat"),
                 harness: Some(String::from("native")),
+                memory: None,
+                compaction: None,
             })
             .expect("create through complete layer chain")
         else {
@@ -130,6 +132,8 @@ mod tests {
                     workspace: workspace.path().display().to_string(),
                     style: style.to_owned(),
                     harness: None,
+                    memory: None,
+                    compaction: None,
                 })
                 .expect("create style-bound session")
             else {
@@ -263,6 +267,8 @@ mod tests {
                 workspace: workspace.path().display().to_string(),
                 style: String::from("persistent-chat"),
                 harness: Some(String::from("fixture")),
+                memory: None,
+                compaction: None,
             })
             .expect("select compatible fixture harness")
         else {
@@ -290,6 +296,8 @@ mod tests {
                 workspace: workspace.path().display().to_string(),
                 style: String::from("fixture-harness-incompatible"),
                 harness: None,
+                memory: None,
+                compaction: None,
             })
             .expect_err("fixture cannot satisfy the style's image requirement");
         assert!(error.to_string().contains("images"), "{error}");
@@ -341,6 +349,8 @@ mod tests {
                 workspace: workspace.path().display().to_string(),
                 style: String::from("persistent-chat"),
                 harness: None,
+                memory: None,
+                compaction: None,
             })
             .expect("create parent")
         else {
@@ -396,6 +406,99 @@ mod tests {
             panic!("inspection response")
         };
         assert_eq!(head_sequence, agentmod_primitives::Sequence::FIRST);
+    }
+
+    #[test]
+    fn session_component_overrides_recompile_and_validate_the_exact_binding() {
+        let storage = tempfile::tempdir().expect("storage");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let config = RuntimeServiceConfig {
+            session_root: storage.path().join("sessions"),
+            version: String::from("test"),
+            styles: agentmod_runtime_service::RuntimeStyleServiceConfig::native(
+                &storage.path().join("sessions"),
+            ),
+        };
+        let service = RuntimeService::new(
+            RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
+            config.clone(),
+        );
+        let RuntimeResponse::SessionComponents {
+            memory_providers,
+            compaction_strategies,
+        } = service
+            .handle_wire(&RuntimeRequest::ListSessionComponents)
+            .expect("list components")
+        else {
+            panic!("component response")
+        };
+        assert!(memory_providers.contains(&String::from("sqlite-fts")));
+        assert!(compaction_strategies.contains(&String::from("sliding_window")));
+        let create = |memory, compaction| {
+            let RuntimeResponse::SessionCreated { session_id } = service
+                .handle_wire(&RuntimeRequest::CreateSession {
+                    workspace: workspace.path().display().to_string(),
+                    style: String::from("ephemeral-turn"),
+                    harness: None,
+                    memory,
+                    compaction,
+                })
+                .expect("create component-selected session")
+            else {
+                panic!("created response")
+            };
+            session_id
+        };
+        let default_id = create(None, None);
+        let selected_id = create(
+            Some(String::from("sqlite-fts")),
+            Some(String::from("sliding_window")),
+        );
+        let inspect = |session_id| {
+            let RuntimeResponse::SessionInspected { state, .. } = service
+                .handle_wire(&RuntimeRequest::InspectSession {
+                    session_id,
+                    at: None,
+                })
+                .expect("inspect")
+            else {
+                panic!("inspection response")
+            };
+            state
+        };
+        let default = inspect(default_id);
+        let selected = inspect(selected_id);
+        assert_eq!(default["style_binding"]["memory"]["provider"], "none");
+        assert_eq!(
+            selected["style_binding"]["memory"]["provider"],
+            "sqlite-fts"
+        );
+        assert_eq!(
+            selected["style_binding"]["compaction"]["strategy"],
+            "sliding_window"
+        );
+        assert_ne!(
+            selected["style_binding"]["compiled_cache_key"],
+            default["style_binding"]["compiled_cache_key"]
+        );
+
+        let restarted = RuntimeService::new(
+            RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
+            config,
+        );
+        restarted
+            .validate_session_style_compatibility(selected_id)
+            .expect("exact selected binding survives restart");
+        let error = restarted
+            .handle_wire(&RuntimeRequest::CreateSession {
+                workspace: workspace.path().display().to_string(),
+                style: String::from("ephemeral-turn"),
+                harness: None,
+                memory: Some(String::from("missing-memory")),
+                compaction: None,
+            })
+            .expect_err("unavailable memory must fail");
+        assert!(error.to_string().contains("STYLE017"), "{error}");
     }
 
     #[test]

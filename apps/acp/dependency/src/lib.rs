@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 2);
+const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 3);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencySession {
@@ -366,6 +366,8 @@ impl AcpRuntimeDependencyPort for LocalRuntimeDependency {
                 workspace,
                 style,
                 harness: None,
+                memory: None,
+                compaction: None,
             })
             .await?
         else {

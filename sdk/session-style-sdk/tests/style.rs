@@ -8,7 +8,8 @@ use agentmod_session_style_sdk::{
     BuiltInStyle, CompactionStrategy, CompileContext, CompiledSessionStyle, DecisionCapability,
     GraphSource, MemoryInjectionLocation, MemoryRetrievalTiming, MemoryWritePolicy,
     StyleCompilerLimits, built_in_manifest, built_in_manifest_for_version, compile_style,
-    compile_style_set, declarative_graph_manifest, parse_json, parse_toml, to_json, to_toml,
+    compile_style_set, declarative_graph_manifest, parse_json, parse_toml,
+    select_compaction_strategy, select_memory_provider, to_json, to_toml,
 };
 use proptest::prelude::*;
 
@@ -91,6 +92,42 @@ fn golden_toml_and_json_are_equivalent_and_round_trip() {
     assert_eq!(encoded_json.trim(), GOLDEN_JSON.trim());
     compile_style(&from_toml, &context(), StyleCompilerLimits::default())
         .expect("golden style compiles");
+}
+
+#[test]
+fn component_overrides_normalize_disabled_profiles_and_recompile_through_the_sdk() {
+    let mut manifest = built_in_manifest(BuiltInStyle::EphemeralTurn);
+    select_memory_provider(&mut manifest, "sqlite-fts");
+    select_compaction_strategy(&mut manifest, "sliding_window").expect("known strategy");
+    let mut runtime = context();
+    runtime.memory_providers.insert(String::from("sqlite-fts"));
+
+    let compiled = compile_style(&manifest, &runtime, StyleCompilerLimits::default())
+        .expect("normalized override");
+
+    assert_eq!(compiled.memory.provider, "sqlite-fts");
+    assert_eq!(
+        compiled.memory.retrieval_timing,
+        MemoryRetrievalTiming::TurnStart
+    );
+    assert_eq!(
+        compiled.memory.injection_location,
+        MemoryInjectionLocation::BeforeCurrentInput
+    );
+    assert_eq!(
+        compiled.compaction.strategy,
+        CompactionStrategy::SlidingWindow
+    );
+    assert!(compiled.compaction.trigger_tokens.is_some());
+
+    select_memory_provider(&mut manifest, "none");
+    select_compaction_strategy(&mut manifest, "none").expect("known strategy");
+    let disabled = compile_style(&manifest, &runtime, StyleCompilerLimits::default())
+        .expect("disabled override");
+    assert_eq!(disabled.memory.provider, "none");
+    assert_eq!(disabled.memory.max_items, 0);
+    assert_eq!(disabled.compaction.strategy, CompactionStrategy::None);
+    assert_eq!(disabled.compaction.trigger_tokens, None);
 }
 
 #[test]

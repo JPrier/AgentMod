@@ -27,10 +27,13 @@ negotiate a compatible major version and capability intersection. Frame kinds
 cover request/response, streams, cancellation, window updates, heartbeat, and
 errors.
 
-Served endpoints include health, durable session create/list/inspect/replay/
-branch, provider turns, cancellation, approval resolution, and bounded session
-event catch-up. Receiving service types translate runtime wire contracts before
-calling logic; logic reaches external state only through data and dependency.
+Served endpoints include health, style/harness/component discovery, durable
+session create/list/inspect/replay/branch, provider turns, cancellation,
+approval resolution, and bounded session event catch-up. Runtime protocol 2.3
+adds optional memory and compaction selections to session creation plus the
+component catalog used by frontends. Receiving service types translate runtime
+wire contracts before calling logic; logic reaches external state only through
+data and dependency.
 
 Runtime protocol 2.1 negotiates `credit_windows`. One nonterminal stream item is
 initially allowed; later items require a `WindowUpdate` bound to the original

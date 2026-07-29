@@ -153,6 +153,10 @@ pub struct CreateSessionCommand {
     pub style: String,
     /// Optional harness override.
     pub harness: Option<String>,
+    /// Optional memory-provider override.
+    pub memory: Option<String>,
+    /// Optional compaction-strategy override.
+    pub compaction: Option<String>,
 }
 
 /// Logic-owned create result.
@@ -743,6 +747,8 @@ where
                 workspace: command.workspace,
                 style: command.style,
                 harness: command.harness,
+                memory: command.memory,
+                compaction: command.compaction,
             })
             .map(|record| CreateSessionResult {
                 session_id: record.session_id,

@@ -14,7 +14,8 @@ agentmod style list [--json]
 agentmod style inspect <id-or-id@version> [--json]
 agentmod style validate <file> [--json]
 agentmod style compile <file> [--json]
-agentmod session create [--workspace <path>] [--style <id>] [--harness <id>] [--json]
+agentmod session create [--workspace <path>] [--style <id>] [--harness <id>]
+                        [--memory <id>] [--compaction <id>] [--json]
 agentmod session list [--limit <count>] [--json]
 agentmod session inspect <id> [--at <sequence>] [--json]
 agentmod session replay <id> [--at <sequence>] [--json]
@@ -44,6 +45,14 @@ workspace, `persistent-chat`, and the style-selected `native` harness. Use
 `harness list` and `harness inspect` to view adapter versions, availability,
 capabilities, and the exact capability-set hash. An explicit `--harness`
 override is accepted only when it satisfies the selected style.
+`--memory` and `--compaction` apply SDK-owned component transforms and compile a
+new immutable per-session binding. Omitting them retains the style defaults;
+invalid or unavailable selections fail with style diagnostics.
+
+The TUI Styles view lists runtime-advertised memory and compaction components.
+Use `/memory <id|style-default>` and
+`/compaction <id|style-default>` before `/new`, or pass both after the harness
+in `/new [workspace] [style] [harness] [memory] [compaction]`.
 
 The TUI command palette supports `/branch <sequence> [style]`. Omitting the
 style preserves the parent binding; providing one resolves and validates that

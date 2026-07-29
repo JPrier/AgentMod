@@ -8,10 +8,10 @@ use std::{
 use agentmod_primitives::ContentHash;
 use agentmod_runtime_data::style::{
     SessionStyleCatalogDataRequest, SessionStyleCatalogRecord, SessionStyleCatalogStatus,
-    SessionStyleDataError, SessionStyleDataPort, SessionStyleDecisionCapability,
-    SessionStyleDiagnostic as DataDiagnostic, SessionStyleEnvironment as DataEnvironment,
-    SessionStyleManifestFormat as DataManifestFormat, SessionStyleSourceKind as DataSourceKind,
-    SessionStyleValidationDataRequest,
+    SessionStyleComponentSelectionDataRequest, SessionStyleDataError, SessionStyleDataPort,
+    SessionStyleDecisionCapability, SessionStyleDiagnostic as DataDiagnostic,
+    SessionStyleEnvironment as DataEnvironment, SessionStyleManifestFormat as DataManifestFormat,
+    SessionStyleSourceKind as DataSourceKind, SessionStyleValidationDataRequest,
 };
 use semver::Version;
 use serde_json::Value;
@@ -180,6 +180,22 @@ pub struct ListStylesCommand {
     pub environment: StyleEnvironment,
 }
 
+/// Style-selectable component catalog command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListStyleComponentsCommand {
+    /// Explicit runtime environment.
+    pub environment: StyleEnvironment,
+}
+
+/// Logic-owned component catalog.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StyleComponentCatalog {
+    /// Available memory provider IDs.
+    pub memory_providers: Vec<String>,
+    /// Available compaction strategy IDs.
+    pub compaction_strategies: Vec<String>,
+}
+
 /// Inspect/resolve command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InspectStyleCommand {
@@ -227,6 +243,19 @@ pub struct SelectStyleHarnessCommand {
     pub environment: StyleEnvironment,
 }
 
+/// Explicit per-session memory and compaction selection command.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectStyleComponentsCommand {
+    /// Fully compiled base style binding.
+    pub binding: SessionStyleBinding,
+    /// Optional memory-provider override.
+    pub memory: Option<String>,
+    /// Optional compaction-strategy override.
+    pub compaction: Option<String>,
+    /// Current runtime compatibility environment.
+    pub environment: StyleEnvironment,
+}
+
 /// Narrow session-style logic boundary.
 pub trait SessionStyleLogicPort {
     /// Lists the live style catalog.
@@ -238,6 +267,19 @@ pub trait SessionStyleLogicPort {
         &self,
         command: ListStylesCommand,
     ) -> Result<Vec<StyleSummary>, SessionStyleLogicError>;
+
+    /// Lists validated runtime components eligible for style selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionStyleLogicError::InvalidData`] for malformed component
+    /// IDs in the runtime environment.
+    fn list_style_components(
+        &self,
+        _command: ListStyleComponentsCommand,
+    ) -> Result<StyleComponentCatalog, SessionStyleLogicError> {
+        Err(SessionStyleLogicError::InvalidData)
+    }
 
     /// Inspects one exact or highest-version style.
     ///
@@ -282,6 +324,19 @@ pub trait SessionStyleLogicPort {
         Err(SessionStyleLogicError::InvalidData)
     }
 
+    /// Recompiles a style after SDK-owned component selection transforms.
+    ///
+    /// # Errors
+    ///
+    /// Returns structured style diagnostics when the selected component
+    /// cannot produce a valid compiled style in the current environment.
+    fn select_style_components(
+        &self,
+        _command: SelectStyleComponentsCommand,
+    ) -> Result<ResolvedStyle, SessionStyleLogicError> {
+        Err(SessionStyleLogicError::InvalidData)
+    }
+
     /// Confirms that a persisted binding still resolves to the exact same
     /// compatible compiled style. No replacement or version fallback occurs.
     ///
@@ -299,6 +354,37 @@ impl<D> SessionStyleLogicPort for super::RuntimeLogic<D>
 where
     D: SessionStyleDataPort,
 {
+    fn list_style_components(
+        &self,
+        command: ListStyleComponentsCommand,
+    ) -> Result<StyleComponentCatalog, SessionStyleLogicError> {
+        let valid = command
+            .environment
+            .memory_providers
+            .iter()
+            .chain(command.environment.compaction_strategies.iter())
+            .all(|id| {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'-' | b'_' | b'.')
+                    })
+            });
+        if !valid {
+            return Err(SessionStyleLogicError::InvalidData);
+        }
+        Ok(StyleComponentCatalog {
+            memory_providers: command.environment.memory_providers.into_iter().collect(),
+            compaction_strategies: command
+                .environment
+                .compaction_strategies
+                .into_iter()
+                .collect(),
+        })
+    }
+
     fn list_styles(
         &self,
         command: ListStylesCommand,
@@ -370,10 +456,23 @@ where
         command: ValidateStyleBindingCommand,
     ) -> Result<(), SessionStyleLogicError> {
         let selector = format!("{}@{}", command.binding.id, command.binding.version);
-        let resolved = self.resolve_style(InspectStyleCommand {
+        let mut resolved = self.resolve_style(InspectStyleCommand {
             selector: selector.clone(),
             environment: command.environment.clone(),
         })?;
+        let memory = (resolved.binding.memory.provider != command.binding.memory.provider)
+            .then(|| command.binding.memory.provider.clone());
+        let compaction = (resolved.binding.compaction.strategy
+            != command.binding.compaction.strategy)
+            .then(|| command.binding.compaction.strategy.clone());
+        if memory.is_some() || compaction.is_some() {
+            resolved = self.select_style_components(SelectStyleComponentsCommand {
+                binding: resolved.binding,
+                memory,
+                compaction,
+                environment: command.environment.clone(),
+            })?;
+        }
         let resolved = self.select_style_harness(SelectStyleHarnessCommand {
             binding: resolved.binding,
             harness: command.binding.harness.clone(),
@@ -397,6 +496,43 @@ where
         let mut binding = command.binding;
         apply_harness_selection(&mut binding, &command.harness, &command.environment)?;
         Ok(ResolvedStyle { binding })
+    }
+
+    fn select_style_components(
+        &self,
+        command: SelectStyleComponentsCommand,
+    ) -> Result<ResolvedStyle, SessionStyleLogicError> {
+        if command.memory.is_none() && command.compaction.is_none() {
+            return Ok(ResolvedStyle {
+                binding: command.binding,
+            });
+        }
+        let record = self
+            .data
+            .select_session_style_components(SessionStyleComponentSelectionDataRequest {
+                environment: data_environment(&command.environment),
+                manifest: command.binding.configuration_json.clone(),
+                memory: command.memory,
+                compaction: command.compaction,
+            })
+            .map_err(|error| match error {
+                SessionStyleDataError::InvalidComponentSelection(selection) => {
+                    SessionStyleLogicError::InvalidComponentSelection {
+                        component: String::from("compaction"),
+                        selection,
+                    }
+                }
+                error => SessionStyleLogicError::Data(error),
+            })?;
+        if availability(&record) != StyleAvailability::Available {
+            return Err(SessionStyleLogicError::ComponentSelectionIncompatible {
+                diagnostics: record.diagnostics.iter().map(diagnostic).collect(),
+            });
+        }
+        let mut selected = binding(&record, &command.environment)?;
+        selected.source = command.binding.source;
+        selected.source_locator = command.binding.source_locator;
+        Ok(ResolvedStyle { binding: selected })
     }
 }
 
@@ -862,5 +998,19 @@ pub enum SessionStyleLogicError {
         harness: String,
         /// Stable sorted missing capability IDs.
         missing: Vec<String>,
+    },
+    /// A component identifier is outside the SDK's typed selection model.
+    #[error("session style {component} selection `{selection}` is invalid")]
+    InvalidComponentSelection {
+        /// Component family.
+        component: String,
+        /// Caller-selected ID.
+        selection: String,
+    },
+    /// The SDK rejected a selected component in the current environment.
+    #[error("session style component selection is incompatible: {diagnostics:?}")]
+    ComponentSelectionIncompatible {
+        /// Stable SDK-derived diagnostics.
+        diagnostics: Vec<StyleDiagnostic>,
     },
 }

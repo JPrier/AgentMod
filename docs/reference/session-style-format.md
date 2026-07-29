@@ -133,6 +133,14 @@ currently executes no compaction, sliding window, and tool-output eviction.
 Typed summary and artifact handoff are accepted by the compiler but fail
 clearly at runtime unless approved summary or handoff material exists.
 
+Calling clients may request a memory-provider or compaction-strategy override
+when creating a session. This produces a newly compiled immutable binding; it
+does not edit the source manifest or mutate an existing session. The SDK
+normalizes `none` and transitions from disabled profiles, then applies the same
+availability, bounds, preservation, and lifecycle validation used for ordinary
+manifests. The selected configuration and its new content/cache hashes are
+retained in session metadata and canonical `session.created` state.
+
 Declared graph node kinds include context transformation, model/tool gates,
 approval, agent coordination, review, bounded loop/branch/parallel control,
 delay/schedule, event/artifact operations, and terminal outcomes. Compilation

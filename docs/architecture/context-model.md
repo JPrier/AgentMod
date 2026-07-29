@@ -29,6 +29,15 @@ writes before data access and retrieved items carry provider, query, scope,
 source, score, creation time, injection event, reference, and byte contribution.
 The `SQLite` adapter follows FTS5 `MATCH` with deterministic `rank` ordering.
 
+Memory and compaction are also explicit per-session creation selections. A
+client override is not a mutable post-creation toggle: the session-style SDK
+normalizes the requested profile, the runtime recompiles the complete style,
+and the resulting configurations and hashes become part of the immutable
+session binding. Selecting `none` installs disabled controls; enabling a
+component from a disabled style installs bounded SDK defaults before normal
+validation. The style's own selection remains the default when no override is
+provided.
+
 `agentmod-harness-protocol` defines a smaller provider-visible `ProjectedEntry`
 wire representation. Before a provider request, runtime logic composes context
 from the session's compiled style. It routes no-memory, file, and SQLite FTS

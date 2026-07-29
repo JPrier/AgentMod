@@ -13,7 +13,8 @@ use agentmod_runtime_dependency::style::{
 };
 use agentmod_session_style_sdk::{
     ApprovalDecision, BuiltInStyle, CompileContext, DecisionCapability, ManifestFormat,
-    SessionStyleManifest, StyleCompilerLimits, compile_style, parse_json, parse_toml, to_json,
+    SessionStyleManifest, StyleCompilerLimits, compile_style, parse_json, parse_toml,
+    select_compaction_strategy, select_memory_provider, to_json,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -97,6 +98,19 @@ pub struct SessionStyleValidationDataRequest {
     pub manifest: String,
     /// Input encoding.
     pub format: SessionStyleManifestFormat,
+}
+
+/// Request to apply SDK-owned per-session component transforms and compile.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionStyleComponentSelectionDataRequest {
+    /// Authoritative runtime availability inputs.
+    pub environment: SessionStyleEnvironment,
+    /// Canonical base manifest JSON.
+    pub manifest: String,
+    /// Optional memory-provider selection.
+    pub memory: Option<String>,
+    /// Optional compaction-strategy selection.
+    pub compaction: Option<String>,
 }
 
 /// Source category exposed to runtime logic and endpoints.
@@ -275,6 +289,16 @@ pub trait SessionStyleDataPort {
         &self,
         request: SessionStyleValidationDataRequest,
     ) -> Result<SessionStyleCatalogRecord, SessionStyleDataError>;
+
+    /// Applies SDK-owned component transforms and recompiles the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid typed selection or environment.
+    fn select_session_style_components(
+        &self,
+        request: SessionStyleComponentSelectionDataRequest,
+    ) -> Result<SessionStyleCatalogRecord, SessionStyleDataError>;
 }
 
 /// Session-style data construction failure.
@@ -292,6 +316,9 @@ pub enum SessionStyleDataError {
     /// A compiled selection could not be normalized.
     #[error("session-style compiled selection serialization failed")]
     InvalidCompiledRecord,
+    /// A component identifier is outside the SDK's typed selection model.
+    #[error("session-style component selection is invalid: {0}")]
+    InvalidComponentSelection(String),
 }
 
 impl<D> SessionStyleDataPort for super::RuntimeData<D>
@@ -386,6 +413,28 @@ where
             &BTreeSet::new(),
             false,
         )
+    }
+
+    fn select_session_style_components(
+        &self,
+        request: SessionStyleComponentSelectionDataRequest,
+    ) -> Result<SessionStyleCatalogRecord, SessionStyleDataError> {
+        let mut manifest = parse_json(&request.manifest)
+            .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?;
+        if let Some(memory) = request.memory.as_deref() {
+            select_memory_provider(&mut manifest, memory);
+        }
+        if let Some(compaction) = request.compaction.as_deref() {
+            select_compaction_strategy(&mut manifest, compaction).map_err(|_| {
+                SessionStyleDataError::InvalidComponentSelection(compaction.to_owned())
+            })?;
+        }
+        self.validate_session_style(SessionStyleValidationDataRequest {
+            environment: request.environment,
+            manifest: to_json(&manifest)
+                .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?,
+            format: SessionStyleManifestFormat::Json,
+        })
     }
 }
 
@@ -912,6 +961,30 @@ mod tests {
             .session_style_catalog(request())
             .expect("cached catalog");
         assert!(second.records.iter().all(|record| record.cache_hit));
+    }
+
+    #[test]
+    fn component_selection_is_transformed_and_compiled_inside_data() {
+        let data = super::super::RuntimeData::new(MockDependency::default());
+        let manifest = agentmod_session_style_sdk::to_json(
+            &agentmod_session_style_sdk::built_in_manifest(BuiltInStyle::EphemeralTurn),
+        )
+        .expect("manifest");
+        let record = data
+            .select_session_style_components(SessionStyleComponentSelectionDataRequest {
+                environment: environment(),
+                manifest,
+                memory: Some(String::from("file")),
+                compaction: Some(String::from("artifact_handoff")),
+            })
+            .expect("selection");
+
+        assert_eq!(record.status, SessionStyleCatalogStatus::Available);
+        let selections = record.selections.expect("compiled selections");
+        assert_eq!(selections.memory_provider, "file");
+        assert_eq!(selections.compaction_strategy, "artifact_handoff");
+        assert!(record.compiled_hash.is_some());
+        assert!(record.cache_key.is_some());
     }
 
     #[test]

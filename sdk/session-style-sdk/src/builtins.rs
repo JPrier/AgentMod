@@ -15,6 +15,25 @@ use crate::{
 #[must_use]
 pub fn built_in_manifest(style: BuiltInStyle) -> SessionStyleManifest {
     let parts = built_in_parts(style);
+    manifest_from_parts(style, parts)
+}
+
+/// Constructs a built-in semantic descriptor only when the requested version
+/// exactly matches the version shipped by this SDK.
+///
+/// This exact-match constructor prevents callers loading persisted session
+/// identities from silently substituting a newer built-in descriptor. Callers
+/// should surface `None` as an unavailable-style or migration-required error.
+#[must_use]
+pub fn built_in_manifest_for_version(
+    style: BuiltInStyle,
+    version: &str,
+) -> Option<SessionStyleManifest> {
+    let parts = built_in_parts(style);
+    (parts.version == version).then(|| manifest_from_parts(style, parts))
+}
+
+fn manifest_from_parts(style: BuiltInStyle, parts: BuiltInParts) -> SessionStyleManifest {
     let retry_attempts = if matches!(
         style,
         BuiltInStyle::ResearchLoop | BuiltInStyle::PlannerWorker
@@ -27,7 +46,7 @@ pub fn built_in_manifest(style: BuiltInStyle) -> SessionStyleManifest {
         schema_version: 1,
         identity: StyleIdentity {
             id: parts.id.to_owned(),
-            version: "1.0.0".to_owned(),
+            version: parts.version.to_owned(),
             runtime_api: "^1.0".to_owned(),
         },
         kind: StyleKind::BuiltIn,
@@ -81,6 +100,7 @@ pub fn built_in_manifest(style: BuiltInStyle) -> SessionStyleManifest {
 
 struct BuiltInParts {
     id: &'static str,
+    version: &'static str,
     graph: &'static str,
     capabilities: Vec<&'static str>,
     tool_groups: Vec<&'static str>,
@@ -94,6 +114,7 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
     let tuple = match style {
         BuiltInStyle::PersistentChat => (
             "persistent-chat",
+            "1.0.0",
             PERSISTENT_CHAT_GRAPH,
             vec!["agents", "approval", "model", "tools"],
             vec!["filesystem"],
@@ -104,16 +125,18 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
         ),
         BuiltInStyle::EphemeralTurn => (
             "ephemeral-turn",
+            "1.1.0",
             EPHEMERAL_TURN_GRAPH,
-            vec!["approval", "context", "model"],
-            Vec::new(),
+            vec!["approval", "context", "model", "tools"],
+            vec!["filesystem"],
             no_memory(),
-            artifact_compaction(),
+            no_compaction(),
             no_children(),
             vec![TerminationOutcome::CompleteTurn, TerminationOutcome::Fail],
         ),
         BuiltInStyle::ResearchLoop => (
             "research-loop",
+            "1.0.0",
             RESEARCH_LOOP_GRAPH,
             vec!["agents", "approval", "artifacts", "model"],
             Vec::new(),
@@ -127,6 +150,7 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
         ),
         BuiltInStyle::PlannerWorker => (
             "planner-worker",
+            "1.0.0",
             PLANNER_WORKER_GRAPH,
             vec!["agents", "approval", "model"],
             Vec::new(),
@@ -140,6 +164,7 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
         ),
         BuiltInStyle::DeclarativeGraph => (
             "declarative-graph",
+            "1.0.0",
             DECLARATIVE_GRAPH,
             vec!["approval", "events"],
             Vec::new(),
@@ -154,13 +179,14 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
     };
     BuiltInParts {
         id: tuple.0,
-        graph: tuple.1,
-        capabilities: tuple.2,
-        tool_groups: tuple.3,
-        memory: tuple.4,
-        compaction: tuple.5,
-        children: tuple.6,
-        outcomes: tuple.7,
+        version: tuple.1,
+        graph: tuple.2,
+        capabilities: tuple.3,
+        tool_groups: tuple.4,
+        memory: tuple.5,
+        compaction: tuple.6,
+        children: tuple.7,
+        outcomes: tuple.8,
     }
 }
 
@@ -406,7 +432,8 @@ max_cost_micros = 25000000
 max_duration_ms = 900000
 
 [declarations]
-capabilities = ["context", "model"]
+capabilities = ["context", "model", "tools"]
+tools = ["filesystem.read"]
 providers = ["mock"]
 
 [[nodes]]
@@ -420,6 +447,12 @@ provider = "mock"
 retry_limit = 1
 
 [[nodes]]
+id = "tool"
+kind = "tool_execution_gate"
+tool = "filesystem.read"
+read_scopes = ["workspace"]
+
+[[nodes]]
 id = "done"
 kind = "complete_turn"
 
@@ -429,6 +462,10 @@ to = "respond"
 
 [[edges]]
 from = "respond"
+to = "tool"
+
+[[edges]]
+from = "tool"
 to = "done"
 "#;
 

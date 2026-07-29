@@ -2,13 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use agentmod_graph_engine::GRAPH_FORMAT_VERSION;
+use agentmod_graph_engine::{GRAPH_FORMAT_VERSION, NodeKind};
 use agentmod_primitives::ContentHash;
 use agentmod_session_style_sdk::{
     BuiltInStyle, CompactionStrategy, CompileContext, CompiledSessionStyle, DecisionCapability,
     GraphSource, MemoryInjectionLocation, MemoryRetrievalTiming, MemoryWritePolicy,
-    StyleCompilerLimits, built_in_manifest, compile_style, compile_style_set, parse_json,
-    parse_toml, to_json, to_toml,
+    StyleCompilerLimits, built_in_manifest, built_in_manifest_for_version, compile_style,
+    compile_style_set, parse_json, parse_toml, to_json, to_toml,
 };
 use proptest::prelude::*;
 
@@ -151,6 +151,135 @@ fn all_five_built_ins_compile_with_hard_limits_and_explicit_completion() {
                 .contains("cache_key")
         );
     }
+}
+
+#[test]
+fn ephemeral_turn_1_1_is_an_exact_tool_capable_fresh_turn_graph() {
+    let manifest = built_in_manifest(BuiltInStyle::EphemeralTurn);
+    assert_eq!(manifest.identity.id, "ephemeral-turn");
+    assert_eq!(manifest.identity.version, "1.1.0");
+    assert_eq!(manifest.compaction.strategy, CompactionStrategy::None);
+    assert!(manifest.compaction.trigger_tokens.is_none());
+    assert!(
+        manifest
+            .required_capabilities
+            .iter()
+            .any(|capability| capability == "tools")
+    );
+    assert_eq!(manifest.allowed_tool_groups, ["filesystem"]);
+
+    let compiled = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("ephemeral-turn 1.1 compiles");
+    let nodes = &compiled.graph.nodes;
+    let node = |id: &str| {
+        nodes
+            .iter()
+            .find(|node| node.id == id)
+            .unwrap_or_else(|| panic!("missing node {id}"))
+    };
+    assert_eq!(node("fresh-context").kind, NodeKind::ContextTransform);
+    assert_eq!(node("respond").kind, NodeKind::ModelCall);
+    assert_eq!(node("tool").kind, NodeKind::ToolExecutionGate);
+    assert_eq!(node("tool").tool.as_deref(), Some("filesystem.read"));
+    assert_eq!(node("done").kind, NodeKind::CompleteTurn);
+    assert_eq!(
+        compiled
+            .graph
+            .nodes
+            .iter()
+            .filter(|node| matches!(
+                node.kind,
+                NodeKind::CompleteTurn | NodeKind::CompleteSession | NodeKind::Fail
+            ))
+            .map(|node| (node.id.as_str(), node.kind))
+            .collect::<Vec<_>>(),
+        [("done", NodeKind::CompleteTurn)]
+    );
+    assert_eq!(
+        compiled.graph.declarations.capabilities,
+        ["context", "model", "tools"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    );
+    assert_eq!(
+        compiled.graph.declarations.tools,
+        ["filesystem.read"].into_iter().map(str::to_owned).collect()
+    );
+
+    let mut current = compiled.graph.entry_index;
+    let mut traversal = vec![compiled.graph.nodes[current].id.as_str()];
+    while let Some(edge) = compiled
+        .graph
+        .edges
+        .iter()
+        .find(|edge| edge.from == current)
+    {
+        assert_eq!(
+            compiled
+                .graph
+                .edges
+                .iter()
+                .filter(|candidate| candidate.from == current)
+                .count(),
+            1,
+            "ephemeral turn control flow must be linear"
+        );
+        current = edge.to;
+        traversal.push(compiled.graph.nodes[current].id.as_str());
+    }
+    assert_eq!(traversal, ["fresh-context", "respond", "tool", "done"]);
+    assert_eq!(compiled.graph.nodes[current].kind, NodeKind::CompleteTurn);
+}
+
+#[test]
+fn ephemeral_turn_version_selection_and_cache_identity_are_exact_and_deterministic() {
+    assert!(
+        built_in_manifest_for_version(BuiltInStyle::EphemeralTurn, "1.0.0").is_none(),
+        "persisted 1.0.0 selectors must not bind to the incompatible 1.1.0 descriptor"
+    );
+    let manifest = built_in_manifest_for_version(BuiltInStyle::EphemeralTurn, "1.1.0")
+        .expect("exact current version");
+    assert_eq!(manifest, built_in_manifest(BuiltInStyle::EphemeralTurn));
+
+    for semantic in [
+        BuiltInStyle::PersistentChat,
+        BuiltInStyle::ResearchLoop,
+        BuiltInStyle::PlannerWorker,
+        BuiltInStyle::DeclarativeGraph,
+    ] {
+        assert!(built_in_manifest_for_version(semantic, "1.0.0").is_some());
+        assert!(built_in_manifest_for_version(semantic, "1.1.0").is_none());
+    }
+
+    let first = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("first deterministic compile");
+    let second = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect("second deterministic compile");
+    assert_eq!(first, second);
+    assert_eq!(first.style_id, "ephemeral-turn");
+    assert_eq!(first.style_version, "1.1.0");
+    assert_eq!(
+        first.cache_key.style_content_hash,
+        second.cache_key.style_content_hash
+    );
+    assert_eq!(
+        first.cache_key.combined_hash,
+        second.cache_key.combined_hash
+    );
+    assert_eq!(
+        first.cache_key.style_content_hash.to_hex(),
+        "a18d8d2e4808a4c13ae7bcad117c1e5a860becaf44952db4a2fd0ca006ebb783"
+    );
+    assert_eq!(
+        first.cache_key.combined_hash.to_hex(),
+        "d44a22b0be917f2e349118efde64d19ef7004b24c6c5fb41c3d93e982d0b9f05"
+    );
+
+    let json = to_json(&manifest).expect("ephemeral JSON");
+    let toml = to_toml(&manifest).expect("ephemeral TOML");
+    assert_eq!(parse_json(&json).expect("JSON round trip"), manifest);
+    assert_eq!(parse_toml(&toml).expect("TOML round trip"), manifest);
 }
 
 #[test]

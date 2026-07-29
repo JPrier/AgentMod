@@ -8,7 +8,7 @@ mod model;
 mod parsing;
 mod validation;
 
-pub use builtins::{built_in_manifest, declarative_graph_manifest};
+pub use builtins::{built_in_manifest, built_in_manifest_for_version, declarative_graph_manifest};
 pub use model::{
     ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits,
     CompactionPreservationRequirement, CompactionSelection, CompactionStrategy, DecisionCapability,

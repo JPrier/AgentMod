@@ -10,10 +10,12 @@ mod validation;
 
 pub use builtins::{built_in_manifest, declarative_graph_manifest};
 pub use model::{
-    ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits, CompactionSelection,
-    CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource, InterceptorDeclaration,
-    MemoryScope, MemorySelection, RetryPolicy, SessionStyleManifest, StyleIdentity, StyleKind,
-    TerminationOutcome, TerminationPolicy, TopLevelSelection,
+    ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits,
+    CompactionPreservationRequirement, CompactionSelection, CompactionStrategy, DecisionCapability,
+    ExecutionBudgets, GraphSource, InterceptorDeclaration, MemoryInjectionLocation,
+    MemoryQueryConstruction, MemoryQuerySource, MemoryRetrievalTiming, MemoryScope,
+    MemorySelection, MemoryWritePolicy, RetryPolicy, SessionStyleManifest, StyleIdentity,
+    StyleKind, TerminationOutcome, TerminationPolicy, TopLevelSelection,
 };
 pub use parsing::{ManifestFormat, ManifestParseError, parse_json, parse_toml, to_json, to_toml};
 pub use validation::{

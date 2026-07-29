@@ -72,10 +72,13 @@ done
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="persistent-before"' --json |
     grep -F '"last_committed_sequence":19' >/dev/null
-"$cli" run "ephemeral before restart" --session "$ephemeral_id" \
+if "$cli" run "ephemeral before restart" --session "$ephemeral_id" \
     --option 'mock_scenario="streaming_text"' \
-    --option 'mock_text="ephemeral-before"' --json |
-    grep -F '"last_committed_sequence":10' >/dev/null
+    --option 'mock_text="ephemeral-before"' --json >/dev/null 2>&1; then
+    echo "unimplemented ephemeral graph silently used the legacy turn path" >&2
+    exit 1
+fi
+test "$(wc -l < "$run_root/sessions/$ephemeral_id/events.jsonl")" -eq 1
 
 stop_runtime
 start_runtime
@@ -87,10 +90,13 @@ done
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="persistent-after"' --json |
     grep -F '"last_committed_sequence":36' >/dev/null
-"$cli" run "ephemeral after restart" --session "$ephemeral_id" \
+if "$cli" run "ephemeral after restart" --session "$ephemeral_id" \
     --option 'mock_scenario="streaming_text"' \
-    --option 'mock_text="ephemeral-after"' --json |
-    grep -F '"last_committed_sequence":19' >/dev/null
+    --option 'mock_text="ephemeral-after"' --json >/dev/null 2>&1; then
+    echo "unsupported style changed behavior after restart" >&2
+    exit 1
+fi
+test "$(wc -l < "$run_root/sessions/$ephemeral_id/events.jsonl")" -eq 1
 
 branch=$("$cli" session branch "$persistent_id" --at 19 \
     --style ephemeral-turn --json)

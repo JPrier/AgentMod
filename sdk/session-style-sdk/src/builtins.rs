@@ -3,10 +3,12 @@ use std::collections::BTreeMap;
 use agentmod_graph_engine::{CompilerLimits, GraphDefinition};
 
 use crate::{
-    ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits, CompactionSelection,
-    CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource, InterceptorDeclaration,
-    MemoryScope, MemorySelection, RetryPolicy, SessionStyleManifest, StyleIdentity, StyleKind,
-    TerminationOutcome, TerminationPolicy, TopLevelSelection,
+    ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits,
+    CompactionPreservationRequirement, CompactionSelection, CompactionStrategy, DecisionCapability,
+    ExecutionBudgets, GraphSource, InterceptorDeclaration, MemoryInjectionLocation,
+    MemoryQueryConstruction, MemoryQuerySource, MemoryRetrievalTiming, MemoryScope,
+    MemorySelection, MemoryWritePolicy, RetryPolicy, SessionStyleManifest, StyleIdentity,
+    StyleKind, TerminationOutcome, TerminationPolicy, TopLevelSelection,
 };
 
 /// Constructs one of the five required built-in semantic descriptors.
@@ -115,7 +117,7 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
             RESEARCH_LOOP_GRAPH,
             vec!["agents", "approval", "artifacts", "model"],
             Vec::new(),
-            file_memory(),
+            research_memory(),
             artifact_compaction(),
             bounded_children(4, 2, 1, 50_000),
             vec![
@@ -128,7 +130,7 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
             PLANNER_WORKER_GRAPH,
             vec!["agents", "approval", "model"],
             Vec::new(),
-            file_memory(),
+            planner_memory(),
             summary_compaction(),
             bounded_children(16, 4, 2, 100_000),
             vec![
@@ -219,8 +221,53 @@ fn file_memory() -> MemorySelection {
     MemorySelection {
         provider: "file".to_owned(),
         scopes: vec![MemoryScope::Session, MemoryScope::Project],
+        retrieval_timing: MemoryRetrievalTiming::TurnStart,
+        query: MemoryQueryConstruction {
+            source: MemoryQuerySource::CurrentInput,
+            include_active_artifacts: true,
+            include_style_context: true,
+            max_query_bytes: 16 * 1024,
+        },
         max_items: 32,
         max_injected_bytes: 256 * 1024,
+        write_policy: MemoryWritePolicy::TurnCompletion,
+        injection_location: MemoryInjectionLocation::BeforeCurrentInput,
+    }
+}
+
+fn research_memory() -> MemorySelection {
+    MemorySelection {
+        provider: "file".to_owned(),
+        scopes: vec![MemoryScope::Session, MemoryScope::Project],
+        retrieval_timing: MemoryRetrievalTiming::IterationStart,
+        query: MemoryQueryConstruction {
+            source: MemoryQuerySource::SessionGoal,
+            include_active_artifacts: true,
+            include_style_context: true,
+            max_query_bytes: 32 * 1024,
+        },
+        max_items: 64,
+        max_injected_bytes: 512 * 1024,
+        write_policy: MemoryWritePolicy::IterationCompletion,
+        injection_location: MemoryInjectionLocation::ContextArtifact,
+    }
+}
+
+fn planner_memory() -> MemorySelection {
+    MemorySelection {
+        provider: "file".to_owned(),
+        scopes: vec![MemoryScope::Session, MemoryScope::Project],
+        retrieval_timing: MemoryRetrievalTiming::BeforeModelRequest,
+        query: MemoryQueryConstruction {
+            source: MemoryQuerySource::CurrentInputAndGoal,
+            include_active_artifacts: true,
+            include_style_context: true,
+            max_query_bytes: 32 * 1024,
+        },
+        max_items: 64,
+        max_injected_bytes: 512 * 1024,
+        write_policy: MemoryWritePolicy::SessionCompletion,
+        injection_location: MemoryInjectionLocation::ContextArtifact,
     }
 }
 
@@ -228,8 +275,12 @@ fn no_memory() -> MemorySelection {
     MemorySelection {
         provider: "none".to_owned(),
         scopes: Vec::new(),
+        retrieval_timing: MemoryRetrievalTiming::Never,
+        query: MemoryQueryConstruction::default(),
         max_items: 0,
         max_injected_bytes: 0,
+        write_policy: MemoryWritePolicy::Never,
+        injection_location: MemoryInjectionLocation::None,
     }
 }
 
@@ -237,8 +288,11 @@ fn summary_compaction() -> CompactionSelection {
     CompactionSelection {
         strategy: CompactionStrategy::Summary,
         trigger_tokens: Some(750_000),
+        reserved_context_tokens: 32_000,
+        max_provider_projection_tokens: 250_000,
         preserve_unresolved_tasks: true,
         preserve_active_processes: true,
+        preservation_requirements: required_projection_records(),
     }
 }
 
@@ -246,8 +300,11 @@ fn artifact_compaction() -> CompactionSelection {
     CompactionSelection {
         strategy: CompactionStrategy::ArtifactHandoff,
         trigger_tokens: Some(750_000),
+        reserved_context_tokens: 32_000,
+        max_provider_projection_tokens: 250_000,
         preserve_unresolved_tasks: true,
         preserve_active_processes: true,
+        preservation_requirements: required_projection_records(),
     }
 }
 
@@ -255,9 +312,24 @@ fn no_compaction() -> CompactionSelection {
     CompactionSelection {
         strategy: CompactionStrategy::None,
         trigger_tokens: None,
+        reserved_context_tokens: 0,
+        max_provider_projection_tokens: 0,
         preserve_unresolved_tasks: true,
         preserve_active_processes: true,
+        preservation_requirements: required_projection_records(),
     }
+}
+
+fn required_projection_records() -> Vec<CompactionPreservationRequirement> {
+    vec![
+        CompactionPreservationRequirement::SystemInstructions,
+        CompactionPreservationRequirement::CurrentInput,
+        CompactionPreservationRequirement::PendingControlState,
+        CompactionPreservationRequirement::ArtifactReferences,
+        CompactionPreservationRequirement::MemoryProvenance,
+        CompactionPreservationRequirement::ActiveGraphState,
+        CompactionPreservationRequirement::ToolCallCorrelation,
+    ]
 }
 
 const fn no_children() -> ChildAgentLimits {

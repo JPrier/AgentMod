@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use agentmod_primitives::{ArtifactId, ContentHash, Sequence};
+use agentmod_primitives::{ArtifactId, ContentHash, EventId, Sequence};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -102,12 +102,21 @@ pub struct RetrievedMemoryEntry {
     pub scope: String,
     /// Source reference.
     pub source: String,
+    /// Provider-local stable reference.
+    #[serde(default)]
+    pub reference: String,
     /// Optional relevance score.
     pub score: Option<f64>,
     /// Bounded content.
     pub content: String,
     /// Event sequence that injected the record.
     pub injection_sequence: Sequence,
+    /// Canonical projection event that performed the injection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injection_event: Option<EventId>,
+    /// Original provider record creation time in Unix milliseconds.
+    #[serde(default)]
+    pub created_at_millis: i64,
     /// Byte contribution to context.
     pub size_bytes: u64,
 }

@@ -36,6 +36,8 @@ pub enum MemoryWriteAuthorization {
 /// Logic-owned write command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriteMemoryCommand {
+    /// Style-selected provider.
+    pub provider: String,
     /// Scope.
     pub scope: MemoryScope,
     /// Provenance.
@@ -62,6 +64,8 @@ pub struct WriteMemoryResult {
 /// Logic-owned retrieval command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetrieveMemoryCommand {
+    /// Style-selected provider.
+    pub provider: String,
     /// Scope.
     pub scope: MemoryScope,
     /// Query.
@@ -151,6 +155,7 @@ where
         let record = self
             .data
             .write_memory(WriteMemoryDataRequest {
+                provider: command.provider,
                 scope: to_data_scope(command.scope)?,
                 source: command.source,
                 content: command.content,
@@ -177,6 +182,7 @@ where
         let query = command.query;
         self.data
             .retrieve_memory(RetrieveMemoryDataRequest {
+                provider: command.provider,
                 scope: to_data_scope(command.scope)?,
                 query: query.clone(),
                 limit: command.limit,
@@ -310,6 +316,7 @@ mod tests {
         });
         assert_eq!(
             logic.write_memory(WriteMemoryCommand {
+                provider: String::from("mock"),
                 scope: MemoryScope::Runtime,
                 source: String::from("fixture"),
                 content: String::from("blocked"),
@@ -329,6 +336,7 @@ mod tests {
         let injection = EventId::from_uuid(Uuid::from_u128(8));
         let items = logic
             .retrieve_memory(RetrieveMemoryCommand {
+                provider: String::from("mock"),
                 scope: MemoryScope::Project(String::from("p1")),
                 query: String::from("remember"),
                 limit: 5,

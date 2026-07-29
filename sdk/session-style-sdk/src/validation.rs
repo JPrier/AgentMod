@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApprovalDefaults, BuiltInStyle, ChildAgentLimits, CompactionSelection, CompactionStrategy,
-    DecisionCapability, ExecutionBudgets, GraphSource, InterceptorDeclaration, MemorySelection,
+    DecisionCapability, ExecutionBudgets, GraphSource, InterceptorDeclaration,
+    MemoryInjectionLocation, MemoryRetrievalTiming, MemorySelection, MemoryWritePolicy,
     RetryPolicy, SessionStyleManifest, StyleKind, TerminationOutcome, TerminationPolicy,
     TopLevelSelection,
 };
@@ -753,6 +754,24 @@ fn validate_memory(
             "use none with zero limits, or an available provider with positive bounded limits",
         ));
     }
+    let retrieves = memory.retrieval_timing != MemoryRetrievalTiming::Never;
+    let valid_disabled_controls = !disabled
+        || (memory.retrieval_timing == MemoryRetrievalTiming::Never
+            && memory.write_policy == MemoryWritePolicy::Never
+            && memory.injection_location == MemoryInjectionLocation::None);
+    let valid_retrieval_controls = !retrieves
+        || (memory.injection_location != MemoryInjectionLocation::None
+            && memory.query.max_query_bytes > 0
+            && u64::from(memory.query.max_query_bytes) <= limits.max_memory_bytes);
+    let valid_injection = retrieves || memory.injection_location == MemoryInjectionLocation::None;
+    if !valid_disabled_controls || !valid_retrieval_controls || !valid_injection {
+        diagnostics.push(error(
+            "STYLE030",
+            format!("{root}.memory"),
+            "memory lifecycle controls are inconsistent or exceed bounds",
+            "use never/never/none for disabled memory; active retrieval requires a bounded query and injection location",
+        ));
+    }
 }
 
 fn validate_compaction(
@@ -762,6 +781,11 @@ fn validate_compaction(
     root: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    validate_unique_values(
+        &compaction.preservation_requirements,
+        &format!("{root}.compaction.preservation_requirements"),
+        diagnostics,
+    );
     let strategy = compaction_name(compaction.strategy);
     let disabled = compaction.strategy == CompactionStrategy::None;
     let valid_trigger = if disabled {
@@ -781,6 +805,22 @@ fn validate_compaction(
             format!("{root}.compaction"),
             "compaction selection is unavailable, unbounded, or drops required live state",
             "use an available strategy, bounded trigger, and preserve tasks/process state",
+        ));
+    }
+    let valid_disabled_controls = !disabled
+        || (compaction.reserved_context_tokens == 0
+            && compaction.max_provider_projection_tokens == 0);
+    let valid_projection_bound = compaction.max_provider_projection_tokens == 0
+        || (compaction.max_provider_projection_tokens <= max_tokens
+            && compaction.reserved_context_tokens < compaction.max_provider_projection_tokens);
+    let valid_unbounded_projection =
+        compaction.max_provider_projection_tokens != 0 || compaction.reserved_context_tokens == 0;
+    if !valid_disabled_controls || !valid_projection_bound || !valid_unbounded_projection {
+        diagnostics.push(error(
+            "STYLE031",
+            format!("{root}.compaction"),
+            "compaction context budgets are inconsistent with the provider projection bound",
+            "use zero context controls for none, or reserve fewer tokens than a bounded projection within the style token budget",
         ));
     }
 }

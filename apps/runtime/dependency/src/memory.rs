@@ -325,7 +325,7 @@ impl MemoryDependencyPort for SqliteFtsMemoryDependency {
     }
 
     fn provider_name(&self) -> &'static str {
-        "sqlite-fts5"
+        "sqlite-fts"
     }
 }
 

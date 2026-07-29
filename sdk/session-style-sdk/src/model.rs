@@ -163,10 +163,113 @@ pub struct MemorySelection {
     /// Searchable scopes.
     #[serde(default)]
     pub scopes: Vec<MemoryScope>,
+    /// Lifecycle boundary at which retrieval is requested.
+    #[serde(default)]
+    pub retrieval_timing: MemoryRetrievalTiming,
+    /// Deterministic inputs used to construct the retrieval query.
+    #[serde(default)]
+    pub query: MemoryQueryConstruction,
     /// Maximum injected records.
     pub max_items: u32,
     /// Maximum injected bytes.
     pub max_injected_bytes: u64,
+    /// Lifecycle boundary at which runtime-owned memory writes are requested.
+    #[serde(default)]
+    pub write_policy: MemoryWritePolicy,
+    /// Provider-projection location for approved retrieved records.
+    #[serde(default)]
+    pub injection_location: MemoryInjectionLocation,
+}
+
+/// Memory retrieval lifecycle boundary.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRetrievalTiming {
+    /// Never retrieve memory.
+    #[default]
+    Never,
+    /// Retrieve once when a user turn starts.
+    TurnStart,
+    /// Retrieve once when a bounded graph iteration starts.
+    IterationStart,
+    /// Retrieve whenever a context-transform graph node executes.
+    ContextNode,
+    /// Retrieve immediately before each provider request.
+    BeforeModelRequest,
+}
+
+/// Deterministic memory-query construction settings.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryQueryConstruction {
+    /// Runtime-owned source text for the query.
+    pub source: MemoryQuerySource,
+    /// Include descriptions of active artifacts in the query.
+    pub include_active_artifacts: bool,
+    /// Include the selected style ID and active graph-node ID.
+    pub include_style_context: bool,
+    /// Maximum UTF-8 bytes in the constructed query.
+    pub max_query_bytes: u32,
+}
+
+impl Default for MemoryQueryConstruction {
+    fn default() -> Self {
+        Self {
+            source: MemoryQuerySource::CurrentInput,
+            include_active_artifacts: false,
+            include_style_context: false,
+            max_query_bytes: 16 * 1024,
+        }
+    }
+}
+
+/// Runtime-owned primary source for a memory query.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryQuerySource {
+    /// The current user input.
+    #[default]
+    CurrentInput,
+    /// The session goal supplied to the active execution.
+    SessionGoal,
+    /// The current input followed by the session goal.
+    CurrentInputAndGoal,
+    /// An explicit query supplied by a graph node or calling client.
+    Explicit,
+}
+
+/// Runtime-owned memory write boundary.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryWritePolicy {
+    /// Never request an automatic memory write.
+    #[default]
+    Never,
+    /// Write only through an explicit graph node or client request.
+    ExplicitOnly,
+    /// Propose a write after successful turn completion.
+    TurnCompletion,
+    /// Propose a write after successful bounded-iteration completion.
+    IterationCompletion,
+    /// Propose a write only when the session reaches a terminal success.
+    SessionCompletion,
+}
+
+/// Location of approved memory records in a provider projection.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryInjectionLocation {
+    /// Do not inject retrieved records.
+    #[default]
+    None,
+    /// Insert records before provider-visible conversation history.
+    BeforeConversation,
+    /// Insert records after provider-visible conversation history.
+    AfterConversation,
+    /// Insert records immediately before the current user input.
+    BeforeCurrentInput,
+    /// Expose records through a typed context artifact reference.
+    ContextArtifact,
 }
 
 /// Memory scope.
@@ -191,10 +294,54 @@ pub struct CompactionSelection {
     pub strategy: CompactionStrategy,
     /// Token threshold, when the strategy is automatic.
     pub trigger_tokens: Option<u64>,
+    /// Tokens reserved for provider output and runtime-required context.
+    #[serde(default)]
+    pub reserved_context_tokens: u64,
+    /// Maximum provider-visible projection after compaction.
+    ///
+    /// Zero retains schema-v1 behavior and delegates the hard projection limit
+    /// to the runtime/provider boundary.
+    #[serde(default)]
+    pub max_provider_projection_tokens: u64,
     /// Preserve unresolved tasks.
     pub preserve_unresolved_tasks: bool,
     /// Preserve active process state.
     pub preserve_active_processes: bool,
+    /// Typed provider-projection records a compactor must retain.
+    #[serde(default = "default_compaction_preservation_requirements")]
+    pub preservation_requirements: Vec<CompactionPreservationRequirement>,
+}
+
+/// Provider-projection records which a compaction strategy must retain.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPreservationRequirement {
+    /// Effective system and developer instructions.
+    SystemInstructions,
+    /// Current user input.
+    CurrentInput,
+    /// Pending approval and continuation references.
+    PendingControlState,
+    /// References to immutable artifacts selected for the projection.
+    ArtifactReferences,
+    /// Provenance for injected memory records.
+    MemoryProvenance,
+    /// Active style graph and node identity.
+    ActiveGraphState,
+    /// Tool-call/result correlation required for the next provider request.
+    ToolCallCorrelation,
+}
+
+fn default_compaction_preservation_requirements() -> Vec<CompactionPreservationRequirement> {
+    vec![
+        CompactionPreservationRequirement::SystemInstructions,
+        CompactionPreservationRequirement::CurrentInput,
+        CompactionPreservationRequirement::PendingControlState,
+        CompactionPreservationRequirement::ArtifactReferences,
+        CompactionPreservationRequirement::MemoryProvenance,
+        CompactionPreservationRequirement::ActiveGraphState,
+        CompactionPreservationRequirement::ToolCallCorrelation,
+    ]
 }
 
 /// Built-in compaction strategy identifier.

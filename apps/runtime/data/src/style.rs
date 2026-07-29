@@ -162,18 +162,32 @@ pub struct SessionStyleExecutionSelections {
     pub memory_provider: String,
     /// Selected memory scopes.
     pub memory_scopes: Vec<String>,
+    /// Selected retrieval lifecycle boundary.
+    pub memory_retrieval_timing: String,
+    /// Canonical query construction.
+    pub memory_query_json: String,
     /// Maximum memory records injected.
     pub memory_max_items: u32,
     /// Maximum injected memory bytes.
     pub memory_max_injected_bytes: u64,
+    /// Selected automatic write boundary.
+    pub memory_write_policy: String,
+    /// Selected projection injection location.
+    pub memory_injection_location: String,
     /// Selected compaction strategy.
     pub compaction_strategy: String,
     /// Optional compaction token trigger.
     pub compaction_trigger_tokens: Option<u64>,
+    /// Reserved non-history context budget.
+    pub compaction_reserved_context_tokens: u64,
+    /// Maximum compacted provider projection.
+    pub compaction_max_provider_projection_tokens: u64,
     /// Whether unresolved tasks are preserved during compaction.
     pub compaction_preserve_unresolved_tasks: bool,
     /// Whether active process state is preserved during compaction.
     pub compaction_preserve_active_processes: bool,
+    /// Typed preservation requirements.
+    pub compaction_preservation_requirements: Vec<String>,
     /// Selected tool groups.
     pub tool_groups: Vec<String>,
     /// Hard iteration cap.
@@ -275,6 +289,9 @@ pub enum SessionStyleDataError {
     /// The shared in-memory cache was poisoned.
     #[error("session-style in-memory cache is unavailable")]
     InMemoryCacheUnavailable,
+    /// A compiled selection could not be normalized.
+    #[error("session-style compiled selection serialization failed")]
+    InvalidCompiledRecord,
 }
 
 impl<D> SessionStyleDataPort for super::RuntimeData<D>
@@ -484,7 +501,7 @@ fn compile_source<D: SessionStyleDependencyPort>(
                 manifest_hash,
                 compiled_hash: Some(ContentHash::digest(compiled_json.as_bytes()).to_hex()),
                 cache_key: Some(cache_key),
-                selections: Some(selections(&compiled)),
+                selections: Some(selections(&compiled)?),
                 compiled_json: Some(compiled_json),
                 runtime_api: environment.runtime_api_version.clone(),
                 cache_hit,
@@ -667,21 +684,36 @@ fn source_kind(kind: DependencyStyleSourceKind) -> SessionStyleSourceKind {
 
 fn selections(
     compiled: &agentmod_session_style_sdk::CompiledSessionStyle,
-) -> SessionStyleExecutionSelections {
-    SessionStyleExecutionSelections {
+) -> Result<SessionStyleExecutionSelections, SessionStyleDataError> {
+    Ok(SessionStyleExecutionSelections {
         memory_provider: compiled.memory.provider.clone(),
         memory_scopes: compiled
             .memory
             .scopes
             .iter()
-            .map(|scope| format!("{scope:?}").to_lowercase())
-            .collect(),
+            .map(serialized_enum_name)
+            .collect::<Result<_, _>>()?,
+        memory_retrieval_timing: serialized_enum_name(&compiled.memory.retrieval_timing)?,
+        memory_query_json: serde_json::to_string(&compiled.memory.query)
+            .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?,
         memory_max_items: compiled.memory.max_items,
         memory_max_injected_bytes: compiled.memory.max_injected_bytes,
-        compaction_strategy: format!("{:?}", compiled.compaction.strategy).to_lowercase(),
+        memory_write_policy: serialized_enum_name(&compiled.memory.write_policy)?,
+        memory_injection_location: serialized_enum_name(&compiled.memory.injection_location)?,
+        compaction_strategy: serialized_enum_name(&compiled.compaction.strategy)?,
         compaction_trigger_tokens: compiled.compaction.trigger_tokens,
+        compaction_reserved_context_tokens: compiled.compaction.reserved_context_tokens,
+        compaction_max_provider_projection_tokens: compiled
+            .compaction
+            .max_provider_projection_tokens,
         compaction_preserve_unresolved_tasks: compiled.compaction.preserve_unresolved_tasks,
         compaction_preserve_active_processes: compiled.compaction.preserve_active_processes,
+        compaction_preservation_requirements: compiled
+            .compaction
+            .preservation_requirements
+            .iter()
+            .map(serialized_enum_name)
+            .collect::<Result<_, _>>()?,
         tool_groups: compiled.allowed_tool_groups.clone(),
         max_iterations: compiled.budgets.max_iterations,
         max_steps: compiled.budgets.max_steps,
@@ -695,7 +727,14 @@ fn selections(
             .iter()
             .map(|(key, value)| (key.clone(), approval(*value).into()))
             .collect(),
-    }
+    })
+}
+
+fn serialized_enum_name<T: Serialize>(value: &T) -> Result<String, SessionStyleDataError> {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or(SessionStyleDataError::InvalidCompiledRecord)
 }
 
 const fn decision_capability(value: SessionStyleDecisionCapability) -> DecisionCapability {
@@ -853,6 +892,21 @@ mod tests {
                 .records
                 .iter()
                 .all(|record| record.status == SessionStyleCatalogStatus::Available)
+        );
+        let persistent = first
+            .records
+            .iter()
+            .find(|record| record.id.as_deref() == Some("persistent-chat"))
+            .and_then(|record| record.selections.as_ref())
+            .expect("persistent selections");
+        assert_eq!(persistent.memory_retrieval_timing, "turn_start");
+        assert_eq!(persistent.memory_write_policy, "turn_completion");
+        assert_eq!(persistent.memory_injection_location, "before_current_input");
+        assert_eq!(persistent.compaction_strategy, "summary");
+        assert!(
+            persistent
+                .compaction_preservation_requirements
+                .contains(&String::from("memory_provenance"))
         );
         let second = data
             .session_style_catalog(request())

@@ -162,6 +162,35 @@ impl CompiledStyleExecutor {
         &self.compiled
     }
 
+    /// Returns whether this graph is supported by the persistent turn adapter.
+    ///
+    /// Selection is based on the immutable compiled graph rather than a style
+    /// ID, so project and plugin styles can compose the same runtime-owned
+    /// lifecycle without impersonating the built-in manifest.
+    pub(crate) fn supports_persistent_turn(&self) -> bool {
+        let Ok(entry) = self.entry() else {
+            return false;
+        };
+        if entry.directive != StyleNodeDirective::ModelCall {
+            return false;
+        }
+        let Ok(Some(model_to_tools)) = self.transition(entry.index, &serde_json::json!({})) else {
+            return false;
+        };
+        if model_to_tools.to.directive != StyleNodeDirective::ToolExecutionGate {
+            return false;
+        }
+        let Ok(Some(to_complete)) =
+            self.transition(model_to_tools.to.index, &serde_json::json!({}))
+        else {
+            return false;
+        };
+        to_complete.to.directive == StyleNodeDirective::CompleteTurn
+            && self
+                .transition(to_complete.to.index, &serde_json::json!({}))
+                .is_ok_and(|transition| transition.is_none())
+    }
+
     fn cursor(&self, index: usize) -> Result<StyleNodeCursor, StyleExecutorError> {
         self.compiled
             .graph
@@ -247,6 +276,10 @@ mod tests {
         style_executor::{CompiledStyleExecutor, StyleExecutorError, StyleNodeDirective},
     };
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture explicitly binds every immutable session-style selection"
+    )]
     fn binding(style: BuiltInStyle) -> SessionStyleBinding {
         let manifest = built_in_manifest(style);
         let manifest_json = to_json(&manifest).expect("manifest json");
@@ -317,14 +350,23 @@ mod tests {
             memory: SessionMemoryConfiguration {
                 provider: String::from("fixture"),
                 scopes: Vec::new(),
+                retrieval_timing: String::from("never"),
+                query_json: String::from(
+                    r#"{"source":"current_input","include_active_artifacts":false,"include_style_context":false,"max_query_bytes":16384}"#,
+                ),
                 max_items: 0,
                 max_injected_bytes: 0,
+                write_policy: String::from("never"),
+                injection_location: String::from("none"),
             },
             compaction: SessionCompactionConfiguration {
                 strategy: String::from("fixture"),
                 trigger_tokens: None,
+                reserved_context_tokens: 0,
+                max_provider_projection_tokens: 0,
                 preserve_unresolved_tasks: true,
                 preserve_active_processes: true,
+                preservation_requirements: Vec::new(),
             },
             tool_groups: Vec::new(),
             harness: String::from("native"),
@@ -351,6 +393,7 @@ mod tests {
     fn persistent_chat_maps_the_compiled_graph_without_a_parallel_model() {
         let executor = CompiledStyleExecutor::from_binding(&binding(BuiltInStyle::PersistentChat))
             .expect("executor");
+        assert!(executor.supports_persistent_turn());
         let respond = executor.entry().expect("entry");
         assert_eq!(respond.id, "respond");
         assert_eq!(respond.directive, StyleNodeDirective::ModelCall);
@@ -372,6 +415,7 @@ mod tests {
     fn research_loop_uses_compiled_conditions_and_rejects_missing_variables() {
         let executor = CompiledStyleExecutor::from_binding(&binding(BuiltInStyle::ResearchLoop))
             .expect("executor");
+        assert!(!executor.supports_persistent_turn());
         let loop_node = executor.node("repeat").expect("loop");
         let repeat = executor
             .transition(loop_node.index, &json!({"iteration":{"remaining":true}}))

@@ -7,14 +7,14 @@ implementation state; planned interfaces and scaffolds do not count as implement
 
 ## Current phase
 
-Session-style refocus, Phase 3 — context composition. Phases 1 and 2 are
-implemented: the runtime discovers, validates, compiles, caches, selects,
-persists, and restart-validates immutable session-style bindings through all
-four runtime tiers. Persistent chat now executes its model, tool gate, and turn
-completion nodes through the generic compiled-style executor while retaining
-the existing proposal, policy, receipt, continuation, harness, and tool paths.
-Built-in manifests other than persistent chat remain selectable and durable but
-do not yet have their distinct orchestration semantics.
+Session-style refocus, Phase 3 — context composition and executor recovery
+hardening. The registry, immutable session binding, and generic persistent-turn
+executor are live. Style-selected no/file/SQLite memory retrieval and
+none/sliding-window/tool-output-eviction compaction now run before provider
+requests through the blocking proposal and permission path, with canonical
+projection and provenance events. Summary generation, artifact handoff,
+automatic memory writes, and the distinct non-persistent built-in orchestration
+semantics remain incomplete.
 
 ## Completed capabilities
 
@@ -53,8 +53,9 @@ do not yet have their distinct orchestration semantics.
 | Native Git host | End-to-end validated | Discovery/status/diff, detached worktrees, commit-free integrity-checked checkpoints and guarded restore have 9 host tests; runtime routing uses keyed grants and `tests/e2e/runtime_git_loop.ps1` validates a real repository status round trip |
 | Native LSP host | End-to-end validated | Separate five-crate host implements LSP 3.17 lifecycle, all required query/edit-proposal operations, cancellation, timeout, restart, workspace containment, keyed authorization and deterministic fixture coverage; runtime project-root routing passes a process E2E |
 | Session-style SDK | Implemented and unit tested | Five built-ins, strict owned TOML/JSON manifests, STYLE001–STYLE029 validation, graph/pipeline compilation, availability/budget checks, inspectable descriptors and compatibility-bound cache keys; 10 tests |
-| Runtime session-style registry and binding | End-to-end validated on Windows | Runtime dependency discovers bounded user/project/plugin TOML/JSON sources and disable markers and persists compiled cache records; data compiles through the SDK and owns catalog/cache records; logic owns exact ID/version selection, compatibility, immutable binding, and fail-closed restart validation; service exposes list/inspect/validate/compile and binds creation/branch operations. Complete identity, manifest, compiled descriptor, memory/compaction/tool/harness/budget/permission selections are canonical and atomic in schema-v2 session metadata, `style.json`, and `style.lock`. CLI commands and the TUI Styles view select live styles. `runtime_style_registry.ps1` proves two distinct styles, restart continuation, explicit branch restyling, and no fallback after disablement; the Unix equivalent exists but has not yet been executed |
+| Runtime session-style registry and binding | End-to-end validated on Windows | Runtime dependency discovers bounded user/project/plugin TOML/JSON sources and disable markers and persists compiled cache records; data compiles through the SDK and owns catalog/cache records; logic owns exact ID/version selection, compatibility, immutable binding, and fail-closed restart validation; service exposes list/inspect/validate/compile and binds creation/branch operations. Complete identity, manifest, compiled descriptor, memory/compaction/tool/harness/budget/permission selections are canonical and atomic in schema-v2 session metadata, `style.json`, and `style.lock`. CLI commands and the TUI Styles view select live styles. `runtime_style_registry.ps1` proves two distinct durable bindings, persistent-style restart continuation, explicit unsupported-graph rejection without journal mutation, branch restyling, and no fallback after disablement; the Unix equivalent exists but has not yet been executed |
 | Generic runtime session-style executor | End-to-end validated for persistent chat on Windows | Runtime logic consumes the exact SDK-compiled graph retained by the immutable session binding, verifies all cache identity hashes, maps every compiled node kind to a runtime-owned directive, and rejects missing or ambiguous transitions. Canonical `style.execution_initialized`, `style.node_entered`, `style.node_completed`, `style.node_failed`, and `style.transition_selected` events reconstruct active/completed/failed nodes and transitions during replay without dispatching effects. Persistent chat follows `respond → tool → done` through this executor while its node adapters reuse the existing provider authorization, harness, tool proposal, permission, receipt, continuation, and assistant-commit paths. Turn-scoped provider failures clear the active node canonically; retained graph and style step limits fail closed. Windows durable-turn, streaming, reconnect, tool, process, approval, cancellation, registry/restart, and workspace tests pass; Unix equivalents are updated but not executed |
+| Style-selected context, memory, and compaction | End-to-end validated for no/file memory and none/sliding compaction on Windows | The SDK now explicitly compiles retrieval timing, query construction, write policy, injection location, reserved context tokens, projection limits, and typed preservation requirements with fail-safe schema-v1 defaults. Runtime data routes no-memory, checksum-protected file memory, and SQLite FTS through distinct selected dependencies. Persistent-compatible styles retrieve bounded records by selected scope, retain provider/query/scope/source/reference/creation/injection/score/byte provenance, and inject at the selected projection location. Context construction, replacement, and compaction proposals traverse the existing style/plugin/user/mandatory pipeline; canonical projection replacements preserve full conversation history. Replay-derived provider token accounting drives trigger-based sliding-window or artifact-safe tool-output eviction. `runtime_style_context.ps1` proves file-vs-none projection differences without provider behavior changes and 18 equivalent none-vs-sliding turns with different projections but identical canonical history. Summary/artifact handoff and automatic writes remain incomplete; the Unix process script has only been syntax-checked |
 | Runtime local RPC transport | Integration tested | Bounded framed negotiation, mandatory bootstrap-token authentication, concurrent local socket/named-pipe connections, request dispatch, ordered `StreamItem`/`StreamEnd` frames, committed-sequence binding, and bounded channel backpressure tests |
 | Runtime↔harness durable turn | End-to-end validated | CLI create/run traverses authenticated named pipe, runtime replay/commit, ordered interception and policy, short-lived keyed grant, supervised harness, deterministic provider, canonical proposal/approval/started/delta/completion events, and assistant commit; Windows E2E passes and Unix automation is present |
 | Runtime provider stream cancellation | End-to-end validated | Harness lifecycle events cross the process boundary as individual bounded frames, are committed one at a time, and cross runtime RPC as ordered bounded stream frames; caller-selected cancellation IDs travel through four-layer CLI/runtime mappings, active cancellation interrupts and drops the harness child, partial visible output and cancellation are committed without completion, and a fresh request reconnects in `runtime_stream_cancel.ps1`; Unix automation is present |
@@ -77,7 +78,9 @@ do not yet have their distinct orchestration semantics.
 
 ## In progress
 
-- Style-selected context, memory, compaction, and pipeline composition.
+- Typed summary/artifact compaction and approved automatic memory-write flows.
+- Stronger graph reducer causality, control-gap recovery, continuation-failure
+  handling, and per-node budget enforcement.
 - TUI management panels for schedules, plugins, MCP, processes, artifacts,
   child agents, and LSP; core interactive streaming is implemented.
 - MCP OAuth authorization-code flow.
@@ -96,7 +99,7 @@ None.
 
 ## Next tasks
 
-1. Activate style-selected context, memory, compaction, and pipelines.
+1. Harden graph replay/recovery and finish summary/artifact/write context paths.
 2. Implement ephemeral turn, research loop, declarative graph, then
    planner-worker-reviewer child sessions.
 3. Connect plugin composition and the harness capability registry.
@@ -157,9 +160,13 @@ mandatory permission precedence, and plugin authority validation have tests.
 
 ## Acceptance scenario status
 
-All acceptance scenarios remain short of cross-platform full-suite completion. The
-session-style refocus Scenario 1 passes its Windows process path and Scenario 12
-passes explicit branch restyling; their Unix scripts have not been executed.
+All acceptance scenarios remain short of cross-platform full-suite completion.
+Style registry selection, restart validation, explicit unsupported-graph
+rejection without journal mutation, and Scenario 12 branch restyling pass their
+Windows process paths; the non-persistent built-ins still need their distinct
+executors before Scenario 1 can continue two different semantic styles.
+Scenario 7 and the deterministic none/file portion of Scenario 8 now pass on
+Windows through `runtime_style_context.ps1`; Unix scripts have not been executed.
 Scenario
 1 has a real model-driven read/edit/failing-test/fix/passing-test process E2E,
 but still lacks symbol search and multi-file edits. Scenarios 3 and 4 now pass

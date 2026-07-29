@@ -80,10 +80,22 @@ pub struct SessionMemoryConfiguration {
     pub provider: String,
     /// Allowed memory scopes in deterministic order.
     pub scopes: Vec<String>,
+    /// Lifecycle boundary selected for retrieval.
+    #[serde(default)]
+    pub retrieval_timing: String,
+    /// Canonical SDK query-construction configuration.
+    #[serde(default)]
+    pub query_json: String,
     /// Maximum records injected into one context.
     pub max_items: u32,
     /// Maximum injected bytes.
     pub max_injected_bytes: u64,
+    /// Lifecycle boundary selected for automatic writes.
+    #[serde(default)]
+    pub write_policy: String,
+    /// Typed provider-projection injection location.
+    #[serde(default)]
+    pub injection_location: String,
 }
 
 /// Session-owned compaction selection copied from the compiled style.
@@ -93,10 +105,19 @@ pub struct SessionCompactionConfiguration {
     pub strategy: String,
     /// Automatic trigger threshold.
     pub trigger_tokens: Option<u64>,
+    /// Context tokens reserved outside compacted history.
+    #[serde(default)]
+    pub reserved_context_tokens: u64,
+    /// Maximum provider-visible projection after compaction.
+    #[serde(default)]
+    pub max_provider_projection_tokens: u64,
     /// Whether unresolved tasks must survive compaction.
     pub preserve_unresolved_tasks: bool,
     /// Whether active process state must survive compaction.
     pub preserve_active_processes: bool,
+    /// Typed records that the selected compactor must retain.
+    #[serde(default)]
+    pub preservation_requirements: Vec<String>,
 }
 
 /// Immutable style execution budgets bound at session creation.
@@ -741,6 +762,15 @@ pub struct StyleExecutionState {
     /// Terminal reason supplied by a failed node, if execution has ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub termination_reason: Option<String>,
+    /// Provider-reported input tokens accumulated from canonical completions.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Provider-reported output tokens accumulated from canonical completions.
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// Cumulative provider tokens observed when compaction last committed.
+    #[serde(default)]
+    pub tokens_at_last_compaction: u64,
 }
 
 /// Durable tool-dispatch reconciliation state.
@@ -903,7 +933,18 @@ fn apply_payload(
             state
                 .conversation
                 .replace_projection(replaced.replacement.clone(), replaced.provenance.clone())
-                .map_err(SessionReducerError::Conversation)
+                .map_err(SessionReducerError::Conversation)?;
+            if matches!(
+                replaced.provenance.method.as_str(),
+                "sliding_window" | "summary" | "artifact_handoff" | "tool_output_eviction"
+            ) && let Some(execution) = state.style_execution.as_mut()
+            {
+                execution.tokens_at_last_compaction = execution
+                    .input_tokens
+                    .checked_add(execution.output_tokens)
+                    .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+            }
+            Ok(())
         }
         RuntimeCommittedEvent::ModelRequestProposed(_)
         | RuntimeCommittedEvent::ModelRequestApproved(_)
@@ -911,13 +952,25 @@ fn apply_payload(
         | RuntimeCommittedEvent::ModelOutputDeltaObserved(_)
         | RuntimeCommittedEvent::ModelToolCallDeltaObserved(_)
         | RuntimeCommittedEvent::ModelToolCallProposed(_)
-        | RuntimeCommittedEvent::ModelResponseCompleted(_)
         | RuntimeCommittedEvent::ModelRequestCancelled(_)
         | RuntimeCommittedEvent::ModelRequestFailed(_)
         | RuntimeCommittedEvent::ToolCallProposed(_)
         | RuntimeCommittedEvent::ToolCallApproved(_)
         | RuntimeCommittedEvent::SchedulerFired(_)
         | RuntimeCommittedEvent::SchedulerDeliveryReconciled(_) => Ok(()),
+        RuntimeCommittedEvent::ModelResponseCompleted(completed) => {
+            if let Some(execution) = state.style_execution.as_mut() {
+                execution.input_tokens = execution
+                    .input_tokens
+                    .checked_add(completed.input_tokens)
+                    .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+                execution.output_tokens = execution
+                    .output_tokens
+                    .checked_add(completed.output_tokens)
+                    .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+            }
+            Ok(())
+        }
         RuntimeCommittedEvent::StyleExecutionInitialized(initialized) => {
             apply_style_execution_initialized(state, initialized)
         }
@@ -1038,6 +1091,9 @@ fn apply_style_execution_initialized(
         failed_nodes: Vec::new(),
         transitions: Vec::new(),
         termination_reason: None,
+        input_tokens: 0,
+        output_tokens: 0,
+        tokens_at_last_compaction: 0,
     });
     Ok(())
 }
@@ -1403,6 +1459,9 @@ pub enum SessionReducerError {
     /// A style node lifecycle or graph transition is invalid.
     #[error("style execution state transition is invalid")]
     InvalidStyleExecutionTransition,
+    /// Provider-reported usage exceeded the replay-safe integer bound.
+    #[error("style provider token usage overflowed")]
+    StyleTokenUsageOverflow,
     /// Conversation state invariant failed.
     #[error("conversation state failed: {0}")]
     Conversation(ConversationError),
@@ -1804,6 +1863,50 @@ to = "done"
             execution.failed_nodes[0].artifact_reference.as_deref(),
             Some("artifact:failure-1")
         );
+    }
+
+    #[test]
+    fn style_token_usage_and_compaction_checkpoint_replay_canonically() {
+        let events = vec![
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(compiled_graph()),
+                    },
+                )),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::ModelResponseCompleted(ModelResponseCompletedEvent {
+                    cancellation_id: String::from("provider-1"),
+                    finish_reason: String::from("stop"),
+                    input_tokens: 11,
+                    output_tokens: 7,
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::ContextProjectionReplaced(ContextProjectionReplacedEvent {
+                    replacement: Vec::new(),
+                    provenance: ProjectionProvenance {
+                        projection_id: String::from("compaction-4"),
+                        source_range: None,
+                        method: String::from("sliding_window"),
+                        committed_at: Sequence::new(4).expect("sequence"),
+                        artifact_id: None,
+                    },
+                }),
+            ),
+        ];
+        let execution = replay(&events)
+            .expect("replay")
+            .style_execution
+            .expect("style execution");
+        assert_eq!(execution.input_tokens, 11);
+        assert_eq!(execution.output_tokens, 7);
+        assert_eq!(execution.tokens_at_last_compaction, 18);
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use agentmod_event_pipeline::BlockingPipelineBuilder;
-use agentmod_runtime_data::RuntimeData;
+use agentmod_runtime_data::{RuntimeData, memory::RuntimeMemoryData};
 use agentmod_runtime_dependency::{
     LocalRuntimeDependencies,
     continuation::FileContinuationDependency,
@@ -217,6 +217,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?,
             FileContinuationDependency::new(sessions_root.clone()),
             scheduler,
+        ))
+        .with_memory(RuntimeMemoryData::first_party(
+            &sessions_root
+                .parent()
+                .unwrap_or(&sessions_root)
+                .join("memory"),
         ));
         let core = RuntimeService::new(
             RuntimeLogic::new(data.clone()),

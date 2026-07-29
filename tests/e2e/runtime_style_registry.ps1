@@ -84,13 +84,19 @@ try {
             --session $persistent.session_id `
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="persistent-before"' --json | ConvertFrom-Json
-        $ephemeralTurn = & $cli run "ephemeral before restart" `
+        & $cli run "ephemeral before restart" `
             --session $ephemeral.session_id `
             --option 'mock_scenario="streaming_text"' `
-            --option 'mock_text="ephemeral-before"' --json | ConvertFrom-Json
+            --option 'mock_text="ephemeral-before"' --json 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            throw "unimplemented ephemeral graph silently used the legacy turn path"
+        }
+        $ephemeralJournal = Join-Path $runRoot (
+            "sessions\" + $ephemeral.session_id + "\events.jsonl"
+        )
         if ($persistentTurn.last_committed_sequence -ne 19 -or
-            $ephemeralTurn.last_committed_sequence -ne 10) {
-            throw "pre-restart turns did not complete"
+            @(Get-Content $ephemeralJournal).Count -ne 1) {
+            throw "pre-restart style execution state was incorrect"
         }
 
         Stop-TestRuntime $daemon
@@ -106,13 +112,16 @@ try {
             --session $persistent.session_id `
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="persistent-after"' --json | ConvertFrom-Json
-        $ephemeralAfter = & $cli run "ephemeral after restart" `
+        & $cli run "ephemeral after restart" `
             --session $ephemeral.session_id `
             --option 'mock_scenario="streaming_text"' `
-            --option 'mock_text="ephemeral-after"' --json | ConvertFrom-Json
+            --option 'mock_text="ephemeral-after"' --json 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            throw "unsupported style changed behavior after restart"
+        }
         if ($persistentAfter.last_committed_sequence -ne 36 -or
-            $ephemeralAfter.last_committed_sequence -ne 19) {
-            throw "post-restart turns did not complete"
+            @(Get-Content $ephemeralJournal).Count -ne 1) {
+            throw "post-restart style execution state was incorrect"
         }
 
         $branch = & $cli session branch $persistent.session_id --at 19 `

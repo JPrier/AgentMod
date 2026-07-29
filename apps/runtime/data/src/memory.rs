@@ -1,9 +1,10 @@
 //! Business-facing replaceable memory datasets.
 
 use agentmod_runtime_dependency::memory::{
-    DependencyMemoryQueryRequest, DependencyMemoryWriteRequest, MemoryDependencyError,
-    MemoryDependencyPort,
+    DependencyMemoryQueryRequest, DependencyMemoryWriteRequest, FileMemoryDependency,
+    MemoryDependencyError, MemoryDependencyPort, NoMemoryDependency, SqliteFtsMemoryDependency,
 };
+use std::path::Path;
 use thiserror::Error;
 
 /// Data-owned memory scope.
@@ -35,6 +36,8 @@ impl MemoryScopeRecord {
 /// Data-owned write request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WriteMemoryDataRequest {
+    /// Selected provider ID.
+    pub provider: String,
     /// Memory scope.
     pub scope: MemoryScopeRecord,
     /// Provenance.
@@ -59,6 +62,8 @@ pub struct WriteMemoryDataRecord {
 /// Data-owned retrieval request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetrieveMemoryDataRequest {
+    /// Selected provider ID.
+    pub provider: String,
     /// Scope.
     pub scope: MemoryScopeRecord,
     /// Query.
@@ -131,6 +136,9 @@ where
         &self,
         request: WriteMemoryDataRequest,
     ) -> Result<WriteMemoryDataRecord, MemoryDataError> {
+        if request.provider != self.dependency.provider_name() {
+            return Err(MemoryDataError::InvalidProvider);
+        }
         let response = self
             .dependency
             .write(DependencyMemoryWriteRequest {
@@ -151,6 +159,9 @@ where
         &self,
         request: RetrieveMemoryDataRequest,
     ) -> Result<Vec<RetrievedMemoryDataRecord>, MemoryDataError> {
+        if request.provider != self.dependency.provider_name() {
+            return Err(MemoryDataError::InvalidProvider);
+        }
         let scope = request.scope.external_key()?;
         let provider = self.dependency.provider_name();
         self.dependency
@@ -179,9 +190,61 @@ where
     }
 }
 
+/// Data-layer router over the first-party replaceable memory dependencies.
+#[derive(Clone, Debug)]
+pub struct RuntimeMemoryData {
+    none: MemoryData<NoMemoryDependency>,
+    file: MemoryData<FileMemoryDependency>,
+    sqlite_fts: MemoryData<SqliteFtsMemoryDependency>,
+}
+
+impl RuntimeMemoryData {
+    /// Creates the first-party provider set below an explicit runtime-owned root.
+    #[must_use]
+    pub fn first_party(root: &Path) -> Self {
+        Self {
+            none: MemoryData::new(NoMemoryDependency),
+            file: MemoryData::new(FileMemoryDependency::new(root.join("file.jsonl"))),
+            sqlite_fts: MemoryData::new(SqliteFtsMemoryDependency::new(
+                root.join("sqlite-fts.sqlite3"),
+            )),
+        }
+    }
+
+    fn selected(&self, provider: &str) -> Result<&dyn MemoryDataPort, MemoryDataError> {
+        match provider {
+            "none" => Ok(&self.none),
+            "file" => Ok(&self.file),
+            "sqlite-fts" | "sqlite-fts5" => Ok(&self.sqlite_fts),
+            _ => Err(MemoryDataError::InvalidProvider),
+        }
+    }
+}
+
+impl MemoryDataPort for RuntimeMemoryData {
+    fn write_memory(
+        &self,
+        request: WriteMemoryDataRequest,
+    ) -> Result<WriteMemoryDataRecord, MemoryDataError> {
+        let provider = request.provider.clone();
+        self.selected(&provider)?.write_memory(request)
+    }
+
+    fn retrieve_memory(
+        &self,
+        request: RetrieveMemoryDataRequest,
+    ) -> Result<Vec<RetrievedMemoryDataRecord>, MemoryDataError> {
+        let provider = request.provider.clone();
+        self.selected(&provider)?.retrieve_memory(request)
+    }
+}
+
 /// Memory data-layer failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum MemoryDataError {
+    /// Provider ID is not part of the configured data router.
+    #[error("memory provider is invalid or unavailable")]
+    InvalidProvider,
     /// Scope is not a normalized supported scope.
     #[error("memory scope is invalid")]
     InvalidScope,
@@ -245,6 +308,7 @@ mod tests {
         });
         let written = data
             .write_memory(WriteMemoryDataRequest {
+                provider: String::from("mock"),
                 scope: MemoryScopeRecord {
                     kind: String::from("project"),
                     identity: String::from("p1"),
@@ -258,6 +322,7 @@ mod tests {
         assert_eq!(data.dependency.writes.borrow()[0].scope, "project:p1");
         let retrieved = data
             .retrieve_memory(RetrieveMemoryDataRequest {
+                provider: String::from("mock"),
                 scope: MemoryScopeRecord {
                     kind: String::from("project"),
                     identity: String::from("p1"),
@@ -268,5 +333,50 @@ mod tests {
             .expect("retrieve");
         assert_eq!(retrieved[0].content, "event sourcing");
         assert_eq!(retrieved[0].provider, "mock");
+    }
+
+    #[test]
+    fn first_party_router_keeps_file_sqlite_and_none_distinct() {
+        let root = tempfile::tempdir().expect("root");
+        let data = RuntimeMemoryData::first_party(root.path());
+        for provider in ["file", "sqlite-fts"] {
+            data.write_memory(WriteMemoryDataRequest {
+                provider: provider.into(),
+                scope: MemoryScopeRecord {
+                    kind: String::from("session"),
+                    identity: String::from("s1"),
+                },
+                source: String::from("fixture"),
+                content: format!("orchid retained by {provider}"),
+                created_at_millis: 1,
+            })
+            .expect("write");
+            let retrieved = data
+                .retrieve_memory(RetrieveMemoryDataRequest {
+                    provider: provider.into(),
+                    scope: MemoryScopeRecord {
+                        kind: String::from("session"),
+                        identity: String::from("s1"),
+                    },
+                    query: String::from("orchid"),
+                    limit: 4,
+                })
+                .expect("retrieve");
+            assert_eq!(retrieved.len(), 1);
+            assert_eq!(retrieved[0].provider, provider);
+        }
+        assert!(
+            data.retrieve_memory(RetrieveMemoryDataRequest {
+                provider: String::from("none"),
+                scope: MemoryScopeRecord {
+                    kind: String::from("session"),
+                    identity: String::from("s1"),
+                },
+                query: String::from("orchid"),
+                limit: 4,
+            })
+            .expect("none")
+            .is_empty()
+        );
     }
 }

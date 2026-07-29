@@ -564,16 +564,27 @@ fn binding(
         memory: SessionMemoryConfiguration {
             provider: required_value_string(memory, "provider")?,
             scopes: string_array(Some(memory), "scopes"),
+            retrieval_timing: required_value_string(memory, "retrieval_timing")?,
+            query_json: serde_json::to_string(required_child(memory, "query")?)
+                .map_err(|_| SessionStyleLogicError::InvalidData)?,
             max_items: value_u64(memory, "max_items")?
                 .try_into()
                 .map_err(|_| SessionStyleLogicError::InvalidData)?,
             max_injected_bytes: value_u64(memory, "max_injected_bytes")?,
+            write_policy: required_value_string(memory, "write_policy")?,
+            injection_location: required_value_string(memory, "injection_location")?,
         },
         compaction: SessionCompactionConfiguration {
             strategy: required_value_string(compaction, "strategy")?,
             trigger_tokens: compaction.get("trigger_tokens").and_then(Value::as_u64),
+            reserved_context_tokens: value_u64(compaction, "reserved_context_tokens")?,
+            max_provider_projection_tokens: value_u64(
+                compaction,
+                "max_provider_projection_tokens",
+            )?,
             preserve_unresolved_tasks: value_bool(compaction, "preserve_unresolved_tasks")?,
             preserve_active_processes: value_bool(compaction, "preserve_active_processes")?,
+            preservation_requirements: string_array(Some(compaction), "preservation_requirements"),
         },
         tool_groups: string_array(Some(&compiled), "allowed_tool_groups"),
         harness: String::from("native"),

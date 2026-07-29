@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use agentmod_graph_engine::GRAPH_FORMAT_VERSION;
 use agentmod_primitives::ContentHash;
 use agentmod_session_style_sdk::{
-    BuiltInStyle, CompileContext, CompiledSessionStyle, DecisionCapability, GraphSource,
+    BuiltInStyle, CompactionStrategy, CompileContext, CompiledSessionStyle, DecisionCapability,
+    GraphSource, MemoryInjectionLocation, MemoryRetrievalTiming, MemoryWritePolicy,
     StyleCompilerLimits, built_in_manifest, compile_style, compile_style_set, parse_json,
     parse_toml, to_json, to_toml,
 };
@@ -110,6 +111,33 @@ fn all_five_built_ins_compile_with_hard_limits_and_explicit_completion() {
         assert!(compiled.budgets.max_cost_micros > 0);
         assert!(compiled.budgets.max_duration_ms > 0);
         assert!(compiled.termination.require_explicit_terminal_node);
+        assert_eq!(
+            compiled.memory.provider == "none",
+            compiled.memory.retrieval_timing == MemoryRetrievalTiming::Never
+        );
+        assert_eq!(
+            compiled.memory.provider == "none",
+            compiled.memory.write_policy == MemoryWritePolicy::Never
+        );
+        assert_eq!(
+            compiled.memory.provider == "none",
+            compiled.memory.injection_location == MemoryInjectionLocation::None
+        );
+        assert_eq!(
+            compiled.compaction.strategy == CompactionStrategy::None,
+            compiled.compaction.trigger_tokens.is_none()
+        );
+        if compiled.compaction.strategy == CompactionStrategy::None {
+            assert_eq!(compiled.compaction.reserved_context_tokens, 0);
+            assert_eq!(compiled.compaction.max_provider_projection_tokens, 0);
+        } else {
+            assert!(compiled.compaction.reserved_context_tokens > 0);
+            assert!(
+                compiled.compaction.reserved_context_tokens
+                    < compiled.compaction.max_provider_projection_tokens
+            );
+        }
+        assert!(!compiled.compaction.preservation_requirements.is_empty());
         assert!(compiled.graph.nodes.iter().any(|node| matches!(
             node.kind,
             agentmod_graph_engine::NodeKind::CompleteTurn
@@ -123,6 +151,83 @@ fn all_five_built_ins_compile_with_hard_limits_and_explicit_completion() {
                 .contains("cache_key")
         );
     }
+}
+
+#[test]
+fn schema_v1_manifests_without_context_controls_receive_safe_explicit_defaults() {
+    let manifest = built_in_manifest(BuiltInStyle::DeclarativeGraph);
+    let mut legacy = serde_json::to_value(manifest).expect("manifest JSON");
+    let memory = legacy["memory"].as_object_mut().expect("memory object");
+    for field in [
+        "retrieval_timing",
+        "query",
+        "write_policy",
+        "injection_location",
+    ] {
+        memory.remove(field);
+    }
+    let compaction = legacy["compaction"]
+        .as_object_mut()
+        .expect("compaction object");
+    for field in [
+        "reserved_context_tokens",
+        "max_provider_projection_tokens",
+        "preservation_requirements",
+    ] {
+        compaction.remove(field);
+    }
+
+    let parsed = parse_json(&serde_json::to_string(&legacy).expect("legacy JSON"))
+        .expect("schema-v1 manifest remains compatible");
+    assert_eq!(parsed.memory.retrieval_timing, MemoryRetrievalTiming::Never);
+    assert_eq!(parsed.memory.write_policy, MemoryWritePolicy::Never);
+    assert_eq!(
+        parsed.memory.injection_location,
+        MemoryInjectionLocation::None
+    );
+    assert_eq!(parsed.compaction.reserved_context_tokens, 0);
+    assert_eq!(parsed.compaction.max_provider_projection_tokens, 0);
+    assert!(!parsed.compaction.preservation_requirements.is_empty());
+
+    let canonical = to_json(&parsed).expect("canonical JSON");
+    for field in [
+        "\"retrieval_timing\"",
+        "\"query\"",
+        "\"write_policy\"",
+        "\"injection_location\"",
+        "\"reserved_context_tokens\"",
+        "\"max_provider_projection_tokens\"",
+        "\"preservation_requirements\"",
+    ] {
+        assert!(canonical.contains(field), "missing canonical field {field}");
+    }
+    compile_style(&parsed, &context(), StyleCompilerLimits::default())
+        .expect("defaulted schema-v1 manifest compiles");
+}
+
+#[test]
+fn inconsistent_memory_and_compaction_controls_are_rejected() {
+    let mut manifest = built_in_manifest(BuiltInStyle::PersistentChat);
+    manifest.memory.provider = "none".to_owned();
+    manifest.memory.scopes.clear();
+    manifest.memory.max_items = 0;
+    manifest.memory.max_injected_bytes = 0;
+    manifest.compaction.strategy = CompactionStrategy::None;
+    manifest.compaction.trigger_tokens = None;
+
+    let error = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect_err("disabled selections must not retain live controls");
+    assert!(codes(&error).contains(&"STYLE030"), "{error}");
+    assert!(codes(&error).contains(&"STYLE031"), "{error}");
+
+    let mut manifest = built_in_manifest(BuiltInStyle::PersistentChat);
+    manifest.memory.query.max_query_bytes = 0;
+    manifest.compaction.reserved_context_tokens =
+        manifest.compaction.max_provider_projection_tokens;
+    let error = compile_style(&manifest, &context(), StyleCompilerLimits::default())
+        .expect_err("active controls must be bounded");
+    assert!(codes(&error).contains(&"STYLE030"), "{error}");
+    assert!(codes(&error).contains(&"STYLE031"), "{error}");
 }
 
 #[test]
@@ -295,6 +400,21 @@ fn style_cache_key_binds_every_required_input() {
             StyleCompilerLimits::default()
         )
         .expect("changed style")
+        .cache_key
+        .combined_hash
+    );
+
+    let mut changed_manifest = manifest.clone();
+    changed_manifest.memory.query.include_style_context =
+        !changed_manifest.memory.query.include_style_context;
+    assert_ne!(
+        baseline.combined_hash,
+        compile_style(
+            &changed_manifest,
+            &context(),
+            StyleCompilerLimits::default()
+        )
+        .expect("changed memory query construction")
         .cache_key
         .combined_hash
     );

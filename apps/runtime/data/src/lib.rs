@@ -56,6 +56,7 @@ pub trait RuntimeDataPort {
 pub struct RuntimeData<D> {
     dependency: D,
     style_cache: Arc<Mutex<BTreeMap<String, style::CachedSessionStyle>>>,
+    memory: Option<memory::RuntimeMemoryData>,
 }
 
 impl<D> RuntimeData<D> {
@@ -65,7 +66,37 @@ impl<D> RuntimeData<D> {
         Self {
             dependency,
             style_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            memory: None,
         }
+    }
+
+    /// Adds the explicit first-party memory-provider router used by live turns.
+    #[must_use]
+    pub fn with_memory(mut self, memory: memory::RuntimeMemoryData) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+}
+
+impl<D> memory::MemoryDataPort for RuntimeData<D> {
+    fn write_memory(
+        &self,
+        request: memory::WriteMemoryDataRequest,
+    ) -> Result<memory::WriteMemoryDataRecord, memory::MemoryDataError> {
+        self.memory
+            .as_ref()
+            .ok_or(memory::MemoryDataError::InvalidProvider)?
+            .write_memory(request)
+    }
+
+    fn retrieve_memory(
+        &self,
+        request: memory::RetrieveMemoryDataRequest,
+    ) -> Result<Vec<memory::RetrievedMemoryDataRecord>, memory::MemoryDataError> {
+        self.memory
+            .as_ref()
+            .ok_or(memory::MemoryDataError::InvalidProvider)?
+            .retrieve_memory(request)
     }
 }
 

@@ -185,6 +185,36 @@ impl RuntimeStyleServiceConfig {
             graph_references: BTreeMap::new(),
         }
     }
+
+    /// Maps service-owned capability configuration into the logic environment
+    /// shared by top-level and runtime-managed child session selection.
+    #[must_use]
+    pub fn logic_environment(&self, workspace: Option<&str>) -> StyleEnvironment {
+        StyleEnvironment {
+            runtime_api_version: self.runtime_api_version.clone(),
+            plugin_set_hash: self.plugin_set_hash.clone(),
+            user_style_root: self.user_style_root.clone(),
+            project_style_root: workspace.map_or_else(
+                || self.project_style_root.clone(),
+                |workspace| Some(PathBuf::from(workspace).join(".agentmod").join("styles")),
+            ),
+            plugin_style_roots: self.plugin_style_roots.clone(),
+            cache_root: self.cache_root.clone(),
+            capabilities: self.capabilities.clone(),
+            tool_groups: self.tool_groups.clone(),
+            providers: self.providers.clone(),
+            plugins: self.plugins.clone(),
+            memory_providers: self.memory_providers.clone(),
+            compaction_strategies: self.compaction_strategies.clone(),
+            supported_decisions: self
+                .supported_decisions
+                .iter()
+                .copied()
+                .map(to_logic_style_decision)
+                .collect(),
+            graph_references: self.graph_references.clone(),
+        }
+    }
 }
 
 /// Endpoint-facing runtime service.
@@ -428,32 +458,7 @@ where
     }
 
     fn style_environment(&self, workspace: Option<&str>) -> StyleEnvironment {
-        StyleEnvironment {
-            runtime_api_version: self.config.styles.runtime_api_version.clone(),
-            plugin_set_hash: self.config.styles.plugin_set_hash.clone(),
-            user_style_root: self.config.styles.user_style_root.clone(),
-            project_style_root: workspace.map_or_else(
-                || self.config.styles.project_style_root.clone(),
-                |workspace| Some(PathBuf::from(workspace).join(".agentmod").join("styles")),
-            ),
-            plugin_style_roots: self.config.styles.plugin_style_roots.clone(),
-            cache_root: self.config.styles.cache_root.clone(),
-            capabilities: self.config.styles.capabilities.clone(),
-            tool_groups: self.config.styles.tool_groups.clone(),
-            providers: self.config.styles.providers.clone(),
-            plugins: self.config.styles.plugins.clone(),
-            memory_providers: self.config.styles.memory_providers.clone(),
-            compaction_strategies: self.config.styles.compaction_strategies.clone(),
-            supported_decisions: self
-                .config
-                .styles
-                .supported_decisions
-                .iter()
-                .copied()
-                .map(to_logic_style_decision)
-                .collect(),
-            graph_references: self.config.styles.graph_references.clone(),
-        }
+        self.config.styles.logic_environment(workspace)
     }
 
     /// Validates the immutable style binding reconstructed from a session's

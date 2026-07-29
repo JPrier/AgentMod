@@ -18,6 +18,7 @@ use agentmod_runtime_dependency::{
 use agentmod_runtime_logic::{
     RuntimeLogic,
     action::ActionProposal,
+    child_session::RuntimeChildSessionLogic,
     harness::{ProviderExecutionLogic, ProviderExecutionPolicy},
     permission::{PermissionEffect, PermissionMatcher, PermissionPolicy, PermissionRule},
     turn::TurnLogic,
@@ -225,15 +226,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .join("memory"),
         ))
         .with_artifacts(agentmod_runtime_data::artifact::RuntimeArtifactData::first_party());
+        let style_config = RuntimeStyleServiceConfig::native(&sessions_root);
+        let child_sessions =
+            RuntimeChildSessionLogic::new(data.clone(), style_config.logic_environment(None));
         let core = RuntimeService::new(
             RuntimeLogic::new(data.clone()),
             RuntimeServiceConfig {
                 session_root: sessions_root.clone(),
                 version: env!("CARGO_PKG_VERSION").into(),
-                styles: RuntimeStyleServiceConfig::native(&sessions_root),
+                styles: style_config,
             },
         );
-        let turns = TurnService::new(TurnLogic::new(data, provider_policy()), sessions_root);
+        let turns = TurnService::new(
+            TurnLogic::new(data, provider_policy()).with_child_sessions(child_sessions),
+            sessions_root,
+        );
         let recovery = turns.recover_startup_tools().await?;
         eprintln!(
             "{}",

@@ -39,6 +39,7 @@ use crate::{
     artifact::{
         ArtifactPersistenceLogic, ArtifactRetention, ArtifactSecurity, PersistArtifactCommand,
     },
+    child_session::ChildSessionLogicPort,
     compaction::{CompactionContext, CompactionError, CompactionStrategy, compact_projection},
     continuation::{
         ApprovalDisposition, ContinuationLogic, ContinuationLogicPort, ContinuationPayload,
@@ -48,8 +49,8 @@ use crate::{
         ToolApprovalContinuation, WakeContinuationCommand,
     },
     conversation::{
-        ConversationEntry, ConversationEntryId, ProjectionProvenance, RetrievedMemoryEntry,
-        TextEntry, ToolCallEntry, ToolResultEntry,
+        ConversationEntry, ConversationEntryId, PendingTaskEntry, ProjectionProvenance,
+        RetrievedMemoryEntry, TextEntry, ToolCallEntry, ToolResultEntry,
     },
     harness::{
         AuthorizedProviderRequest, ExecuteProviderCommand, ProviderEvent, ProviderEventStream,
@@ -113,8 +114,15 @@ enum ContextCompositionBoundary {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ContextCompositionOrigin {
     UserTurn,
+    ChildTask,
     ToolContinuation,
     ApprovalContinuation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TurnInputOrigin {
+    User,
+    ChildTask,
 }
 
 fn process_reconciliation_id(action: &crate::action::ToolCallAction) -> Option<String> {
@@ -417,6 +425,7 @@ pub struct TurnLogic<D> {
     artifacts: ArtifactPersistenceLogic<D>,
     policy: ProviderExecutionPolicy,
     session_gates: Arc<Mutex<BTreeMap<String, Weak<Mutex<()>>>>>,
+    child_sessions: Option<Arc<dyn ChildSessionLogicPort>>,
 }
 
 impl<D: Clone> TurnLogic<D> {
@@ -435,7 +444,18 @@ impl<D: Clone> TurnLogic<D> {
             tools: ToolExecutionLogic::new(data.clone(), tool_policy),
             data,
             session_gates: Arc::new(Mutex::new(BTreeMap::new())),
+            child_sessions: None,
         }
+    }
+
+    /// Enables runtime-managed child sessions for styles that declare them.
+    #[must_use]
+    pub fn with_child_sessions(
+        mut self,
+        child_sessions: impl ChildSessionLogicPort + 'static,
+    ) -> Self {
+        self.child_sessions = Some(Arc::new(child_sessions));
+        self
     }
 
     async fn session_gate(&self, session: &str) -> Arc<Mutex<()>> {
@@ -466,7 +486,8 @@ where
         + 'static,
 {
     async fn run_turn(&self, command: RunTurnCommand) -> Result<RunTurnResult, RunTurnError> {
-        self.run_turn_internal(command, None, None).await
+        self.run_turn_internal(command, None, None, TurnInputOrigin::User)
+            .await
     }
 
     async fn run_scheduled_turn(
@@ -491,6 +512,7 @@ where
                 schedule_id: command.schedule_id,
                 scheduled_for_ms: command.scheduled_for_ms,
             }),
+            TurnInputOrigin::User,
         )
         .await
     }
@@ -503,7 +525,10 @@ where
         let (sender, receiver) = mpsc::channel(16);
         let logic = self.clone();
         tokio::spawn(async move {
-            match logic.run_turn_internal(command, Some(&sender), None).await {
+            match logic
+                .run_turn_internal(command, Some(&sender), None, TurnInputOrigin::User)
+                .await
+            {
                 Ok(result) => {
                     let _ = sender
                         .send(Ok(RunTurnStreamItem::Complete {
@@ -536,6 +561,20 @@ where
         + agentmod_runtime_data::tool::ToolDataPort
         + 'static,
 {
+    /// Executes the exact canonical task assigned to a runtime-managed child.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RunTurnError`] when the typed task identity, selected style,
+    /// context lifecycle, or an existing effect-safe turn path fails.
+    pub async fn run_child_task(
+        &self,
+        command: RunTurnCommand,
+    ) -> Result<RunTurnResult, RunTurnError> {
+        self.run_turn_internal(command, None, None, TurnInputOrigin::ChildTask)
+            .await
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "the style executor adapter keeps canonical node events adjacent to the existing effect-safe provider and tool phases"
@@ -545,6 +584,7 @@ where
         command: RunTurnCommand,
         sink: Option<&mpsc::Sender<Result<RunTurnStreamItem, RunTurnError>>>,
         scheduled: Option<ScheduledTurnPrelude>,
+        input_origin: TurnInputOrigin,
     ) -> Result<RunTurnResult, RunTurnError> {
         validate(&command)?;
         let session_id =
@@ -740,12 +780,34 @@ where
             self.commit_scheduler_fired(&persistence, session_id, &session_directory, scheduled)?;
         }
         let (state, user_sequence, mut style_turn, provider_position) = if resume_context {
-            let user_sequence = current_run_user_sequence(&preflight.state, &command)?;
+            let user_sequence = current_run_input_sequence(&preflight.state, &command)?;
             let position = JournalPosition {
                 sequence: preflight.state.last_sequence,
                 event_id: preflight.last_event_id,
             };
             let style_turn = Self::resume_active_style_turn(&preflight.state, position)?;
+            (preflight.state, user_sequence, style_turn, position)
+        } else if input_origin == TurnInputOrigin::ChildTask {
+            validate_child_task_input(&preflight.state, &command)?;
+            let user_sequence = current_run_input_sequence(&preflight.state, &command)?;
+            let position = JournalPosition {
+                sequence: preflight.state.last_sequence,
+                event_id: preflight.last_event_id,
+            };
+            let style_turn = style_driven
+                .then(|| {
+                    self.begin_style_turn(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &preflight.state,
+                        position,
+                    )
+                })
+                .transpose()?;
+            let position = style_turn
+                .as_ref()
+                .map_or(position, |execution| execution.position);
             (preflight.state, user_sequence, style_turn, position)
         } else {
             let (state, user_sequence, user_event) =
@@ -781,6 +843,11 @@ where
         } else {
             state
         };
+        let context_origin = if input_origin == TurnInputOrigin::ChildTask {
+            ContextCompositionOrigin::ChildTask
+        } else {
+            ContextCompositionOrigin::UserTurn
+        };
         let (state, provider_position) = if style_turn.is_some() {
             let composed = async {
                 let execution = style_turn
@@ -805,7 +872,7 @@ where
                                     provider_position,
                                     &command,
                                     ContextCompositionBoundary::BeforeModelRequest,
-                                    ContextCompositionOrigin::UserTurn,
+                                    context_origin,
                                 )
                                 .await;
                         }
@@ -818,7 +885,7 @@ where
                                 provider_position,
                                 &command,
                                 ContextCompositionBoundary::TurnStart,
-                                ContextCompositionOrigin::UserTurn,
+                                context_origin,
                             )
                             .await?;
                         self.compose_style_context(
@@ -829,7 +896,7 @@ where
                             position,
                             &command,
                             ContextCompositionBoundary::BeforeModelRequest,
-                            ContextCompositionOrigin::UserTurn,
+                            context_origin,
                         )
                         .await
                     }
@@ -845,7 +912,7 @@ where
                                         provider_position,
                                         &command,
                                         ContextCompositionBoundary::TurnStart,
-                                        ContextCompositionOrigin::UserTurn,
+                                        context_origin,
                                     )
                                     .await?;
                                 execution.position = position;
@@ -883,7 +950,7 @@ where
                             position,
                             &command,
                             ContextCompositionBoundary::BeforeModelRequest,
-                            ContextCompositionOrigin::UserTurn,
+                            context_origin,
                         )
                         .await
                     }
@@ -3301,7 +3368,10 @@ where
         };
         let fresh_isolated_context = fresh_context_kind.is_some()
             && boundary == ContextCompositionBoundary::TurnStart
-            && origin == ContextCompositionOrigin::UserTurn;
+            && matches!(
+                origin,
+                ContextCompositionOrigin::UserTurn | ContextCompositionOrigin::ChildTask
+            );
         let (next_state, next_position, boundary_identity, completed_phases, already_completed) =
             self.begin_or_resume_context_boundary(
                 persistence,
@@ -3347,9 +3417,7 @@ where
             )?;
             state = Self::load_state(persistence, session_id, session_directory)?;
             let mut replacement = if fresh_isolated_context {
-                vec![ConversationEntry::UserMessage(
-                    current_run_user(&state, command)?.clone(),
-                )]
+                vec![current_provider_input_entry(&state, command)?]
             } else {
                 projection_without_retrieved_memory(state.conversation.provider_projection())
             };
@@ -3861,7 +3929,11 @@ where
                 position,
                 command,
                 ContextCompositionBoundary::BeforeTurnCompletion,
-                ContextCompositionOrigin::UserTurn,
+                if state.child_origin.is_some() {
+                    ContextCompositionOrigin::ChildTask
+                } else {
+                    ContextCompositionOrigin::UserTurn
+                },
             )?;
         state = next_state;
         if already_completed {
@@ -6099,7 +6171,7 @@ fn recoverable_context_retry(
     let boundary_at_head = execution.context_boundaries.iter().rev().any(|boundary| {
         boundary.identity.node_id == active.node_id
             && boundary.identity.run_id == command.cancellation_id
-            && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+            && boundary.identity.origin == expected_initial_context_origin(state)
             && request_hash == boundary.identity.request_hash
             && boundary.last_sequence == state.last_sequence
     });
@@ -6128,7 +6200,7 @@ fn recoverable_context_retry(
                         boundary.completed_at.is_some()
                             && boundary.identity.boundary == "turn_start"
                             && boundary.identity.run_id == command.cancellation_id
-                            && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+                            && boundary.identity.origin == expected_initial_context_origin(state)
                             && boundary.identity.request_hash == request_hash
                             && exact_compiled_edge(
                                 &execution.graph,
@@ -6216,7 +6288,7 @@ fn recoverable_ephemeral_discard(
     let completed_boundary_at_head = execution.context_boundaries.last().is_some_and(|boundary| {
         boundary.identity.node_id == active.node_id
             && boundary.identity.boundary == "before_turn_completion"
-            && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+            && boundary.identity.origin == expected_initial_context_origin(state)
             && boundary.identity.run_id == run_id
             && boundary.identity.run_id == command.cancellation_id
             && boundary.identity.request_hash == request_hash
@@ -6272,7 +6344,7 @@ fn recoverable_ephemeral_discard_phase(
     is_complete_turn
         && boundary.identity.node_id == active.node_id
         && boundary.identity.boundary == "before_turn_completion"
-        && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+        && boundary.identity.origin == expected_initial_context_origin(state)
         && boundary.identity.run_id == command.cancellation_id
         && boundary.identity.request_hash == request_hash
         && boundary.started_phases.as_slice() == ["discard"]
@@ -6294,25 +6366,25 @@ fn matching_ephemeral_model_evidence<'a>(
     execution: &'a crate::session::StyleExecutionState,
     command: &RunTurnCommand,
 ) -> Option<&'a crate::session::ModelExecutionEvidence> {
-    let user = current_run_user(state, command).ok()?;
+    let input_sequence = current_run_input_sequence(state, command).ok()?;
     let request_hash = current_context_request_hash(state, command).ok()?;
     let evidence = execution.latest_model_execution.as_ref()?;
     let completed_at = evidence.completed_at?;
     (evidence.cancellation_id == command.cancellation_id
         && evidence.response_completed
-        && evidence.user_sequence == Some(user.source_sequence)
-        && evidence.started_at > user.source_sequence
+        && evidence.user_sequence == Some(input_sequence)
+        && evidence.started_at > input_sequence
         && completed_at >= evidence.started_at
         && completed_at < state.last_sequence)
         .then_some(())?;
     execution.context_boundaries.iter().rev().find(|boundary| {
         boundary.identity.boundary == "before_model_request"
-            && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+            && boundary.identity.origin == expected_initial_context_origin(state)
             && boundary.identity.run_id == command.cancellation_id
             && boundary.identity.request_hash == request_hash
-            && boundary.completed_at.is_some_and(|sequence| {
-                sequence > user.source_sequence && sequence < evidence.started_at
-            })
+            && boundary
+                .completed_at
+                .is_some_and(|sequence| sequence > input_sequence && sequence < evidence.started_at)
             && execution.graph.nodes.iter().any(|node| {
                 node.id == boundary.identity.node_id
                     && node.kind == agentmod_graph_engine::NodeKind::ModelCall
@@ -6424,7 +6496,7 @@ fn recoverable_ephemeral_cleanup_retry(
         boundary.identity.node_id == active.node_id
             && boundary.identity.boundary == "before_turn_completion"
             && boundary.identity.run_id == command.cancellation_id
-            && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+            && boundary.identity.origin == expected_initial_context_origin(state)
             && boundary.identity.request_hash == request_hash
             && boundary.started_phases.is_empty()
             && boundary.completed_phases.is_empty()
@@ -6478,7 +6550,61 @@ fn current_run_user_sequence(
     state: &crate::session::SessionState,
     command: &RunTurnCommand,
 ) -> Result<Sequence, RunTurnError> {
-    Ok(current_run_user(state, command)?.source_sequence)
+    current_run_input_sequence(state, command)
+}
+
+fn current_run_input_sequence(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> Result<Sequence, RunTurnError> {
+    current_run_user(state, command)
+        .map(|user| user.source_sequence)
+        .or_else(|_| {
+            state
+                .child_origin
+                .as_ref()
+                .filter(|origin| origin.task == command.prompt)
+                .map(|origin| origin.linked_at)
+                .ok_or(RunTurnError::ContextRecoveryIdentityMismatch)
+        })
+}
+
+fn current_provider_input_entry(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> Result<ConversationEntry, RunTurnError> {
+    if let Ok(user) = current_run_user(state, command) {
+        return Ok(ConversationEntry::UserMessage(user.clone()));
+    }
+    let origin = state
+        .child_origin
+        .as_ref()
+        .filter(|origin| origin.task == command.prompt)
+        .ok_or(RunTurnError::ContextRecoveryIdentityMismatch)?;
+    Ok(ConversationEntry::PendingTask(PendingTaskEntry {
+        id: ConversationEntryId(format!("child-task:{}:{}", origin.task_id, origin.revision)),
+        task_id: origin.task_id.clone(),
+        description: origin.task.clone(),
+        state: String::from("assigned"),
+        source_sequence: origin.linked_at,
+    }))
+}
+
+fn validate_child_task_input(
+    state: &crate::session::SessionState,
+    command: &RunTurnCommand,
+) -> Result<(), RunTurnError> {
+    let origin = state
+        .child_origin
+        .as_ref()
+        .ok_or(RunTurnError::ChildTaskRequired)?;
+    if origin.task != command.prompt
+        || origin.input_hash != ContentHash::digest(command.prompt.as_bytes())
+        || state.lifecycle != crate::session::SessionLifecycle::Active
+    {
+        return Err(RunTurnError::ChildTaskMismatch);
+    }
+    Ok(())
 }
 
 fn current_run_user<'a>(
@@ -6532,8 +6658,18 @@ fn current_context_request_hash(
     state: &crate::session::SessionState,
     command: &RunTurnCommand,
 ) -> Result<ContentHash, RunTurnError> {
-    let user = current_run_user(state, command)?;
-    context_request_hash(command, user.source_sequence, &user.text)
+    let source_sequence = current_run_input_sequence(state, command)?;
+    let current_input = current_run_user(state, command)
+        .map(|user| user.text.as_str())
+        .or_else(|_| {
+            state
+                .child_origin
+                .as_ref()
+                .filter(|origin| origin.task == command.prompt)
+                .map(|origin| origin.task.as_str())
+                .ok_or(RunTurnError::ContextRecoveryIdentityMismatch)
+        })?;
+    context_request_hash(command, source_sequence, current_input)
 }
 
 fn context_request_hash(
@@ -6563,10 +6699,19 @@ fn append_identity_field(target: &mut Vec<u8>, value: &[u8]) -> Result<(), RunTu
 const fn boundary_origin(origin: ContextCompositionOrigin) -> ContextBoundaryOrigin {
     match origin {
         ContextCompositionOrigin::UserTurn => ContextBoundaryOrigin::UserTurn,
+        ContextCompositionOrigin::ChildTask => ContextBoundaryOrigin::ChildTask,
         ContextCompositionOrigin::ToolContinuation => ContextBoundaryOrigin::ToolContinuation,
         ContextCompositionOrigin::ApprovalContinuation => {
             ContextBoundaryOrigin::ApprovalContinuation
         }
+    }
+}
+
+fn expected_initial_context_origin(state: &crate::session::SessionState) -> ContextBoundaryOrigin {
+    if state.child_origin.is_some() {
+        ContextBoundaryOrigin::ChildTask
+    } else {
+        ContextBoundaryOrigin::UserTurn
     }
 }
 
@@ -7303,7 +7448,7 @@ fn research_base_run_id_from_state(state: &crate::session::SessionState) -> Opti
         .iter()
         .find(|boundary| {
             boundary.identity.boundary == "turn_start"
-                && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+                && boundary.identity.origin == expected_initial_context_origin(state)
         })
         .map(|boundary| boundary.identity.run_id.as_str())
 }
@@ -7477,6 +7622,10 @@ pub enum RunTurnError {
     InvalidResearchCompletionCriterion,
     #[error("declarative graph inputs are invalid or exceed the compiled loop bound")]
     InvalidDeclarativeInputs,
+    #[error("runtime-managed child task input is required")]
+    ChildTaskRequired,
+    #[error("runtime-managed child task input does not match its canonical assignment")]
+    ChildTaskMismatch,
     #[error("style-owned tool approval is not supported by this graph adapter")]
     StyleOwnedToolApprovalUnsupported,
     #[error("style-owned tool replacement is not supported by this graph adapter")]
@@ -7549,9 +7698,10 @@ mod tests {
     use crate::{
         permission::{PermissionEffect, PermissionMatcher, PermissionPolicy, PermissionRule},
         session::{
-            ApprovalRequestedEvent, ApprovalResolvedEvent, ModelRequestCancelledEvent,
-            RuntimeCommittedEvent, SessionCreatedEvent, StyleExecutionInitializedEvent,
-            StyleNodeCompletedEvent, StyleNodeEnteredEvent, StyleTransitionSelectedEvent, replay,
+            ApprovalRequestedEvent, ApprovalResolvedEvent, ChildSessionLinkedEvent,
+            ModelRequestCancelledEvent, RuntimeCommittedEvent, SessionCreatedEvent,
+            StyleExecutionInitializedEvent, StyleNodeCompletedEvent, StyleNodeEnteredEvent,
+            StyleTransitionSelectedEvent, replay,
         },
         style_executor::tests::binding,
     };
@@ -8101,6 +8251,34 @@ mod tests {
                 style_binding: Some(Box::new(binding)),
             }),
         )]
+    }
+
+    fn child_ephemeral_created_events(task: &str) -> Vec<EventEnvelope<Value>> {
+        let binding = binding(BuiltInStyle::EphemeralTurn);
+        vec![
+            data_event(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture-workspace"),
+                    style: binding.id.clone(),
+                    style_binding: Some(Box::new(binding)),
+                }),
+            ),
+            data_event(
+                2,
+                RuntimeCommittedEvent::ChildSessionLinked(ChildSessionLinkedEvent {
+                    parent_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                    parent_action_sequence: Sequence::new(17).expect("parent sequence"),
+                    parent_graph_node_id: String::from("spawn-workers"),
+                    task_id: String::from("task-1"),
+                    revision: 0,
+                    depth: 1,
+                    task: task.to_owned(),
+                    input_hash: ContentHash::digest(task.as_bytes()),
+                    token_budget: 10_000,
+                }),
+            ),
+        ]
     }
 
     fn research_created_events() -> Vec<EventEnvelope<Value>> {
@@ -9375,6 +9553,46 @@ mod tests {
             !format!("{entries:?}").contains("turn-one-secret-output"),
             "discarded provider-visible output must not leak into the next turn"
         );
+    }
+
+    #[tokio::test]
+    async fn child_task_uses_typed_pending_task_without_fabricating_user_history() {
+        let task = String::from("inspect the exact scheduler recovery invariant");
+        let data = MockTurnData::with_scenario(
+            child_ephemeral_created_events(&task),
+            vec![Ok(successful_harness_reply("worker result"))],
+            Err(ToolDataError::Unavailable),
+        );
+        let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
+        let mut child_command = command();
+        child_command.prompt = task.clone();
+
+        let result = Box::pin(logic.run_child_task(child_command)).await;
+        assert!(
+            result.is_ok(),
+            "child task failed: {result:?}; events: {:?}",
+            data.event_types()
+        );
+
+        let state = load_mock_state(&data);
+        assert!(
+            state
+                .conversation
+                .history()
+                .iter()
+                .all(|entry| !matches!(entry, ConversationEntry::UserMessage(_)))
+        );
+        let commands = data.state.harness_commands.lock().expect("commands");
+        let HarnessDataCommand::Execute { entries, .. } = &commands[0] else {
+            panic!("execute command");
+        };
+        assert!(matches!(
+            entries.as_slice(),
+            [agentmod_runtime_data::harness::HarnessDataEntry::Metadata { key, value }]
+                if key == "pending_task"
+                    && value["id"] == "task-1"
+                    && value["description"] == task
+        ));
     }
 
     #[tokio::test]

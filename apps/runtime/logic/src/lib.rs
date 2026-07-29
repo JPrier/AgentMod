@@ -2,6 +2,7 @@
 
 pub mod action;
 pub mod artifact;
+pub mod child_session;
 pub mod compaction;
 pub mod continuation;
 pub mod conversation;

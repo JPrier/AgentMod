@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
+    action::{ActionProposal, ConsequentialAction, ProposalId},
     conversation::{ConversationEntry, ConversationError, ConversationState, ProjectionProvenance},
     projection::measure_projection,
 };
@@ -222,6 +223,29 @@ pub struct SessionBranchedEvent {
     pub fork_sequence: Sequence,
 }
 
+/// Immutable causal ownership and typed task input for a worker session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildSessionLinkedEvent {
+    /// Runtime-managed parent session.
+    pub parent_session_id: SessionId,
+    /// Canonical parent creation proposal used for reconciliation.
+    pub parent_action_sequence: Sequence,
+    /// Parent graph node that created the worker.
+    pub parent_graph_node_id: String,
+    /// Runtime-owned task identity.
+    pub task_id: String,
+    /// Zero-based task revision.
+    pub revision: u32,
+    /// One-based child-session depth.
+    pub depth: u32,
+    /// Bounded typed task input; this is not a user message.
+    pub task: String,
+    /// Hash of the exact task bytes.
+    pub input_hash: ContentHash,
+    /// Hard worker token budget.
+    pub token_budget: u64,
+}
+
 /// Structured content append payload.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ConversationEntryCommittedEvent {
@@ -264,6 +288,8 @@ pub struct ContextBoundaryIdentity {
 pub enum ContextBoundaryOrigin {
     /// Initial model request for a user-authored turn.
     UserTurn,
+    /// Initial model request for a runtime-owned typed child task.
+    ChildTask,
     /// Model continuation after a non-approval tool batch.
     ToolContinuation,
     /// Model continuation after resolving a durable approval.
@@ -755,6 +781,73 @@ pub struct ArtifactPersistenceCompletedEvent {
     pub byte_size: u64,
 }
 
+/// Stable identity for one child-agent creation proposal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildAgentExecutionIdentity {
+    /// Deterministic identity derived from the graph cursor and task.
+    pub execution_id: String,
+    /// Spawn node that owns this child.
+    pub node_id: String,
+    /// One-based spawn-node attempt.
+    pub attempt: u32,
+    /// Zero-based orchestration loop iteration.
+    pub loop_iteration: u32,
+    /// One-based graph step.
+    pub step: u64,
+    /// Runtime-owned task identity.
+    pub task_id: String,
+}
+
+/// Canonical child-session creation intent before policy and atomic branching.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildAgentCreationProposedEvent {
+    /// Exact graph/task identity.
+    pub identity: ChildAgentExecutionIdentity,
+    /// Bounded task description.
+    pub task: String,
+    /// Explicit child style selector.
+    pub child_style: String,
+    /// Style-selected workspace mode.
+    pub workspace_mode: String,
+    /// Hard child token budget.
+    pub token_budget: u64,
+}
+
+/// Final child-session creation action authorized before atomic branching.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildAgentCreationApprovedEvent {
+    /// Exact graph/task identity.
+    pub identity: ChildAgentExecutionIdentity,
+    /// Digest of the final intercepted action.
+    pub action_digest: ContentHash,
+}
+
+/// Atomic child branch became durable.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildAgentCreatedEvent {
+    /// Exact proposal identity.
+    pub identity: ChildAgentExecutionIdentity,
+    /// Runtime-managed child session.
+    pub child_session_id: SessionId,
+    /// Parent proposal sequence retained by the typed child ownership link.
+    pub parent_action_sequence: Sequence,
+    /// Exact selected child style.
+    pub child_style: String,
+}
+
+/// Child session reached a canonical terminal result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildAgentCompletedEvent {
+    /// Exact proposal identity.
+    pub identity: ChildAgentExecutionIdentity,
+    /// Runtime-managed child session.
+    pub child_session_id: SessionId,
+    /// Verified child journal head.
+    pub child_head_sequence: Sequence,
+    /// Bounded structured handoff summary.
+    pub summary: String,
+}
+
 /// Typed committed events consumed by the pure session reducer.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "event", content = "payload", rename_all = "snake_case")]
@@ -763,6 +856,8 @@ pub enum RuntimeCommittedEvent {
     SessionCreated(SessionCreatedEvent),
     /// Establishes immutable parent/fork ancestry for a child session.
     SessionBranched(SessionBranchedEvent),
+    /// Establishes immutable parent/task ownership for a worker session.
+    ChildSessionLinked(ChildSessionLinkedEvent),
     /// Adds structured canonical content.
     ConversationEntryCommitted(ConversationEntryCommittedEvent),
     /// Replaces only provider-visible structured state.
@@ -841,6 +936,14 @@ pub enum RuntimeCommittedEvent {
     ArtifactPersistenceDispatched(ArtifactPersistenceDispatchedEvent),
     /// Records a request-bound terminal artifact receipt.
     ArtifactPersistenceCompleted(ArtifactPersistenceCompletedEvent),
+    /// Records child-session creation intent before policy and branching.
+    ChildAgentCreationProposed(ChildAgentCreationProposedEvent),
+    /// Records the final approved child-session creation action.
+    ChildAgentCreationApproved(ChildAgentCreationApprovedEvent),
+    /// Records the atomically created child session.
+    ChildAgentCreated(ChildAgentCreatedEvent),
+    /// Records a verified terminal child result.
+    ChildAgentCompleted(ChildAgentCompletedEvent),
 }
 
 impl RuntimeCommittedEvent {
@@ -850,6 +953,7 @@ impl RuntimeCommittedEvent {
         match self {
             Self::SessionCreated(_) => "session.created",
             Self::SessionBranched(_) => "session.branched",
+            Self::ChildSessionLinked(_) => "child_session.linked",
             Self::ConversationEntryCommitted(_) => "conversation.entry_committed",
             Self::ContextProjectionReplaced(_) => "context.projection_replaced",
             Self::ContextBoundaryStarted(_) => "context.boundary_started",
@@ -889,6 +993,10 @@ impl RuntimeCommittedEvent {
             Self::ArtifactPersistenceApproved(_) => "artifact.persistence_approved",
             Self::ArtifactPersistenceDispatched(_) => "artifact.persistence_dispatched",
             Self::ArtifactPersistenceCompleted(_) => "artifact.persistence_completed",
+            Self::ChildAgentCreationProposed(_) => "child_agent.creation_proposed",
+            Self::ChildAgentCreationApproved(_) => "child_agent.creation_approved",
+            Self::ChildAgentCreated(_) => "child_agent.created",
+            Self::ChildAgentCompleted(_) => "child_agent.completed",
         }
     }
 }
@@ -905,6 +1013,55 @@ pub enum ArtifactPersistenceState {
     Dispatched,
     /// A request-bound terminal receipt is canonical.
     Completed,
+}
+
+/// Replay-owned child-agent lifecycle.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildAgentState {
+    /// Creation proposal is canonical; no policy outcome is canonical yet.
+    Proposed,
+    /// Policy approved the exact action; no durable child is known yet.
+    Approved,
+    /// Child session exists and may be active.
+    Active,
+    /// Child session reached a verified canonical terminal state.
+    Completed,
+}
+
+/// Replay-owned runtime-managed child session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildAgentRecord {
+    /// Exact graph/task identity.
+    pub identity: ChildAgentExecutionIdentity,
+    /// Bounded task description.
+    pub task: String,
+    /// Selected child style.
+    pub child_style: String,
+    /// Style-selected workspace mode.
+    pub workspace_mode: String,
+    /// Hard child token budget.
+    pub token_budget: u64,
+    /// Current lifecycle.
+    pub state: ChildAgentState,
+    /// Parent sequence that proposed the child.
+    pub proposed_at: Sequence,
+    /// Digest of the policy-approved action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<ContentHash>,
+    /// Parent sequence that approved the child action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<Sequence>,
+    /// Runtime-managed child session after atomic creation.
+    pub child_session_id: Option<SessionId>,
+    /// Creation sequence in the parent journal.
+    pub created_at: Option<Sequence>,
+    /// Verified child journal head after completion.
+    pub child_head_sequence: Option<Sequence>,
+    /// Parent completion sequence.
+    pub completed_at: Option<Sequence>,
+    /// Bounded result summary.
+    pub summary: Option<String>,
 }
 
 /// Safe next action derived only from canonical artifact-persistence state.
@@ -990,6 +1147,9 @@ pub struct SessionState {
     /// Parent session and fork point for a branch.
     #[serde(default)]
     pub ancestry: Option<SessionAncestry>,
+    /// Immutable parent/task ownership for a runtime-managed worker session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_origin: Option<ChildSessionOrigin>,
     /// Durable lifecycle.
     pub lifecycle: SessionLifecycle,
     /// Canonical content and provider projection.
@@ -1002,6 +1162,9 @@ pub struct SessionState {
     /// Artifact-persistence outbox records keyed by stable execution identity.
     #[serde(default)]
     pub artifact_persistences: BTreeMap<String, ArtifactPersistenceRecord>,
+    /// Runtime-managed child sessions keyed by deterministic execution ID.
+    #[serde(default)]
+    pub child_agents: BTreeMap<String, ChildAgentRecord>,
     /// Restart/reconnect reconciliation state keyed by provider call ID.
     #[serde(default)]
     pub process_reconciliations: BTreeMap<String, ProcessReconciliationRecord>,
@@ -1018,6 +1181,31 @@ pub struct SessionAncestry {
     pub parent_session_id: SessionId,
     /// Inclusive parent sequence used for the branch.
     pub fork_sequence: Sequence,
+}
+
+/// Replay-derived worker ownership and typed input.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildSessionOrigin {
+    /// Runtime-managed parent.
+    pub parent_session_id: SessionId,
+    /// Canonical parent proposal sequence.
+    pub parent_action_sequence: Sequence,
+    /// Child journal sequence that established the typed input.
+    pub linked_at: Sequence,
+    /// Parent graph node that owns this worker.
+    pub parent_graph_node_id: String,
+    /// Runtime-owned task identity.
+    pub task_id: String,
+    /// Zero-based task revision.
+    pub revision: u32,
+    /// One-based child depth.
+    pub depth: u32,
+    /// Bounded typed task input.
+    pub task: String,
+    /// Hash of the exact task bytes.
+    pub input_hash: ContentHash,
+    /// Hard worker token budget.
+    pub token_budget: u64,
 }
 
 /// Canonical style execution projection reconstructed without running nodes.
@@ -1302,11 +1490,13 @@ fn initialize(
         style_binding: created.style_binding.as_deref().cloned(),
         style_execution: None,
         ancestry: None,
+        child_origin: None,
         lifecycle: SessionLifecycle::Active,
         conversation: ConversationState::new(),
         approvals: BTreeMap::new(),
         tool_executions: BTreeMap::new(),
         artifact_persistences: BTreeMap::new(),
+        child_agents: BTreeMap::new(),
         process_reconciliations: BTreeMap::new(),
         last_sequence: event.metadata.sequence,
         last_event_checksum: event.integrity_checksum,
@@ -1329,6 +1519,9 @@ fn apply_payload(
             Err(SessionReducerError::DuplicateSessionCreation)
         }
         RuntimeCommittedEvent::SessionBranched(branched) => apply_branch_ancestry(state, branched),
+        RuntimeCommittedEvent::ChildSessionLinked(linked) => {
+            apply_child_session_link(state, linked, event.metadata.sequence)
+        }
         RuntimeCommittedEvent::ConversationEntryCommitted(committed) => state
             .conversation
             .append(committed.entry.clone())
@@ -1382,16 +1575,16 @@ fn apply_payload(
         | RuntimeCommittedEvent::SchedulerFired(_)
         | RuntimeCommittedEvent::SchedulerDeliveryReconciled(_) => Ok(()),
         RuntimeCommittedEvent::ModelRequestStarted(started) => {
-            let user_sequence =
-                state
-                    .conversation
-                    .history()
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        ConversationEntry::UserMessage(user) => Some(user.source_sequence),
-                        _ => None,
-                    });
+            let user_sequence = state
+                .conversation
+                .provider_projection()
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    ConversationEntry::UserMessage(user) => Some(user.source_sequence),
+                    ConversationEntry::PendingTask(task) => Some(task.source_sequence),
+                    _ => None,
+                });
             if let Some(execution) = state.style_execution.as_mut() {
                 if let Some(evidence) = execution.latest_model_execution.as_mut() {
                     if evidence.completed_at.is_none()
@@ -1528,6 +1721,18 @@ fn apply_payload(
         RuntimeCommittedEvent::ArtifactPersistenceCompleted(completed) => {
             apply_artifact_persistence_completed(state, completed, event.metadata.sequence)
         }
+        RuntimeCommittedEvent::ChildAgentCreationProposed(proposed) => {
+            apply_child_agent_creation_proposed(state, proposed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ChildAgentCreationApproved(approved) => {
+            apply_child_agent_creation_approved(state, approved, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ChildAgentCreated(created) => {
+            apply_child_agent_created(state, created, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ChildAgentCompleted(completed) => {
+            apply_child_agent_completed(state, completed, event.metadata.sequence)
+        }
         RuntimeCommittedEvent::ToolExecutionDispatched(dispatched) => {
             apply_tool_dispatch(state, dispatched, event.metadata.sequence)
         }
@@ -1634,6 +1839,40 @@ fn apply_branch_ancestry(
     Ok(())
 }
 
+fn apply_child_session_link(
+    state: &mut SessionState,
+    linked: &ChildSessionLinkedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if sequence.get() != 2
+        || state.ancestry.is_some()
+        || state.child_origin.is_some()
+        || linked.parent_session_id == state.id
+        || linked.parent_graph_node_id.trim().is_empty()
+        || linked.task_id.trim().is_empty()
+        || linked.task.trim().is_empty()
+        || linked.task.len() > 64 * 1024
+        || linked.input_hash != ContentHash::digest(linked.task.as_bytes())
+        || linked.depth == 0
+        || linked.token_budget == 0
+    {
+        return Err(SessionReducerError::InvalidChildSessionLink);
+    }
+    state.child_origin = Some(ChildSessionOrigin {
+        parent_session_id: linked.parent_session_id,
+        parent_action_sequence: linked.parent_action_sequence,
+        linked_at: sequence,
+        parent_graph_node_id: linked.parent_graph_node_id.clone(),
+        task_id: linked.task_id.clone(),
+        revision: linked.revision,
+        depth: linked.depth,
+        task: linked.task.clone(),
+        input_hash: linked.input_hash,
+        token_budget: linked.token_budget,
+    });
+    Ok(())
+}
+
 fn apply_context_boundary_started(
     state: &mut SessionState,
     started: &ContextBoundaryStartedEvent,
@@ -1668,8 +1907,11 @@ fn apply_context_boundary_started(
         return Err(SessionReducerError::InvalidContextBoundaryTransition);
     }
     match (started.identity.boundary.as_str(), started.identity.origin) {
-        ("turn_start", ContextBoundaryOrigin::UserTurn) => {}
-        ("before_model_request", ContextBoundaryOrigin::UserTurn) => {
+        ("turn_start", ContextBoundaryOrigin::UserTurn | ContextBoundaryOrigin::ChildTask) => {}
+        (
+            "before_model_request",
+            ContextBoundaryOrigin::UserTurn | ContextBoundaryOrigin::ChildTask,
+        ) => {
             let Some(previous) = execution.context_boundaries.last() else {
                 return Err(SessionReducerError::InvalidContextBoundaryTransition);
             };
@@ -1706,7 +1948,10 @@ fn apply_context_boundary_started(
                 return Err(SessionReducerError::InvalidContextBoundaryTransition);
             }
         }
-        ("before_turn_completion", ContextBoundaryOrigin::UserTurn) => {
+        (
+            "before_turn_completion",
+            ContextBoundaryOrigin::UserTurn | ContextBoundaryOrigin::ChildTask,
+        ) => {
             let is_complete_turn = execution
                 .graph
                 .nodes
@@ -2124,6 +2369,198 @@ fn apply_artifact_persistence_completed(
     Ok(())
 }
 
+fn apply_child_agent_creation_proposed(
+    state: &mut SessionState,
+    proposed: &ChildAgentCreationProposedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let identity = &proposed.identity;
+    let execution = state
+        .style_execution
+        .as_ref()
+        .ok_or(SessionReducerError::StyleExecutionNotInitialized)?;
+    if identity.execution_id.trim().is_empty()
+        || identity.task_id.trim().is_empty()
+        || proposed.task.trim().is_empty()
+        || proposed.task.len() > 64 * 1024
+        || proposed.child_style.trim().is_empty()
+        || proposed.workspace_mode.trim().is_empty()
+        || proposed.token_budget == 0
+        || graph_node_kind(&execution.graph, &identity.node_id) != Some(NodeKind::SpawnChildAgent)
+        || !active_node_matches(
+            execution.active_node.as_ref(),
+            &identity.node_id,
+            identity.attempt,
+            identity.loop_iteration,
+            identity.step,
+        )
+        || state.child_agents.contains_key(&identity.execution_id)
+        || state.child_agents.values().any(|record| {
+            record.identity.task_id == identity.task_id
+                && record.identity.attempt == identity.attempt
+                && record.identity.loop_iteration == identity.loop_iteration
+        })
+    {
+        return Err(SessionReducerError::InvalidChildAgentTransition);
+    }
+    state.child_agents.insert(
+        identity.execution_id.clone(),
+        ChildAgentRecord {
+            identity: identity.clone(),
+            task: proposed.task.clone(),
+            child_style: proposed.child_style.clone(),
+            workspace_mode: proposed.workspace_mode.clone(),
+            token_budget: proposed.token_budget,
+            state: ChildAgentState::Proposed,
+            proposed_at: sequence,
+            action_digest: None,
+            approved_at: None,
+            child_session_id: None,
+            created_at: None,
+            child_head_sequence: None,
+            completed_at: None,
+            summary: None,
+        },
+    );
+    Ok(())
+}
+
+fn apply_child_agent_creation_approved(
+    state: &mut SessionState,
+    approved: &ChildAgentCreationApprovedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let execution = state
+        .style_execution
+        .as_ref()
+        .ok_or(SessionReducerError::StyleExecutionNotInitialized)?;
+    if graph_node_kind(&execution.graph, &approved.identity.node_id)
+        != Some(NodeKind::SpawnChildAgent)
+        || !active_node_matches(
+            execution.active_node.as_ref(),
+            &approved.identity.node_id,
+            approved.identity.attempt,
+            approved.identity.loop_iteration,
+            approved.identity.step,
+        )
+    {
+        return Err(SessionReducerError::InvalidChildAgentTransition);
+    }
+    let record = state
+        .child_agents
+        .get_mut(&approved.identity.execution_id)
+        .ok_or(SessionReducerError::InvalidChildAgentTransition)?;
+    let expected_digest = ActionProposal {
+        id: ProposalId(record.identity.execution_id.clone()),
+        action: ConsequentialAction::ChildAgentCreation {
+            style: record.child_style.clone(),
+            workspace_mode: record.workspace_mode.clone(),
+            token_budget: record.token_budget,
+        },
+        style: state.style.clone(),
+        workspace: state.workspace.clone(),
+        origin: String::from("runtime"),
+    }
+    .digest()
+    .map_err(|_| SessionReducerError::InvalidChildAgentTransition)?;
+    if record.identity != approved.identity
+        || record.state != ChildAgentState::Proposed
+        || approved.action_digest != expected_digest
+        || record.action_digest.is_some()
+        || record.approved_at.is_some()
+        || record.child_session_id.is_some()
+        || record.created_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidChildAgentTransition);
+    }
+    record.state = ChildAgentState::Approved;
+    record.action_digest = Some(approved.action_digest);
+    record.approved_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_child_agent_created(
+    state: &mut SessionState,
+    created: &ChildAgentCreatedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let execution = state
+        .style_execution
+        .as_ref()
+        .ok_or(SessionReducerError::StyleExecutionNotInitialized)?;
+    if created.child_session_id == state.id
+        || graph_node_kind(&execution.graph, &created.identity.node_id)
+            != Some(NodeKind::SpawnChildAgent)
+        || !active_node_matches(
+            execution.active_node.as_ref(),
+            &created.identity.node_id,
+            created.identity.attempt,
+            created.identity.loop_iteration,
+            created.identity.step,
+        )
+    {
+        return Err(SessionReducerError::InvalidChildAgentTransition);
+    }
+    let record = state
+        .child_agents
+        .get_mut(&created.identity.execution_id)
+        .ok_or(SessionReducerError::InvalidChildAgentTransition)?;
+    if record.identity != created.identity
+        || record.state != ChildAgentState::Approved
+        || record.child_style != created.child_style
+        || record.proposed_at != created.parent_action_sequence
+        || record.action_digest.is_none()
+        || record.approved_at.is_none()
+        || record.child_session_id.is_some()
+        || record.created_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidChildAgentTransition);
+    }
+    record.state = ChildAgentState::Active;
+    record.child_session_id = Some(created.child_session_id);
+    record.created_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_child_agent_completed(
+    state: &mut SessionState,
+    completed: &ChildAgentCompletedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let execution = state
+        .style_execution
+        .as_ref()
+        .ok_or(SessionReducerError::StyleExecutionNotInitialized)?;
+    if execution
+        .active_node
+        .as_ref()
+        .and_then(|active| graph_node_kind(&execution.graph, &active.node_id))
+        != Some(NodeKind::WaitForAgents)
+        || completed.summary.len() > 256 * 1024
+    {
+        return Err(SessionReducerError::InvalidChildAgentTransition);
+    }
+    let record = state
+        .child_agents
+        .get_mut(&completed.identity.execution_id)
+        .ok_or(SessionReducerError::InvalidChildAgentTransition)?;
+    if record.identity != completed.identity
+        || record.state != ChildAgentState::Active
+        || record.child_session_id != Some(completed.child_session_id)
+        || record.created_at.is_none()
+        || record.completed_at.is_some()
+        || record.child_head_sequence.is_some()
+        || record.summary.is_some()
+    {
+        return Err(SessionReducerError::InvalidChildAgentTransition);
+    }
+    record.state = ChildAgentState::Completed;
+    record.child_head_sequence = Some(completed.child_head_sequence);
+    record.completed_at = Some(sequence);
+    record.summary = Some(completed.summary.clone());
+    Ok(())
+}
+
 fn apply_style_node_completed(
     state: &mut SessionState,
     completed: &StyleNodeCompletedEvent,
@@ -2138,6 +2575,8 @@ fn apply_style_node_completed(
         &state.artifact_persistences,
         &state.approvals,
         &state.tool_executions,
+        &state.child_agents,
+        state.child_origin.as_ref(),
         completed,
         state.last_sequence,
     ) {
@@ -2401,6 +2840,7 @@ fn artifact_persistence_effect_evidence_complete(
 
 #[allow(
     clippy::too_many_arguments,
+    clippy::too_many_lines,
     reason = "replay validation keeps every independent canonical evidence projection explicit"
 )]
 fn style_node_effect_evidence_complete(
@@ -2410,6 +2850,8 @@ fn style_node_effect_evidence_complete(
     artifact_persistences: &BTreeMap<String, ArtifactPersistenceRecord>,
     approvals: &BTreeMap<ContinuationId, ApprovalRecord>,
     tool_executions: &BTreeMap<String, ToolExecutionRecord>,
+    child_agents: &BTreeMap<String, ChildAgentRecord>,
+    child_origin: Option<&ChildSessionOrigin>,
     completed: &StyleNodeCompletedEvent,
     journal_head: Sequence,
 ) -> bool {
@@ -2434,6 +2876,48 @@ fn style_node_effect_evidence_complete(
         return approvals.get(&continuation_id).is_some_and(|approval| {
             approval.state == ApprovalState::Approved && approval.resolved_at == Some(journal_head)
         });
+    }
+    if graph_node_kind(&execution.graph, &completed.node_id) == Some(NodeKind::SpawnChildAgent) {
+        let Some(expected) = completed
+            .result_reference
+            .as_deref()
+            .and_then(|reference| reference.strip_prefix("children:"))
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            return false;
+        };
+        let matching = child_agents
+            .values()
+            .filter(|record| {
+                record.identity.node_id == completed.node_id
+                    && record.identity.attempt == completed.attempt
+                    && record.identity.loop_iteration == completed.loop_iteration
+                    && record.identity.step == completed.step
+                    && matches!(
+                        record.state,
+                        ChildAgentState::Active | ChildAgentState::Completed
+                    )
+            })
+            .count();
+        return expected > 0 && matching == expected;
+    }
+    if graph_node_kind(&execution.graph, &completed.node_id) == Some(NodeKind::WaitForAgents) {
+        let Some(expected) = completed
+            .result_reference
+            .as_deref()
+            .and_then(|reference| reference.strip_prefix("children-completed:"))
+            .and_then(|value| value.parse::<usize>().ok())
+        else {
+            return false;
+        };
+        let matching = child_agents
+            .values()
+            .filter(|record| {
+                record.state == ChildAgentState::Completed
+                    && record.identity.loop_iteration == completed.loop_iteration
+            })
+            .count();
+        return expected > 0 && matching == expected;
     }
     if is_declarative_graph(&execution.graph)
         && graph_node_kind(&execution.graph, &completed.node_id)
@@ -2473,6 +2957,7 @@ fn style_node_effect_evidence_complete(
             execution,
             conversation,
             binding,
+            child_origin,
             completed,
             journal_head,
             fresh_context_method.expect("fresh context method exists"),
@@ -2486,7 +2971,12 @@ fn style_node_effect_evidence_complete(
             };
             boundary.identity.node_id == completed.node_id
                 && boundary.identity.boundary == "before_turn_completion"
-                && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+                && boundary.identity.origin
+                    == if child_origin.is_some() {
+                        ContextBoundaryOrigin::ChildTask
+                    } else {
+                        ContextBoundaryOrigin::UserTurn
+                    }
                 && boundary.completed_phases.as_slice() == ["discard"]
                 && boundary.completed_at == Some(journal_head)
                 && provenance.method == "ephemeral_discard"
@@ -2497,10 +2987,15 @@ fn style_node_effect_evidence_complete(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "fresh-context evidence validates user and typed-child inputs plus exact memory provenance"
+)]
 fn fresh_context_effect_evidence_complete(
     execution: &StyleExecutionState,
     conversation: &ConversationState,
     binding: Option<&SessionStyleBinding>,
+    child_origin: Option<&ChildSessionOrigin>,
     completed: &StyleNodeCompletedEvent,
     journal_head: Sequence,
     method: &str,
@@ -2511,32 +3006,59 @@ fn fresh_context_effect_evidence_complete(
     let Some(provenance) = conversation.projection_provenance() else {
         return false;
     };
-    let users = conversation
+    let inputs = conversation
         .provider_projection()
         .iter()
-        .filter_map(|entry| match entry {
-            ConversationEntry::UserMessage(user) => Some(user),
-            _ => None,
+        .filter(|entry| {
+            matches!(
+                entry,
+                ConversationEntry::UserMessage(_) | ConversationEntry::PendingTask(_)
+            )
         })
         .collect::<Vec<_>>();
-    let [user] = users.as_slice() else {
+    let [input] = inputs.as_slice() else {
         return false;
     };
-    let Some(canonical_user) = conversation
-        .history()
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            ConversationEntry::UserMessage(candidate)
-                if candidate.source_sequence <= boundary.identity.source_head =>
-            {
-                Some(candidate)
-            }
-            _ => None,
-        })
-    else {
-        return false;
+    let (source_sequence, exact_input, expected_origin) = match input {
+        ConversationEntry::UserMessage(user) => {
+            let canonical_user =
+                conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        ConversationEntry::UserMessage(candidate)
+                            if candidate.source_sequence <= boundary.identity.source_head =>
+                        {
+                            Some(candidate)
+                        }
+                        _ => None,
+                    });
+            (
+                user.source_sequence,
+                canonical_user == Some(user),
+                ContextBoundaryOrigin::UserTurn,
+            )
+        }
+        ConversationEntry::PendingTask(task) => {
+            let exact = child_origin.is_some_and(|origin| {
+                task.task_id == origin.task_id
+                    && task.description == origin.task
+                    && task.state == "assigned"
+                    && task.source_sequence == origin.linked_at
+                    && origin.input_hash == ContentHash::digest(task.description.as_bytes())
+            });
+            (
+                task.source_sequence,
+                exact,
+                ContextBoundaryOrigin::ChildTask,
+            )
+        }
+        _ => unreachable!("filtered provider input"),
     };
+    if !exact_input {
+        return false;
+    }
     let Some(replacement_event) = boundary.phase_replacement_event else {
         return false;
     };
@@ -2545,32 +3067,44 @@ fn fresh_context_effect_evidence_complete(
         return false;
     };
     if conversation.provider_projection().iter().any(|entry| {
-        !matches!(entry, ConversationEntry::UserMessage(_))
-            && !matches!(
-                entry,
-                ConversationEntry::RetrievedMemory(memory)
-                    if memory.injection_sequence == provenance.committed_at
-                        && memory.injection_event == Some(replacement_event)
-                        && memory.provider == selected_memory_provider
-                        && selected_memory_provider != "none"
-            )
+        !matches!(
+            entry,
+            ConversationEntry::UserMessage(_) | ConversationEntry::PendingTask(_)
+        ) && !matches!(
+            entry,
+            ConversationEntry::RetrievedMemory(memory)
+                if memory.injection_sequence == provenance.committed_at
+                    && memory.injection_event == Some(replacement_event)
+                    && memory.provider == selected_memory_provider
+                    && selected_memory_provider != "none"
+        )
     }) {
         return false;
     }
     boundary.identity.node_id == completed.node_id
         && boundary.identity.boundary == "turn_start"
-        && boundary.identity.origin == ContextBoundaryOrigin::UserTurn
+        && boundary.identity.origin == expected_origin
         && boundary.completed_phases.as_slice() == ["memory"]
         && boundary.completed_at == Some(journal_head)
         && provenance.method == method
         && provenance.committed_at.checked_next().ok() == Some(journal_head)
-        && provenance.source_range == Some((user.source_sequence, user.source_sequence))
-        && *user == canonical_user
-        && user
-            .id
-            .0
-            .strip_prefix("user:")
-            .is_some_and(|suffix| suffix.ends_with(&format!(":{}", boundary.identity.run_id)))
+        && provenance.source_range == Some((source_sequence, source_sequence))
+        && match input {
+            ConversationEntry::UserMessage(user) => {
+                user.id.0.strip_prefix("user:").is_some_and(|suffix| {
+                    suffix.ends_with(&format!(":{}", boundary.identity.run_id))
+                })
+            }
+            ConversationEntry::PendingTask(task) => {
+                task.id.0
+                    == format!(
+                        "child-task:{}:{}",
+                        task.task_id,
+                        child_origin.map_or(0, |origin| origin.revision)
+                    )
+            }
+            _ => false,
+        }
 }
 
 fn is_ephemeral_turn_graph(graph: &ExecutableGraph) -> bool {
@@ -2926,6 +3460,9 @@ pub enum SessionReducerError {
     /// A branch may declare ancestry only once.
     #[error("session branch ancestry is already established")]
     DuplicateBranchAncestry,
+    /// A worker may establish one exact parent/task link at sequence two.
+    #[error("child session ownership link is invalid")]
+    InvalidChildSessionLink,
     /// Style execution initialization appeared more than once.
     #[error("style execution was initialized more than once")]
     DuplicateStyleExecutionInitialization,
@@ -2944,6 +3481,9 @@ pub enum SessionReducerError {
     /// Artifact persistence did not follow proposal, approval, dispatch, receipt ordering.
     #[error("artifact persistence state transition is invalid")]
     InvalidArtifactPersistenceTransition,
+    /// Child sessions did not follow proposal, atomic creation, and terminal ordering.
+    #[error("child-agent state transition is invalid")]
+    InvalidChildAgentTransition,
     /// Context composition did not follow start, phase, completion ordering.
     #[error("context boundary state transition is invalid")]
     InvalidContextBoundaryTransition,
@@ -3075,6 +3615,197 @@ mod tests {
                 style_binding: None,
             }),
         )
+    }
+
+    #[test]
+    fn child_session_link_replays_typed_task_without_conversation_input() {
+        let parent = SessionId::from_uuid(uuid("018f6f83-7b80-7000-8000-000000000099"));
+        let task = String::from("inspect the scheduler recovery invariant");
+        let linked = envelope(
+            2,
+            RuntimeCommittedEvent::ChildSessionLinked(ChildSessionLinkedEvent {
+                parent_session_id: parent,
+                parent_action_sequence: Sequence::new(17).expect("sequence"),
+                parent_graph_node_id: String::from("spawn-workers"),
+                task_id: String::from("task-1"),
+                revision: 0,
+                depth: 1,
+                input_hash: ContentHash::digest(task.as_bytes()),
+                task: task.clone(),
+                token_budget: 10_000,
+            }),
+        );
+
+        let events = [created(), linked];
+        let state = replay(&events).expect("child replay");
+
+        let origin = state.child_origin.expect("typed child origin");
+        assert_eq!(origin.parent_session_id, parent);
+        assert_eq!(origin.task, task);
+        assert!(state.ancestry.is_none());
+        assert!(state.conversation.history().is_empty());
+    }
+
+    #[test]
+    fn child_session_link_rejects_mismatched_task_hash() {
+        let linked = envelope(
+            2,
+            RuntimeCommittedEvent::ChildSessionLinked(ChildSessionLinkedEvent {
+                parent_session_id: SessionId::from_uuid(uuid(
+                    "018f6f83-7b80-7000-8000-000000000099",
+                )),
+                parent_action_sequence: Sequence::new(17).expect("sequence"),
+                parent_graph_node_id: String::from("spawn-workers"),
+                task_id: String::from("task-1"),
+                revision: 0,
+                depth: 1,
+                task: String::from("exact task"),
+                input_hash: ContentHash::digest(b"different task"),
+                token_budget: 10_000,
+            }),
+        );
+
+        let events = [created(), linked];
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidChildSessionLink)
+        ));
+    }
+
+    #[test]
+    fn child_creation_requires_exact_policy_digest_before_atomic_receipt() {
+        let style_binding = binding(BuiltInStyle::PlannerWorker);
+        let graph: CompiledSessionStyle =
+            serde_json::from_str(&style_binding.compiled_style_json).expect("compiled style");
+        let identity = ChildAgentExecutionIdentity {
+            execution_id: String::from("child:spawn-workers:task-1:0"),
+            node_id: String::from("spawn-workers"),
+            attempt: 1,
+            loop_iteration: 0,
+            step: 2,
+            task_id: String::from("task-1"),
+        };
+        let proposal = ChildAgentCreationProposedEvent {
+            identity: identity.clone(),
+            task: String::from("inspect scheduler recovery"),
+            child_style: String::from("ephemeral-turn@1.1.0"),
+            workspace_mode: String::from("shared_read_only"),
+            token_budget: 10_000,
+        };
+        let digest = ActionProposal {
+            id: ProposalId(identity.execution_id.clone()),
+            action: ConsequentialAction::ChildAgentCreation {
+                style: proposal.child_style.clone(),
+                workspace_mode: proposal.workspace_mode.clone(),
+                token_budget: proposal.token_budget,
+            },
+            style: style_binding.id.clone(),
+            workspace: String::from("fixture"),
+            origin: String::from("runtime"),
+        }
+        .digest()
+        .expect("digest");
+        let mut events = vec![
+            envelope(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture"),
+                    style: style_binding.id.clone(),
+                    style_binding: Some(Box::new(style_binding)),
+                }),
+            ),
+            envelope(
+                2,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(graph.graph),
+                        input_reference: None,
+                    },
+                )),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("plan"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                    node_id: String::from("plan"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                    result_reference: Some(String::from("plan-artifact")),
+                    artifact_reference: None,
+                }),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::StyleTransitionSelected(StyleTransitionSelectedEvent {
+                    from_node_id: String::from("plan"),
+                    to_node_id: String::from("spawn-workers"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 1,
+                }),
+            ),
+            envelope(
+                6,
+                RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                    node_id: String::from("spawn-workers"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 2,
+                }),
+            ),
+            envelope(
+                7,
+                RuntimeCommittedEvent::ChildAgentCreationProposed(proposal),
+            ),
+        ];
+        let mut wrong = events.clone();
+        wrong.push(envelope(
+            8,
+            RuntimeCommittedEvent::ChildAgentCreationApproved(ChildAgentCreationApprovedEvent {
+                identity: identity.clone(),
+                action_digest: ContentHash::digest(b"wrong"),
+            }),
+        ));
+        assert!(matches!(
+            replay(&wrong),
+            Err(SessionReducerError::InvalidChildAgentTransition)
+        ));
+
+        events.push(envelope(
+            8,
+            RuntimeCommittedEvent::ChildAgentCreationApproved(ChildAgentCreationApprovedEvent {
+                identity: identity.clone(),
+                action_digest: digest,
+            }),
+        ));
+        events.push(envelope(
+            9,
+            RuntimeCommittedEvent::ChildAgentCreated(ChildAgentCreatedEvent {
+                identity: identity.clone(),
+                child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                parent_action_sequence: Sequence::new(7).expect("proposal sequence"),
+                child_style: String::from("ephemeral-turn@1.1.0"),
+            }),
+        ));
+
+        let state = replay(&events).expect("approved child receipt");
+        assert_eq!(
+            state
+                .child_agents
+                .get(&identity.execution_id)
+                .expect("child")
+                .state,
+            ChildAgentState::Active
+        );
     }
 
     fn compiled_graph() -> ExecutableGraph {

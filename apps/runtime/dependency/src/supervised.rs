@@ -31,10 +31,10 @@ use crate::{
     process_tool::ProcessCapabilityDependency,
     receipt::ToolReceiptDependency,
     registry::{
-        DependencyCreateBranchRequest, DependencyCreateSessionRequest, DependencyCreatedSession,
-        DependencyListSessionsRequest, DependencyPrepareSessionRequest, DependencyPreparedSession,
-        DependencySessionMetadata, FileSessionCatalogDependency, SessionCatalogDependencyError,
-        SessionCatalogDependencyPort,
+        DependencyCreateBranchRequest, DependencyCreateChildSessionRequest,
+        DependencyCreateSessionRequest, DependencyCreatedSession, DependencyListSessionsRequest,
+        DependencyPrepareSessionRequest, DependencyPreparedSession, DependencySessionMetadata,
+        FileSessionCatalogDependency, SessionCatalogDependencyError, SessionCatalogDependencyPort,
     },
     scheduler::{
         DependencyRuntimeSchedule, DependencyScheduleStoreResult, DependencyScheduledExecution,
@@ -300,6 +300,13 @@ impl SessionCatalogDependencyPort for SupervisedRuntimeDependencies {
         request: DependencyCreateBranchRequest,
     ) -> Result<DependencyCreatedSession, SessionCatalogDependencyError> {
         FileSessionCatalogDependency.create_branch(request)
+    }
+
+    fn create_child_session(
+        &self,
+        request: DependencyCreateChildSessionRequest,
+    ) -> Result<DependencyCreatedSession, SessionCatalogDependencyError> {
+        FileSessionCatalogDependency.create_child_session(request)
     }
 
     fn list_sessions(

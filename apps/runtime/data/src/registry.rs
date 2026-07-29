@@ -5,9 +5,9 @@ use std::{path::PathBuf, str::FromStr};
 use agentmod_primitives::{CausationId, CorrelationId, EventId, SessionId, TimestampMillis};
 use agentmod_runtime_dependency::registry::{
     DependencyBranchArtifact, DependencyBranchEvent, DependencyCreateBranchRequest,
-    DependencyCreateSessionRequest, DependencyListSessionsRequest, DependencyPrepareSessionRequest,
-    DependencyPreparedSession, FileSessionCatalogDependency, SessionCatalogDependencyError,
-    SessionCatalogDependencyPort,
+    DependencyCreateChildSessionRequest, DependencyCreateSessionRequest,
+    DependencyListSessionsRequest, DependencyPrepareSessionRequest, DependencyPreparedSession,
+    FileSessionCatalogDependency, SessionCatalogDependencyError, SessionCatalogDependencyPort,
 };
 use thiserror::Error;
 
@@ -112,6 +112,33 @@ pub struct CreateBranchDataRequest {
     pub artifacts: Vec<BranchArtifactDataRecord>,
 }
 
+/// Data request for atomic runtime-managed worker creation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateChildSessionDataRequest {
+    /// Sessions root.
+    pub sessions_root: PathBuf,
+    /// Prepared child identity and normalized workspace.
+    pub prepared: PreparedSessionDataRecord,
+    /// Explicit child style.
+    pub style: String,
+    /// Canonical immutable binding JSON.
+    pub style_binding_json: String,
+    /// Canonical selected manifest JSON.
+    pub style_manifest_json: String,
+    /// Canonical compiled descriptor JSON.
+    pub compiled_style_json: String,
+    /// Runtime-managed parent session.
+    pub parent_session_id: SessionId,
+    /// Canonical parent proposal sequence.
+    pub parent_action_sequence: u64,
+    /// Parent graph node that owns the child.
+    pub parent_graph_node_id: String,
+    /// Runtime-owned task identity.
+    pub task_id: String,
+    /// Complete sealed child journal.
+    pub events: Vec<BranchEventDataRecord>,
+}
+
 /// Listing request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListSessionsDataRequest {
@@ -136,6 +163,16 @@ pub struct SessionSummaryDataRecord {
     pub state: String,
     /// Creation time for ordering.
     pub created_at_millis: i64,
+    /// Parent session for a branch.
+    pub parent_session_id: Option<SessionId>,
+    /// Inclusive parent sequence used to create a branch.
+    pub fork_sequence: Option<u64>,
+    /// Parent session for a runtime-managed worker.
+    pub child_parent_session_id: Option<SessionId>,
+    /// Parent proposal sequence used to reconcile a worker.
+    pub child_parent_action_sequence: Option<u64>,
+    /// Runtime-owned child task.
+    pub child_task_id: Option<String>,
 }
 
 /// Narrow session catalog data interface.
@@ -170,6 +207,17 @@ pub trait SessionRegistryDataPort {
     fn create_branch(
         &self,
         request: CreateBranchDataRequest,
+    ) -> Result<CreatedSessionDataRecord, SessionRegistryDataError>;
+
+    /// Atomically persists a runtime-managed worker session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionRegistryDataError`] when dependency mapping or
+    /// persistence fails.
+    fn create_child_session(
+        &self,
+        request: CreateChildSessionDataRequest,
     ) -> Result<CreatedSessionDataRecord, SessionRegistryDataError>;
 
     /// Lists lightweight records without loading conversations.
@@ -246,6 +294,18 @@ where
             .map_err(SessionRegistryDataError::Dependency)
     }
 
+    fn create_child_session(
+        &self,
+        request: CreateChildSessionDataRequest,
+    ) -> Result<CreatedSessionDataRecord, SessionRegistryDataError> {
+        self.dependency
+            .create_child_session(to_dependency_child(request))
+            .map(|created| CreatedSessionDataRecord {
+                session_directory: created.session_directory,
+            })
+            .map_err(SessionRegistryDataError::Dependency)
+    }
+
     fn list(
         &self,
         request: ListSessionsDataRequest,
@@ -270,6 +330,21 @@ where
                     sequence: record.sequence,
                     state: record.state,
                     created_at_millis: record.created_at_millis,
+                    parent_session_id: record
+                        .parent_session_id
+                        .as_deref()
+                        .map(SessionId::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRegistryDataError::InvalidSessionId)?,
+                    fork_sequence: record.fork_sequence,
+                    child_parent_session_id: record
+                        .child_parent_session_id
+                        .as_deref()
+                        .map(SessionId::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRegistryDataError::InvalidSessionId)?,
+                    child_parent_action_sequence: record.child_parent_action_sequence,
+                    child_task_id: record.child_task_id,
                 })
             })
             .collect()
@@ -324,6 +399,18 @@ where
             .map_err(SessionRegistryDataError::Dependency)
     }
 
+    fn create_child_session(
+        &self,
+        request: CreateChildSessionDataRequest,
+    ) -> Result<CreatedSessionDataRecord, SessionRegistryDataError> {
+        self.dependency
+            .create_child_session(to_dependency_child(request))
+            .map(|created| CreatedSessionDataRecord {
+                session_directory: created.session_directory,
+            })
+            .map_err(SessionRegistryDataError::Dependency)
+    }
+
     fn list(
         &self,
         request: ListSessionsDataRequest,
@@ -348,6 +435,21 @@ where
                     sequence: record.sequence,
                     state: record.state,
                     created_at_millis: record.created_at_millis,
+                    parent_session_id: record
+                        .parent_session_id
+                        .as_deref()
+                        .map(SessionId::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRegistryDataError::InvalidSessionId)?,
+                    fork_sequence: record.fork_sequence,
+                    child_parent_session_id: record
+                        .child_parent_session_id
+                        .as_deref()
+                        .map(SessionId::from_str)
+                        .transpose()
+                        .map_err(|_| SessionRegistryDataError::InvalidSessionId)?,
+                    child_parent_action_sequence: record.child_parent_action_sequence,
+                    child_task_id: record.child_task_id,
                 })
             })
             .collect()
@@ -393,6 +495,32 @@ fn to_dependency_branch(request: CreateBranchDataRequest) -> DependencyCreateBra
                 mime_type: artifact.mime_type,
                 creation_event: artifact.creation_event,
                 bytes: artifact.bytes,
+            })
+            .collect(),
+    }
+}
+
+fn to_dependency_child(
+    request: CreateChildSessionDataRequest,
+) -> DependencyCreateChildSessionRequest {
+    DependencyCreateChildSessionRequest {
+        sessions_root: request.sessions_root,
+        prepared: to_dependency_prepared(request.prepared),
+        style: request.style,
+        style_binding_json: request.style_binding_json,
+        style_manifest_json: request.style_manifest_json,
+        compiled_style_json: request.compiled_style_json,
+        parent_session_id: request.parent_session_id.to_string(),
+        parent_action_sequence: request.parent_action_sequence,
+        parent_graph_node_id: request.parent_graph_node_id,
+        task_id: request.task_id,
+        events: request
+            .events
+            .into_iter()
+            .map(|event| DependencyBranchEvent {
+                sequence: event.sequence,
+                event_id: event.event_id,
+                event_json: event.event_json,
             })
             .collect(),
     }

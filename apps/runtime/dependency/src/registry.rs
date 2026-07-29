@@ -125,6 +125,33 @@ pub struct DependencyCreateBranchRequest {
     pub artifacts: Vec<DependencyBranchArtifact>,
 }
 
+/// Atomic runtime-managed worker-session creation request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyCreateChildSessionRequest {
+    /// Sessions storage root.
+    pub sessions_root: PathBuf,
+    /// Prepared child identity and normalized workspace.
+    pub prepared: DependencyPreparedSession,
+    /// Explicit validated child style.
+    pub style: String,
+    /// Canonical immutable binding JSON.
+    pub style_binding_json: String,
+    /// Canonical selected manifest JSON.
+    pub style_manifest_json: String,
+    /// Canonical compiled descriptor JSON.
+    pub compiled_style_json: String,
+    /// Runtime-managed parent session.
+    pub parent_session_id: String,
+    /// Canonical parent proposal sequence.
+    pub parent_action_sequence: u64,
+    /// Parent graph node that owns the child.
+    pub parent_graph_node_id: String,
+    /// Runtime-owned task identity.
+    pub task_id: String,
+    /// Complete child journal, starting at sequence one.
+    pub events: Vec<DependencyBranchEvent>,
+}
+
 /// Session listing request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyListSessionsRequest {
@@ -153,6 +180,12 @@ pub struct DependencySessionMetadata {
     pub parent_session_id: Option<String>,
     /// Inclusive parent fork point.
     pub fork_sequence: Option<u64>,
+    /// Parent session for a runtime-managed worker.
+    pub child_parent_session_id: Option<String>,
+    /// Parent proposal sequence used to reconcile this worker.
+    pub child_parent_action_sequence: Option<u64>,
+    /// Runtime-owned task identity.
+    pub child_task_id: Option<String>,
 }
 
 /// Narrow session catalog dependency used by runtime data.
@@ -188,6 +221,17 @@ pub trait SessionCatalogDependencyPort {
     fn create_branch(
         &self,
         request: DependencyCreateBranchRequest,
+    ) -> Result<DependencyCreatedSession, SessionCatalogDependencyError>;
+
+    /// Atomically creates a runtime-managed worker session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionCatalogDependencyError`] when the request is invalid
+    /// or the atomic filesystem creation cannot complete.
+    fn create_child_session(
+        &self,
+        request: DependencyCreateChildSessionRequest,
     ) -> Result<DependencyCreatedSession, SessionCatalogDependencyError>;
 
     /// Reads bounded metadata without loading conversations.
@@ -287,6 +331,34 @@ impl SessionCatalogDependencyPort for FileSessionCatalogDependency {
         })
     }
 
+    fn create_child_session(
+        &self,
+        request: DependencyCreateChildSessionRequest,
+    ) -> Result<DependencyCreatedSession, SessionCatalogDependencyError> {
+        validate_root(&request.sessions_root)?;
+        validate_child_session(&request)?;
+        fs::create_dir_all(&request.sessions_root).map_err(map_io)?;
+        let final_directory = request
+            .sessions_root
+            .join(request.prepared.session_id.to_string());
+        if final_directory.exists() {
+            return Err(SessionCatalogDependencyError::AlreadyExists);
+        }
+        let temporary = request
+            .sessions_root
+            .join(format!(".creating-{}", request.prepared.session_id));
+        fs::create_dir(&temporary).map_err(map_io)?;
+        if let Err(error) = populate_child_directory(&temporary, &request) {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+        fs::rename(&temporary, &final_directory).map_err(map_io)?;
+        sync_directory(&request.sessions_root)?;
+        Ok(DependencyCreatedSession {
+            session_directory: final_directory,
+        })
+    }
+
     fn list_sessions(
         &self,
         request: DependencyListSessionsRequest,
@@ -347,6 +419,13 @@ impl SessionCatalogDependencyPort for crate::LocalRuntimeDependencies {
         FileSessionCatalogDependency.create_branch(request)
     }
 
+    fn create_child_session(
+        &self,
+        request: DependencyCreateChildSessionRequest,
+    ) -> Result<DependencyCreatedSession, SessionCatalogDependencyError> {
+        FileSessionCatalogDependency.create_child_session(request)
+    }
+
     fn list_sessions(
         &self,
         request: DependencyListSessionsRequest,
@@ -378,6 +457,9 @@ fn populate_directory(
         created_at_millis: request.prepared.timestamp.get(),
         parent_session_id: None,
         fork_sequence: None,
+        child_parent_session_id: None,
+        child_parent_action_sequence: None,
+        child_task_id: None,
     };
     write_session_descriptors(temporary, &metadata, workspace.as_ref(), &descriptors)?;
     JsonlJournalDependency
@@ -459,6 +541,9 @@ fn populate_branch_directory(
         created_at_millis: request.prepared.timestamp.get(),
         parent_session_id: Some(&request.parent_session_id),
         fork_sequence: Some(request.fork_sequence),
+        child_parent_session_id: None,
+        child_parent_action_sequence: None,
+        child_task_id: None,
     };
     write_session_descriptors(temporary, &metadata, workspace.as_ref(), &descriptors)?;
     for artifact in &request.artifacts {
@@ -499,6 +584,72 @@ fn populate_branch_directory(
             .map_err(|error| SessionCatalogDependencyError::Journal(error.to_string()))?;
     }
     sync_directory(temporary)
+}
+
+fn populate_child_directory(
+    temporary: &Path,
+    request: &DependencyCreateChildSessionRequest,
+) -> Result<(), SessionCatalogDependencyError> {
+    create_session_subdirectories(temporary)?;
+    let descriptors = parse_style_descriptors(
+        &request.style,
+        &request.style_binding_json,
+        &request.style_manifest_json,
+        &request.compiled_style_json,
+    )?;
+    let workspace = request.prepared.normalized_workspace.to_string_lossy();
+    let metadata = StoredMetadata {
+        schema_version: SCHEMA_VERSION,
+        session_id: request.prepared.session_id.to_string(),
+        workspace: workspace.as_ref(),
+        style: &request.style,
+        style_binding: Some(&descriptors.binding),
+        sequence: u64::try_from(request.events.len())
+            .map_err(|_| SessionCatalogDependencyError::SequenceOverflow)?,
+        state: "active",
+        created_at_millis: request.prepared.timestamp.get(),
+        parent_session_id: None,
+        fork_sequence: None,
+        child_parent_session_id: Some(&request.parent_session_id),
+        child_parent_action_sequence: Some(request.parent_action_sequence),
+        child_task_id: Some(&request.task_id),
+    };
+    write_session_descriptors(temporary, &metadata, workspace.as_ref(), &descriptors)?;
+    for event in &request.events {
+        JsonlJournalDependency
+            .append(DependencyAppendJournalRequest {
+                session_directory: temporary.to_owned(),
+                sequence: event.sequence,
+                event_id: event.event_id.clone(),
+                event_json: event.event_json.clone(),
+                durability: DependencyDurability::Full,
+            })
+            .map_err(|error| SessionCatalogDependencyError::Journal(error.to_string()))?;
+    }
+    sync_directory(temporary)
+}
+
+fn validate_child_session(
+    request: &DependencyCreateChildSessionRequest,
+) -> Result<(), SessionCatalogDependencyError> {
+    if request.parent_session_id.is_empty()
+        || request.parent_action_sequence == 0
+        || request.parent_graph_node_id.trim().is_empty()
+        || request.task_id.trim().is_empty()
+        || request.events.len() != 2
+    {
+        return Err(SessionCatalogDependencyError::InvalidChildSession);
+    }
+    for (index, event) in request.events.iter().enumerate() {
+        let expected = u64::try_from(index)
+            .map_err(|_| SessionCatalogDependencyError::SequenceOverflow)?
+            .checked_add(1)
+            .ok_or(SessionCatalogDependencyError::SequenceOverflow)?;
+        if event.sequence != expected || event.event_id.is_empty() || event.event_json.is_empty() {
+            return Err(SessionCatalogDependencyError::InvalidChildSession);
+        }
+    }
+    Ok(())
 }
 
 fn validate_branch(
@@ -662,6 +813,12 @@ struct StoredMetadata<'a> {
     parent_session_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     fork_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_parent_session_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_parent_action_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    child_task_id: Option<&'a str>,
 }
 
 #[derive(Deserialize)]
@@ -679,6 +836,12 @@ struct StoredMetadataOwned {
     parent_session_id: Option<String>,
     #[serde(default)]
     fork_sequence: Option<u64>,
+    #[serde(default)]
+    child_parent_session_id: Option<String>,
+    #[serde(default)]
+    child_parent_action_sequence: Option<u64>,
+    #[serde(default)]
+    child_task_id: Option<String>,
 }
 
 impl From<StoredMetadataOwned> for DependencySessionMetadata {
@@ -692,6 +855,9 @@ impl From<StoredMetadataOwned> for DependencySessionMetadata {
             created_at_millis: value.created_at_millis,
             parent_session_id: value.parent_session_id,
             fork_sequence: value.fork_sequence,
+            child_parent_session_id: value.child_parent_session_id,
+            child_parent_action_sequence: value.child_parent_action_sequence,
+            child_task_id: value.child_task_id,
         }
     }
 }
@@ -738,6 +904,9 @@ pub enum SessionCatalogDependencyError {
     /// Branch journal events were empty or non-monotonic.
     #[error("session branch event set is invalid")]
     InvalidBranchEvents,
+    /// Worker ownership or initial journal is invalid.
+    #[error("child session creation request is invalid")]
+    InvalidChildSession,
     /// Branch artifact identity, hash, media type, or size was invalid.
     #[error("session branch artifact is invalid")]
     InvalidBranchArtifact,
@@ -942,6 +1111,66 @@ mod tests {
         assert_eq!(
             FileSessionCatalogDependency.create_branch(invalid),
             Err(SessionCatalogDependencyError::InvalidBranchArtifact)
+        );
+    }
+
+    #[test]
+    fn child_session_is_distinct_from_branch_and_catalogued_by_parent_proposal() {
+        let root = tempfile::tempdir().expect("root");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions = root.path().join("sessions");
+        let (style_binding_json, style_manifest_json, compiled_style_json) = style_documents();
+        let request = DependencyCreateChildSessionRequest {
+            sessions_root: sessions.clone(),
+            prepared: prepared(workspace.path()),
+            style: String::from("persistent-chat"),
+            style_binding_json,
+            style_manifest_json,
+            compiled_style_json,
+            parent_session_id: Uuid::from_u128(8).to_string(),
+            parent_action_sequence: 17,
+            parent_graph_node_id: String::from("spawn-workers"),
+            task_id: String::from("task-1"),
+            events: vec![
+                DependencyBranchEvent {
+                    sequence: 1,
+                    event_id: Uuid::from_u128(10).to_string(),
+                    event_json: br#"{"event":"session.created"}"#.to_vec(),
+                },
+                DependencyBranchEvent {
+                    sequence: 2,
+                    event_id: Uuid::from_u128(11).to_string(),
+                    event_json: br#"{"event":"child_session.linked"}"#.to_vec(),
+                },
+            ],
+        };
+
+        FileSessionCatalogDependency
+            .create_child_session(request.clone())
+            .expect("child");
+        let listed = FileSessionCatalogDependency
+            .list_sessions(DependencyListSessionsRequest {
+                sessions_root: sessions,
+                limit: 10,
+            })
+            .expect("list");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].child_parent_session_id.as_deref(),
+            Some(request.parent_session_id.as_str())
+        );
+        assert_eq!(listed[0].child_parent_action_sequence, Some(17));
+        assert_eq!(listed[0].child_task_id.as_deref(), Some("task-1"));
+        assert!(listed[0].parent_session_id.is_none());
+        assert!(listed[0].fork_sequence.is_none());
+
+        let mut invalid = request;
+        invalid.prepared.session_id = SessionId::from_uuid(Uuid::from_u128(12));
+        invalid.events[1].sequence = 3;
+        assert_eq!(
+            FileSessionCatalogDependency.create_child_session(invalid),
+            Err(SessionCatalogDependencyError::InvalidChildSession)
         );
     }
 }

@@ -14,6 +14,7 @@ pub mod registry;
 pub mod scheduler;
 pub mod session;
 pub mod style;
+pub(crate) mod style_executor;
 pub mod tool;
 pub mod turn;
 

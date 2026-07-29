@@ -50,7 +50,7 @@ try {
             --session $created.session_id `
             --option 'mock_scenario="one_tool_call"' --json | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw "tool turn failed" }
-        if ($turn.last_committed_sequence -ne 18) {
+        if ($turn.last_committed_sequence -ne 27) {
             throw "tool turn committed unexpected sequence $($turn.last_committed_sequence)"
         }
         $visible = ($turn.events | Where-Object event -eq "text" |

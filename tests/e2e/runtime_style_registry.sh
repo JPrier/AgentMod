@@ -71,7 +71,7 @@ done
 "$cli" run "persistent before restart" --session "$persistent_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="persistent-before"' --json |
-    grep -F '"last_committed_sequence":10' >/dev/null
+    grep -F '"last_committed_sequence":19' >/dev/null
 "$cli" run "ephemeral before restart" --session "$ephemeral_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="ephemeral-before"' --json |
@@ -86,13 +86,13 @@ done
 "$cli" run "persistent after restart" --session "$persistent_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="persistent-after"' --json |
-    grep -F '"last_committed_sequence":19' >/dev/null
+    grep -F '"last_committed_sequence":36' >/dev/null
 "$cli" run "ephemeral after restart" --session "$ephemeral_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="ephemeral-after"' --json |
     grep -F '"last_committed_sequence":19' >/dev/null
 
-branch=$("$cli" session branch "$persistent_id" --at 10 \
+branch=$("$cli" session branch "$persistent_id" --at 19 \
     --style ephemeral-turn --json)
 branch_id=$(printf '%s' "$branch" |
     sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')

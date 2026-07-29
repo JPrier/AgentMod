@@ -148,6 +148,15 @@ try {
             }).Count -ne 1) {
             throw "duplicate approval changed canonical state or reran the tool"
         }
+        $continued = & $cli run "continue after approved graph completion" `
+            --session $created.session_id `
+            --option 'mock_scenario="streaming_text"' `
+            --option 'mock_text="post-approval-turn"' --json | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0 -or
+            ($continued.events | Where-Object event -eq "text" |
+                ForEach-Object text) -notcontains "post-approval-turn") {
+            throw "style graph did not return to its entry after approval completion"
+        }
 
         $deniedWorkspace = Join-Path $runRoot "denied-workspace"
         New-Item -ItemType Directory -Path $deniedWorkspace -Force | Out-Null

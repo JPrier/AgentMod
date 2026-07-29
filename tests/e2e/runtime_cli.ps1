@@ -20,8 +20,10 @@ try {
         "0123456789abcdef0123456789abcdef0123456789abcdef"
     )
     $env:AGENTMOD_HARNESS_PROGRAM = $harness
+    $runtimeStderr = Join-Path $runRoot "runtime.stderr.log"
     $daemon = Start-Process -FilePath $runtime -ArgumentList "serve" `
-        -WorkingDirectory $runRoot -WindowStyle Hidden -PassThru
+        -WorkingDirectory $runRoot -WindowStyle Hidden `
+        -RedirectStandardError $runtimeStderr -PassThru
     try {
         $ready = $false
         for ($attempt = 0; $attempt -lt 50; $attempt++) {
@@ -51,8 +53,14 @@ try {
             --session $created.session_id `
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="daemon-turn-ok"' --json | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0) { throw "turn execution failed" }
-        if ($turn.last_committed_sequence -ne 10) {
+        if ($LASTEXITCODE -ne 0) {
+            $runtimeDiagnostics = Get-Content $runtimeStderr -ErrorAction SilentlyContinue
+            $failedJournal = Get-Content (
+                Join-Path $runRoot ("sessions\" + $created.session_id + "\events.jsonl")
+            ) -ErrorAction SilentlyContinue
+            throw "turn execution failed`n$runtimeDiagnostics`n$failedJournal"
+        }
+        if ($turn.last_committed_sequence -ne 19) {
             throw "turn did not commit its complete provider lifecycle"
         }
         $visible = ($turn.events | Where-Object event -eq "text" |
@@ -71,7 +79,7 @@ try {
             }
         }
         $journal = Get-Content (Join-Path $sessionRoot "events.jsonl")
-        if ($journal.Count -ne 10) {
+        if ($journal.Count -ne 19) {
             throw "canonical journal does not contain the complete turn"
         }
         $eventTypes = @($journal | ForEach-Object {
@@ -80,6 +88,8 @@ try {
         $expectedTypes = @(
             "session.created",
             "conversation.entry_committed",
+            "style.execution_initialized",
+            "style.node_entered",
             "model.request_proposed",
             "model.request_approved",
             "model.request_started",
@@ -87,10 +97,29 @@ try {
             "model.output_delta_observed",
             "model.output_delta_observed",
             "model.response_completed",
-            "conversation.entry_committed"
+            "style.node_completed",
+            "style.transition_selected",
+            "style.node_entered",
+            "style.node_completed",
+            "style.transition_selected",
+            "style.node_entered",
+            "conversation.entry_committed",
+            "style.node_completed"
         )
         if ((Compare-Object $eventTypes $expectedTypes -SyncWindow 0).Count -ne 0) {
             throw "canonical provider lifecycle event order was incorrect"
+        }
+        $inspected = & $cli session inspect $created.session_id --json |
+            ConvertFrom-Json
+        $execution = $inspected.state.style_execution
+        if ($null -eq $execution -or
+            $null -ne $execution.active_node -or
+            @($execution.completed_nodes).Count -ne 3 -or
+            @($execution.transitions).Count -ne 2 -or
+            @($execution.completed_nodes).node_id[0] -ne "respond" -or
+            @($execution.completed_nodes).node_id[1] -ne "tool" -or
+            @($execution.completed_nodes).node_id[2] -ne "done") {
+            throw "session inspection did not expose the completed style graph"
         }
         Write-Output "runtime/CLI/harness durable-turn E2E passed"
     }

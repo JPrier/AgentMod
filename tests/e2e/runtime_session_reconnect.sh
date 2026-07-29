@@ -44,17 +44,26 @@ first_after="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["
 "$cli" session events "$session_id" --after "$first_after" --limit 4 --json >"$run_root/second.json"
 second_after="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["last_delivered_sequence"])' "$run_root/second.json")"
 "$cli" session events "$session_id" --after "$second_after" --limit 4 --json >"$run_root/third.json"
+third_after="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["last_delivered_sequence"])' "$run_root/third.json")"
+"$cli" session events "$session_id" --after "$third_after" --limit 4 --json >"$run_root/fourth.json"
+fourth_after="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["last_delivered_sequence"])' "$run_root/fourth.json")"
+"$cli" session events "$session_id" --after "$fourth_after" --limit 4 --json >"$run_root/fifth.json"
+fifth_after="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["last_delivered_sequence"])' "$run_root/fifth.json")"
+"$cli" session events "$session_id" --after "$fifth_after" --limit 4 --json >"$run_root/caught-up.json"
 
-python3 - "$run_root/first.json" "$run_root/second.json" "$run_root/third.json" <<'PY'
+python3 - "$run_root/first.json" "$run_root/second.json" "$run_root/third.json" \
+    "$run_root/fourth.json" "$run_root/fifth.json" "$run_root/caught-up.json" <<'PY'
 import json
 import sys
 
 pages = [json.load(open(path, encoding="utf-8")) for path in sys.argv[1:]]
-sequences = [event["sequence"] for page in pages for event in page["events"]]
-assert sequences == list(range(1, 11)), sequences
-assert pages[0]["has_more"] and pages[1]["has_more"]
-assert not pages[2]["has_more"]
-assert pages[2]["head_sequence"] == pages[2]["last_delivered_sequence"] == 10
+sequences = [event["sequence"] for page in pages[:-1] for event in page["events"]]
+assert sequences == list(range(1, 20)), sequences
+assert all(page["has_more"] for page in pages[:4])
+assert not pages[4]["has_more"]
+assert pages[4]["head_sequence"] == pages[4]["last_delivered_sequence"] == 19
+assert pages[5]["events"] == [] and not pages[5]["has_more"]
+assert pages[5]["head_sequence"] == pages[5]["last_delivered_sequence"] == 19
 PY
 
 printf 'runtime credit-window reconnect-from-sequence E2E passed\n'

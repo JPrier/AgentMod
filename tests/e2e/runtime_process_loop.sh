@@ -43,7 +43,7 @@ session_id=$(printf '%s' "$created" | sed -n \
     's/.*"session_id":"\([^"]*\)".*/\1/p')
 turn=$("$repository/target/debug/agentmod" run "run the tool and continue" \
     --session "$session_id" --option 'mock_scenario="one_process_call"' --json)
-printf '%s' "$turn" | grep -F '"last_committed_sequence":19' >/dev/null
+printf '%s' "$turn" | grep -F '"last_committed_sequence":28' >/dev/null
 journal="$run_root/sessions/$session_id/events.jsonl"
 for event_type in tool.call_proposed tool.call_approved tool.execution_dispatched tool.execution_started \
     tool.output_observed tool.execution_completed; do

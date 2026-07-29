@@ -48,19 +48,36 @@ turn=$("$repository/target/debug/agentmod" run "complete the deterministic turn"
     --session "$session_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="daemon-turn-ok"' --json)
-printf '%s' "$turn" | grep -F '"last_committed_sequence":10' >/dev/null
+printf '%s' "$turn" | grep -F '"last_committed_sequence":19' >/dev/null
 printf '%s' "$turn" | grep -F '"text":"daemon-turn-ok"' >/dev/null
 
 for required in metadata.json events.jsonl style.json style.lock workspace.json \
     continuations snapshots artifacts process-logs branches; do
     test -e "$run_root/sessions/$session_id/$required"
 done
-test "$(wc -l < "$run_root/sessions/$session_id/events.jsonl")" -eq 10
+test "$(wc -l < "$run_root/sessions/$session_id/events.jsonl")" -eq 19
 for event_type in session.created conversation.entry_committed \
     model.request_proposed model.request_approved model.request_started \
-    model.output_delta_observed model.response_completed; do
+    model.output_delta_observed model.response_completed \
+    style.execution_initialized style.node_entered style.node_completed \
+    style.transition_selected; do
     grep -F "\"event_type\":\"$event_type\"" \
         "$run_root/sessions/$session_id/events.jsonl" >/dev/null
 done
+inspection=$("$repository/target/debug/agentmod" session inspect \
+    "$session_id" --json)
+python3 - "$inspection" <<'PY'
+import json
+import sys
+
+execution = json.loads(sys.argv[1])["state"]["style_execution"]
+assert execution["active_node"] is None
+assert [node["node_id"] for node in execution["completed_nodes"]] == [
+    "respond",
+    "tool",
+    "done",
+]
+assert len(execution["transitions"]) == 2
+PY
 
 echo "runtime/CLI/harness durable-turn E2E passed"

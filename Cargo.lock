@@ -884,8 +884,10 @@ version = "0.1.0"
 dependencies = [
  "agentmod-event-model",
  "agentmod-event-pipeline",
+ "agentmod-graph-engine",
  "agentmod-primitives",
  "agentmod-runtime-data",
+ "agentmod-session-style-sdk",
  "async-trait",
  "semver",
  "serde",

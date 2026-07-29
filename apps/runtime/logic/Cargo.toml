@@ -10,8 +10,10 @@ repository.workspace = true
 [dependencies]
 agentmod-event-model = { path = "../../../core/event-model" }
 agentmod-event-pipeline = { path = "../../../core/event-pipeline" }
+agentmod-graph-engine = { path = "../../../core/graph-engine" }
 agentmod-primitives = { path = "../../../core/primitives" }
 agentmod-runtime-data = { path = "../data" }
+agentmod-session-style-sdk = { path = "../../../sdk/session-style-sdk" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

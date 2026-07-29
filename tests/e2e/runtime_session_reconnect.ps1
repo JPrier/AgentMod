@@ -53,26 +53,35 @@ try {
         $third = & $cli session events $created.session_id `
             --after $second.last_delivered_sequence --limit 4 --json |
             ConvertFrom-Json
-        $caughtUp = & $cli session events $created.session_id `
+        $fourth = & $cli session events $created.session_id `
             --after $third.last_delivered_sequence --limit 4 --json |
+            ConvertFrom-Json
+        $fifth = & $cli session events $created.session_id `
+            --after $fourth.last_delivered_sequence --limit 4 --json |
+            ConvertFrom-Json
+        $caughtUp = & $cli session events $created.session_id `
+            --after $fifth.last_delivered_sequence --limit 4 --json |
             ConvertFrom-Json
 
         $sequences = @(
             @($first.events).sequence +
             @($second.events).sequence +
-            @($third.events).sequence
+            @($third.events).sequence +
+            @($fourth.events).sequence +
+            @($fifth.events).sequence
         )
-        if ((Compare-Object $sequences (1..10) -SyncWindow 0).Count -ne 0) {
+        if ((Compare-Object $sequences (1..19) -SyncWindow 0).Count -ne 0) {
             throw "reconnect pages omitted or duplicated canonical events"
         }
         if (-not $first.has_more -or -not $second.has_more -or
-            $third.has_more -or $third.head_sequence -ne 10 -or
-            $third.last_delivered_sequence -ne 10) {
+            -not $third.has_more -or -not $fourth.has_more -or
+            $fifth.has_more -or $fifth.head_sequence -ne 19 -or
+            $fifth.last_delivered_sequence -ne 19) {
             throw "reconnect cursor metadata was incorrect"
         }
         if (@($caughtUp.events).Count -ne 0 -or $caughtUp.has_more -or
-            $caughtUp.head_sequence -ne 10 -or
-            $caughtUp.last_delivered_sequence -ne 10) {
+            $caughtUp.head_sequence -ne 19 -or
+            $caughtUp.last_delivered_sequence -ne 19) {
             throw "caught-up reconnect page was not stable and empty"
         }
         Write-Output "runtime credit-window reconnect-from-sequence E2E passed"

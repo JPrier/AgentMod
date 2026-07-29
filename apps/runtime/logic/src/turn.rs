@@ -57,9 +57,14 @@ use crate::{
         ModelToolCallProposedEvent, ProcessReconciliationCompletedEvent,
         ProcessReconciliationStartedEvent, ProcessReconciliationStatus, RuntimeCommittedEvent,
         SchedulerDeliveryReconciledEvent, SchedulerFiredEvent, SessionReducerError,
-        ToolCallApprovedEvent, ToolCallProposedEvent, ToolExecutionCompletedEvent,
-        ToolExecutionDispatchedEvent, ToolExecutionFailedEvent, ToolExecutionStartedEvent,
-        ToolExecutionState, ToolOutputObservedEvent, reduce,
+        StyleExecutionInitializedEvent, StyleNodeCompletedEvent, StyleNodeEnteredEvent,
+        StyleNodeFailedEvent, StyleTransitionSelectedEvent, ToolCallApprovedEvent,
+        ToolCallProposedEvent, ToolExecutionCompletedEvent, ToolExecutionDispatchedEvent,
+        ToolExecutionFailedEvent, ToolExecutionStartedEvent, ToolExecutionState,
+        ToolOutputObservedEvent, reduce,
+    },
+    style_executor::{
+        CompiledStyleExecutor, StyleExecutorError, StyleNodeCursor, StyleNodeDirective,
     },
     tool::{
         AuthorizedToolRequest, PrepareToolCommand, ToolAuthorizationOutcome, ToolEvent,
@@ -105,6 +110,13 @@ struct JournalPosition {
 struct AuthorizedTurn {
     request: AuthorizedProviderRequest,
     position: JournalPosition,
+}
+
+struct ActiveStyleTurn {
+    executor: CompiledStyleExecutor,
+    current: StyleNodeCursor,
+    position: JournalPosition,
+    step: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -472,6 +484,10 @@ where
         + agentmod_runtime_data::tool::ToolDataPort
         + 'static,
 {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the style executor adapter keeps canonical node events adjacent to the existing effect-safe provider and tool phases"
+    )]
     async fn run_turn_internal(
         &self,
         command: RunTurnCommand,
@@ -490,20 +506,61 @@ where
         }
         let (state, user_sequence, user_event) =
             self.commit_user(&persistence, session_id, &session_directory, &command)?;
-        let authorized = self
+        // The service boundary rejects legacy unbound sessions before they
+        // reach this path. Keeping the internal fallback preserves replay and
+        // focused logic fixtures without silently migrating durable sessions.
+        let style_driven = state
+            .style_binding
+            .as_ref()
+            .is_some_and(|binding| binding.id == "persistent-chat");
+        let mut style_turn = style_driven
+            .then(|| {
+                self.begin_style_turn(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &state,
+                    JournalPosition {
+                        sequence: user_sequence,
+                        event_id: user_event.metadata.event_id,
+                    },
+                )
+            })
+            .transpose()?;
+        let provider_position = style_turn.as_ref().map_or(
+            JournalPosition {
+                sequence: user_sequence,
+                event_id: user_event.metadata.event_id,
+            },
+            |execution| execution.position,
+        );
+        let authorized = match self
             .authorize_and_commit(
                 &persistence,
                 session_id,
                 &session_directory,
-                JournalPosition {
-                    sequence: user_sequence,
-                    event_id: user_event.metadata.event_id,
-                },
+                provider_position,
                 state,
                 &command,
             )
-            .await?;
-        let (events, observed) = self
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(execution) = style_turn.as_ref() {
+                    self.fail_style_node_at_head(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        execution,
+                        "model_authorization_failed",
+                        None,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+        let (events, observed) = match self
             .execute_and_commit(
                 &persistence,
                 session_id,
@@ -512,18 +569,84 @@ where
                 &command.cancellation_id,
                 sink,
             )
-            .await?;
-        let tool_outcome = self
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(execution) = style_turn.as_ref() {
+                    self.fail_style_node_at_head(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        execution,
+                        "model_execution_failed",
+                        None,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
+        if let Some(execution) = style_turn.as_mut() {
+            execution.position = observed;
+            if let Some(reason) = provider_node_failure(&events) {
+                execution.position = self.fail_style_node_at_head(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    execution,
+                    reason,
+                    None,
+                )?;
+                return Ok(RunTurnResult {
+                    events,
+                    first_committed_sequence: user_sequence,
+                    last_committed_sequence: execution.position.sequence,
+                    awaiting_continuation: None,
+                });
+            }
+            self.complete_and_enter_next(
+                &persistence,
+                session_id,
+                &session_directory,
+                execution,
+                Some(format!("model:{}", command.cancellation_id)),
+            )?;
+            if execution.current.directive != StyleNodeDirective::ToolExecutionGate {
+                return Err(RunTurnError::UnexpectedStyleNode {
+                    expected: "tool_execution_gate",
+                    actual: execution.current.id.clone(),
+                });
+            }
+        }
+        let tool_outcome = match self
             .resolve_tool_calls(
                 &persistence,
                 session_id,
                 &session_directory,
                 &command,
                 events,
-                observed,
+                style_turn
+                    .as_ref()
+                    .map_or(observed, |execution| execution.position),
                 sink,
             )
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                if let Some(execution) = style_turn.as_ref() {
+                    self.fail_style_node_at_head(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        execution,
+                        "tool_gate_failed",
+                        None,
+                    )?;
+                }
+                return Err(error);
+            }
+        };
         let (events, observed) = match tool_outcome {
             ToolLoopOutcome::Complete { events, position } => (events, position),
             ToolLoopOutcome::Awaiting {
@@ -539,15 +662,48 @@ where
                 });
             }
         };
-        let last_sequence = self.commit_visible_assistant(
+        if let Some(execution) = style_turn.as_mut() {
+            execution.position = observed;
+            self.complete_and_enter_next(
+                &persistence,
+                session_id,
+                &session_directory,
+                execution,
+                Some(String::from("tool-gate:complete")),
+            )?;
+            if execution.current.directive != StyleNodeDirective::CompleteTurn {
+                return Err(RunTurnError::UnexpectedStyleNode {
+                    expected: "complete_turn",
+                    actual: execution.current.id.clone(),
+                });
+            }
+        }
+        let assistant_position = self.commit_visible_assistant(
             &persistence,
             session_id,
             session_directory,
-            observed.sequence,
-            observed.event_id,
+            style_turn
+                .as_ref()
+                .map_or(observed.sequence, |value| value.position.sequence),
+            style_turn
+                .as_ref()
+                .map_or(observed.event_id, |value| value.position.event_id),
             &command.cancellation_id,
             &events,
         )?;
+        let last_sequence = if let Some(execution) = style_turn.as_mut() {
+            execution.position = assistant_position;
+            self.complete_terminal_style_node(
+                &persistence,
+                session_id,
+                &command.sessions_root.join(session_id.to_string()),
+                execution,
+                Some(format!("turn:{}", command.cancellation_id)),
+            )?;
+            execution.position.sequence
+        } else {
+            assistant_position.sequence
+        };
         Ok(RunTurnResult {
             events,
             first_committed_sequence: user_sequence,
@@ -892,6 +1048,7 @@ where
             })
             .map_err(RunTurnError::Persistence)?
             .state;
+        let mut style_turn = Self::resume_active_style_turn(&state, position)?;
         let authorized = self
             .authorize_and_commit(
                 &persistence,
@@ -935,19 +1092,58 @@ where
                 awaiting_continuation: Some(continuation_id.to_string()),
             }),
             ToolLoopOutcome::Complete { events, position } => {
-                let last_committed_sequence = self.commit_visible_assistant(
+                if let Some(execution) = style_turn.as_mut() {
+                    if execution.current.directive != StyleNodeDirective::ToolExecutionGate {
+                        return Err(RunTurnError::UnexpectedStyleNode {
+                            expected: "tool_execution_gate",
+                            actual: execution.current.id.clone(),
+                        });
+                    }
+                    execution.position = position;
+                    self.complete_and_enter_next(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        execution,
+                        Some(String::from("tool-gate:approval-resumed")),
+                    )?;
+                    if execution.current.directive != StyleNodeDirective::CompleteTurn {
+                        return Err(RunTurnError::UnexpectedStyleNode {
+                            expected: "complete_turn",
+                            actual: execution.current.id.clone(),
+                        });
+                    }
+                }
+                let assistant_position = self.commit_visible_assistant(
                     &persistence,
                     session_id,
-                    session_directory,
-                    position.sequence,
-                    position.event_id,
+                    session_directory.clone(),
+                    style_turn
+                        .as_ref()
+                        .map_or(position.sequence, |value| value.position.sequence),
+                    style_turn
+                        .as_ref()
+                        .map_or(position.event_id, |value| value.position.event_id),
                     &resumed_turn.cancellation_id,
                     &events,
                 )?;
+                let last_committed_position = if let Some(execution) = style_turn.as_mut() {
+                    execution.position = assistant_position;
+                    self.complete_terminal_style_node(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        execution,
+                        Some(format!("turn:{}", resumed_turn.cancellation_id)),
+                    )?;
+                    execution.position
+                } else {
+                    assistant_position
+                };
                 Ok(ResolveTurnApprovalResult {
                     transitioned: true,
                     events,
-                    last_committed_sequence,
+                    last_committed_sequence: last_committed_position.sequence,
                     awaiting_continuation: None,
                 })
             }
@@ -2201,6 +2397,290 @@ where
         Ok(position)
     }
 
+    fn begin_style_turn(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        state: &crate::session::SessionState,
+        mut position: JournalPosition,
+    ) -> Result<ActiveStyleTurn, RunTurnError> {
+        let binding = state
+            .style_binding
+            .as_ref()
+            .ok_or(RunTurnError::StyleMigrationRequired)?;
+        let executor =
+            CompiledStyleExecutor::from_binding(binding).map_err(RunTurnError::StyleExecutor)?;
+        let step = state.style_execution.as_ref().map_or(1, |execution| {
+            execution
+                .completed_nodes
+                .iter()
+                .map(|node| node.step)
+                .chain(execution.failed_nodes.iter().map(|node| node.step))
+                .chain(
+                    execution
+                        .transitions
+                        .iter()
+                        .map(|transition| transition.step),
+                )
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+        });
+        if let Some(execution) = &state.style_execution {
+            if execution.graph.as_ref() != &executor.compiled().graph {
+                return Err(RunTurnError::StyleGraphMismatch);
+            }
+            if let Some(active) = &execution.active_node {
+                return Err(RunTurnError::StyleRecoveryRequired(active.node_id.clone()));
+            }
+            if execution.termination_reason.is_some() {
+                return Err(RunTurnError::StyleExecutionTerminal);
+            }
+        } else {
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::StyleExecutionInitialized(Box::new(
+                    StyleExecutionInitializedEvent {
+                        graph: Box::new(executor.compiled().graph.clone()),
+                    },
+                )),
+            )?;
+        }
+        let current = executor.entry().map_err(RunTurnError::StyleExecutor)?;
+        if current.directive != StyleNodeDirective::ModelCall {
+            return Err(RunTurnError::UnexpectedStyleNode {
+                expected: "model_call",
+                actual: current.id,
+            });
+        }
+        let max_steps = binding
+            .budgets
+            .max_steps
+            .min(executor.compiled().graph.budget.max_steps);
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                node_id: current.id.clone(),
+                attempt: 1,
+                loop_iteration: 0,
+                step,
+            }),
+        )?;
+        if step > max_steps {
+            self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::StyleNodeFailed(StyleNodeFailedEvent {
+                    node_id: current.id,
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step,
+                    reason: String::from("step_budget_exhausted"),
+                    artifact_reference: None,
+                    termination_reason: Some(String::from("step_budget_exhausted")),
+                }),
+            )?;
+            return Err(RunTurnError::StyleStepBudgetExceeded { limit: max_steps });
+        }
+        Ok(ActiveStyleTurn {
+            executor,
+            current,
+            position,
+            step,
+        })
+    }
+
+    fn resume_active_style_turn(
+        state: &crate::session::SessionState,
+        position: JournalPosition,
+    ) -> Result<Option<ActiveStyleTurn>, RunTurnError> {
+        let Some(binding) = state
+            .style_binding
+            .as_ref()
+            .filter(|binding| binding.id == "persistent-chat")
+        else {
+            return Ok(None);
+        };
+        let canonical = state
+            .style_execution
+            .as_ref()
+            .ok_or(RunTurnError::StyleGraphMismatch)?;
+        let entered = canonical
+            .active_node
+            .as_ref()
+            .ok_or_else(|| RunTurnError::StyleRecoveryRequired(String::from("<none>")))?;
+        let executor =
+            CompiledStyleExecutor::from_binding(binding).map_err(RunTurnError::StyleExecutor)?;
+        if canonical.graph.as_ref() != &executor.compiled().graph {
+            return Err(RunTurnError::StyleGraphMismatch);
+        }
+        let current = executor
+            .node(&entered.node_id)
+            .map_err(RunTurnError::StyleExecutor)?;
+        Ok(Some(ActiveStyleTurn {
+            executor,
+            current,
+            position,
+            step: entered.step,
+        }))
+    }
+
+    fn complete_and_enter_next(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+        result_reference: Option<String>,
+    ) -> Result<(), RunTurnError> {
+        (execution.position.sequence, execution.position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            execution.position.sequence,
+            execution.position.event_id,
+            RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                node_id: execution.current.id.clone(),
+                attempt: 1,
+                loop_iteration: 0,
+                step: execution.step,
+                result_reference,
+                artifact_reference: None,
+            }),
+        )?;
+        let transition = execution
+            .executor
+            .transition(execution.current.index, &json!({}))
+            .map_err(RunTurnError::StyleExecutor)?
+            .ok_or_else(|| RunTurnError::UnexpectedStyleNode {
+                expected: "nonterminal graph transition",
+                actual: execution.current.id.clone(),
+            })?;
+        (execution.position.sequence, execution.position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            execution.position.sequence,
+            execution.position.event_id,
+            RuntimeCommittedEvent::StyleTransitionSelected(StyleTransitionSelectedEvent {
+                from_node_id: transition.from.id,
+                to_node_id: transition.to.id.clone(),
+                attempt: 1,
+                loop_iteration: 0,
+                step: execution.step,
+            }),
+        )?;
+        execution.step = execution
+            .step
+            .checked_add(1)
+            .ok_or(RunTurnError::SequenceOverflow)?;
+        execution.current = transition.to;
+        (execution.position.sequence, execution.position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            execution.position.sequence,
+            execution.position.event_id,
+            RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                node_id: execution.current.id.clone(),
+                attempt: 1,
+                loop_iteration: 0,
+                step: execution.step,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn complete_terminal_style_node(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+        result_reference: Option<String>,
+    ) -> Result<(), RunTurnError> {
+        if execution
+            .executor
+            .transition(execution.current.index, &json!({}))
+            .map_err(RunTurnError::StyleExecutor)?
+            .is_some()
+        {
+            return Err(RunTurnError::UnexpectedStyleNode {
+                expected: "terminal graph node",
+                actual: execution.current.id.clone(),
+            });
+        }
+        (execution.position.sequence, execution.position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            execution.position.sequence,
+            execution.position.event_id,
+            RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                node_id: execution.current.id.clone(),
+                attempt: 1,
+                loop_iteration: 0,
+                step: execution.step,
+                result_reference,
+                artifact_reference: None,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn fail_style_node_at_head(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &ActiveStyleTurn,
+        reason: &str,
+        termination_reason: Option<&str>,
+    ) -> Result<JournalPosition, RunTurnError> {
+        let loaded = persistence
+            .load_session(LoadSessionCommand {
+                session_directory: session_directory.to_owned(),
+                expected_session_id: session_id,
+            })
+            .map_err(RunTurnError::Persistence)?;
+        let active = loaded
+            .state
+            .style_execution
+            .as_ref()
+            .and_then(|state| state.active_node.as_ref())
+            .filter(|active| active.node_id == execution.current.id)
+            .ok_or_else(|| RunTurnError::StyleRecoveryRequired(execution.current.id.clone()))?;
+        let (sequence, event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            loaded.state.last_sequence,
+            loaded.last_event_id,
+            RuntimeCommittedEvent::StyleNodeFailed(StyleNodeFailedEvent {
+                node_id: active.node_id.clone(),
+                attempt: active.attempt,
+                loop_iteration: active.loop_iteration,
+                step: active.step,
+                reason: reason.to_owned(),
+                artifact_reference: None,
+                termination_reason: termination_reason.map(str::to_owned),
+            }),
+        )?;
+        Ok(JournalPosition { sequence, event_id })
+    }
+
     fn commit_user(
         &self,
         persistence: &SessionPersistenceLogic<D>,
@@ -2403,7 +2883,7 @@ where
         previous_event_id: agentmod_primitives::EventId,
         cancellation_id: &str,
         events: &[ProviderEvent],
-    ) -> Result<Sequence, RunTurnError> {
+    ) -> Result<JournalPosition, RunTurnError> {
         let visible_text: String = events
             .iter()
             .filter_map(|event| match event {
@@ -2412,7 +2892,10 @@ where
             })
             .collect();
         if visible_text.is_empty() {
-            return Ok(previous_sequence);
+            return Ok(JournalPosition {
+                sequence: previous_sequence,
+                event_id: previous_event_id,
+            });
         }
         let sequence = previous_sequence
             .checked_next()
@@ -2432,6 +2915,7 @@ where
                 }),
             }),
         )?;
+        let event_id = event.metadata.event_id;
         persistence
             .commit_event(CommitSessionEventCommand {
                 session_directory,
@@ -2439,7 +2923,7 @@ where
                 durability: CommitDurability::Data,
             })
             .map_err(RunTurnError::Persistence)?;
-        Ok(sequence)
+        Ok(JournalPosition { sequence, event_id })
     }
 
     fn seal_event(
@@ -2615,12 +3099,41 @@ fn project(entries: &[ConversationEntry]) -> Vec<ProviderEntry> {
         .collect()
 }
 
+fn provider_node_failure(events: &[ProviderEvent]) -> Option<&'static str> {
+    events.iter().find_map(|event| match event {
+        ProviderEvent::Cancelled => Some("model_request_cancelled"),
+        ProviderEvent::Failed { .. } => Some("model_request_failed"),
+        ProviderEvent::Started
+        | ProviderEvent::Text(_)
+        | ProviderEvent::ToolDelta { .. }
+        | ProviderEvent::ToolProposed { .. }
+        | ProviderEvent::Completed { .. } => None,
+    })
+}
+
 #[derive(Debug, Error)]
 pub enum RunTurnError {
     #[error("turn request is invalid")]
     Invalid,
     #[error("session identifier is invalid")]
     InvalidSession,
+    #[error("the session predates immutable style execution and requires migration")]
+    StyleMigrationRequired,
+    #[error("compiled session-style execution failed: {0}")]
+    StyleExecutor(StyleExecutorError),
+    #[error("the compiled session graph does not match canonical execution state")]
+    StyleGraphMismatch,
+    #[error("style node `{0}` requires explicit recovery before execution may continue")]
+    StyleRecoveryRequired(String),
+    #[error("style execution is terminal")]
+    StyleExecutionTerminal,
+    #[error("style graph step budget {limit} is exhausted")]
+    StyleStepBudgetExceeded { limit: u64 },
+    #[error("expected style node kind `{expected}`, found node `{actual}`")]
+    UnexpectedStyleNode {
+        expected: &'static str,
+        actual: String,
+    },
     #[error("continuation identifier is invalid")]
     InvalidContinuation,
     #[error("continuation payload is invalid")]
@@ -2956,6 +3469,33 @@ mod tests {
             options: serde_json::json!({}),
             cancellation_id: "cancel-1".into(),
         }
+    }
+
+    #[test]
+    fn provider_terminal_failures_are_classified_as_failed_style_nodes() {
+        assert_eq!(
+            provider_node_failure(&[ProviderEvent::Cancelled]),
+            Some("model_request_cancelled")
+        );
+        assert_eq!(
+            provider_node_failure(&[ProviderEvent::Failed {
+                code: String::from("fixture"),
+                message: String::from("fixture failure"),
+                retryable: true,
+            }]),
+            Some("model_request_failed")
+        );
+        assert_eq!(
+            provider_node_failure(&[
+                ProviderEvent::Started,
+                ProviderEvent::Completed {
+                    reason: String::from("stop"),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                },
+            ]),
+            None
+        );
     }
 
     #[test]

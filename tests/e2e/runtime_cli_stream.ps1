@@ -120,7 +120,7 @@ try {
         if ($visible -ne "alpha beta live-cli") {
             throw "unexpected streamed provider output: $visible"
         }
-        if ($terminal[0].last_committed_sequence -ne 10) {
+        if ($terminal[0].last_committed_sequence -ne 19) {
             throw "terminal item did not report the full committed turn"
         }
         Write-Output "runtime live CLI streaming JSON E2E passed"

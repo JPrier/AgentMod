@@ -1161,7 +1161,9 @@ fn build_cache_key(
     manifest: &SessionStyleManifest,
     context: &CompileContext,
 ) -> Result<StyleCacheKey, serde_json::Error> {
-    let style = ContentHash::digest(&serde_json::to_vec(manifest)?);
+    // Bind the cache key to the exact canonical manifest representation
+    // returned by `to_json` and retained in session style locks.
+    let style = ContentHash::digest(&serde_json::to_vec_pretty(manifest)?);
     let runtime = ContentHash::digest(context.runtime_api_version.as_bytes());
     let capabilities = ContentHash::digest(&encode_strings(context.capabilities.iter()));
     let mut combined = Vec::new();

@@ -45,7 +45,7 @@ test -n "$session_id"
 
 turn=$("$repository/target/debug/agentmod" run "read src/lib.rs and continue" \
     --session "$session_id" --option 'mock_scenario="one_tool_call"' --json)
-printf '%s' "$turn" | grep -F '"last_committed_sequence":18' >/dev/null
+printf '%s' "$turn" | grep -F '"last_committed_sequence":27' >/dev/null
 printf '%s' "$turn" | grep -F \
     '"text":"continued after approved runtime decision"' >/dev/null
 

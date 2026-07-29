@@ -88,7 +88,7 @@ try {
             --session $ephemeral.session_id `
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="ephemeral-before"' --json | ConvertFrom-Json
-        if ($persistentTurn.last_committed_sequence -ne 10 -or
+        if ($persistentTurn.last_committed_sequence -ne 19 -or
             $ephemeralTurn.last_committed_sequence -ne 10) {
             throw "pre-restart turns did not complete"
         }
@@ -110,12 +110,12 @@ try {
             --session $ephemeral.session_id `
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="ephemeral-after"' --json | ConvertFrom-Json
-        if ($persistentAfter.last_committed_sequence -ne 19 -or
+        if ($persistentAfter.last_committed_sequence -ne 36 -or
             $ephemeralAfter.last_committed_sequence -ne 19) {
             throw "post-restart turns did not complete"
         }
 
-        $branch = & $cli session branch $persistent.session_id --at 10 `
+        $branch = & $cli session branch $persistent.session_id --at 19 `
             --style ephemeral-turn --json | ConvertFrom-Json
         $branchInspection = & $cli session inspect $branch.session_id --json |
             ConvertFrom-Json

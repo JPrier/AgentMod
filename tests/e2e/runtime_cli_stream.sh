@@ -79,7 +79,7 @@ visible = "".join(
     if event["event"]["event"] == "text"
 )
 assert visible == "alpha beta live-cli", visible
-assert terminal[0]["last_committed_sequence"] == 10
+assert terminal[0]["last_committed_sequence"] == 19
 PY
 
 printf 'runtime live CLI streaming JSON E2E passed\n'

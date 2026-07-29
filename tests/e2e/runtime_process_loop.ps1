@@ -50,7 +50,7 @@ try {
             --session $created.session_id `
             --option 'mock_scenario="one_process_call"' --json | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw "process turn failed" }
-        if ($turn.last_committed_sequence -ne 19) {
+        if ($turn.last_committed_sequence -ne 28) {
             throw "unexpected process turn sequence $($turn.last_committed_sequence)"
         }
         $journalPath = Join-Path $runRoot (

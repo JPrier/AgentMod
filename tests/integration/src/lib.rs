@@ -23,8 +23,8 @@ mod tests {
     use agentmod_protocol_support::authorization::{
         AuthorizationClaims, AuthorizationKey, seal_authorization,
     };
-    use agentmod_runtime_data::RuntimeData;
     use agentmod_runtime_data::continuation::ContinuationData;
+    use agentmod_runtime_data::{RuntimeData, node_executor::RuntimeNodeExecutorData};
     use agentmod_runtime_dependency::{
         LocalRuntimeDependencies, continuation::FileContinuationDependency,
     };
@@ -50,12 +50,20 @@ mod tests {
         permission::{PermissionEffect, PermissionMatcher, PermissionPolicy, PermissionRule},
     };
 
+    fn runtime_logic() -> RuntimeLogic<RuntimeData<LocalRuntimeDependencies>> {
+        RuntimeLogic::new(
+            RuntimeData::new(LocalRuntimeDependencies).with_node_executors(
+                RuntimeNodeExecutorData::native().expect("native node-executor registry"),
+            ),
+        )
+    }
+
     #[test]
     fn runtime_endpoint_creates_and_lists_a_complete_durable_session() {
         let storage = tempfile::tempdir().expect("storage");
         let workspace = tempfile::tempdir().expect("workspace");
         let service = RuntimeService::new(
-            RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
+            runtime_logic(),
             RuntimeServiceConfig {
                 session_root: storage.path().join("sessions"),
                 version: String::from("test"),
@@ -110,7 +118,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let sessions_root = storage.path().join("sessions");
         let service = RuntimeService::new(
-            RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
+            runtime_logic(),
             RuntimeServiceConfig {
                 session_root: sessions_root.clone(),
                 version: String::from("test"),
@@ -226,7 +234,7 @@ mod tests {
                 .join("styles"),
         );
         let service = RuntimeService::new(
-            RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
+            runtime_logic(),
             RuntimeServiceConfig {
                 session_root: sessions_root.clone(),
                 version: String::from("test"),
@@ -341,7 +349,7 @@ mod tests {
         let storage = tempfile::tempdir().expect("storage");
         let workspace = tempfile::tempdir().expect("workspace");
         let service = RuntimeService::new(
-            RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
+            runtime_logic(),
             RuntimeServiceConfig {
                 session_root: storage.path().join("sessions"),
                 version: String::from("test"),
@@ -430,10 +438,7 @@ mod tests {
                 &storage.path().join("sessions"),
             ),
         };
-        let service = RuntimeService::new(
-            RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
-            config.clone(),
-        );
+        let service = RuntimeService::new(runtime_logic(), config.clone());
         let RuntimeResponse::SessionComponents {
             memory_providers,
             compaction_strategies,
@@ -537,10 +542,7 @@ mod tests {
             selected["style_binding"]["compiled_cache_key"]
         );
 
-        let restarted = RuntimeService::new(
-            RuntimeLogic::new(RuntimeData::new(LocalRuntimeDependencies)),
-            config,
-        );
+        let restarted = RuntimeService::new(runtime_logic(), config);
         restarted
             .validate_session_style_compatibility(selected_id)
             .expect("exact selected binding survives restart");

@@ -9,6 +9,7 @@ use agentmod_primitives::{ArtifactId, ContentHash, EventId, Sequence, SessionId,
 use agentmod_runtime_data::{
     identity::{AllocateEventIdentityDataRequest, EventIdentityDataError, EventIdentityDataPort},
     journal::{JournalDataError, JournalEventDataPort, ScanEventsDataRequest},
+    node_executor::NodeExecutorDataPort,
     registry::{
         BranchArtifactDataRecord, BranchEventDataRecord, CreateBranchDataRequest,
         PrepareSessionDataRequest, SessionRegistryDataError, SessionRegistryDataPort,
@@ -19,6 +20,7 @@ use thiserror::Error;
 
 use crate::{
     conversation::{ArtifactEntry, ConversationEntry, ConversationEntryId, ProjectionProvenance},
+    node_executor::{RuntimeExecutabilityError, validate_runtime_executability},
     session::{
         ContextProjectionReplacedEvent, ConversationEntryCommittedEvent, RuntimeCommittedEvent,
         SessionBranchedEvent, SessionCreatedEvent, SessionReducerError, SessionState,
@@ -165,7 +167,10 @@ pub trait SessionHistoryLogicPort {
 
 impl<D> SessionHistoryLogicPort for super::RuntimeLogic<D>
 where
-    D: JournalEventDataPort + SessionRegistryDataPort + EventIdentityDataPort,
+    D: JournalEventDataPort
+        + SessionRegistryDataPort
+        + EventIdentityDataPort
+        + NodeExecutorDataPort,
 {
     fn inspect_session(
         &self,
@@ -290,6 +295,8 @@ where
             .or_else(|| inspection.state.style_binding.clone())
             .ok_or(SessionHistoryLogicError::MissingStyleBinding)?;
         validate_style_binding(&style_binding)?;
+        validate_runtime_executability(&self.data, &style_binding)
+            .map_err(SessionHistoryLogicError::RuntimeExecutability)?;
         let style = style_binding.id.clone();
         let prepared = self
             .data
@@ -672,6 +679,9 @@ pub enum SessionHistoryLogicError {
     /// Requested style is unsafe.
     #[error("session style identifier is invalid")]
     InvalidStyle,
+    /// The branch style is compiled but cannot execute in this runtime.
+    #[error("branch style is not runtime-executable: {0}")]
+    RuntimeExecutability(RuntimeExecutabilityError),
     /// Session predates immutable style binding and needs explicit migration.
     #[error("session has no immutable style binding; select a replacement style explicitly")]
     MissingStyleBinding,

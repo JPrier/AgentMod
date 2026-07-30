@@ -6,6 +6,7 @@ use agentmod_event_pipeline::BlockingPipelineBuilder;
 use agentmod_runtime_data::{
     RuntimeData,
     memory::RuntimeMemoryData,
+    node_executor::RuntimeNodeExecutorData,
     plugin::{RuntimePluginData, compile_plugin_catalog},
 };
 use agentmod_runtime_dependency::{
@@ -326,6 +327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             FileContinuationDependency::new(sessions_root.clone()),
             scheduler,
         ))
+        .with_node_executors(RuntimeNodeExecutorData::native()?)
         .with_memory(RuntimeMemoryData::first_party(
             &sessions_root
                 .parent()

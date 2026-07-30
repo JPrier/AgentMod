@@ -6,13 +6,17 @@ use agentmod_event_model::{
     EventClassification, EventEnvelope, EventMetadata, EventOrigin, EventScope,
 };
 use agentmod_primitives::{ContentHash, Sequence, SessionId, Version};
+use agentmod_runtime_data::node_executor::NodeExecutorDataPort;
 use agentmod_runtime_data::registry::{
     CreateSessionDataRequest, ListSessionsDataRequest, PrepareSessionDataRequest,
     PreparedSessionDataRecord, SessionRegistryDataError, SessionRegistryDataPort,
 };
 use thiserror::Error;
 
-use crate::session::{RuntimeCommittedEvent, SessionCreatedEvent, SessionStyleBinding};
+use crate::{
+    node_executor::{RuntimeExecutabilityError, validate_runtime_executability},
+    session::{RuntimeCommittedEvent, SessionCreatedEvent, SessionStyleBinding},
+};
 
 const MAX_SESSION_LIST: usize = 1_000;
 const MAX_STYLE_LENGTH: usize = 128;
@@ -87,13 +91,15 @@ pub trait SessionRegistryLogicPort {
 
 impl<D> SessionRegistryLogicPort for super::RuntimeLogic<D>
 where
-    D: SessionRegistryDataPort,
+    D: SessionRegistryDataPort + NodeExecutorDataPort,
 {
     fn create_session(
         &self,
         command: CreateSessionCommand,
     ) -> Result<CreateSessionResult, SessionRegistryLogicError> {
         validate_create(&command)?;
+        validate_runtime_executability(&self.data, &command.style_binding)
+            .map_err(SessionRegistryLogicError::RuntimeExecutability)?;
         let prepared = self
             .data
             .prepare(PrepareSessionDataRequest {
@@ -234,6 +240,9 @@ pub enum SessionRegistryLogicError {
     /// Selected style binding is incomplete or inconsistent.
     #[error("session style binding is invalid")]
     InvalidStyleBinding,
+    /// The compiled style is valid but cannot execute in this runtime.
+    #[error("session style is not runtime-executable: {0}")]
+    RuntimeExecutability(RuntimeExecutabilityError),
     /// Data operation failed.
     #[error("session registry data failed: {0}")]
     Data(SessionRegistryDataError),

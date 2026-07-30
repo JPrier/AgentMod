@@ -12,6 +12,7 @@ use agentmod_primitives::{CausationId, ContentHash, Sequence, SessionId, Version
 use agentmod_runtime_data::{
     identity::{AllocateEventIdentityDataRequest, EventIdentityDataPort},
     journal::JournalEventDataPort,
+    node_executor::NodeExecutorDataPort,
     registry::{
         BranchEventDataRecord, CreateChildSessionDataRequest, ListSessionsDataRequest,
         PrepareSessionDataRequest, SessionRegistryDataPort,
@@ -23,6 +24,7 @@ use thiserror::Error;
 
 use crate::{
     RuntimeLogic,
+    node_executor::{RuntimeExecutabilityError, validate_runtime_executability},
     persistence::{LoadSessionCommand, SessionPersistenceLogic, SessionPersistenceLogicPort},
     session::{
         ChildSessionLinkedEvent, RuntimeCommittedEvent, SessionCreatedEvent, SessionStyleBinding,
@@ -114,6 +116,7 @@ where
         + Sync
         + EventIdentityDataPort
         + JournalEventDataPort
+        + NodeExecutorDataPort
         + SessionRegistryDataPort
         + SessionStyleDataPort,
 {
@@ -140,6 +143,8 @@ where
             .map_err(ChildSessionLogicError::Style)?
             .binding;
         restrict_child_binding(&mut expected_style, &command)?;
+        validate_runtime_executability(&self.data, &expected_style)
+            .map_err(ChildSessionLogicError::RuntimeExecutability)?;
         let matches = self
             .data
             .list(ListSessionsDataRequest {
@@ -411,6 +416,9 @@ pub enum ChildSessionLogicError {
     /// Exact child style resolution failed.
     #[error("child style could not be resolved: {0}")]
     Style(SessionStyleLogicError),
+    /// The selected child graph cannot execute in this runtime.
+    #[error("child style is not runtime-executable: {0}")]
+    RuntimeExecutability(RuntimeExecutabilityError),
     /// Session catalog creation or inspection failed.
     #[error("child session registry failed: {0}")]
     Registry(agentmod_runtime_data::registry::SessionRegistryDataError),

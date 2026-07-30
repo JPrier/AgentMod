@@ -7,6 +7,7 @@ pub mod harness_registry;
 pub mod identity;
 pub mod journal;
 pub mod memory;
+pub mod node_executor;
 pub mod plugin;
 pub mod registry;
 pub mod scheduler;
@@ -60,6 +61,7 @@ pub struct RuntimeData<D> {
     dependency: D,
     style_cache: Arc<Mutex<BTreeMap<String, style::CachedSessionStyle>>>,
     memory: Option<memory::RuntimeMemoryData>,
+    node_executors: Option<node_executor::RuntimeNodeExecutorData>,
     artifacts: Option<artifact::RuntimeArtifactData>,
     plugins: Option<plugin::RuntimePluginData>,
 }
@@ -72,6 +74,7 @@ impl<D> RuntimeData<D> {
             dependency,
             style_cache: Arc::new(Mutex::new(BTreeMap::new())),
             memory: None,
+            node_executors: None,
             artifacts: None,
             plugins: None,
         }
@@ -81,6 +84,17 @@ impl<D> RuntimeData<D> {
     #[must_use]
     pub fn with_memory(mut self, memory: memory::RuntimeMemoryData) -> Self {
         self.memory = Some(memory);
+        self
+    }
+
+    /// Adds the immutable node-executor capability registry assembled by the
+    /// runtime composition root.
+    #[must_use]
+    pub fn with_node_executors(
+        mut self,
+        node_executors: node_executor::RuntimeNodeExecutorData,
+    ) -> Self {
+        self.node_executors = Some(node_executors);
         self
     }
 
@@ -176,6 +190,19 @@ impl<D> memory::MemoryDataPort for RuntimeData<D> {
             .as_ref()
             .ok_or(memory::MemoryDataError::InvalidProvider)?
             .retrieve_memory(request)
+    }
+}
+
+impl<D> node_executor::NodeExecutorDataPort for RuntimeData<D> {
+    fn list_node_executors(
+        &self,
+        request: node_executor::ListNodeExecutorsDataRequest,
+    ) -> Result<Vec<node_executor::NodeExecutorDataRecord>, node_executor::NodeExecutorDataError>
+    {
+        self.node_executors
+            .as_ref()
+            .ok_or(node_executor::NodeExecutorDataError::Unavailable)?
+            .list_node_executors(request)
     }
 }
 

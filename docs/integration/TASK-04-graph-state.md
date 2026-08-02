@@ -113,15 +113,26 @@ On Windows (Rust 1.91.1 MSVC), in the task worktree:
 
 ```shell
 cargo check -p agentmod-graph-state
-cargo test  -p agentmod-graph-state            # 32 unit + 9 integration, all pass
+cargo test  -p agentmod-graph-state            # 33 unit + 9 determinism + 9 state-contract, all pass
 cargo clippy -p agentmod-graph-state --all-targets -- -D warnings   # clean
 cargo test  -p agentmod-runtime-logic --lib graph_state              # 4 tests pass
 cargo test  -p agentmod-runtime-logic                                # 134 pass
 cargo clippy -p agentmod-runtime-logic --all-targets -- -D warnings  # clean
 cargo check --workspace                                              # builds
+cargo test --workspace --all-features                                # 205 pass; 1 pre-existing failure (see below)
+cargo clippy --workspace --all-targets --all-features -- -D warnings # clean
 cargo run -p xtask -- architecture --manifest-path Cargo.toml        # 90 packages, no violations
 cargo fmt --all -- --check                                           # clean
 ```
+
+## Pre-existing environmental failure (not caused by this workstream)
+
+`agentmod-session-style-sdk::golden_toml_and_json_are_equivalent_and_round_trip`
+fails identically at the untouched base commit `abbf97b` on this Windows
+machine: `core.autocrlf=true` checks `custom-style.toml` out with CRLF endings
+(the committed blob has LF), so the manifest parsed from TOML differs from the
+LF golden JSON in the inline graph source. Verified in a scratch clone of the
+base commit; no file owned by this task is involved.
 
 ## Definition-of-done evidence
 

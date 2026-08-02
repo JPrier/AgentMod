@@ -950,6 +950,15 @@ pub fn validate_value_for(
     declaration: &VariableDeclaration,
     value: &GraphValue,
 ) -> Result<(), GraphStateError> {
+    // The classification gate precedes the type gate so secret enforcement is
+    // the primary contract, not a fallback for type mismatches.
+    if matches!(declaration.classification, SecurityClassification::Secret)
+        && !value.is_secret_reference()
+    {
+        return Err(GraphStateError::SecretPlaintext {
+            name: declaration.name.clone(),
+        });
+    }
     if !declaration.r#type.accepts(value) {
         return Err(GraphStateError::TypeMismatch {
             name: declaration.name.clone(),
@@ -962,13 +971,6 @@ pub fn validate_value_for(
             name: declaration.name.clone(),
             actual: value.serialized_bytes(),
             maximum: declaration.max_serialized_bytes,
-        });
-    }
-    if matches!(declaration.classification, SecurityClassification::Secret)
-        && !value.is_secret_reference()
-    {
-        return Err(GraphStateError::SecretPlaintext {
-            name: declaration.name.clone(),
         });
     }
     Ok(())

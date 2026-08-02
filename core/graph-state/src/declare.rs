@@ -425,6 +425,16 @@ impl VariableDeclaration {
                 });
             }
         }
+        if matches!(self.classification, SecurityClassification::Secret)
+            && !secret_compatible_type(&self.r#type)
+        {
+            return Err(DeclareError::InvalidTypeBounds {
+                detail: format!(
+                    "secret-classified variable `{}` must declare a secret-reference type",
+                    self.name
+                ),
+            });
+        }
         if !merge_policy_compatible(self) {
             return Err(DeclareError::MergePolicyTypeMismatch {
                 name: self.name.clone(),
@@ -463,6 +473,16 @@ pub fn merge_policy_compatible(declaration: &VariableDeclaration) -> bool {
         MergePolicy::ListAppend | MergePolicy::SetUnion => declaration.r#type.is_list(),
         MergePolicy::ObjectFieldMerge => declaration.r#type.is_map(),
         MergePolicy::RejectConflict | MergePolicy::LastWriter { .. } => true,
+    }
+}
+
+/// Returns whether a type admits only approved secret references.
+#[must_use]
+pub fn secret_compatible_type(r#type: &VariableType) -> bool {
+    match r#type {
+        VariableType::Secret => true,
+        VariableType::Optional(inner) => secret_compatible_type(inner),
+        _ => false,
     }
 }
 

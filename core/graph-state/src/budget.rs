@@ -1101,6 +1101,48 @@ mod tests {
     }
 
     #[test]
+    fn pricing_provenance_binds_model_provider_and_record_identity() {
+        let mut ledger = ledger();
+        let at = TimestampMillis::new(1_700_000_000_001);
+        let binding = PricingBinding {
+            model: "model-x".into(),
+            provider: "provider-y".into(),
+            pricing_record_version: "2026-07-28.1".into(),
+            recorded_at: TimestampMillis::new(1_700_000_000_000),
+        };
+        let evidence = UsageEvidence::new(
+            BudgetDimension::ProviderCostMicros,
+            250,
+            UsageKind::Estimated,
+            Some(binding.clone()),
+        );
+        let event = ledger.commit(&evidence, at).expect("commit");
+        // The committed event retains the exact pricing identity for replay
+        // provenance; reconstruction preserves it verbatim.
+        assert_eq!(
+            event,
+            BudgetEvent::BudgetCommitted {
+                dimension: BudgetDimension::ProviderCostMicros,
+                delta: 250,
+                kind: UsageKind::Estimated,
+                evidence_hash: evidence.evidence_hash,
+                pricing: Some(binding.clone()),
+                recorded_at: at,
+            }
+        );
+        let init = BudgetEvent::BudgetsInitialized {
+            session_id: session(),
+            limits: limits(),
+            recorded_at: TimestampMillis::new(1_700_000_000_000),
+            wall_clock_enabled: false,
+        };
+        let rebuilt = BudgetLedger::reconstruct(session(), &init, &[event]).expect("reconstruct");
+        assert_eq!(rebuilt, ledger);
+        assert_eq!(rebuilt.remaining(BudgetDimension::ProviderCostMicros), 750);
+        let _ = binding;
+    }
+
+    #[test]
     fn estimated_usage_counts_conservatively() {
         let mut ledger = ledger();
         let at = TimestampMillis::new(1_700_000_000_001);

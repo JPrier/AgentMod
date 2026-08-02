@@ -933,13 +933,14 @@ fn validate_compaction(
                     && is_name(&summary.model)
                     && summary.max_request_tokens > 0
                     && summary.max_request_tokens <= max_tokens
+                    && context.providers.contains(&summary.provider)
             }));
     if !valid_summary {
         diagnostics.push(error(
             "STYLE034",
             format!("{root}.compaction.summary"),
             "typed-summary compaction has invalid summary bounds or provider/model selection",
-            "use schema version 1 with a positive bounded summary size; any explicit summary provider/model must be named with a positive request-token bound within the style budget",
+            "use schema version 1 with a positive bounded summary size; any explicit summary provider/model must be named with a positive request-token bound within the style budget and be available in the runtime",
         ));
     }
 }

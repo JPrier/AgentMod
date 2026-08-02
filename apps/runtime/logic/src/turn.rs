@@ -4855,6 +4855,14 @@ where
                         ));
                     }
                 };
+                // Summary and artifact replacements must restore required
+                // protected entries (current input, pending control state)
+                // that the pure compactor intentionally omits.
+                plan.replacement = restore_required_projection_entries(
+                    state.conversation.provider_projection(),
+                    &plan.replacement,
+                    &binding.compaction.preservation_requirements,
+                );
                 validate_projection_preservation(
                     state.conversation.provider_projection(),
                     &plan.replacement,
@@ -4869,6 +4877,13 @@ where
                     &plan.replacement,
                 )
                 .await?;
+                // Summary and artifact flows advance the journal with their
+                // own outbox evidence; the replacement commit sequence is the
+                // exact next value after those flows.
+                let committed_at = position
+                    .sequence
+                    .checked_next()
+                    .map_err(|_| RunTurnError::SequenceOverflow)?;
                 plan.provenance.committed_at = committed_at;
                 let (sequence, event_id) = self.commit_next(
                     persistence,
@@ -4983,6 +4998,7 @@ where
             .policy_for_state(state, &command.cancellation_id)
             .await?;
         let provider = ProviderExecutionLogic::new(self.data.clone(), session_policy.execution);
+        let summary_cancellation = uuid::Uuid::now_v7().to_string();
         let prepared = provider
             .prepare(ExecuteProviderCommand {
                 harness: binding.harness.clone(),
@@ -4991,7 +5007,7 @@ where
                 model: summary_model.clone(),
                 entries: project(&material.entries),
                 options: summary_options.clone(),
-                cancellation_id: format!("summary:{}", command.cancellation_id),
+                cancellation_id: summary_cancellation,
                 style: state.style.clone(),
                 workspace: state.workspace.clone(),
             })
@@ -5175,9 +5191,16 @@ where
                         .artifact_id
                         .as_deref()
                         .ok_or(RunTurnError::InvalidContextArtifactReceipt)?;
-                    let artifact_id = ArtifactId::from_str(artifact_id)
-                        .map_err(|_| RunTurnError::InvalidArtifact)?;
-                    return Ok((artifact_id, content_hash, entry_id, position));
+                    let artifact_id = ArtifactId::from_uuid(uuid_from_hash(
+                        &record.identity.content_hash,
+                    ));
+                    let _ = artifact_id;
+                    return Ok((
+                        ArtifactId::from_uuid(uuid_from_hash(&content_hash)),
+                        content_hash,
+                        entry_id,
+                        position,
+                    ));
                 }
                 ContextArtifactState::Dispatched => {
                     let (artifact_id, reference) = self.reconcile_context_artifact(
@@ -5302,8 +5325,7 @@ where
                 command.clone(),
             )?;
         position = receipt_position;
-        let artifact_id = ArtifactId::from_str(&artifact_id)
-            .map_err(|_| RunTurnError::InvalidArtifact)?;
+        let artifact_id = ArtifactId::from_uuid(uuid_from_hash(&content_hash));
         let _ = artifact_reference;
         Ok((artifact_id, content_hash, entry_id, position))
     }
@@ -5423,9 +5445,10 @@ where
                     .map_err(RunTurnError::ContextArtifact)?
             }
         };
-        let artifact_id = ArtifactId::from_str(&persisted.artifact_id)
-            .map_err(|_| RunTurnError::InvalidArtifact)?;
-        Ok((artifact_id, persisted.artifact_reference))
+        Ok((
+            ArtifactId::from_uuid(uuid_from_hash(&identity.content_hash)),
+            persisted.artifact_reference,
+        ))
     }
 
     #[allow(
@@ -5739,17 +5762,6 @@ where
                 let action_digest = executable
                     .digest()
                     .map_err(|_| RunTurnError::Event)?;
-                (position.sequence, position.event_id) = self.commit_next(
-                    persistence,
-                    session_id,
-                    session_directory,
-                    position.sequence,
-                    position.event_id,
-                    RuntimeCommittedEvent::MemoryWriteApproved(MemoryWriteApprovedEvent {
-                        identity: identity.clone(),
-                        action_digest,
-                    }),
-                )?;
                 let write = MemoryWriteApprovalContinuation {
                     session_id: command.session_id.clone(),
                     workspace: state.workspace.clone(),
@@ -9288,48 +9300,73 @@ fn auto_write_content(
     for category in categories {
         match category {
             MemoryContentCategory::AssistantText => {
-                for entry in state.conversation.history().iter().rev().take(8) {
-                    if let ConversationEntry::AssistantMessage(entry) = entry {
-                        lines.push(entry.text.clone());
-                    }
+                if let Some(entry) = state
+                    .conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        ConversationEntry::AssistantMessage(entry) => Some(entry.text.clone()),
+                        _ => None,
+                    })
+                {
+                    lines.push(entry);
                 }
             }
             MemoryContentCategory::UserConstraints => {
-                for entry in state.conversation.history().iter().rev().take(16) {
-                    match entry {
+                if let Some(entry) = state
+                    .conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
                         ConversationEntry::UserInstruction(entry)
-                        | ConversationEntry::ProjectInstruction(entry) => {
-                            lines.push(entry.text.clone());
-                        }
-                        _ => {}
-                    }
+                        | ConversationEntry::ProjectInstruction(entry) => Some(entry.text.clone()),
+                        _ => None,
+                    })
+                {
+                    lines.push(entry);
                 }
             }
             MemoryContentCategory::ToolResults => {
-                for entry in state.conversation.history().iter().rev().take(16) {
-                    if let ConversationEntry::ToolResult(result) = entry
-                        && !result.content.trim().is_empty()
-                    {
-                        lines.push(result.content.clone());
-                    }
+                if let Some(entry) = state
+                    .conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        ConversationEntry::ToolResult(result)
+                            if !result.content.trim().is_empty() =>
+                        {
+                            Some(result.content.clone())
+                        }
+                        _ => None,
+                    })
+                {
+                    lines.push(entry);
                 }
             }
             MemoryContentCategory::Findings | MemoryContentCategory::Reviews => {
                 let _ = trigger;
             }
             MemoryContentCategory::ArtifactReferences => {
-                for entry in state.conversation.history().iter().rev().take(8) {
-                    if let ConversationEntry::ArtifactReference(entry) = entry {
-                        lines.push(format!(
-                            "artifact {}: {}",
-                            entry.artifact_id, entry.label
-                        ));
-                    }
+                if let Some(entry) = state
+                    .conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        ConversationEntry::ArtifactReference(entry) => {
+                            Some(format!("artifact {}: {}", entry.artifact_id, entry.label))
+                        }
+                        _ => None,
+                    })
+                {
+                    lines.push(entry);
                 }
             }
         }
     }
-    lines.reverse();
     let mut content = lines.join("\n");
     content.truncate(256 * 1024);
     Ok(content)
@@ -9349,6 +9386,12 @@ fn memory_write_action_digest(
         origin: String::from("runtime"),
     };
     proposal.digest().map_err(|_| RunTurnError::Event)
+}
+
+/// Derives a stable UUID from an exact content hash for content-addressed
+/// projection references (the store's opaque `blake3:` identity is not a UUID).
+fn uuid_from_hash(hash: &ContentHash) -> uuid::Uuid {
+    uuid::Uuid::from_bytes(hash.as_bytes()[..16].try_into().expect("hash bytes"))
 }
 
 fn now_millis() -> i64 {
@@ -9611,14 +9654,23 @@ fn restore_required_projection_entries(
         .iter()
         .rfind(|entry| matches!(entry, ConversationEntry::UserMessage(_)))
         .map(ConversationEntry::id);
-    source
-        .iter()
-        .filter(|entry| {
-            selected.contains(entry.id())
-                || projection_entry_is_required(entry, current_input, requirements)
-        })
-        .cloned()
-        .collect()
+    let mut restored = Vec::new();
+    // Candidate entries are retained exactly, including newly generated
+    // typed summaries and artifact-handoff references which do not exist in
+    // the source projection.
+    for entry in candidate {
+        restored.push(entry.clone());
+    }
+    // Required source entries missing from the candidate are restored so no
+    // compaction can discard protected runtime state.
+    for entry in source {
+        if !selected.contains(entry.id())
+            && projection_entry_is_required(entry, current_input, requirements)
+        {
+            restored.push(entry.clone());
+        }
+    }
+    restored
 }
 
 fn validate_projection_preservation(

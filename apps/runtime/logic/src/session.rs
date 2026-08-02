@@ -3030,6 +3030,7 @@ fn apply_artifact_persistence_proposed(
             artifact_reference: None,
         },
     );
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 
@@ -3122,6 +3123,25 @@ fn apply_artifact_persistence_completed(
     Ok(())
 }
 
+/// Advances the active open context boundary's journal head for boundary-scoped
+/// outbox events (typed-summary and artifact-handoff compaction) that commit
+/// between a phase start and its replacement/phase completion.
+fn advance_open_boundary(
+    state: &mut SessionState,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if let Some(execution) = state.style_execution.as_mut()
+        && let Some(boundary) = execution.context_boundaries.last_mut()
+        && boundary.completed_at.is_none()
+    {
+        if boundary.last_sequence.checked_next() != Ok(sequence) {
+            return Err(SessionReducerError::InvalidContextBoundaryTransition);
+        }
+        boundary.last_sequence = sequence;
+    }
+    Ok(())
+}
+
 fn valid_summary_identity(identity: &ContextSummaryIdentity) -> bool {
     !identity.summary_id.trim().is_empty()
         && !identity.provider.trim().is_empty()
@@ -3161,6 +3181,7 @@ fn apply_context_summary_proposed(
             output_tokens: 0,
         },
     );
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 
@@ -3195,6 +3216,7 @@ fn apply_context_summary_approved(
     record.state = ContextSummaryState::Approved;
     record.action_digest = Some(approved.action_digest);
     record.approved_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 
@@ -3213,6 +3235,7 @@ fn apply_context_summary_started(
     }
     record.state = ContextSummaryState::Started;
     record.started_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 
@@ -3253,6 +3276,7 @@ fn apply_context_summary_completed(
             .checked_add(completed.output_tokens)
             .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
     }
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 
@@ -3273,6 +3297,7 @@ fn apply_context_summary_failed(
     }
     record.state = ContextSummaryState::Failed;
     record.completed_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 
@@ -3462,6 +3487,7 @@ fn apply_context_artifact_proposed(
             artifact_reference: None,
         },
     );
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 
@@ -3496,6 +3522,7 @@ fn apply_context_artifact_approved(
     record.state = ContextArtifactState::Approved;
     record.action_digest = Some(approved.action_digest);
     record.approved_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 
@@ -3515,6 +3542,7 @@ fn apply_context_artifact_dispatched(
     }
     record.state = ContextArtifactState::Dispatched;
     record.dispatched_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 
@@ -3546,6 +3574,7 @@ fn apply_context_artifact_completed(
     record.completed_at = Some(sequence);
     record.artifact_id = Some(completed.artifact_id.clone());
     record.artifact_reference = Some(completed.artifact_reference.clone());
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 
@@ -3567,6 +3596,7 @@ fn apply_context_artifact_failed(
     }
     record.state = ContextArtifactState::Failed;
     record.completed_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
     Ok(())
 }
 

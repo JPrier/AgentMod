@@ -5,6 +5,7 @@ pub mod artifact;
 pub mod child_session;
 pub mod compaction;
 pub mod continuation;
+pub mod context_ports;
 pub mod conversation;
 pub mod harness;
 pub mod harness_registry;

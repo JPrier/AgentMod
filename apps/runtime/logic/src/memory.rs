@@ -48,6 +48,8 @@ pub struct WriteMemoryCommand {
     pub created_at: TimestampMillis,
     /// Mandatory policy outcome.
     pub authorization: MemoryWriteAuthorization,
+    /// Canonical cross-restart duplicate key, when automatic writes are active.
+    pub deduplication_key: Option<String>,
 }
 
 /// Logic-owned write result.
@@ -59,6 +61,8 @@ pub struct WriteMemoryResult {
     pub reference: String,
     /// Whether the provider retained it.
     pub retained: bool,
+    /// Whether an identical canonical write was already retained.
+    pub deduplicated: bool,
 }
 
 /// Logic-owned retrieval command.
@@ -160,12 +164,14 @@ where
                 source: command.source,
                 content: command.content,
                 created_at_millis: command.created_at.get(),
+                deduplication_key: command.deduplication_key,
             })
             .map_err(MemoryLogicError::Data)?;
         Ok(WriteMemoryResult {
             provider: record.provider,
             reference: record.reference,
             retained: record.retained,
+            deduplicated: record.deduplicated,
         })
     }
 
@@ -295,6 +301,7 @@ mod tests {
                 provider: String::from("mock"),
                 reference: String::from("m1"),
                 retained: true,
+                deduplicated: false,
             })
         }
 
@@ -327,6 +334,7 @@ mod tests {
                 content: String::from("blocked"),
                 created_at: TimestampMillis::new(1),
                 authorization: MemoryWriteAuthorization::Unapproved,
+                deduplication_key: None,
             }),
             Err(MemoryLogicError::WriteNotApproved)
         );

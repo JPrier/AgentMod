@@ -27,6 +27,8 @@ pub struct DependencyMemoryWriteRequest {
     pub content: String,
     /// External clock value.
     pub created_at_millis: i64,
+    /// Canonical cross-restart duplicate key, when automatic writes are active.
+    pub deduplication_key: Option<String>,
 }
 
 /// Dependency-owned written reference.
@@ -36,6 +38,8 @@ pub struct DependencyMemoryWriteResponse {
     pub id: String,
     /// Whether this provider retained the item.
     pub retained: bool,
+    /// Whether an identical canonical write was already retained.
+    pub deduplicated: bool,
 }
 
 /// Dependency-owned memory query.
@@ -105,6 +109,7 @@ impl MemoryDependencyPort for NoMemoryDependency {
         Ok(DependencyMemoryWriteResponse {
             id: Uuid::now_v7().to_string(),
             retained: false,
+            deduplicated: false,
         })
     }
 
@@ -149,13 +154,24 @@ impl MemoryDependencyPort for FileMemoryDependency {
             .open(&self.path)
             .map_err(redacted_io)?;
         file.lock_exclusive().map_err(redacted_io)?;
+        if let Some(key) = request.deduplication_key.as_deref() {
+            if let Some(existing) = find_dedup_record(&file, request.scope.as_str(), key)? {
+                FileExt::unlock(&file).map_err(redacted_io)?;
+                return Ok(DependencyMemoryWriteResponse {
+                    id: existing.id,
+                    retained: true,
+                    deduplicated: true,
+                });
+            }
+        }
         let record = StoredFileRecord {
-            schema_version: 1,
+            schema_version: 2,
             id: Uuid::now_v7().to_string(),
             scope: request.scope,
             source: request.source,
             content: request.content,
             created_at_millis: request.created_at_millis,
+            deduplication_key: request.deduplication_key,
             checksum: String::new(),
         }
         .seal()?;
@@ -171,6 +187,7 @@ impl MemoryDependencyPort for FileMemoryDependency {
         Ok(DependencyMemoryWriteResponse {
             id: record.id,
             retained: true,
+            deduplicated: false,
         })
     }
 
@@ -259,6 +276,10 @@ impl SqliteFtsMemoryDependency {
                  CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
                     id UNINDEXED, scope UNINDEXED, source UNINDEXED, content,
                     created_at_millis UNINDEXED, tokenize='unicode61'
+                 );
+                 CREATE TABLE IF NOT EXISTS memory_dedup (
+                    dedup_key TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL
                  );",
             )
             .map_err(|_| MemoryDependencyError::Database)?;
@@ -273,7 +294,25 @@ impl MemoryDependencyPort for SqliteFtsMemoryDependency {
     ) -> Result<DependencyMemoryWriteResponse, MemoryDependencyError> {
         validate_write(&request)?;
         let id = Uuid::now_v7().to_string();
-        self.connection()?
+        let connection = self.connection()?;
+        if let Some(key) = request.deduplication_key.as_deref() {
+            let mut existing = connection
+                .prepare("SELECT memory_id FROM memory_dedup WHERE dedup_key = ?1")
+                .map_err(|_| MemoryDependencyError::Database)?;
+            let rows = existing
+                .query_map(params![key], |row| row.get::<_, String>(0))
+                .map_err(|_| MemoryDependencyError::Database)?;
+            let rows = rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|_| MemoryDependencyError::Database)?;
+            if let Some(existing_id) = rows.into_iter().next() {
+                return Ok(DependencyMemoryWriteResponse {
+                    id: existing_id,
+                    retained: true,
+                    deduplicated: true,
+                });
+            }
+        }
+        connection
             .execute(
                 "INSERT INTO memory_fts
                  (id, scope, source, content, created_at_millis)
@@ -287,7 +326,19 @@ impl MemoryDependencyPort for SqliteFtsMemoryDependency {
                 ],
             )
             .map_err(|_| MemoryDependencyError::Database)?;
-        Ok(DependencyMemoryWriteResponse { id, retained: true })
+        if let Some(key) = request.deduplication_key.as_deref() {
+            connection
+                .execute(
+                    "INSERT INTO memory_dedup (dedup_key, memory_id) VALUES (?1, ?2)",
+                    params![key, id],
+                )
+                .map_err(|_| MemoryDependencyError::Database)?;
+        }
+        Ok(DependencyMemoryWriteResponse {
+            id,
+            retained: true,
+            deduplicated: false,
+        })
     }
 
     fn query(
@@ -337,6 +388,8 @@ struct StoredFileRecord {
     source: String,
     content: String,
     created_at_millis: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deduplication_key: Option<String>,
     checksum: String,
 }
 
@@ -347,7 +400,7 @@ impl StoredFileRecord {
     }
 
     fn verify(&self) -> Result<(), MemoryDependencyError> {
-        if self.schema_version != 1
+        if !matches!(self.schema_version, 1 | 2)
             || self.id.parse::<Uuid>().is_err()
             || self.checksum != self.expected_checksum()?
         {
@@ -357,17 +410,52 @@ impl StoredFileRecord {
     }
 
     fn expected_checksum(&self) -> Result<String, MemoryDependencyError> {
-        let bytes = serde_json::to_vec(&(
-            self.schema_version,
-            &self.id,
-            &self.scope,
-            &self.source,
-            &self.content,
-            self.created_at_millis,
-        ))
+        let tuple = if self.schema_version == 1 {
+            serde_json::to_value((
+                self.schema_version,
+                &self.id,
+                &self.scope,
+                &self.source,
+                &self.content,
+                self.created_at_millis,
+            ))
+        } else {
+            serde_json::to_value((
+                self.schema_version,
+                &self.id,
+                &self.scope,
+                &self.source,
+                &self.content,
+                self.created_at_millis,
+                self.deduplication_key.as_deref().unwrap_or(""),
+            ))
+        }
         .map_err(|_| MemoryDependencyError::Serialization)?;
+        let bytes = serde_json::to_vec(&tuple)
+            .map_err(|_| MemoryDependencyError::Serialization)?;
         Ok(blake3::hash(&bytes).to_hex().to_string())
     }
+}
+
+fn find_dedup_record(
+    file: &File,
+    scope: &str,
+    key: &str,
+) -> Result<Option<StoredFileRecord>, MemoryDependencyError> {
+    let mut found = None;
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(redacted_io)?;
+        if line.len() > RECORD_LIMIT {
+            return Err(MemoryDependencyError::CorruptRecord);
+        }
+        let record: StoredFileRecord =
+            serde_json::from_str(&line).map_err(|_| MemoryDependencyError::CorruptRecord)?;
+        record.verify()?;
+        if record.scope == scope && record.deduplication_key.as_deref() == Some(key) {
+            found = Some(record);
+        }
+    }
+    Ok(found)
 }
 
 fn validate_write(request: &DependencyMemoryWriteRequest) -> Result<(), MemoryDependencyError> {
@@ -463,6 +551,7 @@ mod tests {
                 source: String::from("fixture"),
                 content: content.into(),
                 created_at_millis: at,
+                deduplication_key: None,
             })
             .expect("write");
     }
@@ -485,6 +574,7 @@ mod tests {
                 source: String::from("fixture"),
                 content: String::from("ignored"),
                 created_at_millis: 1,
+                deduplication_key: None,
             })
             .expect("write");
         assert!(!response.retained);
@@ -523,5 +613,94 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].content, "canonical session context");
         assert!(matches[0].score.is_some());
+    }
+
+    #[test]
+    fn file_memory_deduplication_key_survives_adapter_recreation() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("memory.jsonl");
+        let key = "canonical-write:abc123";
+        let write = |provider: &dyn MemoryDependencyPort| {
+            provider
+                .write(DependencyMemoryWriteRequest {
+                    scope: String::from("session:s1"),
+                    source: String::from("auto"),
+                    content: String::from("durable memory fact"),
+                    created_at_millis: 10,
+                    deduplication_key: Some(key.to_owned()),
+                })
+                .expect("write")
+        };
+        let first = write(&FileMemoryDependency::new(path.clone()));
+        assert!(!first.deduplicated);
+        // A new adapter over the same store simulates a restart.
+        let second = write(&FileMemoryDependency::new(path));
+        assert!(second.deduplicated);
+        assert_eq!(first.id, second.id);
+        let matches = FileMemoryDependency::new(root.path().join("memory.jsonl"))
+            .query(DependencyMemoryQueryRequest {
+                scope: String::from("session:s1"),
+                query: String::from("durable memory fact"),
+                limit: 10,
+            })
+            .expect("query");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, first.id);
+    }
+
+    #[test]
+    fn sqlite_deduplication_key_is_scoped_and_idempotent_across_recreation() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("memory.sqlite3");
+        let key = "canonical-write:xyz";
+        let write = |provider: &dyn MemoryDependencyPort| {
+            provider
+                .write(DependencyMemoryWriteRequest {
+                    scope: String::from("project:p2"),
+                    source: String::from("auto"),
+                    content: String::from("sqlite durable fact"),
+                    created_at_millis: 11,
+                    deduplication_key: Some(key.to_owned()),
+                })
+                .expect("write")
+        };
+        let first = write(&SqliteFtsMemoryDependency::new(path.clone()));
+        assert!(!first.deduplicated);
+        let second = write(&SqliteFtsMemoryDependency::new(path));
+        assert!(second.deduplicated);
+        assert_eq!(first.id, second.id);
+    }
+
+    #[test]
+    fn legacy_schema_one_records_still_verify_after_dedup_field_lands() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("memory.jsonl");
+        // A schema-v1 record must remain readable by the v2 reader.
+        let legacy = StoredFileRecord {
+            schema_version: 1,
+            id: Uuid::now_v7().to_string(),
+            scope: String::from("session:s1"),
+            source: String::from("legacy"),
+            content: String::from("old memory fact"),
+            created_at_millis: 1,
+            deduplication_key: None,
+            checksum: String::new(),
+        }
+        .seal()
+        .expect("seal");
+        fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&legacy).expect("json")),
+        )
+        .expect("write");
+        let matches = FileMemoryDependency::new(path)
+            .query(DependencyMemoryQueryRequest {
+                scope: String::from("session:s1"),
+                query: String::from("old memory fact"),
+                limit: 10,
+            })
+            .expect("query");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].source, "legacy");
     }
 }

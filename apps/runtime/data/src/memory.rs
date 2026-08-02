@@ -46,6 +46,8 @@ pub struct WriteMemoryDataRequest {
     pub content: String,
     /// External creation time.
     pub created_at_millis: i64,
+    /// Canonical cross-restart duplicate key, when automatic writes are active.
+    pub deduplication_key: Option<String>,
 }
 
 /// Data-owned write result.
@@ -57,6 +59,8 @@ pub struct WriteMemoryDataRecord {
     pub reference: String,
     /// Whether the selected provider retained it.
     pub retained: bool,
+    /// Whether an identical canonical write was already retained.
+    pub deduplicated: bool,
 }
 
 /// Data-owned retrieval request.
@@ -146,12 +150,14 @@ where
                 source: request.source,
                 content: request.content,
                 created_at_millis: request.created_at_millis,
+                deduplication_key: request.deduplication_key,
             })
             .map_err(MemoryDataError::Dependency)?;
         Ok(WriteMemoryDataRecord {
             provider: self.dependency.provider_name().into(),
             reference: response.id,
             retained: response.retained,
+            deduplicated: response.deduplicated,
         })
     }
 
@@ -279,6 +285,7 @@ mod tests {
             Ok(DependencyMemoryWriteResponse {
                 id: String::from("m1"),
                 retained: true,
+                deduplicated: false,
             })
         }
 
@@ -316,6 +323,7 @@ mod tests {
                 source: String::from("user"),
                 content: String::from("remember"),
                 created_at_millis: 1,
+                deduplication_key: None,
             })
             .expect("write");
         assert_eq!(written.provider, "mock");
@@ -349,6 +357,7 @@ mod tests {
                 source: String::from("fixture"),
                 content: format!("orchid retained by {provider}"),
                 created_at_millis: 1,
+                deduplication_key: None,
             })
             .expect("write");
             let retrieved = data

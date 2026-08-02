@@ -28,6 +28,7 @@ fn seed_file_memory_for_process_e2e() {
         source,
         content,
         created_at_millis,
+        deduplication_key: None,
     };
     let response = match provider.as_str() {
         "file" => FileMemoryDependency::new(path).write(request),

@@ -9380,6 +9380,7 @@ mod tests {
                 provider: request.provider,
                 reference: String::from("ignored"),
                 retained: false,
+                deduplicated: false,
             })
         }
 

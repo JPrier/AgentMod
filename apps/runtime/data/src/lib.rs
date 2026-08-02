@@ -169,6 +169,16 @@ impl<D> artifact::ArtifactDataPort for RuntimeData<D> {
             .ok_or(artifact::ArtifactDataError::InvalidRequest)?
             .inspect_artifact(request)
     }
+
+    fn read_artifact(
+        &self,
+        request: artifact::ReadArtifactDataRequest,
+    ) -> Result<artifact::ReadArtifactDataRecord, artifact::ArtifactDataError> {
+        self.artifacts
+            .as_ref()
+            .ok_or(artifact::ArtifactDataError::InvalidRequest)?
+            .read_artifact(request)
+    }
 }
 
 impl<D> memory::MemoryDataPort for RuntimeData<D> {

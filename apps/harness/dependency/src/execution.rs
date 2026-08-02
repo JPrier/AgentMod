@@ -411,19 +411,19 @@ fn planner_worker_events(
     });
     let text = match (phase, pending_task) {
         (Some("plan"), _) => String::from(
-            r#"{"tasks":[{"task_id":"task-1","description":"inspect runtime child recovery"},{"task_id":"task-2","description":"inspect planner join evidence"}]}"#,
+            r#"{"tasks":[{"task_id":"task-1","description":"inspect runtime child recovery","goal":"verify child sessions recover exactly once","scope":["apps/runtime/logic"],"dependencies":[],"expected_artifacts":["child recovery evidence"],"workspace_mode":"shared_read_only","tool_groups":[],"validation_commands":["cargo check -p agentmod-runtime-logic"],"completion_criteria":["journal valid","no writes"],"review_criteria":["no writes","canonical evidence"],"token_budget":50000,"cost_budget_micros":5000000,"max_steps":32,"retry_policy":{"max_attempts":2,"retryable_failures":["provider.unavailable"]},"risk":"low"},{"task_id":"task-2","description":"inspect planner join evidence","goal":"verify joins reference exact child sets","scope":["apps/runtime/logic"],"dependencies":[],"expected_artifacts":["join evidence"],"workspace_mode":"shared_read_only","tool_groups":[],"validation_commands":["cargo check -p agentmod-runtime-logic"],"completion_criteria":["join exact"],"review_criteria":["join exact"],"token_budget":50000,"cost_budget_micros":5000000,"max_steps":32,"retry_policy":{"max_attempts":2,"retryable_failures":["provider.unavailable"]},"risk":"low"}]}"#,
         ),
         (None, Some(task)) => format!(
-            r#"{{"worker_result":{task},"status":"completed","evidence":["canonical child journal"]}}"#
+            r#"{{"worker_result":{task},"status":"completed","evidence":["canonical child journal"],"changed_files":["docs/integration/TASK-06-planner-worker.md"],"exit_status":0,"unresolved_issues":[],"lsp_diagnostics":[]}}"#
         ),
         (Some("integrate"), _) => format!(
-            r#"{{"integration":"combined runtime-owned child handoffs","iteration":{iteration},"tests":"deterministic fixture passed"}}"#
+            r#"{{"integration":"combined runtime-owned child handoffs","iteration":{iteration},"tests":"deterministic fixture passed","applied_child_execution_ids":["child:spawn-workers:{iteration}:task-1:1","child:spawn-workers:{iteration}:task-2:2"]}}"#
         ),
         (Some("review"), _) if iteration == 0 => String::from(
-            r#"{"approved":false,"rejected_task_ids":["task-2"],"findings":["task-2 requires one evidence-bound revision"]}"#,
+            r#"{"approved":false,"rejected_task_ids":["task-2"],"findings":[{"finding_id":"F-1","severity":"warning","affected_tasks":["task-2"],"evidence":["package:task-2","diff:task-2"],"required_correction":"task-2 requires one evidence-bound revision"}]}"#,
         ),
         (Some("review"), _) => String::from(
-            r#"{"approved":true,"rejected_task_ids":[],"findings":["child revision and integration evidence approved"]}"#,
+            r#"{"approved":true,"rejected_task_ids":[],"findings":[{"finding_id":"F-2","severity":"info","affected_tasks":["task-1"],"evidence":["package:task-1","integration:0"],"required_correction":"none"}]}"#,
         ),
         _ => {
             return Err(ProviderExecutionDependencyError::InvalidRequest(

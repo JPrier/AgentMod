@@ -265,6 +265,15 @@ pub struct ChildSessionLinkedEvent {
     pub input_hash: ContentHash,
     /// Hard worker token budget.
     pub token_budget: u64,
+    /// Enforced workspace mode for the child.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace_mode: String,
+    /// Expected result artifacts declared by the plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_artifacts: Vec<String>,
+    /// Validation commands declared by the plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_commands: Vec<String>,
 }
 
 /// Structured content append payload.
@@ -841,7 +850,7 @@ pub struct ArtifactPersistenceCompletedEvent {
 }
 
 /// Stable identity for one child-agent creation proposal.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ChildAgentExecutionIdentity {
     /// Deterministic identity derived from the graph cursor and task.
     pub execution_id: String,
@@ -907,13 +916,83 @@ pub struct ChildAgentCompletedEvent {
     pub summary: String,
 }
 
+/// Risk classification retained for one planner task.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskRisk {
+    /// Low-risk mechanical change.
+    #[default]
+    Low,
+    /// Medium-risk change with wider surface.
+    Medium,
+    /// High-risk change touching security or architecture.
+    High,
+}
+
+/// Bounded retry policy retained for one planner task.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TaskRetryPolicy {
+    /// Maximum dispatch attempts for this task.
+    #[serde(default)]
+    pub max_attempts: u32,
+    /// Stable classified failures that may retry.
+    #[serde(default)]
+    pub retryable_failures: Vec<String>,
+}
+
 /// Runtime-owned task emitted by a planner model response.
+///
+/// The full schema is validated by planner logic before canonical
+/// commitment; every field beyond `task_id` carries serde defaults so
+/// older journals remain replayable.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlannedTask {
     /// Stable task identity within the parent session.
     pub task_id: String,
-    /// Bounded typed worker assignment.
+    /// Bounded typed worker assignment (goal-derived instruction).
     pub description: String,
+    /// Explicit goal statement.
+    #[serde(default)]
+    pub goal: String,
+    /// Bounded scope boundaries.
+    #[serde(default)]
+    pub scope: Vec<String>,
+    /// Referenced task dependencies by stable task ID.
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    /// Expected result artifacts produced by the worker.
+    #[serde(default)]
+    pub expected_artifacts: Vec<String>,
+    /// Workspace mode selected for this task (empty means policy default).
+    #[serde(default)]
+    pub workspace_mode: String,
+    /// Allowed tool groups retained for the child binding.
+    #[serde(default)]
+    pub tool_groups: Vec<String>,
+    /// Validation commands the worker must run before completing.
+    #[serde(default)]
+    pub validation_commands: Vec<String>,
+    /// Completion criteria used by the worker and reviewer.
+    #[serde(default)]
+    pub completion_criteria: Vec<String>,
+    /// Review criteria used by the evidence-based reviewer.
+    #[serde(default)]
+    pub review_criteria: Vec<String>,
+    /// Hard per-task token budget.
+    #[serde(default)]
+    pub token_budget: u64,
+    /// Hard per-task cost budget in micro-dollars.
+    #[serde(default)]
+    pub cost_budget_micros: u64,
+    /// Hard per-task step budget.
+    #[serde(default)]
+    pub max_steps: u32,
+    /// Bounded retry policy.
+    #[serde(default)]
+    pub retry_policy: TaskRetryPolicy,
+    /// Risk classification retained for review and security filtering.
+    #[serde(default)]
+    pub risk: TaskRisk,
 }
 
 /// Structured planner output committed before child creation.
@@ -961,6 +1040,127 @@ pub struct ReviewerFindingsCommittedEvent {
     pub rejected_task_ids: Vec<String>,
     /// Bounded structured findings.
     pub findings: Vec<String>,
+}
+
+/// Canonical workspace lease grant committed by the parent before a child
+/// write phase.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceLeaseAcquiredEvent {
+    /// Spawn node that owns the lease.
+    pub node_id: String,
+    /// Zero-based orchestration iteration.
+    pub loop_iteration: u32,
+    /// Runtime-owned workspace text.
+    pub workspace: String,
+    /// Workspace mode requiring the lease.
+    pub mode: String,
+    /// Exact child execution ID that holds the lease.
+    pub owner_execution_id: String,
+    /// Task bound to the lease.
+    pub task_id: String,
+    /// Portable expiry in Unix milliseconds; zero means no expiry.
+    pub expires_at_ms: i64,
+}
+
+/// Canonical release of a workspace lease after the write phase.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceLeaseReleasedEvent {
+    /// Exact lease owner that releases the lease.
+    pub owner_execution_id: String,
+    /// Task bound to the released lease.
+    pub task_id: String,
+}
+
+/// Canonical reconciliation of an expired or dead lease after restart.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceLeaseReconciledEvent {
+    /// Owner whose lease was reclaimed.
+    pub owner_execution_id: String,
+    /// Task bound to the reclaimed lease.
+    pub task_id: String,
+    /// Why the lease was reclaimed.
+    pub reason: String,
+}
+
+/// Immutable artifact-backed worker result package committed by the parent
+/// after a verified child terminal state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerResultPackageCommittedEvent {
+    /// Exact child execution identity.
+    pub identity: ChildAgentExecutionIdentity,
+    /// Child session whose journal produced the package.
+    pub child_session_id: SessionId,
+    /// Content-addressed immutable result package reference.
+    pub package_reference: String,
+    /// Package media type.
+    pub mime_type: String,
+    /// Package byte count.
+    pub byte_size: u64,
+    /// Bounded summary retained in canonical state.
+    pub summary: String,
+}
+
+/// Canonical integration result over applied worker artifacts.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct IntegrationResultCommittedEvent {
+    /// Integrate graph node.
+    pub node_id: String,
+    /// One-based node attempt.
+    pub attempt: u32,
+    /// Zero-based orchestration iteration.
+    pub loop_iteration: u32,
+    /// One-based graph step.
+    pub step: u64,
+    /// Deterministically ordered child execution IDs whose changes were
+    /// applied.
+    pub applied_child_execution_ids: Vec<String>,
+    /// Detected overlapping changed paths.
+    pub overlapping_paths: Vec<String>,
+    /// Detected conflicting changed paths.
+    pub conflicting_paths: Vec<String>,
+    /// Content-addressed integration-result artifact.
+    pub integration_reference: String,
+    /// Integration validation exit status, when run.
+    pub validation_exit_status: Option<i32>,
+    /// Bounded integration summary.
+    pub summary: String,
+}
+
+/// Canonical durable child-creation approval intent.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ChildCreationApprovalRequestedEvent {
+    /// Exact child execution identity.
+    pub identity: ChildAgentExecutionIdentity,
+    /// Continuation ID backing the approval.
+    pub continuation_id: String,
+    /// Exact bound style selector.
+    pub child_style: String,
+    /// Exact bound workspace mode.
+    pub workspace_mode: String,
+    /// Exact bound workspace.
+    pub workspace: String,
+    /// Exact bound tool groups.
+    pub tool_groups: Vec<String>,
+    /// Exact bound token budget.
+    pub token_budget: u64,
+    /// Portable expiry of the approval decision.
+    pub expires_at_ms: i64,
+}
+
+/// Canonical durable child-creation approval outcome.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
+pub struct ChildCreationApprovalResolvedEvent {
+    /// Exact child execution identity.
+    pub identity: ChildAgentExecutionIdentity,
+    /// Continuation ID that was resolved.
+    pub continuation_id: String,
+    /// Whether the exact bound child may be created.
+    pub approved: bool,
+    /// Whether this resolution transitioned the continuation state.
+    pub transitioned: bool,
 }
 
 /// Typed committed events consumed by the pure session reducer.
@@ -1069,6 +1269,20 @@ pub enum RuntimeCommittedEvent {
     ChildJoinCompleted(ChildJoinCompletedEvent),
     /// Records a structured reviewer decision.
     ReviewerFindingsCommitted(ReviewerFindingsCommittedEvent),
+    /// Records a canonical workspace lease grant for a write phase.
+    WorkspaceLeaseAcquired(WorkspaceLeaseAcquiredEvent),
+    /// Records a canonical workspace lease release.
+    WorkspaceLeaseReleased(WorkspaceLeaseReleasedEvent),
+    /// Records canonical reconciliation of an expired/dead lease.
+    WorkspaceLeaseReconciled(WorkspaceLeaseReconciledEvent),
+    /// Records an immutable artifact-backed worker result package.
+    WorkerResultPackageCommitted(WorkerResultPackageCommittedEvent),
+    /// Records an integration result over applied worker artifacts.
+    IntegrationResultCommitted(IntegrationResultCommittedEvent),
+    /// Records durable child-creation approval intent.
+    ChildCreationApprovalRequested(ChildCreationApprovalRequestedEvent),
+    /// Records a durable child-creation approval outcome.
+    ChildCreationApprovalResolved(ChildCreationApprovalResolvedEvent),
 }
 
 impl RuntimeCommittedEvent {
@@ -1127,6 +1341,13 @@ impl RuntimeCommittedEvent {
             Self::TaskPlanCommitted(_) => "style.task_plan_committed",
             Self::ChildJoinCompleted(_) => "child_agent.join_completed",
             Self::ReviewerFindingsCommitted(_) => "style.reviewer_findings_committed",
+            Self::WorkspaceLeaseAcquired(_) => "workspace.lease_acquired",
+            Self::WorkspaceLeaseReleased(_) => "workspace.lease_released",
+            Self::WorkspaceLeaseReconciled(_) => "workspace.lease_reconciled",
+            Self::WorkerResultPackageCommitted(_) => "worker.result_package_committed",
+            Self::IntegrationResultCommitted(_) => "integration.result_committed",
+            Self::ChildCreationApprovalRequested(_) => "child_creation.approval_requested",
+            Self::ChildCreationApprovalResolved(_) => "child_creation.approval_resolved",
         }
     }
 }
@@ -1192,6 +1413,15 @@ pub struct ChildAgentRecord {
     pub completed_at: Option<Sequence>,
     /// Bounded result summary.
     pub summary: Option<String>,
+    /// Immutable artifact-backed result package reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_package_reference: Option<String>,
+    /// Result package media type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_package_mime_type: Option<String>,
+    /// Result package byte count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_package_byte_size: Option<u64>,
 }
 
 /// Replay-owned planner/worker/reviewer orchestration state.
@@ -1205,6 +1435,106 @@ pub struct PlannerWorkerState {
     pub joins: Vec<ChildJoinRecord>,
     /// Structured reviewer decisions in canonical order.
     pub reviews: Vec<ReviewerDecisionRecord>,
+    /// Canonical workspace leases keyed by owner execution ID.
+    pub workspace_leases: BTreeMap<String, WorkspaceLeaseRecord>,
+    /// Immutable worker result packages in commit order.
+    pub result_packages: Vec<WorkerResultPackageRecord>,
+    /// Integration results in commit order.
+    pub integration_results: Vec<IntegrationResultRecord>,
+    /// Durable child-creation approvals keyed by execution ID.
+    pub child_approvals: BTreeMap<String, ChildApprovalRecord>,
+}
+
+/// Replay-owned canonical workspace lease.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceLeaseRecord {
+    /// Runtime-owned workspace text.
+    pub workspace: String,
+    /// Workspace mode requiring the lease.
+    pub mode: String,
+    /// Exact child execution ID that holds the lease.
+    pub owner_execution_id: String,
+    /// Task bound to the lease.
+    pub task_id: String,
+    /// Portable expiry in Unix milliseconds; zero means no expiry.
+    pub expires_at_ms: i64,
+    /// Canonical acquisition sequence.
+    pub acquired_at: Sequence,
+    /// Canonical release sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<Sequence>,
+    /// Canonical reconciliation sequence and reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciled_at: Option<Sequence>,
+}
+
+/// Replay-owned immutable worker result package.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkerResultPackageRecord {
+    /// Exact child execution identity.
+    pub identity: ChildAgentExecutionIdentity,
+    /// Child session that produced the package.
+    pub child_session_id: SessionId,
+    /// Content-addressed immutable package reference.
+    pub package_reference: String,
+    /// Package media type.
+    pub mime_type: String,
+    /// Package byte count.
+    pub byte_size: u64,
+    /// Bounded canonical summary.
+    pub summary: String,
+    /// Canonical commit sequence.
+    pub committed_at: Sequence,
+}
+
+/// Replay-owned integration result.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct IntegrationResultRecord {
+    /// Orchestration iteration integrated.
+    pub loop_iteration: u32,
+    /// Deterministically ordered applied child execution IDs.
+    pub applied_child_execution_ids: Vec<String>,
+    /// Overlapping changed paths detected.
+    pub overlapping_paths: Vec<String>,
+    /// Conflicting changed paths detected.
+    pub conflicting_paths: Vec<String>,
+    /// Content-addressed integration-result artifact.
+    pub integration_reference: String,
+    /// Integration validation exit status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_exit_status: Option<i32>,
+    /// Bounded summary.
+    pub summary: String,
+    /// Canonical commit sequence.
+    pub committed_at: Sequence,
+}
+
+/// Replay-owned durable child-creation approval.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildApprovalRecord {
+    /// Exact child execution identity.
+    pub identity: ChildAgentExecutionIdentity,
+    /// Continuation ID backing the approval.
+    pub continuation_id: String,
+    /// Exact bound style selector.
+    pub child_style: String,
+    /// Exact bound workspace mode.
+    pub workspace_mode: String,
+    /// Exact bound workspace.
+    pub workspace: String,
+    /// Exact bound tool groups.
+    pub tool_groups: Vec<String>,
+    /// Exact bound token budget.
+    pub token_budget: u64,
+    /// Portable approval expiry.
+    pub expires_at_ms: i64,
+    /// Whether the bound child may be created once.
+    pub approved: Option<bool>,
+    /// Canonical request sequence.
+    pub requested_at: Sequence,
+    /// Canonical resolution sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<Sequence>,
 }
 
 /// Replay-owned exact child set that released one wait node.
@@ -1409,6 +1739,15 @@ pub struct ChildSessionOrigin {
     pub input_hash: ContentHash,
     /// Hard worker token budget.
     pub token_budget: u64,
+    /// Enforced workspace mode for the child.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub workspace_mode: String,
+    /// Expected result artifacts declared by the plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_artifacts: Vec<String>,
+    /// Validation commands declared by the plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub validation_commands: Vec<String>,
 }
 
 /// Canonical style execution projection reconstructed without running nodes.
@@ -1988,6 +2327,27 @@ fn apply_payload(
         RuntimeCommittedEvent::ReviewerFindingsCommitted(committed) => {
             apply_reviewer_findings_committed(state, committed, event.metadata.sequence)
         }
+        RuntimeCommittedEvent::WorkspaceLeaseAcquired(acquired) => {
+            apply_workspace_lease_acquired(state, acquired, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::WorkspaceLeaseReleased(released) => {
+            apply_workspace_lease_released(state, released, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::WorkspaceLeaseReconciled(reconciled) => {
+            apply_workspace_lease_reconciled(state, reconciled, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::WorkerResultPackageCommitted(committed) => {
+            apply_worker_result_package_committed(state, committed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::IntegrationResultCommitted(committed) => {
+            apply_integration_result_committed(state, committed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ChildCreationApprovalRequested(requested) => {
+            apply_child_creation_approval_requested(state, requested, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ChildCreationApprovalResolved(resolved) => {
+            apply_child_creation_approval_resolved(state, resolved, event.metadata.sequence)
+        }
         RuntimeCommittedEvent::ToolExecutionDispatched(dispatched) => {
             apply_tool_dispatch(state, dispatched, event.metadata.sequence)
         }
@@ -2124,6 +2484,9 @@ fn apply_child_session_link(
         task: linked.task.clone(),
         input_hash: linked.input_hash,
         token_budget: linked.token_budget,
+        workspace_mode: linked.workspace_mode.clone(),
+        expected_artifacts: linked.expected_artifacts.clone(),
+        validation_commands: linked.validation_commands.clone(),
     });
     Ok(())
 }
@@ -2678,6 +3041,9 @@ fn apply_child_agent_creation_proposed(
             child_head_sequence: None,
             completed_at: None,
             summary: None,
+            result_package_reference: None,
+            result_package_mime_type: None,
+            result_package_byte_size: None,
         },
     );
     Ok(())
@@ -2971,6 +3337,267 @@ fn apply_reviewer_findings_committed(
         findings: committed.findings.clone(),
         committed_at: sequence,
     });
+    Ok(())
+}
+
+fn apply_workspace_lease_acquired(
+    state: &mut SessionState,
+    acquired: &WorkspaceLeaseAcquiredEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let execution = state
+        .style_execution
+        .as_ref()
+        .ok_or(SessionReducerError::StyleExecutionNotInitialized)?;
+    if acquired.node_id.trim().is_empty()
+        || acquired.workspace.trim().is_empty()
+        || acquired.mode.trim().is_empty()
+        || acquired.owner_execution_id.trim().is_empty()
+        || acquired.task_id.trim().is_empty()
+        || graph_node_kind(&execution.graph, &acquired.node_id) != Some(NodeKind::SpawnChildAgent)
+        || state.planner_worker.workspace_leases.contains_key(&acquired.owner_execution_id)
+        || state
+            .planner_worker
+            .workspace_leases
+            .values()
+            .any(|lease| {
+                lease.released_at.is_none()
+                    && lease.reconciled_at.is_none()
+                    && lease.workspace == acquired.workspace
+                    && lease.mode == acquired.mode
+            })
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    state.planner_worker.workspace_leases.insert(
+        acquired.owner_execution_id.clone(),
+        WorkspaceLeaseRecord {
+            workspace: acquired.workspace.clone(),
+            mode: acquired.mode.clone(),
+            owner_execution_id: acquired.owner_execution_id.clone(),
+            task_id: acquired.task_id.clone(),
+            expires_at_ms: acquired.expires_at_ms,
+            acquired_at: sequence,
+            released_at: None,
+            reconciled_at: None,
+        },
+    );
+    Ok(())
+}
+
+fn apply_workspace_lease_released(
+    state: &mut SessionState,
+    released: &WorkspaceLeaseReleasedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = state
+        .planner_worker
+        .workspace_leases
+        .get_mut(&released.owner_execution_id)
+        .ok_or(SessionReducerError::InvalidPlannerWorkerTransition)?;
+    if record.task_id != released.task_id
+        || record.released_at.is_some()
+        || record.reconciled_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    record.released_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_workspace_lease_reconciled(
+    state: &mut SessionState,
+    reconciled: &WorkspaceLeaseReconciledEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = state
+        .planner_worker
+        .workspace_leases
+        .get_mut(&reconciled.owner_execution_id)
+        .ok_or(SessionReducerError::InvalidPlannerWorkerTransition)?;
+    if record.task_id != reconciled.task_id
+        || reconciled.reason.trim().is_empty()
+        || reconciled.reason.len() > 4096
+        || record.released_at.is_some()
+        || record.reconciled_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    record.reconciled_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_worker_result_package_committed(
+    state: &mut SessionState,
+    committed: &WorkerResultPackageCommittedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let execution = state
+        .style_execution
+        .as_ref()
+        .ok_or(SessionReducerError::StyleExecutionNotInitialized)?;
+    if execution
+        .active_node
+        .as_ref()
+        .and_then(|active| graph_node_kind(&execution.graph, &active.node_id))
+        != Some(NodeKind::WaitForAgents)
+        || committed.package_reference.trim().is_empty()
+        || committed.mime_type.trim().is_empty()
+        || committed.byte_size == 0
+        || committed.summary.len() > 256 * 1024
+        || state
+            .planner_worker
+            .result_packages
+            .iter()
+            .any(|package| package.identity.execution_id == committed.identity.execution_id)
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    let record = state
+        .child_agents
+        .get_mut(&committed.identity.execution_id)
+        .ok_or(SessionReducerError::InvalidPlannerWorkerTransition)?;
+    if record.state != ChildAgentState::Completed
+        || record.child_session_id != Some(committed.child_session_id)
+        || record.completed_at.is_none()
+        || record.result_package_reference.is_some()
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    record.result_package_reference = Some(committed.package_reference.clone());
+    record.result_package_mime_type = Some(committed.mime_type.clone());
+    record.result_package_byte_size = Some(committed.byte_size);
+    state.planner_worker.result_packages.push(WorkerResultPackageRecord {
+        identity: committed.identity.clone(),
+        child_session_id: committed.child_session_id,
+        package_reference: committed.package_reference.clone(),
+        mime_type: committed.mime_type.clone(),
+        byte_size: committed.byte_size,
+        summary: committed.summary.clone(),
+        committed_at: sequence,
+    });
+    Ok(())
+}
+
+fn apply_integration_result_committed(
+    state: &mut SessionState,
+    committed: &IntegrationResultCommittedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let execution = state
+        .style_execution
+        .as_ref()
+        .ok_or(SessionReducerError::StyleExecutionNotInitialized)?;
+    let mut applied = committed.applied_child_execution_ids.clone();
+    applied.sort();
+    applied.dedup();
+    let expected = state
+        .planner_worker
+        .result_packages
+        .iter()
+        .filter(|package| package.identity.loop_iteration == committed.loop_iteration)
+        .map(|package| package.identity.execution_id.clone())
+        .collect::<Vec<_>>();
+    let mut expected_sorted = expected.clone();
+    expected_sorted.sort();
+    expected_sorted.dedup();
+    if graph_node_kind(&execution.graph, &committed.node_id) != Some(NodeKind::ModelCall)
+        || !active_node_matches(
+            execution.active_node.as_ref(),
+            &committed.node_id,
+            committed.attempt,
+            committed.loop_iteration,
+            committed.step,
+        )
+        || applied.is_empty()
+        || applied != expected_sorted
+        || committed.applied_child_execution_ids.len() != applied.len()
+        || committed.integration_reference.trim().is_empty()
+        || committed.summary.len() > 256 * 1024
+        || state
+            .planner_worker
+            .integration_results
+            .iter()
+            .any(|result| result.loop_iteration == committed.loop_iteration)
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    state
+        .planner_worker
+        .integration_results
+        .push(IntegrationResultRecord {
+            loop_iteration: committed.loop_iteration,
+            applied_child_execution_ids: applied,
+            overlapping_paths: committed.overlapping_paths.clone(),
+            conflicting_paths: committed.conflicting_paths.clone(),
+            integration_reference: committed.integration_reference.clone(),
+            validation_exit_status: committed.validation_exit_status,
+            summary: committed.summary.clone(),
+            committed_at: sequence,
+        });
+    Ok(())
+}
+
+fn apply_child_creation_approval_requested(
+    state: &mut SessionState,
+    requested: &ChildCreationApprovalRequestedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if requested.continuation_id.trim().is_empty()
+        || requested.child_style.trim().is_empty()
+        || requested.workspace_mode.trim().is_empty()
+        || requested.workspace.trim().is_empty()
+        || requested.token_budget == 0
+        || requested.expires_at_ms <= 0
+        || state
+            .planner_worker
+            .child_approvals
+            .contains_key(&requested.identity.execution_id)
+        || state
+            .child_agents
+            .values()
+            .any(|record| record.identity.execution_id == requested.identity.execution_id)
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    state.planner_worker.child_approvals.insert(
+        requested.identity.execution_id.clone(),
+        ChildApprovalRecord {
+            identity: requested.identity.clone(),
+            continuation_id: requested.continuation_id.clone(),
+            child_style: requested.child_style.clone(),
+            workspace_mode: requested.workspace_mode.clone(),
+            workspace: requested.workspace.clone(),
+            tool_groups: requested.tool_groups.clone(),
+            token_budget: requested.token_budget,
+            expires_at_ms: requested.expires_at_ms,
+            approved: None,
+            requested_at: sequence,
+            resolved_at: None,
+        },
+    );
+    Ok(())
+}
+
+fn apply_child_creation_approval_resolved(
+    state: &mut SessionState,
+    resolved: &ChildCreationApprovalResolvedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = state
+        .planner_worker
+        .child_approvals
+        .get_mut(&resolved.identity.execution_id)
+        .ok_or(SessionReducerError::InvalidPlannerWorkerTransition)?;
+    if record.continuation_id != resolved.continuation_id
+        || record.identity != resolved.identity
+        || record.approved.is_some()
+        || record.resolved_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidPlannerWorkerTransition);
+    }
+    record.approved = Some(resolved.approved);
+    record.resolved_at = Some(sequence);
     Ok(())
 }
 
@@ -4283,10 +4910,38 @@ mod tests {
                         PlannedTask {
                             task_id: String::from("task-1"),
                             description: String::from("inspect scheduler recovery"),
+                            goal: String::from("inspect scheduler recovery"),
+                            scope: Vec::new(),
+                            dependencies: Vec::new(),
+                            expected_artifacts: Vec::new(),
+                            workspace_mode: String::from("shared_read_only"),
+                            tool_groups: Vec::new(),
+                            validation_commands: Vec::new(),
+                            completion_criteria: vec![String::from("complete")],
+                            review_criteria: Vec::new(),
+                            token_budget: 5_000,
+                            cost_budget_micros: 100_000,
+                            max_steps: 8,
+                            retry_policy: TaskRetryPolicy::default(),
+                            risk: TaskRisk::Low,
                         },
                         PlannedTask {
                             task_id: String::from("task-2"),
                             description: String::from("inspect tool recovery"),
+                            goal: String::from("inspect tool recovery"),
+                            scope: Vec::new(),
+                            dependencies: Vec::new(),
+                            expected_artifacts: Vec::new(),
+                            workspace_mode: String::from("shared_read_only"),
+                            tool_groups: Vec::new(),
+                            validation_commands: Vec::new(),
+                            completion_criteria: vec![String::from("complete")],
+                            review_criteria: Vec::new(),
+                            token_budget: 5_000,
+                            cost_budget_micros: 100_000,
+                            max_steps: 8,
+                            retry_policy: TaskRetryPolicy::default(),
+                            risk: TaskRisk::Low,
                         },
                     ],
                 }),
@@ -4345,6 +5000,9 @@ mod tests {
                 input_hash: ContentHash::digest(task.as_bytes()),
                 task: task.clone(),
                 token_budget: 10_000,
+                workspace_mode: String::from("shared_read_only"),
+                expected_artifacts: Vec::new(),
+                validation_commands: Vec::new(),
             }),
         );
 
@@ -4374,6 +5032,9 @@ mod tests {
                 task: String::from("exact task"),
                 input_hash: ContentHash::digest(b"different task"),
                 token_budget: 10_000,
+                workspace_mode: String::from("shared_read_only"),
+                expected_artifacts: Vec::new(),
+                validation_commands: Vec::new(),
             }),
         );
 

@@ -6,8 +6,9 @@ use agentmod_runtime_dependency::artifact::{
     ArtifactDependencyError, ArtifactDependencyPort, DependencyAbortArtifactRequest,
     DependencyArtifactCompression, DependencyArtifactLimits, DependencyArtifactRetention,
     DependencyArtifactSecurity, DependencyFinalizeArtifactRequest,
-    DependencyInspectArtifactRequest, DependencyStartArtifactRequest,
-    DependencyWriteArtifactChunkRequest, LocalArtifactDependency,
+    DependencyInspectArtifactRequest, DependencyReadArtifactRangeRequest,
+    DependencyStartArtifactRequest, DependencyWriteArtifactChunkRequest,
+    LocalArtifactDependency,
 };
 use thiserror::Error;
 
@@ -86,6 +87,28 @@ pub struct InspectArtifactDataRequest {
     pub artifact_reference: String,
 }
 
+/// Data-owned immutable artifact content read request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadArtifactDataRequest {
+    /// Session-scoped artifact store root.
+    pub store_root: PathBuf,
+    /// Exact portable immutable reference.
+    pub artifact_reference: String,
+}
+
+/// Data-owned immutable artifact content record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadArtifactDataRecord {
+    /// Exact portable immutable reference.
+    pub artifact_reference: String,
+    /// Retained media type.
+    pub mime_type: String,
+    /// Exact byte count.
+    pub byte_size: u64,
+    /// Exact content bytes.
+    pub bytes: Vec<u8>,
+}
+
 /// Narrow artifact data interface consumed by runtime logic.
 pub trait ArtifactDataPort {
     /// Persists exact approved bytes as one immutable content-addressed object.
@@ -109,6 +132,17 @@ pub trait ArtifactDataPort {
         &self,
         request: InspectArtifactDataRequest,
     ) -> Result<PersistedArtifactDataRecord, ArtifactDataError>;
+
+    /// Reads exact immutable content bytes for a reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactDataError`] for invalid references, missing objects,
+    /// or dependency failures.
+    fn read_artifact(
+        &self,
+        request: ReadArtifactDataRequest,
+    ) -> Result<ReadArtifactDataRecord, ArtifactDataError>;
 }
 
 /// First-party artifact data router with explicit hard bounds.
@@ -233,6 +267,60 @@ impl ArtifactDataPort for RuntimeArtifactData {
             producer: metadata.producer,
             content_hash: metadata.content_hash,
             deduplicated: true,
+        })
+    }
+
+    fn read_artifact(
+        &self,
+        request: ReadArtifactDataRequest,
+    ) -> Result<ReadArtifactDataRecord, ArtifactDataError> {
+        if request.store_root.as_os_str().is_empty() {
+            return Err(ArtifactDataError::InvalidRequest);
+        }
+        let reference = agentmod_runtime_dependency::artifact::ArtifactReference::parse(
+            request.artifact_reference,
+        )
+        .map_err(ArtifactDataError::Dependency)?;
+        let metadata = self
+            .store(&request.store_root)?
+            .inspect(DependencyInspectArtifactRequest {
+                artifact_reference: reference.clone(),
+            })
+            .map_err(|error| {
+                if error == ArtifactDependencyError::ArtifactNotFound {
+                    ArtifactDataError::NotFound
+                } else {
+                    ArtifactDataError::Dependency(error)
+                }
+            })?;
+        let mut offset = 0_u64;
+        let mut bytes = Vec::new();
+        loop {
+            let range = self
+                .store(&request.store_root)?
+                .read_range(DependencyReadArtifactRangeRequest {
+                    artifact_reference: reference.clone(),
+                    offset,
+                    length: DEFAULT_MAX_ARTIFACT_BYTES_U64,
+                })
+                .map_err(ArtifactDataError::Dependency)?;
+            if range.bytes.is_empty() {
+                break;
+            }
+            offset = offset.saturating_add(u64::try_from(range.bytes.len()).unwrap_or_default());
+            bytes.extend_from_slice(&range.bytes);
+            if offset >= metadata.byte_size {
+                break;
+            }
+        }
+        if u64::try_from(bytes.len()).unwrap_or_default() != metadata.byte_size {
+            return Err(ArtifactDataError::InvalidDependencyRecord);
+        }
+        Ok(ReadArtifactDataRecord {
+            artifact_reference: metadata.artifact_reference.as_str().to_owned(),
+            mime_type: metadata.mime_type,
+            byte_size: metadata.byte_size,
+            bytes,
         })
     }
 }

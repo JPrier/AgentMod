@@ -65,6 +65,12 @@ pub struct EnsureChildSessionCommand {
     pub tool_groups: Vec<String>,
     /// Style-selected child memory access.
     pub memory_access: ChildMemoryAccess,
+    /// Enforced workspace mode for the child.
+    pub workspace_mode: String,
+    /// Expected result artifacts declared by the plan.
+    pub expected_artifacts: Vec<String>,
+    /// Validation commands declared by the plan.
+    pub validation_commands: Vec<String>,
 }
 
 /// Logic-owned child session identity.
@@ -184,6 +190,9 @@ where
                     || origin.task != command.task
                     || origin.input_hash != ContentHash::digest(command.task.as_bytes())
                     || origin.token_budget != command.token_budget
+                    || origin.workspace_mode != command.workspace_mode
+                    || origin.expected_artifacts != command.expected_artifacts
+                    || origin.validation_commands != command.validation_commands
                 {
                     return Err(ChildSessionLogicError::RecoveryIdentityMismatch);
                 }
@@ -241,6 +250,9 @@ where
                 task: command.task.clone(),
                 input_hash: ContentHash::digest(command.task.as_bytes()),
                 token_budget: command.token_budget,
+                workspace_mode: command.workspace_mode.clone(),
+                expected_artifacts: command.expected_artifacts.clone(),
+                validation_commands: command.validation_commands.clone(),
             }),
         )
         .map_err(|_| ChildSessionLogicError::Event)?;
@@ -339,9 +351,12 @@ fn restrict_child_binding(
     binding: &mut SessionStyleBinding,
     command: &EnsureChildSessionCommand,
 ) -> Result<(), ChildSessionLogicError> {
+    let mode = crate::workspace::task_workspace_mode(&command.workspace_mode, "shared_read_only");
+    let retained =
+        crate::workspace::restrict_tool_groups(&mode, &command.tool_groups.iter().cloned().collect(), false);
     binding
         .tool_groups
-        .retain(|group| command.tool_groups.contains(group));
+        .retain(|group| retained.iter().any(|retained| retained == group));
     binding.budgets.max_tokens = binding
         .budgets
         .max_tokens
@@ -462,6 +477,9 @@ mod tests {
             context_budget_tokens: 300,
             tool_groups: vec![String::from("filesystem.read")],
             memory_access,
+            workspace_mode: String::from("shared_read_only"),
+            expected_artifacts: Vec::new(),
+            validation_commands: Vec::new(),
         }
     }
 

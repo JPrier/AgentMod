@@ -52,6 +52,14 @@ use crate::{
         ChildHandoffEntry, ConversationEntry, ConversationEntryId, PendingTaskEntry,
         ProjectionProvenance, RetrievedMemoryEntry, TextEntry, ToolCallEntry, ToolResultEntry,
     },
+    integration::{build_integration_artifact, decide_integration},
+    planner::{PlannerValidationContext, parse_and_validate_plan, workspace_mode_string},
+    result_package::{
+        build_result_package, usage_from_state,
+    },
+    workspace::{
+        dead_lease_owners, task_workspace_mode, write_phase_grant,
+    },
     harness::{
         AuthorizedProviderRequest, ExecuteProviderCommand, ProviderEvent, ProviderEventStream,
         ProviderExecutionError, ProviderExecutionLogic, ProviderExecutionPolicy,
@@ -81,10 +89,12 @@ use crate::{
         ArtifactPersistenceProposedEvent, ArtifactPersistenceResumeAction,
         ChildAgentCompletedEvent, ChildAgentCreatedEvent, ChildAgentCreationApprovedEvent,
         ChildAgentCreationProposedEvent, ChildAgentExecutionIdentity, ChildAgentState,
+        ChildCreationApprovalRequestedEvent, ChildCreationApprovalResolvedEvent,
         ChildJoinCompletedEvent, ContextBoundaryCompletedEvent, ContextBoundaryIdentity,
         ContextBoundaryOrigin, ContextBoundaryStartedEvent, ContextPhaseCompletedEvent,
         ContextPhaseIdentity, ContextPhaseStartedEvent, ContextProjectionReplacedEvent,
-        ConversationEntryCommittedEvent, ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent,
+        ConversationEntryCommittedEvent, IntegrationResultCommittedEvent,
+        ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent,
         ModelRequestCancelledEvent, ModelRequestFailedEvent, ModelRequestProposedEvent,
         ModelRequestStartedEvent, ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent,
         ModelToolCallProposedEvent, PlannedTask, PluginInvocationCompletedEvent,
@@ -97,7 +107,8 @@ use crate::{
         TaskPlanCommittedEvent, ToolCallApprovedEvent, ToolCallProposedEvent,
         ToolExecutionCompletedEvent, ToolExecutionDispatchedEvent, ToolExecutionFailedEvent,
         ToolExecutionStartedEvent, ToolExecutionState, ToolExecutionTerminalOutcome,
-        ToolOutputObservedEvent, reduce,
+        ToolOutputObservedEvent, WorkerResultPackageCommittedEvent, WorkspaceLeaseAcquiredEvent,
+        reduce,
     },
     style_executor::{
         CompiledStyleExecutor, StyleAdapterKind, StyleExecutorError, StyleNodeCursor,
@@ -656,10 +667,15 @@ where
                                 sink,
                             )
                             .await?;
-                        let tasks = parse_planner_tasks(
-                            &events,
-                            execution.executor.compiled().child_agents.max_children,
+                        let context = planner_validation_context(
+                            &Self::load_state(&persistence, session_id, &session_directory)?,
+                            execution.executor.compiled(),
                         )?;
+                        let tasks = parse_and_validate_plan(
+                            &provider_visible_text(&events),
+                            &context,
+                        )
+                        .map_err(RunTurnError::PlannerValidation)?;
                         let loaded =
                             Self::load_state(&persistence, session_id, &session_directory)?;
                         let model_response_sequence = loaded
@@ -694,14 +710,23 @@ where
                     )?;
                 }
                 StyleNodeDirective::SpawnChildAgent => {
-                    self.spawn_planner_children(
-                        &persistence,
-                        session_id,
-                        &session_directory,
-                        &command,
-                        &mut execution,
-                    )
-                    .await?;
+                    let awaiting = self
+                        .spawn_planner_children(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            &command,
+                            &mut execution,
+                        )
+                        .await?;
+                    if let Some(continuation_id) = awaiting {
+                        return Ok(RunTurnResult {
+                            events: visible_events,
+                            first_committed_sequence: user_sequence,
+                            last_committed_sequence: execution.position.sequence,
+                            awaiting_continuation: Some(continuation_id),
+                        });
+                    }
                     let state = Self::load_state(&persistence, session_id, &session_directory)?;
                     let child_count = state
                         .child_agents
@@ -734,6 +759,8 @@ where
                         .await?;
                     visible_events.extend(child_events);
                     let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                    let ready_remaining =
+                        planner_undispatched_tasks(&state, execution.loop_iteration)?;
                     let child_count = state
                         .child_agents
                         .values()
@@ -742,12 +769,15 @@ where
                                 && record.state == ChildAgentState::Completed
                         })
                         .count();
-                    self.complete_and_enter_next(
+                    self.complete_and_enter_next_with(
                         &persistence,
                         session_id,
                         &session_directory,
                         &mut execution,
                         Some(format!("children-completed:{child_count}")),
+                        None,
+                        &json!({"tasks":{"ready_remaining": ready_remaining}}),
+                        false,
                     )?;
                 }
                 StyleNodeDirective::ModelCall if execution.current.id == "integrate" => {
@@ -757,6 +787,24 @@ where
                         &session_directory,
                         &mut execution,
                     )?;
+                    let integration_state =
+                        Self::load_state(&persistence, session_id, &session_directory)?;
+                    let integration_ready = integration_state
+                        .planner_worker
+                        .integration_results
+                        .iter()
+                        .any(|result| {
+                            result.loop_iteration == execution.loop_iteration
+                        });
+                    if !integration_ready {
+                        self.commit_planner_integration(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            &mut execution,
+                            &command,
+                        )?;
+                    }
                     let phase_command =
                         planner_phase_command(&command, "integrate", execution.loop_iteration);
                     let events = self
@@ -806,8 +854,23 @@ where
                     let review = if let Some(review) = existing {
                         (review.approved, review.rejected_task_ids, review.findings)
                     } else {
-                        let phase_command =
+                        let mut phase_command =
                             planner_phase_command(&command, "review", execution.loop_iteration);
+                        let evidence = self
+                            .planner_review_evidence(
+                                &persistence,
+                                session_id,
+                                &session_directory,
+                                &command,
+                                &mut execution,
+                                &phase_command,
+                            )?;
+                        if let Some(options) = phase_command.options.as_object_mut() {
+                            options.insert(
+                                String::from("mock_planner_evidence"),
+                                evidence.clone(),
+                            );
+                        }
                         let events = self
                             .execute_planner_model_node(
                                 &persistence,
@@ -824,6 +887,7 @@ where
                             &Self::load_state(&persistence, session_id, &session_directory)?
                                 .planner_worker
                                 .tasks,
+                            &evidence,
                         )?;
                         (execution.position.sequence, execution.position.event_id) = self
                             .commit_next(
@@ -852,6 +916,21 @@ where
                         &session_directory,
                         &mut execution,
                         Some(format!("review:approved:{}", review.0)),
+                    )?;
+                }
+                StyleNodeDirective::Loop if execution.current.id == "waves" => {
+                    let state = Self::load_state(&persistence, session_id, &session_directory)?;
+                    let ready_remaining =
+                        planner_undispatched_tasks(&state, execution.loop_iteration)?;
+                    self.complete_and_enter_next_with(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &mut execution,
+                        Some(format!("waves:remaining:{ready_remaining}")),
+                        None,
+                        &json!({"tasks":{"ready_remaining": ready_remaining}}),
+                        false,
                     )?;
                 }
                 StyleNodeDirective::Loop => {
@@ -1018,7 +1097,7 @@ where
 
     #[allow(
         clippy::too_many_lines,
-        reason = "child creation keeps proposal, policy, exact recovery, binding restriction, and atomic receipt adjacent"
+        reason = "child creation keeps readiness, proposal, policy, durable approval, exact recovery, binding restriction, and atomic receipt adjacent"
     )]
     async fn spawn_planner_children(
         &self,
@@ -1027,15 +1106,15 @@ where
         session_directory: &std::path::Path,
         command: &RunTurnCommand,
         execution: &mut ActiveStyleTurn,
-    ) -> Result<(), RunTurnError> {
+    ) -> Result<Option<String>, RunTurnError> {
         let policy = execution.executor.compiled().child_agents.clone();
         let child_style = policy
             .child_style
             .clone()
             .ok_or(RunTurnError::InvalidChildPolicy)?;
-        let workspace_mode = policy
+        let default_mode = policy
             .workspace_mode
-            .map(child_workspace_mode)
+            .map(workspace_mode_string)
             .ok_or(RunTurnError::InvalidChildPolicy)?;
         let context_budget_tokens = policy
             .context_budget_tokens
@@ -1045,20 +1124,16 @@ where
             .ok_or(RunTurnError::InvalidChildPolicy)?;
         loop {
             let state = Self::load_state(persistence, session_id, session_directory)?;
-            let tasks = planner_tasks_for_iteration(&state, execution.loop_iteration)?;
-            let pending = tasks.into_iter().find(|task| {
-                !state.child_agents.values().any(|record| {
-                    record.identity.loop_iteration == execution.loop_iteration
-                        && record.identity.task_id == task.task_id
-                        && matches!(
-                            record.state,
-                            ChildAgentState::Active | ChildAgentState::Completed
-                        )
-                })
-            });
-            let Some(task) = pending else {
-                return Ok(());
+            let tasks = planner_ready_tasks(
+                &state,
+                execution.loop_iteration,
+                u64::from(policy.max_concurrent),
+                &default_mode,
+            )?;
+            let Some(task) = tasks.into_iter().next() else {
+                return Ok(None);
             };
+            let workspace_mode = task_workspace_mode(&task.workspace_mode, &default_mode);
             let identity = ChildAgentExecutionIdentity {
                 execution_id: format!(
                     "child:{}:{}:{}:{}",
@@ -1091,7 +1166,7 @@ where
                             task: task.description.clone(),
                             child_style: child_style.clone(),
                             workspace_mode: workspace_mode.clone(),
-                            token_budget: policy.per_child_token_budget,
+                            token_budget: task.token_budget.min(policy.per_child_token_budget),
                         },
                     ),
                 )?;
@@ -1114,14 +1189,46 @@ where
                     action: ConsequentialAction::ChildAgentCreation {
                         style: child_style.clone(),
                         workspace_mode: workspace_mode.clone(),
-                        token_budget: policy.per_child_token_budget,
+                        token_budget: task.token_budget.min(policy.per_child_token_budget),
                     },
                     style: state.style.clone(),
                     workspace: state.workspace.clone(),
                     origin: String::from("runtime"),
                 };
-                self.authorize_style_action(proposal.clone(), "child session creation")
-                    .await?;
+                match self
+                    .authorize_style_action(proposal.clone(), "child session creation")
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(RunTurnError::ContextApprovalRequired { .. }) => {
+                        let awaiting = self.commit_durable_child_approval(
+                            persistence,
+                            session_id,
+                            session_directory,
+                            execution,
+                            &identity,
+                            &task,
+                            &child_style,
+                            &workspace_mode,
+                            command,
+                        )?;
+                        if awaiting.is_some() {
+                            return Ok(awaiting);
+                        }
+                        let state = Self::load_state(persistence, session_id, session_directory)?;
+                        let approval = state
+                            .planner_worker
+                            .child_approvals
+                            .get(&identity.execution_id)
+                            .ok_or(RunTurnError::InvalidChildPolicy)?;
+                        if approval.approved == Some(false) {
+                            return Err(RunTurnError::ChildCreationDenied {
+                                execution_id: identity.execution_id.clone(),
+                            });
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
                 let action_digest = proposal.digest().map_err(|_| RunTurnError::Event)?;
                 (execution.position.sequence, execution.position.event_id) = self.commit_next(
                     persistence,
@@ -1166,10 +1273,13 @@ where
                         revision: execution.loop_iteration,
                         depth,
                         task: task.description,
-                        token_budget: policy.per_child_token_budget,
+                        token_budget: task.token_budget.min(policy.per_child_token_budget),
                         context_budget_tokens,
-                        tool_groups: policy.tool_groups.clone(),
+                        tool_groups: task.tool_groups.clone(),
                         memory_access,
+                        workspace_mode: workspace_mode.clone(),
+                        expected_artifacts: task.expected_artifacts.clone(),
+                        validation_commands: task.validation_commands.clone(),
                     })
                     .map_err(RunTurnError::ChildSession)?;
                 (execution.position.sequence, execution.position.event_id) = self.commit_next(
@@ -1192,7 +1302,7 @@ where
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
-        reason = "child wait binds the parent cursor, each child journal, typed task command, and terminal parent receipt"
+        reason = "child wait binds the parent cursor, concurrent dispatch, workspace leases, result packages, and terminal parent receipts"
     )]
     async fn wait_for_planner_children(
         &self,
@@ -1202,93 +1312,172 @@ where
         command: &RunTurnCommand,
         execution: &mut ActiveStyleTurn,
     ) -> Result<Vec<ProviderEvent>, RunTurnError> {
+        let policy = execution.executor.compiled().child_agents.clone();
+        let max_concurrent = usize::try_from(policy.max_concurrent)
+            .unwrap_or(1)
+            .max(1);
         let mut visible = Vec::new();
         loop {
             let state = Self::load_state(persistence, session_id, session_directory)?;
-            let active = state
+            let mut active = state
                 .child_agents
                 .values()
-                .find(|record| {
+                .filter(|record| {
                     record.identity.loop_iteration == execution.loop_iteration
                         && record.state == ChildAgentState::Active
                 })
-                .cloned();
-            let Some(record) = active else {
+                .cloned()
+                .collect::<Vec<_>>();
+            if active.is_empty() {
                 break;
-            };
-            let child_session_id = record
-                .child_session_id
-                .ok_or(RunTurnError::InvalidChildPolicy)?;
-            let child_directory = command.sessions_root.join(child_session_id.to_string());
-            let child_persistence = SessionPersistenceLogic::new(self.data.clone());
-            let before = child_persistence
-                .load_session(LoadSessionCommand {
-                    session_directory: child_directory.clone(),
-                    expected_session_id: child_session_id,
+            }
+            active.sort_by(|left, right| {
+                left.identity
+                    .execution_id
+                    .cmp(&right.identity.execution_id)
+            });
+            let mut batch = active.into_iter().take(max_concurrent).collect::<Vec<_>>();
+            let write_capable = batch
+                .iter()
+                .filter(|record| {
+                    record.workspace_mode
+                        == crate::workspace::modes::SHARED_SERIALIZED_WRITES
                 })
-                .map_err(RunTurnError::Persistence)?;
-            let child_events =
-                if before.state.lifecycle == crate::session::SessionLifecycle::Completed {
-                    Vec::new()
-                } else {
-                    Box::pin(self.run_child_task(RunTurnCommand {
-                        sessions_root: command.sessions_root.clone(),
-                        session_id: child_session_id.to_string(),
-                        prompt: record.task.clone(),
-                        provider: command.provider.clone(),
-                        model: command.model.clone(),
-                        options: command.options.clone(),
-                        cancellation_id: planner_child_cancellation_id(
-                            &command.cancellation_id,
-                            &record.identity.task_id,
-                            record.identity.loop_iteration,
-                        ),
-                    }))
-                    .await?
-                    .events
-                };
-            visible.extend(child_events.clone());
-            let mut loaded = child_persistence
-                .load_session(LoadSessionCommand {
-                    session_directory: child_directory.clone(),
-                    expected_session_id: child_session_id,
-                })
-                .map_err(RunTurnError::Persistence)?;
-            if loaded.state.lifecycle == crate::session::SessionLifecycle::Active {
-                self.commit_next(
-                    &child_persistence,
-                    child_session_id,
-                    &child_directory,
-                    loaded.state.last_sequence,
-                    loaded.last_event_id,
-                    RuntimeCommittedEvent::SessionLifecycleChanged(
-                        crate::session::SessionLifecycleChangedEvent {
-                            lifecycle: crate::session::SessionLifecycle::Completed,
-                            reason: Some(String::from("child task completed")),
-                        },
-                    ),
+                .map(|record| record.identity.execution_id.clone())
+                .collect::<Vec<_>>();
+            if write_capable.len() > 1 {
+                batch.truncate(1);
+            }
+            let lease_owner = write_capable
+                .first()
+                .and_then(|execution_id| {
+                    batch
+                        .iter()
+                        .find(|record| &record.identity.execution_id == execution_id)
+                });
+            if let Some(writer) = lease_owner {
+                self.acquire_planner_workspace_lease(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    execution,
+                    writer,
                 )?;
-                loaded = child_persistence
+            }
+            let mut futures = Vec::with_capacity(batch.len());
+            for record in batch {
+                let logic = self.clone();
+                let sessions_root = command.sessions_root.clone();
+                let provider = command.provider.clone();
+                let model = command.model.clone();
+                let options = command.options.clone();
+                let child_session_id = record
+                    .child_session_id
+                    .ok_or(RunTurnError::InvalidChildPolicy)?;
+                let cancellation_id = planner_child_cancellation_id(
+                    &command.cancellation_id,
+                    &record.identity.task_id,
+                    record.identity.loop_iteration,
+                );
+                let prompt = record.task.clone();
+                futures.push(Box::pin(async move {
+                    let child_directory = sessions_root.join(child_session_id.to_string());
+                    let child_persistence = SessionPersistenceLogic::new(logic.data.clone());
+                    let before = child_persistence
+                        .load_session(LoadSessionCommand {
+                            session_directory: child_directory.clone(),
+                            expected_session_id: child_session_id,
+                        })
+                        .map_err(RunTurnError::Persistence)?;
+                    if before.state.lifecycle == crate::session::SessionLifecycle::Completed {
+                        return Ok((record, child_session_id, Vec::new()));
+                    }
+                    let result = logic
+                        .run_child_task(RunTurnCommand {
+                            sessions_root,
+                            session_id: child_session_id.to_string(),
+                            prompt,
+                            provider,
+                            model,
+                            options,
+                            cancellation_id,
+                        })
+                        .await?;
+                    Ok((record, child_session_id, result.events))
+                }));
+            }
+            let finished = futures::future::join_all(futures).await;
+            let mut finished = finished
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()?;
+            finished.sort_by(|left, right| {
+                left.0
+                    .identity
+                    .execution_id
+                    .cmp(&right.0.identity.execution_id)
+            });
+            for (record, child_session_id, child_events) in finished {
+                visible.extend(child_events.clone());
+                let child_directory = command.sessions_root.join(child_session_id.to_string());
+                let child_persistence = SessionPersistenceLogic::new(self.data.clone());
+                let mut loaded = child_persistence
                     .load_session(LoadSessionCommand {
-                        session_directory: child_directory,
+                        session_directory: child_directory.clone(),
                         expected_session_id: child_session_id,
                     })
                     .map_err(RunTurnError::Persistence)?;
+                if loaded.state.lifecycle == crate::session::SessionLifecycle::Active {
+                    self.commit_next(
+                        &child_persistence,
+                        child_session_id,
+                        &child_directory,
+                        loaded.state.last_sequence,
+                        loaded.last_event_id,
+                        RuntimeCommittedEvent::SessionLifecycleChanged(
+                            crate::session::SessionLifecycleChangedEvent {
+                                lifecycle: crate::session::SessionLifecycle::Completed,
+                                reason: Some(String::from("child task completed")),
+                            },
+                        ),
+                    )?;
+                    loaded = child_persistence
+                        .load_session(LoadSessionCommand {
+                            session_directory: child_directory,
+                            expected_session_id: child_session_id,
+                        })
+                        .map_err(RunTurnError::Persistence)?;
+                }
+                let summary = latest_assistant_summary(&loaded.state, &child_events);
+                (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    execution.position.sequence,
+                    execution.position.event_id,
+                    RuntimeCommittedEvent::ChildAgentCompleted(ChildAgentCompletedEvent {
+                        identity: record.identity.clone(),
+                        child_session_id,
+                        child_head_sequence: loaded.state.last_sequence,
+                        summary,
+                    }),
+                )?;
+                self.commit_worker_result_package(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    execution,
+                    &record,
+                    &loaded.state,
+                    command,
+                )?;
+                self.maybe_release_workspace_lease(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    execution,
+                    &record.identity,
+                )?;
             }
-            let summary = latest_assistant_summary(&loaded.state, &child_events);
-            (execution.position.sequence, execution.position.event_id) = self.commit_next(
-                persistence,
-                session_id,
-                session_directory,
-                execution.position.sequence,
-                execution.position.event_id,
-                RuntimeCommittedEvent::ChildAgentCompleted(ChildAgentCompletedEvent {
-                    identity: record.identity,
-                    child_session_id,
-                    child_head_sequence: loaded.state.last_sequence,
-                    summary,
-                }),
-            )?;
         }
         let state = Self::load_state(persistence, session_id, session_directory)?;
         if !state
@@ -1296,6 +1485,7 @@ where
             .joins
             .iter()
             .any(|join| join.loop_iteration == execution.loop_iteration)
+            && !planner_undispatched_tasks(&state, execution.loop_iteration)?
         {
             let mut child_execution_ids = state
                 .child_agents
@@ -1374,7 +1564,7 @@ where
                             id: entry_id,
                             child_session: child_session_id.to_string(),
                             summary: record.summary.unwrap_or_default(),
-                            artifact_id: None,
+                            artifact_id: record.result_package_reference.clone(),
                             source_sequence: sequence,
                         }),
                     },
@@ -1382,6 +1572,404 @@ where
             )?;
         }
         Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "the result package binds canonical child identity, usage, and artifact bytes without reading the full transcript"
+    )]
+    fn commit_worker_result_package(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+        record: &crate::session::ChildAgentRecord,
+        child_state: &crate::session::SessionState,
+        command: &RunTurnCommand,
+    ) -> Result<(), RunTurnError> {
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        if state
+            .planner_worker
+            .result_packages
+            .iter()
+            .any(|package| package.identity.execution_id == record.identity.execution_id)
+        {
+            return Ok(());
+        }
+        let task = state
+            .planner_worker
+            .tasks
+            .get(&record.identity.task_id)
+            .cloned()
+            .ok_or(RunTurnError::PlannerOutputInvalid)?;
+        let usage = usage_from_state(child_state, record.token_budget);
+        let package = build_result_package(
+            record,
+            &task,
+            child_state,
+            &session_id.to_string(),
+            record.identity.loop_iteration,
+            &command.provider,
+            &command.model,
+            child_state
+                .style_binding
+                .as_ref()
+                .map_or("native", |binding| binding.harness.as_str()),
+            child_state
+                .child_origin
+                .as_ref()
+                .map_or(1, |origin| origin.depth),
+            usage,
+        );
+        let bytes = package.to_bytes().map_err(|_| RunTurnError::IntegrationArtifactEncoding)?;
+        let persisted = self
+            .data
+            .persist_artifact(agentmod_runtime_data::artifact::PersistArtifactDataRequest {
+                store_root: session_directory.join("artifacts").join("workers"),
+                creation_event: execution.position.event_id.to_string(),
+                producer: String::from("runtime.planner"),
+                mime_type: String::from("application/vnd.agentmod.worker-result-package+json"),
+                bytes,
+                security: agentmod_runtime_data::artifact::ArtifactSecurityRecord::Private,
+                retention: agentmod_runtime_data::artifact::ArtifactRetentionRecord::Session,
+            })
+            .map_err(RunTurnError::ResultPackageData)?;
+        let summary = package.handoff_line();
+        (execution.position.sequence, execution.position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            execution.position.sequence,
+            execution.position.event_id,
+            RuntimeCommittedEvent::WorkerResultPackageCommitted(
+                WorkerResultPackageCommittedEvent {
+                    identity: record.identity.clone(),
+                    child_session_id: record
+                        .child_session_id
+                        .ok_or(RunTurnError::InvalidChildPolicy)?,
+                    package_reference: persisted.artifact_reference,
+                    mime_type: persisted.mime_type,
+                    byte_size: persisted.byte_size,
+                    summary,
+                },
+            ),
+        )?;
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "integration records exact applied artifacts, conflict detection, and the immutable integration result"
+    )]
+    fn commit_planner_integration(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+        _command: &RunTurnCommand,
+    ) -> Result<(), RunTurnError> {
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        let packages = state
+            .planner_worker
+            .result_packages
+            .iter()
+            .filter(|package| package.identity.loop_iteration == execution.loop_iteration)
+            .map(|package| {
+                let stored = self
+                    .data
+                    .read_artifact(agentmod_runtime_data::artifact::ReadArtifactDataRequest {
+                        store_root: session_directory.join("artifacts").join("workers"),
+                        artifact_reference: package.package_reference.clone(),
+                    })
+                    .map_err(RunTurnError::ResultPackageData)?;
+                let package: crate::result_package::WorkerResultPackage =
+                    serde_json::from_slice(&stored.bytes)
+                        .map_err(|_| RunTurnError::IntegrationArtifactEncoding)?;
+                Ok(package)
+            })
+            .collect::<Result<Vec<_>, RunTurnError>>()?;
+        let decision = decide_integration(&packages);
+        let artifact = build_integration_artifact(
+            &session_id.to_string(),
+            execution.loop_iteration,
+            &packages,
+            &decision,
+        );
+        let bytes = artifact.to_bytes().map_err(|_| RunTurnError::IntegrationArtifactEncoding)?;
+        let persisted = self
+            .data
+            .persist_artifact(agentmod_runtime_data::artifact::PersistArtifactDataRequest {
+                store_root: session_directory.join("artifacts").join("integration"),
+                creation_event: execution.position.event_id.to_string(),
+                producer: String::from("runtime.integrator"),
+                mime_type: String::from("application/vnd.agentmod.integration-result+json"),
+                bytes,
+                security: agentmod_runtime_data::artifact::ArtifactSecurityRecord::Private,
+                retention: agentmod_runtime_data::artifact::ArtifactRetentionRecord::Session,
+            })
+            .map_err(RunTurnError::ResultPackageData)?;
+        (execution.position.sequence, execution.position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            execution.position.sequence,
+            execution.position.event_id,
+            RuntimeCommittedEvent::IntegrationResultCommitted(
+                IntegrationResultCommittedEvent {
+                    node_id: execution.current.id.clone(),
+                    attempt: execution.attempt,
+                    loop_iteration: execution.loop_iteration,
+                    step: execution.step,
+                    applied_child_execution_ids: decision.applied_child_execution_ids,
+                    overlapping_paths: decision.overlapping_paths,
+                    conflicting_paths: decision.conflicting_paths,
+                    integration_reference: persisted.artifact_reference,
+                    validation_exit_status: artifact.exit_status_reference(),
+                    summary: artifact.summary,
+                },
+            ),
+        )?;
+        Ok(())
+    }
+
+    fn acquire_planner_workspace_lease(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+        record: &crate::session::ChildAgentRecord,
+    ) -> Result<(), RunTurnError> {
+        let now_ms = current_time_millis();
+        let mut state = Self::load_state(persistence, session_id, session_directory)?;
+        for owner in dead_lease_owners(&state.planner_worker, now_ms) {
+            let lease = state
+                .planner_worker
+                .workspace_leases
+                .get(&owner)
+                .cloned()
+                .ok_or(RunTurnError::InvalidChildPolicy)?;
+            (execution.position.sequence, execution.position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                execution.position.sequence,
+                execution.position.event_id,
+                RuntimeCommittedEvent::WorkspaceLeaseReconciled(
+                    crate::session::WorkspaceLeaseReconciledEvent {
+                        owner_execution_id: owner,
+                        task_id: lease.task_id,
+                        reason: String::from("expired lease reclaimed after restart"),
+                    },
+                ),
+            )?;
+        }
+        state = Self::load_state(persistence, session_id, session_directory)?;
+        if !write_phase_grant(
+            &state.planner_worker,
+            &state.workspace,
+            &record.identity.execution_id,
+            now_ms,
+        ) {
+            return Err(RunTurnError::WorkspaceLeaseUnavailable {
+                workspace: state.workspace.clone(),
+            });
+        }
+        let expires_at_ms = now_ms.saturating_add(30 * 60 * 1_000);
+        (execution.position.sequence, execution.position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            execution.position.sequence,
+            execution.position.event_id,
+            RuntimeCommittedEvent::WorkspaceLeaseAcquired(WorkspaceLeaseAcquiredEvent {
+                node_id: execution.current.id.clone(),
+                loop_iteration: execution.loop_iteration,
+                workspace: state.workspace.clone(),
+                mode: record.workspace_mode.clone(),
+                owner_execution_id: record.identity.execution_id.clone(),
+                task_id: record.identity.task_id.clone(),
+                expires_at_ms,
+            }),
+        )?;
+        Ok(())
+    }
+
+    fn maybe_release_workspace_lease(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+        identity: &ChildAgentExecutionIdentity,
+    ) -> Result<(), RunTurnError> {
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        let Some(lease) = state.planner_worker.workspace_leases.get(&identity.execution_id) else {
+            return Ok(());
+        };
+        if lease.released_at.is_some() || lease.reconciled_at.is_some() {
+            return Ok(());
+        }
+        (execution.position.sequence, execution.position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            execution.position.sequence,
+            execution.position.event_id,
+            RuntimeCommittedEvent::WorkspaceLeaseReleased(
+                crate::session::WorkspaceLeaseReleasedEvent {
+                    owner_execution_id: identity.execution_id.clone(),
+                    task_id: identity.task_id.clone(),
+                },
+            ),
+        )?;
+        Ok(())
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "reviewer evidence binds every canonical worker result, integration result, and unresolved issue without leaking full transcripts"
+    )]
+    #[allow(
+        clippy::unused_self,
+        reason = "evidence binding stays adjacent to the planner adapter for review routing"
+    )]
+    fn planner_review_evidence(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        _command: &RunTurnCommand,
+        execution: &mut ActiveStyleTurn,
+        _phase_command: &RunTurnCommand,
+    ) -> Result<Value, RunTurnError> {
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        let packages = state
+            .planner_worker
+            .result_packages
+            .iter()
+            .filter(|package| package.identity.loop_iteration == execution.loop_iteration)
+            .cloned()
+            .collect::<Vec<_>>();
+        let integration = state
+            .planner_worker
+            .integration_results
+            .iter()
+            .find(|result| result.loop_iteration == execution.loop_iteration)
+            .cloned();
+        let evidence = serde_json::json!({
+            "iteration": execution.loop_iteration,
+            "worker_results": packages.iter().map(|package| {
+                serde_json::json!({
+                    "task_id": package.identity.task_id,
+                    "execution_id": package.identity.execution_id,
+                    "package_reference": package.package_reference,
+                    "summary": package.summary,
+                })
+            }).collect::<Vec<_>>(),
+            "integration": integration.map(|result| {
+                serde_json::json!({
+                    "applied_child_execution_ids": result.applied_child_execution_ids,
+                    "overlapping_paths": result.overlapping_paths,
+                    "conflicting_paths": result.conflicting_paths,
+                    "integration_reference": result.integration_reference,
+                })
+            }),
+            "completion_criteria": state.planner_worker.tasks.values().map(|task| {
+                serde_json::json!({
+                    "task_id": task.task_id,
+                    "completion_criteria": task.completion_criteria,
+                    "review_criteria": task.review_criteria,
+                    "validation_commands": task.validation_commands,
+                    "risk": task.risk,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        Ok(evidence)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "durable child approval binds the exact parent/task/style/workspace/tools/budgets before any child branch"
+    )]
+    fn commit_durable_child_approval(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        execution: &mut ActiveStyleTurn,
+        identity: &ChildAgentExecutionIdentity,
+        task: &PlannedTask,
+        child_style: &str,
+        workspace_mode: &str,
+        command: &RunTurnCommand,
+    ) -> Result<Option<String>, RunTurnError> {
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        if let Some(record) = state.planner_worker.child_approvals.get(&identity.execution_id) {
+            return match record.approved {
+                Some(_) => Ok(None),
+                None => Ok(Some(record.continuation_id.clone())),
+            };
+        }
+        let continuation_id = ContinuationId::from_uuid(execution.position.event_id.into_uuid());
+        let expires_at_ms = current_time_millis().saturating_add(7 * 24 * 60 * 60 * 1_000);
+        ContinuationLogic::new(self.data.clone())
+            .create_continuation(CreateContinuationCommand {
+                session_id: command.session_id.clone(),
+                id: continuation_id,
+                wake_condition: ContinuationWakeCondition::Manual,
+                payload: ContinuationPayload::ChildApproval(Box::new(
+                    crate::continuation::ChildApprovalContinuation {
+                        session_id: command.session_id.clone(),
+                        workspace: state.workspace.clone(),
+                        provider: command.provider.clone(),
+                        model: command.model.clone(),
+                        options: command.options.clone(),
+                        style: state.style.clone(),
+                        cancellation_id: command.cancellation_id.clone(),
+                        execution_id: identity.execution_id.clone(),
+                        task_id: identity.task_id.clone(),
+                        node_id: identity.node_id.clone(),
+                        attempt: identity.attempt,
+                        loop_iteration: identity.loop_iteration,
+                        step: identity.step,
+                        child_style: child_style.to_owned(),
+                        workspace_mode: workspace_mode.to_owned(),
+                        tool_groups: task.tool_groups.clone(),
+                        token_budget: task.token_budget.min(
+                            execution.executor.compiled().child_agents.per_child_token_budget,
+                        ),
+                        expires_at_ms,
+                    },
+                )),
+                expires_at: None,
+            })
+            .map_err(RunTurnError::Continuation)?;
+        (execution.position.sequence, execution.position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            execution.position.sequence,
+            execution.position.event_id,
+            RuntimeCommittedEvent::ChildCreationApprovalRequested(
+                ChildCreationApprovalRequestedEvent {
+                    identity: identity.clone(),
+                    continuation_id: continuation_id.to_string(),
+                    child_style: child_style.to_owned(),
+                    workspace_mode: workspace_mode.to_owned(),
+                    workspace: state.workspace,
+                    tool_groups: task.tool_groups.clone(),
+                    token_budget: task
+                        .token_budget
+                        .min(execution.executor.compiled().child_agents.per_child_token_budget),
+                    expires_at_ms,
+                },
+            ),
+        )?;
+        Ok(Some(continuation_id.to_string()))
     }
 
     /// Enables runtime-managed child sessions for styles that declare them.
@@ -3365,6 +3953,7 @@ where
             let (workspace, style) = match &loaded_continuation.payload {
                 ContinuationPayload::ToolApproval(payload) => (&payload.workspace, &payload.style),
                 ContinuationPayload::StyleApproval(payload) => (&payload.workspace, &payload.style),
+                ContinuationPayload::ChildApproval(payload) => (&payload.workspace, &payload.style),
                 ContinuationPayload::DeferredTurn(_) | ContinuationPayload::Opaque(_) => {
                     return Err(RunTurnError::InvalidContinuationPayload);
                 }
@@ -3573,6 +4162,68 @@ where
                 events: result.events,
                 last_committed_sequence: result.last_committed_sequence,
                 awaiting_continuation: result.awaiting_continuation,
+            });
+        }
+        if matches!(&resolved.payload, ContinuationPayload::ChildApproval(_)) {
+            let ContinuationPayload::ChildApproval(payload) = resolved.payload else {
+                unreachable!("child approval variant was checked")
+            };
+            if payload.session_id != command.session_id
+                || loaded.state.workspace != payload.workspace
+                || loaded.state.style != payload.style
+                || payload.expires_at_ms <= current_time_millis()
+            {
+                return Err(RunTurnError::InvalidContinuationPayload);
+            }
+            let child_approval = loaded
+                .state
+                .planner_worker
+                .child_approvals
+                .get(&payload.execution_id)
+                .cloned();
+            let Some(child_approval) = child_approval else {
+                return Err(RunTurnError::InvalidContinuationPayload);
+            };
+            if child_approval.continuation_id != continuation_id.to_string()
+                || child_approval.child_style != payload.child_style
+                || child_approval.workspace_mode != payload.workspace_mode
+                || child_approval.tool_groups != payload.tool_groups
+                || child_approval.token_budget != payload.token_budget
+                || child_approval.identity.execution_id != payload.execution_id
+                || child_approval.identity.task_id != payload.task_id
+                || child_approval.identity.node_id != payload.node_id
+                || child_approval.identity.attempt != payload.attempt
+                || child_approval.identity.loop_iteration != payload.loop_iteration
+                || child_approval.identity.step != payload.step
+            {
+                return Err(RunTurnError::InvalidContinuationPayload);
+            }
+            let mut position = JournalPosition {
+                sequence: loaded.state.last_sequence,
+                event_id: loaded.last_event_id,
+            };
+            if child_approval.approved.is_none() {
+                (position.sequence, position.event_id) = self.commit_next(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    position.sequence,
+                    position.event_id,
+                    RuntimeCommittedEvent::ChildCreationApprovalResolved(
+                        ChildCreationApprovalResolvedEvent {
+                            identity: child_approval.identity,
+                            continuation_id: continuation_id.to_string(),
+                            approved: command.approved,
+                            transitioned: resolved.transitioned,
+                        },
+                    ),
+                )?;
+            }
+            return Ok(ResolveTurnApprovalResult {
+                transitioned: resolved.transitioned,
+                events: Vec::new(),
+                last_committed_sequence: position.sequence,
+                awaiting_continuation: None,
             });
         }
         let ContinuationPayload::ToolApproval(payload_ref) = &resolved.payload else {
@@ -8393,8 +9044,7 @@ fn validate_planner_child_policy(
         || children.max_depth == 0
         || children.per_child_token_budget == 0
         || children.child_style.is_none()
-        || children.workspace_mode
-            != Some(agentmod_session_style_sdk::ChildWorkspaceMode::SharedReadOnly)
+        || children.workspace_mode.is_none()
         || children.inherit_provider != Some(true)
         || children.inherit_model != Some(true)
         || children.context_budget_tokens.is_none()
@@ -8407,26 +9057,6 @@ fn validate_planner_child_policy(
         return Err(RunTurnError::InvalidChildPolicy);
     }
     Ok(())
-}
-
-fn child_workspace_mode(mode: agentmod_session_style_sdk::ChildWorkspaceMode) -> String {
-    match mode {
-        agentmod_session_style_sdk::ChildWorkspaceMode::SharedReadOnly => {
-            String::from("shared_read_only")
-        }
-        agentmod_session_style_sdk::ChildWorkspaceMode::SharedSerializedWrites => {
-            String::from("shared_serialized_writes")
-        }
-        agentmod_session_style_sdk::ChildWorkspaceMode::IndependentGitWorktree => {
-            String::from("independent_git_worktree")
-        }
-        agentmod_session_style_sdk::ChildWorkspaceMode::TemporaryCopy => {
-            String::from("temporary_copy")
-        }
-        agentmod_session_style_sdk::ChildWorkspaceMode::ExplicitCustomWorkspace => {
-            String::from("explicit_custom_workspace")
-        }
-    }
 }
 
 fn planner_phase_command(
@@ -8462,48 +9092,146 @@ fn provider_visible_text(events: &[ProviderEvent]) -> String {
         .collect()
 }
 
-fn parse_planner_tasks(
-    events: &[ProviderEvent],
-    max_children: u32,
+fn planner_validation_context(
+    state: &crate::session::SessionState,
+    compiled: &agentmod_session_style_sdk::CompiledSessionStyle,
+) -> Result<PlannerValidationContext, RunTurnError> {
+    let binding = state
+        .style_binding
+        .as_ref()
+        .ok_or(RunTurnError::StyleMigrationRequired)?;
+    Ok(PlannerValidationContext {
+        max_children: compiled.child_agents.max_children,
+        max_concurrent: compiled.child_agents.max_concurrent,
+        parent_max_tokens: binding.budgets.max_tokens,
+        parent_max_cost_micros: binding.budgets.max_cost_micros,
+        parent_max_steps: binding.budgets.max_steps,
+        available_tool_groups: compiled
+            .allowed_tool_groups
+            .iter()
+            .cloned()
+            .collect(),
+        available_styles: BTreeSet::from([compiled.child_agents.child_style.clone().ok_or(
+            RunTurnError::InvalidChildPolicy,
+        )?]),
+        available_harnesses: BTreeSet::from([String::from("native"), String::from("fixture")]),
+        default_child_style: compiled
+            .child_agents
+            .child_style
+            .clone()
+            .ok_or(RunTurnError::InvalidChildPolicy)?,
+        default_workspace_mode: compiled
+            .child_agents
+            .workspace_mode
+            .map(workspace_mode_string)
+            .ok_or(RunTurnError::InvalidChildPolicy)?,
+        default_token_budget: compiled.child_agents.per_child_token_budget,
+        default_cost_budget_micros: compiled
+            .child_agents
+            .per_child_cost_budget_micros
+            .unwrap_or(0),
+        default_max_steps: binding.budgets.max_steps,
+    })
+}
+
+/// Returns tasks that are ready to dispatch now, bounded by the concurrency
+/// ceiling minus already-active children, in deterministic task-ID order.
+fn planner_ready_tasks(
+    state: &crate::session::SessionState,
+    loop_iteration: u32,
+    max_concurrent: u64,
+    default_mode: &str,
 ) -> Result<Vec<PlannedTask>, RunTurnError> {
-    let value: Value = serde_json::from_str(&provider_visible_text(events))
-        .map_err(|_| RunTurnError::PlannerOutputInvalid)?;
-    let tasks = value
-        .get("tasks")
-        .and_then(Value::as_array)
-        .ok_or(RunTurnError::PlannerOutputInvalid)?;
-    if tasks.len() < 2 || u32::try_from(tasks.len()).map_or(true, |count| count > max_children) {
-        return Err(RunTurnError::PlannerOutputInvalid);
-    }
-    let mut ids = BTreeSet::new();
-    tasks
-        .iter()
-        .map(|task| {
-            let task_id = task
-                .get("task_id")
-                .or_else(|| task.get("id"))
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty() && value.len() <= 256)
-                .ok_or(RunTurnError::PlannerOutputInvalid)?;
-            let description = task
-                .get("description")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty() && value.len() <= 64 * 1024)
-                .ok_or(RunTurnError::PlannerOutputInvalid)?;
-            if !ids.insert(task_id.to_owned()) {
-                return Err(RunTurnError::PlannerOutputInvalid);
-            }
-            Ok(PlannedTask {
-                task_id: task_id.to_owned(),
-                description: description.to_owned(),
+    let iteration_tasks = planner_tasks_for_iteration(state, loop_iteration)?;
+    let active = state
+        .child_agents
+        .values()
+        .filter(|record| {
+            record.identity.loop_iteration == loop_iteration
+                && matches!(
+                    record.state,
+                    ChildAgentState::Active | ChildAgentState::Completed
+                )
+        })
+        .count() as u64;
+    let capacity = max_concurrent.saturating_sub(active);
+    let mut ready = iteration_tasks
+        .into_iter()
+        .filter(|task| {
+            !state.child_agents.values().any(|record| {
+                record.identity.loop_iteration == loop_iteration
+                    && record.identity.task_id == task.task_id
             })
         })
-        .collect()
+        .filter(|task| task_dependencies_satisfied(state, task, loop_iteration))
+        .collect::<Vec<_>>();
+    ready.sort_by(|left, right| left.task_id.cmp(&right.task_id));
+    ready.truncate(
+        usize::try_from(capacity).unwrap_or(usize::MAX),
+    );
+    let _ = default_mode;
+    Ok(ready)
+}
+
+fn task_dependencies_satisfied(
+    state: &crate::session::SessionState,
+    task: &PlannedTask,
+    loop_iteration: u32,
+) -> bool {
+    let iteration_tasks = state
+        .planner_worker
+        .tasks
+        .values()
+        .map(|task| task.task_id.clone())
+        .collect::<BTreeSet<_>>();
+    task.dependencies.iter().all(|dependency| {
+        let in_iteration = iteration_tasks.contains(dependency);
+        state
+            .child_agents
+            .values()
+            .any(|record| {
+                record.identity.task_id == *dependency
+                    && record.state == ChildAgentState::Completed
+                    && if in_iteration {
+                        record.identity.loop_iteration == loop_iteration
+                    } else {
+                        record.identity.loop_iteration <= loop_iteration
+                    }
+            })
+    })
+}
+
+/// Returns whether any task for the iteration has not yet been dispatched or
+/// completed, requiring another dispatch wave.
+fn planner_undispatched_tasks(
+    state: &crate::session::SessionState,
+    loop_iteration: u32,
+) -> Result<bool, RunTurnError> {
+    let tasks = planner_tasks_for_iteration(state, loop_iteration)?;
+    Ok(tasks.into_iter().any(|task| {
+        !state.child_agents.values().any(|record| {
+            record.identity.loop_iteration == loop_iteration
+                && record.identity.task_id == task.task_id
+                && matches!(
+                    record.state,
+                    ChildAgentState::Active | ChildAgentState::Completed
+                )
+        })
+    }))
+}
+
+fn current_time_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 fn parse_reviewer_findings(
     events: &[ProviderEvent],
     tasks: &BTreeMap<String, PlannedTask>,
+    evidence: &Value,
 ) -> Result<(bool, Vec<String>, Vec<String>), RunTurnError> {
     let value: Value = serde_json::from_str(&provider_visible_text(events))
         .map_err(|_| RunTurnError::ReviewerOutputInvalid)?;
@@ -8530,11 +9258,54 @@ fn parse_reviewer_findings(
         .ok_or(RunTurnError::ReviewerOutputInvalid)?
         .iter()
         .map(|value| {
-            value
-                .as_str()
-                .filter(|finding| !finding.trim().is_empty() && finding.len() <= 64 * 1024)
-                .map(str::to_owned)
-                .ok_or(RunTurnError::ReviewerOutputInvalid)
+            if !value.is_object() {
+                return Err(RunTurnError::ReviewerOutputInvalid);
+            }
+            let finding_id = value
+                .get("finding_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty() && value.len() <= 256)
+                .ok_or(RunTurnError::ReviewerOutputInvalid)?;
+            let severity = value
+                .get("severity")
+                .and_then(Value::as_str)
+                .filter(|value| matches!(*value, "info" | "warning" | "error" | "critical"))
+                .ok_or(RunTurnError::ReviewerOutputInvalid)?;
+            let affected_tasks = value
+                .get("affected_tasks")
+                .and_then(Value::as_array)
+                .ok_or(RunTurnError::ReviewerOutputInvalid)?
+                .iter()
+                .all(|task| {
+                    task.as_str()
+                        .is_some_and(|task_id| tasks.contains_key(task_id))
+                });
+            let evidence_refs = value
+                .get("evidence")
+                .and_then(Value::as_array)
+                .ok_or(RunTurnError::ReviewerOutputInvalid)?
+                .iter()
+                .filter_map(|reference| reference.as_str())
+                .collect::<Vec<_>>();
+            let correction = value
+                .get("required_correction")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty() && value.len() <= 64 * 1024)
+                .ok_or(RunTurnError::ReviewerOutputInvalid)?;
+            let evidence_valid = evidence_refs.iter().all(|reference| {
+                reference.starts_with("package:")
+                    || reference.starts_with("integration:")
+                    || reference.starts_with("diff:")
+                    || reference.starts_with("test:")
+                    || reference.starts_with("diag:")
+            });
+            if !affected_tasks || !evidence_valid || evidence_refs.is_empty() {
+                return Err(RunTurnError::ReviewerOutputInvalid);
+            }
+            Ok(format!(
+                "{finding_id}|{severity}|{correction}|{evidence}",
+                evidence = evidence_refs.join(",")
+            ))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut unique = rejected_task_ids.clone();
@@ -8543,6 +9314,7 @@ fn parse_reviewer_findings(
     if approved != rejected_task_ids.is_empty()
         || unique.len() != rejected_task_ids.len()
         || findings.is_empty()
+        || !evidence.is_object()
     {
         return Err(RunTurnError::ReviewerOutputInvalid);
     }
@@ -9119,6 +9891,18 @@ pub enum RunTurnError {
     ResearchArtifactEncoding,
     #[error("research artifact persistence failed: {0}")]
     ResearchArtifact(crate::artifact::ArtifactPersistenceError),
+    #[error("concurrent child execution failed")]
+    ConcurrentChildFailed,
+    #[error("durable child-creation approval denied child `{execution_id}`")]
+    ChildCreationDenied { execution_id: String },
+    #[error("workspace `{workspace}` lease is unavailable for the write phase")]
+    WorkspaceLeaseUnavailable { workspace: String },
+    #[error("worker result package persistence failed: {0}")]
+    ResultPackageData(agentmod_runtime_data::artifact::ArtifactDataError),
+    #[error("planner output validation failed: {0}")]
+    PlannerValidation(crate::planner::PlannerValidationError),
+    #[error("integration result artifact could not be encoded")]
+    IntegrationArtifactEncoding,
     #[error("durable tool receipt does not match dispatch {0}")]
     InvalidRecoveryReceipt(String),
     #[error(
@@ -9148,7 +9932,8 @@ mod tests {
     use agentmod_runtime_data::{
         artifact::{
             ArtifactDataError, ArtifactDataPort, InspectArtifactDataRequest,
-            PersistArtifactDataRequest, PersistedArtifactDataRecord,
+            PersistArtifactDataRequest, PersistedArtifactDataRecord, ReadArtifactDataRecord,
+            ReadArtifactDataRequest,
         },
         continuation::{
             ContinuationDataError, ContinuationDataPort, ContinuationPayloadRecord,
@@ -9182,11 +9967,12 @@ mod tests {
 
     use crate::{
         permission::{PermissionEffect, PermissionMatcher, PermissionPolicy, PermissionRule},
+        planner::{PlannerValidationContext, PlannerValidationError},
         session::{
             ApprovalRequestedEvent, ApprovalResolvedEvent, ChildSessionLinkedEvent,
             ModelRequestCancelledEvent, RuntimeCommittedEvent, SessionCreatedEvent,
             StyleExecutionInitializedEvent, StyleNodeCompletedEvent, StyleNodeEnteredEvent,
-            StyleTransitionSelectedEvent, replay,
+            StyleTransitionSelectedEvent, TaskRetryPolicy, TaskRisk, replay,
         },
         style_executor::tests::binding,
     };
@@ -9430,6 +10216,26 @@ mod tests {
                 .get(&request.artifact_reference)
                 .cloned()
                 .ok_or(ArtifactDataError::NotFound)
+        }
+
+        fn read_artifact(
+            &self,
+            request: ReadArtifactDataRequest,
+        ) -> Result<ReadArtifactDataRecord, ArtifactDataError> {
+            let record = self
+                .state
+                .artifact_records
+                .lock()
+                .expect("artifact records")
+                .get(&request.artifact_reference)
+                .cloned()
+                .ok_or(ArtifactDataError::NotFound)?;
+            Ok(ReadArtifactDataRecord {
+                artifact_reference: record.artifact_reference,
+                mime_type: record.mime_type,
+                byte_size: record.byte_size,
+                bytes: Vec::new(),
+            })
         }
     }
 
@@ -9761,6 +10567,9 @@ mod tests {
                     task: task.to_owned(),
                     input_hash: ContentHash::digest(task.as_bytes()),
                     token_budget: 10_000,
+                    workspace_mode: String::from("shared_read_only"),
+                    expected_artifacts: Vec::new(),
+                    validation_commands: Vec::new(),
                 }),
             ),
         ]
@@ -13031,9 +13840,11 @@ mod tests {
     #[test]
     fn planner_task_output_is_bounded_and_rejects_duplicate_ids() {
         let valid = vec![ProviderEvent::Text(String::from(
-            r#"{"tasks":[{"task_id":"one","description":"first"},{"task_id":"two","description":"second"}]}"#,
+            r#"{"tasks":[{"task_id":"one","description":"first","token_budget":1000,"cost_budget_micros":1000,"max_steps":8},{"task_id":"two","description":"second","token_budget":1000,"cost_budget_micros":1000,"max_steps":8}]}"#,
         ))];
-        let tasks = parse_planner_tasks(&valid, 2).expect("valid task plan");
+        let context = planner_validation_fixture();
+        let tasks =
+            parse_and_validate_plan(&provider_visible_text(&valid), &context).expect("valid plan");
         assert_eq!(
             tasks
                 .iter()
@@ -13043,16 +13854,33 @@ mod tests {
         );
 
         let duplicate = vec![ProviderEvent::Text(String::from(
-            r#"{"tasks":[{"task_id":"one","description":"first"},{"task_id":"one","description":"second"}]}"#,
+            r#"{"tasks":[{"task_id":"one","description":"first","token_budget":1000,"cost_budget_micros":1000,"max_steps":8},{"task_id":"one","description":"second","token_budget":1000,"cost_budget_micros":1000,"max_steps":8}]}"#,
         ))];
         assert!(matches!(
-            parse_planner_tasks(&duplicate, 2),
-            Err(RunTurnError::PlannerOutputInvalid)
+            parse_and_validate_plan(&provider_visible_text(&duplicate), &context),
+            Err(PlannerValidationError::DuplicateTaskId)
         ));
-        assert!(matches!(
-            parse_planner_tasks(&valid, 1),
-            Err(RunTurnError::PlannerOutputInvalid)
-        ));
+    }
+
+    fn planner_validation_fixture() -> PlannerValidationContext {
+        PlannerValidationContext {
+            max_children: 16,
+            max_concurrent: 4,
+            parent_max_tokens: 1_000_000,
+            parent_max_cost_micros: 100_000_000,
+            parent_max_steps: 1_000,
+            available_tool_groups: BTreeSet::from([
+                String::from("filesystem.read"),
+                String::from("filesystem.write"),
+            ]),
+            available_styles: BTreeSet::from([String::from("ephemeral-turn@1.1.0")]),
+            available_harnesses: BTreeSet::from([String::from("native")]),
+            default_child_style: String::from("ephemeral-turn@1.1.0"),
+            default_workspace_mode: String::from("shared_read_only"),
+            default_token_budget: 100_000,
+            default_cost_budget_micros: 10_000_000,
+            default_max_steps: 64,
+        }
     }
 
     #[test]
@@ -13063,6 +13891,20 @@ mod tests {
                 PlannedTask {
                     task_id: String::from("one"),
                     description: String::from("first"),
+                    goal: String::from("first"),
+                    scope: Vec::new(),
+                    dependencies: Vec::new(),
+                    expected_artifacts: Vec::new(),
+                    workspace_mode: String::from("shared_read_only"),
+                    tool_groups: Vec::new(),
+                    validation_commands: Vec::new(),
+                    completion_criteria: vec![String::from("complete")],
+                    review_criteria: Vec::new(),
+                    token_budget: 5_000,
+                    cost_budget_micros: 100_000,
+                    max_steps: 8,
+                    retry_policy: TaskRetryPolicy::default(),
+                    risk: TaskRisk::Low,
                 },
             ),
             (
@@ -13070,30 +13912,60 @@ mod tests {
                 PlannedTask {
                     task_id: String::from("two"),
                     description: String::from("second"),
+                    goal: String::from("second"),
+                    scope: Vec::new(),
+                    dependencies: Vec::new(),
+                    expected_artifacts: Vec::new(),
+                    workspace_mode: String::from("shared_read_only"),
+                    tool_groups: Vec::new(),
+                    validation_commands: Vec::new(),
+                    completion_criteria: vec![String::from("complete")],
+                    review_criteria: Vec::new(),
+                    token_budget: 5_000,
+                    cost_budget_micros: 100_000,
+                    max_steps: 8,
+                    retry_policy: TaskRetryPolicy::default(),
+                    risk: TaskRisk::Low,
                 },
             ),
         ]);
+        let evidence = json!({});
         let rejected = vec![ProviderEvent::Text(String::from(
-            r#"{"approved":false,"rejected_task_ids":["two"],"findings":["revise two"]}"#,
+            r#"{"approved":false,"rejected_task_ids":["two"],"findings":[{"finding_id":"F-1","severity":"warning","affected_tasks":["two"],"evidence":["package:two"],"required_correction":"revise two"}]}"#,
         ))];
         assert_eq!(
-            parse_reviewer_findings(&rejected, &tasks).expect("valid rejection"),
+            parse_reviewer_findings(&rejected, &tasks, &evidence).expect("valid rejection"),
             (
                 false,
                 vec![String::from("two")],
-                vec![String::from("revise two")]
+                vec![String::from("F-1|warning|revise two|package:two")]
             )
         );
 
         for invalid in [
-            r#"{"approved":true,"rejected_task_ids":["two"],"findings":["conflict"]}"#,
-            r#"{"approved":false,"rejected_task_ids":["missing"],"findings":["unknown"]}"#,
-            r#"{"approved":false,"rejected_task_ids":["two","two"],"findings":["duplicate"]}"#,
+            r#"{"approved":true,"rejected_task_ids":["two"],"findings":[{"finding_id":"F-1","severity":"warning","affected_tasks":["two"],"evidence":["package:two"],"required_correction":"x"}]}"#,
+            r#"{"approved":false,"rejected_task_ids":["missing"],"findings":[{"finding_id":"F-1","severity":"warning","affected_tasks":["missing"],"evidence":["package:missing"],"required_correction":"x"}]}"#,
+            r#"{"approved":false,"rejected_task_ids":["two","two"],"findings":[{"finding_id":"F-1","severity":"warning","affected_tasks":["two"],"evidence":["package:two"],"required_correction":"x"}]}"#,
         ] {
             assert!(matches!(
-                parse_reviewer_findings(&[ProviderEvent::Text(String::from(invalid))], &tasks),
+                parse_reviewer_findings(
+                    &[ProviderEvent::Text(String::from(invalid))],
+                    &tasks,
+                    &evidence
+                ),
                 Err(RunTurnError::ReviewerOutputInvalid)
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod send_checks {
+    use super::*;
+
+    #[test]
+    fn run_turn_error_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<RunTurnError>();
     }
 }

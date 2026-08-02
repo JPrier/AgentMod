@@ -173,8 +173,8 @@ pub struct ChildHandoffEntry {
     pub child_session: String,
     /// Bounded handoff summary.
     pub summary: String,
-    /// Optional complete transcript/result artifact.
-    pub artifact_id: Option<ArtifactId>,
+    /// Optional immutable result-package reference.
+    pub artifact_id: Option<String>,
     /// Event sequence that committed the handoff.
     pub source_sequence: Sequence,
 }

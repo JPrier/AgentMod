@@ -15,6 +15,7 @@ agentmod-primitives = { path = "../../../core/primitives" }
 agentmod-runtime-data = { path = "../data" }
 agentmod-session-style-sdk = { path = "../../../sdk/session-style-sdk" }
 async-trait.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver = "1.0"

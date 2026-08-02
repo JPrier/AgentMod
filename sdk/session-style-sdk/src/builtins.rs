@@ -171,7 +171,7 @@ fn built_in_parts(style: BuiltInStyle) -> BuiltInParts {
         ),
         BuiltInStyle::PlannerWorker => (
             "planner-worker",
-            "1.1.0",
+            "1.2.0",
             32,
             PLANNER_WORKER_GRAPH,
             vec!["agents", "approval", "model"],
@@ -623,6 +623,11 @@ id = "wait-workers"
 kind = "wait_for_agents"
 
 [[nodes]]
+id = "waves"
+kind = "loop"
+max_iterations = 32
+
+[[nodes]]
 id = "integrate"
 kind = "model_call"
 provider = "mock"
@@ -653,7 +658,27 @@ to = "wait-workers"
 
 [[edges]]
 from = "wait-workers"
+to = "waves"
+condition = "tasks.ready_remaining == true"
+label = "dispatch-next-wave"
+
+[[edges]]
+from = "wait-workers"
 to = "integrate"
+condition = "tasks.ready_remaining == false"
+label = "all-complete"
+
+[[edges]]
+from = "waves"
+to = "spawn-workers"
+condition = "tasks.ready_remaining == true"
+label = "next-wave"
+
+[[edges]]
+from = "waves"
+to = "integrate"
+condition = "tasks.ready_remaining == false"
+label = "all-dispatched"
 
 [[edges]]
 from = "integrate"

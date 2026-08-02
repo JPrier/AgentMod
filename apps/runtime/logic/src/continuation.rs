@@ -2,10 +2,11 @@
 
 use agentmod_primitives::{ContinuationId, TimestampMillis};
 use agentmod_runtime_data::continuation::{
-    ContinuationDataError, ContinuationDataPort, ContinuationPayloadRecord, ContinuationRecord,
-    ContinuationStateRecord, ContinuationWakeRecord, CreateContinuationDataRequest,
-    DeferredTurnPayloadRecord, PendingToolCallPayloadRecord, ResolveContinuationDataRequest,
-    StyleApprovalPayloadRecord, ToolApprovalPayloadRecord,
+    ChildApprovalPayloadRecord, ContinuationDataError, ContinuationDataPort,
+    ContinuationPayloadRecord, ContinuationRecord, ContinuationStateRecord,
+    ContinuationWakeRecord, CreateContinuationDataRequest, DeferredTurnPayloadRecord,
+    PendingToolCallPayloadRecord, ResolveContinuationDataRequest, StyleApprovalPayloadRecord,
+    ToolApprovalPayloadRecord,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -159,6 +160,8 @@ pub enum ContinuationPayload {
     StyleApproval(Box<StyleApprovalContinuation>),
     /// Complete provider turn deferred behind a scheduler-owned trigger.
     DeferredTurn(Box<DeferredTurnContinuation>),
+    /// Durable runtime-owned child-creation approval bound to one task.
+    ChildApproval(Box<ChildApprovalContinuation>),
     /// Storage-only marker for callers without an executable action.
     Opaque(String),
 }
@@ -217,6 +220,55 @@ pub struct DeferredTurnContinuation {
     pub style: String,
     /// Stable cancellation identifier for the deferred turn.
     pub cancellation_id: String,
+}
+
+/// Logic-owned restart-safe durable child-creation approval.
+///
+/// The payload binds the exact parent/task/style/workspace/tools/budgets so
+/// resolution and restart revalidation can reject changed or expired
+/// identities before a child is created exactly once.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the payload binds every exact identity component for restart revalidation"
+)]
+pub struct ChildApprovalContinuation {
+    /// Canonical session containing the pending child.
+    pub session_id: String,
+    /// Workspace selected for the turn.
+    pub workspace: String,
+    /// Provider adapter selected for the turn.
+    pub provider: String,
+    /// Provider model selected for the turn.
+    pub model: String,
+    /// Provider-specific request options.
+    pub options: Value,
+    /// Session style selected for execution.
+    pub style: String,
+    /// Stable cancellation identifier for the turn.
+    pub cancellation_id: String,
+    /// Exact child execution identity.
+    pub execution_id: String,
+    /// Runtime-owned task identity.
+    pub task_id: String,
+    /// Spawn node that owns the child.
+    pub node_id: String,
+    /// One-based node attempt.
+    pub attempt: u32,
+    /// Zero-based loop iteration.
+    pub loop_iteration: u32,
+    /// One-based graph step.
+    pub step: u64,
+    /// Exact bound child style selector.
+    pub child_style: String,
+    /// Exact bound workspace mode.
+    pub workspace_mode: String,
+    /// Exact bound tool groups.
+    pub tool_groups: Vec<String>,
+    /// Exact bound token budget.
+    pub token_budget: u64,
+    /// Portable approval expiry in Unix milliseconds.
+    pub expires_at_ms: i64,
 }
 
 /// Logic-owned restart-safe tool approval payload.
@@ -657,6 +709,27 @@ fn validate_payload(
         {
             Err(ContinuationLogicError::InvalidPayload)
         }
+        ContinuationPayload::ChildApproval(child)
+            if child.session_id != session_id
+                || child.workspace.trim().is_empty()
+                || child.provider.trim().is_empty()
+                || child.model.trim().is_empty()
+                || !child.options.is_object()
+                || child.style.trim().is_empty()
+                || child.cancellation_id.trim().is_empty()
+                || child.execution_id.trim().is_empty()
+                || child.task_id.trim().is_empty()
+                || child.node_id.trim().is_empty()
+                || child.attempt == 0
+                || child.step == 0
+                || child.child_style.trim().is_empty()
+                || child.workspace_mode.trim().is_empty()
+                || child.tool_groups.len() > 64
+                || child.token_budget == 0
+                || child.expires_at_ms <= 0 =>
+        {
+            Err(ContinuationLogicError::InvalidPayload)
+        }
         ContinuationPayload::Opaque(label) if label.trim().is_empty() => {
             Err(ContinuationLogicError::InvalidPayload)
         }
@@ -722,6 +795,28 @@ fn to_data_payload(payload: ContinuationPayload) -> ContinuationPayloadRecord {
                 cancellation_id: turn.cancellation_id,
             }))
         }
+        ContinuationPayload::ChildApproval(child) => {
+            ContinuationPayloadRecord::ChildApproval(Box::new(ChildApprovalPayloadRecord {
+                session_id: child.session_id,
+                workspace: child.workspace,
+                provider: child.provider,
+                model: child.model,
+                options: child.options,
+                style: child.style,
+                cancellation_id: child.cancellation_id,
+                execution_id: child.execution_id,
+                task_id: child.task_id,
+                node_id: child.node_id,
+                attempt: child.attempt,
+                loop_iteration: child.loop_iteration,
+                step: child.step,
+                child_style: child.child_style,
+                workspace_mode: child.workspace_mode,
+                tool_groups: child.tool_groups,
+                token_budget: child.token_budget,
+                expires_at_ms: child.expires_at_ms,
+            }))
+        }
         ContinuationPayload::Opaque(label) => ContinuationPayloadRecord::Opaque { label },
     }
 }
@@ -782,6 +877,28 @@ fn from_data_payload(payload: ContinuationPayloadRecord) -> ContinuationPayload 
                 options: turn.options,
                 style: turn.style,
                 cancellation_id: turn.cancellation_id,
+            }))
+        }
+        ContinuationPayloadRecord::ChildApproval(child) => {
+            ContinuationPayload::ChildApproval(Box::new(ChildApprovalContinuation {
+                session_id: child.session_id,
+                workspace: child.workspace,
+                provider: child.provider,
+                model: child.model,
+                options: child.options,
+                style: child.style,
+                cancellation_id: child.cancellation_id,
+                execution_id: child.execution_id,
+                task_id: child.task_id,
+                node_id: child.node_id,
+                attempt: child.attempt,
+                loop_iteration: child.loop_iteration,
+                step: child.step,
+                child_style: child.child_style,
+                workspace_mode: child.workspace_mode,
+                tool_groups: child.tool_groups,
+                token_budget: child.token_budget,
+                expires_at_ms: child.expires_at_ms,
             }))
         }
         ContinuationPayloadRecord::Opaque { label } => ContinuationPayload::Opaque(label),

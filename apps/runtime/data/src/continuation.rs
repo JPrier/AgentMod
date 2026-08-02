@@ -55,6 +55,8 @@ pub enum ContinuationPayloadRecord {
     StyleApproval(Box<StyleApprovalPayloadRecord>),
     /// A complete provider turn deferred until an authenticated scheduler claim.
     DeferredTurn(Box<DeferredTurnPayloadRecord>),
+    /// A durable runtime-owned child-creation approval waiting for resolution.
+    ChildApproval(Box<ChildApprovalPayloadRecord>),
     /// Generic fixture payload used by storage-only callers.
     Opaque {
         /// Stable non-secret label.
@@ -116,6 +118,47 @@ pub struct DeferredTurnPayloadRecord {
     pub style: String,
     /// Stable cancellation identity for the deferred turn.
     pub cancellation_id: String,
+}
+
+/// Data-owned restart-safe durable child-creation approval payload.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ChildApprovalPayloadRecord {
+    /// Session identifier used for defense-in-depth validation.
+    pub session_id: String,
+    /// Canonical workspace text.
+    pub workspace: String,
+    /// Provider selected for the resumed turn.
+    pub provider: String,
+    /// Model selected for the resumed turn.
+    pub model: String,
+    /// Provider-specific options.
+    pub options: serde_json::Value,
+    /// Explicit session style.
+    pub style: String,
+    /// Stable cancellation identity for the turn.
+    pub cancellation_id: String,
+    /// Exact child execution identity.
+    pub execution_id: String,
+    /// Runtime-owned task identity.
+    pub task_id: String,
+    /// Spawn node that owns the child.
+    pub node_id: String,
+    /// One-based node attempt.
+    pub attempt: u32,
+    /// Zero-based loop iteration.
+    pub loop_iteration: u32,
+    /// One-based graph step.
+    pub step: u64,
+    /// Exact bound child style selector.
+    pub child_style: String,
+    /// Exact bound workspace mode.
+    pub workspace_mode: String,
+    /// Exact bound tool groups.
+    pub tool_groups: Vec<String>,
+    /// Exact bound token budget.
+    pub token_budget: u64,
+    /// Portable approval expiry in Unix milliseconds.
+    pub expires_at_ms: i64,
 }
 
 /// Data-owned restart-safe tool approval payload.

@@ -898,6 +898,7 @@ dependencies = [
  "agentmod-runtime-data",
  "agentmod-session-style-sdk",
  "async-trait",
+ "futures",
  "semver",
  "serde",
  "serde_json",

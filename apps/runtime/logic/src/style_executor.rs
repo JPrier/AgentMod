@@ -395,7 +395,7 @@ impl CompiledStyleExecutor {
     /// Returns whether this graph is the bounded planner/worker/reviewer
     /// lifecycle supported by the runtime-owned child-session adapter.
     fn supports_planner_worker_reviewer(&self) -> bool {
-        if self.compiled.graph.nodes.len() != 7 || self.compiled.graph.edges.len() != 7 {
+        if self.compiled.graph.nodes.len() != 8 || self.compiled.graph.edges.len() != 10 {
             return false;
         }
         let Ok(plan) = self.entry() else {
@@ -407,7 +407,28 @@ impl CompiledStyleExecutor {
         let Ok(Some(wait)) = self.transition(spawn.to.index, &serde_json::json!({})) else {
             return false;
         };
-        let Ok(Some(integrate)) = self.transition(wait.to.index, &serde_json::json!({})) else {
+        let Ok(Some(waves)) = self.transition(
+            wait.to.index,
+            &serde_json::json!({"tasks":{"ready_remaining":true}}),
+        ) else {
+            return false;
+        };
+        let Ok(Some(integrate)) = self.transition(
+            wait.to.index,
+            &serde_json::json!({"tasks":{"ready_remaining":false}}),
+        ) else {
+            return false;
+        };
+        let Ok(Some(next_wave)) = self.transition(
+            waves.to.index,
+            &serde_json::json!({"tasks":{"ready_remaining":true}}),
+        ) else {
+            return false;
+        };
+        let Ok(Some(integrated)) = self.transition(
+            waves.to.index,
+            &serde_json::json!({"tasks":{"ready_remaining":false}}),
+        ) else {
             return false;
         };
         let Ok(Some(review)) = self.transition(integrate.to.index, &serde_json::json!({})) else {
@@ -431,6 +452,10 @@ impl CompiledStyleExecutor {
         plan.directive == StyleNodeDirective::ModelCall
             && spawn.to.directive == StyleNodeDirective::SpawnChildAgent
             && wait.to.directive == StyleNodeDirective::WaitForAgents
+            && waves.to.directive == StyleNodeDirective::Loop
+            && waves.to.max_iterations.is_some()
+            && next_wave.to.index == spawn.to.index
+            && integrated.to.index == integrate.to.index
             && integrate.to.directive == StyleNodeDirective::ModelCall
             && review.to.directive == StyleNodeDirective::Review
             && revision.to.directive == StyleNodeDirective::Loop

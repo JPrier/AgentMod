@@ -9,21 +9,25 @@ pub mod conversation;
 pub mod harness;
 pub mod harness_registry;
 pub mod history;
+pub mod integration;
 pub mod interception;
 pub mod introspection;
 pub mod memory;
 pub mod node_executor;
 pub mod permission;
 pub mod persistence;
+pub mod planner;
 pub mod plugin;
 pub(crate) mod projection;
 pub mod registry;
+pub mod result_package;
 pub mod scheduler;
 pub mod session;
 pub mod style;
 pub(crate) mod style_executor;
 pub mod tool;
 pub mod turn;
+pub mod workspace;
 
 use std::path::PathBuf;
 

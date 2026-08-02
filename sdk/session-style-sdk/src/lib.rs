@@ -14,9 +14,11 @@ pub use model::{
     ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits, ChildCancellationBehavior,
     ChildJoinBehavior, ChildMemoryAccess, ChildWorkspaceMode, CompactionPreservationRequirement,
     CompactionSelection, CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource,
-    HarnessSelection, InterceptorDeclaration, MemoryInjectionLocation, MemoryQueryConstruction,
-    MemoryQuerySource, MemoryRetrievalTiming, MemoryScope, MemorySelection, MemoryWritePolicy,
-    RetryPolicy, SessionStyleManifest, StyleIdentity, StyleKind, TerminationOutcome,
+    HarnessSelection, InterceptorDeclaration, MemoryAutoWriteSelection, MemoryAutoWriteTrigger,
+    MemoryContentCategory, MemoryDedupPolicy, MemoryInjectionLocation, MemoryQueryConstruction,
+    MemoryQuerySource, MemoryRetentionPolicy, MemoryRetrievalTiming, MemoryScope, MemorySelection,
+    MemoryWriteApprovalMode, MemoryWriteFailureBehavior, MemoryWritePolicy, RetryPolicy,
+    SessionStyleManifest, StyleIdentity, StyleKind, SummaryCompactionSelection, TerminationOutcome,
     TerminationPolicy, TopLevelSelection,
 };
 pub use parsing::{ManifestFormat, ManifestParseError, parse_json, parse_toml, to_json, to_toml};

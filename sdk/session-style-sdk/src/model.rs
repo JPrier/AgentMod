@@ -202,6 +202,129 @@ pub struct MemorySelection {
     /// Provider-projection location for approved retrieved records.
     #[serde(default)]
     pub injection_location: MemoryInjectionLocation,
+    /// Style-selected automatic memory-write policy, when active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_write: Option<MemoryAutoWriteSelection>,
+}
+
+/// Style-selected automatic memory-write policy.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryAutoWriteSelection {
+    /// Lifecycle boundary that proposes the automatic write.
+    pub trigger: MemoryAutoWriteTrigger,
+    /// Content categories eligible for automatic retention.
+    #[serde(default)]
+    pub categories: Vec<MemoryContentCategory>,
+    /// Target scope for automatic writes.
+    pub scope: MemoryScope,
+    /// Provider used for writes; `none` selects the retrieval provider.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Maximum retained writes per (provider, scope) key.
+    pub max_records: u32,
+    /// Maximum bytes retained by one automatic write.
+    pub max_bytes: u32,
+    /// Cross-restart duplicate prevention policy.
+    #[serde(default)]
+    pub dedup: MemoryDedupPolicy,
+    /// Retention policy applied at the provider.
+    #[serde(default)]
+    pub retention: MemoryRetentionPolicy,
+    /// Approval mode for the write proposal.
+    #[serde(default)]
+    pub approval: MemoryWriteApprovalMode,
+    /// Failure behavior when policy or the provider rejects the write.
+    #[serde(default)]
+    pub failure: MemoryWriteFailureBehavior,
+}
+
+/// Lifecycle boundary that may propose an automatic memory write.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryAutoWriteTrigger {
+    /// Automatic writes are disabled.
+    #[default]
+    Never,
+    /// Propose one write after a successful turn completion.
+    TurnCompletion,
+    /// Propose one write after a successful bounded iteration completion.
+    IterationCompletion,
+    /// Propose one write when the session reaches a terminal success.
+    SessionCompletion,
+    /// Propose one write after a research finding is persisted.
+    ResearchFindingPersisted,
+    /// Propose one write after a runtime-managed child session completes.
+    ChildCompletion,
+    /// Propose one write after a reviewer approval.
+    ReviewerApproval,
+    /// Propose one write when an explicit memory-extraction node executes.
+    ExplicitNode,
+}
+
+/// Content category eligible for automatic retention.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryContentCategory {
+    /// Visible assistant output text.
+    #[default]
+    AssistantText,
+    /// User constraints and explicit instructions.
+    UserConstraints,
+    /// Bounded tool-result content.
+    ToolResults,
+    /// Persisted research findings.
+    Findings,
+    /// Reviewer decisions and findings.
+    Reviews,
+    /// Immutable artifact references.
+    ArtifactReferences,
+}
+
+/// Cross-restart duplicate prevention policy for automatic memory writes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryDedupPolicy {
+    /// Retain every proposed write.
+    None,
+    /// Deduplicate on provider, scope, source, and content identity.
+    #[default]
+    CanonicalIdentity,
+    /// Deduplicate on the exact content digest only.
+    ContentOnly,
+}
+
+/// Provider retention policy for automatic memory writes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryRetentionPolicy {
+    /// Retain until an explicit removal policy acts.
+    #[default]
+    Permanent,
+    /// Retain with the owning session.
+    Session,
+}
+
+/// Approval mode for an automatic memory-write proposal.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryWriteApprovalMode {
+    /// Traverse mandatory policy only; user approval is never required.
+    #[default]
+    MandatoryOnly,
+    /// The write enters the durable user-approval continuation path.
+    RequireUserApproval,
+}
+
+/// Failure behavior when an automatic memory write cannot complete.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryWriteFailureBehavior {
+    /// Fail the owning turn with a canonical write failure.
+    FailTurn,
+    /// Skip this write and continue the owning turn.
+    #[default]
+    Skip,
 }
 
 /// Memory retrieval lifecycle boundary.
@@ -333,6 +456,35 @@ pub struct CompactionSelection {
     /// Typed provider-projection records a compactor must retain.
     #[serde(default = "default_compaction_preservation_requirements")]
     pub preservation_requirements: Vec<CompactionPreservationRequirement>,
+    /// Explicit provider/model selection for live typed-summary compaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SummaryCompactionSelection>,
+    /// Maximum provider-visible summary content bytes.
+    #[serde(default = "default_summary_max_bytes")]
+    pub summary_max_bytes: u32,
+    /// Canonical bounded summary schema version written by the runtime.
+    #[serde(default = "default_summary_schema_version")]
+    pub summary_schema_version: u16,
+}
+
+fn default_summary_max_bytes() -> u32 {
+    64 * 1024
+}
+
+fn default_summary_schema_version() -> u16 {
+    1
+}
+
+/// Explicit provider/model selection for one live typed-summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryCompactionSelection {
+    /// Provider used for the summary model request.
+    pub provider: String,
+    /// Model used for the summary model request.
+    pub model: String,
+    /// Maximum provider tokens consumed by one summary call.
+    pub max_request_tokens: u64,
 }
 
 /// Provider-projection records which a compaction strategy must retain.

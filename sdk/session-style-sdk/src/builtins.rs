@@ -12,6 +12,14 @@ use crate::{
     TerminationPolicy, TopLevelSelection,
 };
 
+fn default_summary_max_bytes() -> u32 {
+    64 * 1024
+}
+
+fn default_summary_schema_version() -> u16 {
+    1
+}
+
 /// Constructs one of the five required built-in semantic descriptors.
 #[must_use]
 pub fn built_in_manifest(style: BuiltInStyle) -> SessionStyleManifest {
@@ -282,6 +290,7 @@ fn file_memory() -> MemorySelection {
         max_injected_bytes: 256 * 1024,
         write_policy: MemoryWritePolicy::TurnCompletion,
         injection_location: MemoryInjectionLocation::BeforeCurrentInput,
+        auto_write: None,
     }
 }
 
@@ -300,6 +309,7 @@ fn research_memory() -> MemorySelection {
         max_injected_bytes: 512 * 1024,
         write_policy: MemoryWritePolicy::IterationCompletion,
         injection_location: MemoryInjectionLocation::BeforeCurrentInput,
+        auto_write: None,
     }
 }
 
@@ -318,6 +328,7 @@ fn planner_memory() -> MemorySelection {
         max_injected_bytes: 512 * 1024,
         write_policy: MemoryWritePolicy::SessionCompletion,
         injection_location: MemoryInjectionLocation::BeforeCurrentInput,
+        auto_write: None,
     }
 }
 
@@ -331,6 +342,7 @@ fn no_memory() -> MemorySelection {
         max_injected_bytes: 0,
         write_policy: MemoryWritePolicy::Never,
         injection_location: MemoryInjectionLocation::None,
+        auto_write: None,
     }
 }
 
@@ -343,6 +355,9 @@ fn summary_compaction() -> CompactionSelection {
         preserve_unresolved_tasks: true,
         preserve_active_processes: true,
         preservation_requirements: required_projection_records(),
+        summary: None,
+        summary_max_bytes: default_summary_max_bytes(),
+        summary_schema_version: default_summary_schema_version(),
     }
 }
 
@@ -355,6 +370,9 @@ fn no_compaction() -> CompactionSelection {
         preserve_unresolved_tasks: true,
         preserve_active_processes: true,
         preservation_requirements: required_projection_records(),
+        summary: None,
+        summary_max_bytes: default_summary_max_bytes(),
+        summary_schema_version: default_summary_schema_version(),
     }
 }
 

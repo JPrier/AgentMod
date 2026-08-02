@@ -338,11 +338,11 @@ fn ephemeral_turn_version_selection_and_cache_identity_are_exact_and_determinist
     );
     assert_eq!(
         first.cache_key.style_content_hash.to_hex(),
-        "c28950785dcadaffd12861df0b02bac671f82a7a0d9f65a3cda9451def5feeda"
+        "2c6dd271c61cbdd0fb15eeac9ac24163065c7ff868b72669cdac42f615e36369"
     );
     assert_eq!(
         first.cache_key.combined_hash.to_hex(),
-        "941929db2f0536e7624467a0ade02c9ccd95ea2edc02bc4285f18a309d92fb93"
+        "9303fe9efc4c07bde98516b02ecae637048bc50a7328842e016289f0c266cff6"
     );
 
     let json = to_json(&manifest).expect("ephemeral JSON");
@@ -513,11 +513,11 @@ fn research_loop_version_and_cache_identity_are_exact_and_deterministic() {
     assert_eq!(first.style_version, "1.1.0");
     assert_eq!(
         first.cache_key.style_content_hash.to_hex(),
-        "4df10d7ea07306da14dc6735af520d37f3fb8ccf6136ebeca99dd378817a1bf2"
+        "643bd0a61de2a1508687ff97394258671e6d19a942b1c163b8c961c873272f29"
     );
     assert_eq!(
         first.cache_key.combined_hash.to_hex(),
-        "f7d30ae18e812512ccce77e379fec38b289dcd321d5e584c1ec50fa53f998276"
+        "2bc54543e69f08dde76c753df0b31b998bd3473a6c3aaecaafbe5f9584cabe20"
     );
 
     let json = to_json(&manifest).expect("research JSON");
@@ -666,11 +666,11 @@ fn declarative_graph_version_and_cache_identity_are_exact_and_deterministic() {
     assert_eq!(first.style_version, "1.1.0");
     assert_eq!(
         first.cache_key.style_content_hash.to_hex(),
-        "4771b38f94121592175bff6ff9766f725e6a72efd493bd43e0ee3168ea4034b7"
+        "8ba8ee2ae61a2a94e28ded954fd11f6152b051493952b0f8638da63498611e73"
     );
     assert_eq!(
         first.cache_key.combined_hash.to_hex(),
-        "579af94d1a645cbeccabf59b174232fa874deeef94c6a4311e9e087202a266cf"
+        "31612dceff808a7da584e4e43a5cd03eae4ae9e33949c4a1b3f51861d59f042f"
     );
 
     let json = to_json(&manifest).expect("declarative JSON");

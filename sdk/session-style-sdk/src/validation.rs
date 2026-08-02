@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ApprovalDefaults, BuiltInStyle, ChildAgentLimits, ChildWorkspaceMode, CompactionSelection,
     CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource, InterceptorDeclaration,
-    MemoryInjectionLocation, MemoryRetrievalTiming, MemorySelection, MemoryWritePolicy,
-    RetryPolicy, SessionStyleManifest, StyleKind, TerminationOutcome, TerminationPolicy,
-    TopLevelSelection,
+    MemoryAutoWriteSelection, MemoryAutoWriteTrigger, MemoryInjectionLocation, MemoryRetrievalTiming,
+    MemoryScope, MemorySelection, MemoryWritePolicy, RetryPolicy,
+    SessionStyleManifest, StyleKind, TerminationOutcome, TerminationPolicy, TopLevelSelection,
 };
 
 /// Current session-style manifest schema.
@@ -261,6 +261,7 @@ pub fn compile_style(
     validate_compaction(
         &manifest.compaction,
         context,
+        limits,
         manifest.budgets.max_tokens,
         &root,
         &mut diagnostics,
@@ -821,11 +822,62 @@ fn validate_memory(
             "use never/never/none for disabled memory; active retrieval requires a bounded query and injection location",
         ));
     }
+    if let Some(auto_write) = memory.auto_write.as_ref() {
+        validate_auto_write(auto_write, memory, context, limits, root, diagnostics);
+    }
 }
+
+fn validate_auto_write(
+    auto_write: &MemoryAutoWriteSelection,
+    memory: &MemorySelection,
+    context: &CompileContext,
+    limits: StyleCompilerLimits,
+    root: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if auto_write.trigger == MemoryAutoWriteTrigger::Never {
+        return;
+    }
+    let provider = auto_write.provider.as_deref().unwrap_or("none");
+    let valid_provider = provider == "none"
+        || memory.provider != "none" && provider == memory.provider
+        || context.memory_providers.contains(provider);
+    let valid_bounds = auto_write.max_records > 0
+        && auto_write.max_records <= limits.max_memory_items
+        && auto_write.max_bytes > 0
+        && u64::from(auto_write.max_bytes) <= limits.max_memory_bytes;
+    if !valid_provider || !valid_bounds {
+        diagnostics.push(error(
+            "STYLE032",
+            format!("{root}.memory.auto_write"),
+            "automatic memory writes select an unavailable provider or exceed bounds",
+            "use an available provider and positive bounded record/byte limits",
+        ));
+    }
+    let scoped = matches!(
+        auto_write.scope,
+        MemoryScope::Session | MemoryScope::Project | MemoryScope::User | MemoryScope::Runtime
+    );
+    if !scoped || auto_write.categories.is_empty() {
+        diagnostics.push(error(
+            "STYLE033",
+            format!("{root}.memory.auto_write"),
+            "automatic memory writes must select a scope and eligible content categories",
+            "select at least one eligible content category and a supported scope",
+        ));
+    }
+    validate_unique_values(
+        &auto_write.categories,
+        &format!("{root}.memory.auto_write.categories"),
+        diagnostics,
+    );
+}
+
 
 fn validate_compaction(
     compaction: &CompactionSelection,
     context: &CompileContext,
+    limits: StyleCompilerLimits,
     max_tokens: u64,
     root: &str,
     diagnostics: &mut Vec<Diagnostic>,
@@ -870,6 +922,24 @@ fn validate_compaction(
             format!("{root}.compaction"),
             "compaction context budgets are inconsistent with the provider projection bound",
             "use zero context controls for none, or reserve fewer tokens than a bounded projection within the style token budget",
+        ));
+    }
+    let valid_summary = compaction.strategy != CompactionStrategy::Summary
+        || (compaction.summary_max_bytes > 0
+            && u64::from(compaction.summary_max_bytes) <= limits.max_memory_bytes
+            && compaction.summary_schema_version == 1
+            && compaction.summary.as_ref().is_none_or(|summary| {
+                is_name(&summary.provider)
+                    && is_name(&summary.model)
+                    && summary.max_request_tokens > 0
+                    && summary.max_request_tokens <= max_tokens
+            }));
+    if !valid_summary {
+        diagnostics.push(error(
+            "STYLE034",
+            format!("{root}.compaction.summary"),
+            "typed-summary compaction has invalid summary bounds or provider/model selection",
+            "use schema version 1 with a positive bounded summary size; any explicit summary provider/model must be named with a positive request-token bound within the style budget",
         ));
     }
 }

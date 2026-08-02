@@ -47,6 +47,7 @@ pub fn select_memory_provider(manifest: &mut SessionStyleManifest, provider: &st
         manifest.memory.max_injected_bytes = 0;
         manifest.memory.write_policy = MemoryWritePolicy::Never;
         manifest.memory.injection_location = MemoryInjectionLocation::None;
+        manifest.memory.auto_write = None;
         return;
     }
     if manifest.memory.provider == "none" {
@@ -89,6 +90,7 @@ pub fn select_compaction_strategy(
         manifest.compaction.trigger_tokens = None;
         manifest.compaction.reserved_context_tokens = 0;
         manifest.compaction.max_provider_projection_tokens = 0;
+        manifest.compaction.summary = None;
         return Ok(());
     }
     if manifest.compaction.strategy == CompactionStrategy::None {

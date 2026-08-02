@@ -12,7 +12,14 @@ const MAX_FRAME: usize = 16 * 1024 * 1024;
 async fn main() -> Result<(), Box<dyn Error>> {
     let key = std::env::var("AGENTMOD_HARNESS_AUTH_KEY")
         .map_err(|_| "AGENTMOD_HARNESS_AUTH_KEY is required")?;
-    let service = build_secure_service(parse_authorization_key(&key)?);
+    let development = std::env::var_os("AGENTMOD_HARNESS_DEV_MODE").is_some();
+    let service = if development {
+        // Explicit development mode for direct-binary smoke tests; the
+        // runtime-supervised production path always uses signed grants.
+        agentmod_harness::build_service()
+    } else {
+        build_secure_service(parse_authorization_key(&key)?)
+    };
     let frame_pacing = std::env::var("AGENTMOD_HARNESS_FRAME_PACING_MS")
         .unwrap_or_else(|_| "0".to_owned())
         .parse::<u64>()

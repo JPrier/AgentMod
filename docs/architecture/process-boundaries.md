@@ -15,7 +15,11 @@ desynchronization, and never automatically retries an ambiguous provider
 exchange. Runtime and harness negotiate provider behavior through
 `agentmod-harness-protocol`. The composition root registers the native adapter
 and an independent deterministic fixture adapter; neither adapter is imported
-as a runtime internal.
+as a runtime internal. A genuinely independent second harness binary
+(`agentmod-harness-fixture`, `independent-fixture` v2.0.0) implements the same
+protocol with its own N-tier crates and deliberately distinct capabilities,
+proving harness selection is not hard-coded; it is exercised by process
+conformance tests and `tests/e2e/independent_harness.ps1`/`.sh`.
 
 Harness process launch uses a runtime-generated 256-bit key passed only through
 the child environment. Each approved model action receives a short-lived,

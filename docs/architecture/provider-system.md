@@ -45,6 +45,16 @@ reconnect-from-sequence without repeating effects. Interactive TUI rendering
 is live; continuous live subscription after catch-up remains incomplete.
 
 OpenAI-compatible, OpenRouter, OpenAI, Anthropic, Gemini, and local HTTP
-adapters, authentication, live discovery, structured output, cost metadata, and
-provider-specific retry classification remain to be implemented. No
-live-provider compatibility claim is made yet.
+adapters are now implemented in the harness dependency layer with shared SSE
+normalization (fragmented UTF-8, keepalives, bounded frames), provider-specific
+wire serialization and errors isolated per adapter, retry classification that
+never auto-retries ambiguous exchanges, redacted authentication, usage/cost
+metadata with pricing-record identity, and environment/file secret references.
+A bounded provider/model catalog is exposed through the additive `Catalog`
+wire command. Every wire format has deterministic local HTTP fixture coverage;
+live-provider claims still require the opt-in smoke scripts and are not
+required by default CI. A genuinely independent second harness binary
+(`agentmod-harness-fixture`, `independent-fixture` v2.0.0) implements the
+protocol with its own N-tier crates and distinct capabilities, proving harness
+selection is not hard-coded. See `docs/guides/providers.md` and
+`docs/integration/TASK-08-live-providers.md`.

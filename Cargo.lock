@@ -442,6 +442,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentmod-graph-state"
+version = "0.1.0"
+dependencies = [
+ "agentmod-event-model",
+ "agentmod-expression-engine",
+ "agentmod-primitives",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "uuid",
+]
+
+[[package]]
 name = "agentmod-harness"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,27 @@
+[package]
+name = "agentmod-graph-state"
+description = "Canonical typed graph variables, merge semantics, deterministic conditions, and execution-budget accounting for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-event-model = { path = "../event-model" }
+agentmod-expression-engine = { path = "../expression-engine" }
+agentmod-primitives = { path = "../primitives" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "core"
+domain = "graph-state"

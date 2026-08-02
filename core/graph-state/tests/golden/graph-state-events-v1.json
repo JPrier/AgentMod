@@ -1,0 +1,141 @@
+[
+  {
+    "event": "variables_initialized",
+    "value": {
+      "session_id": "00000000-0000-0000-0000-000000000000",
+      "declarations_hash": "5854b35cf5c18be3df795310567c7e5009dd71676641c1b703a9551770975898",
+      "declarations": [
+        {
+          "name": "counter",
+          "type": {
+            "type": "unsigned_integer",
+            "value": {
+              "min": 0,
+              "max": 100000
+            }
+          },
+          "scope": {
+            "kind": "run"
+          },
+          "producers": [],
+          "consumers": [],
+          "mutability": "assignable",
+          "max_serialized_bytes": 16384,
+          "classification": "session_internal",
+          "merge_policy": {
+            "policy": "reject_conflict"
+          },
+          "default": null
+        },
+        {
+          "name": "notes",
+          "type": {
+            "type": "list",
+            "value": {
+              "element": {
+                "type": "string",
+                "value": {
+                  "max_bytes": 128
+                }
+              },
+              "max_len": 64
+            }
+          },
+          "scope": {
+            "kind": "run"
+          },
+          "producers": [],
+          "consumers": [],
+          "mutability": "assignable",
+          "max_serialized_bytes": 16384,
+          "classification": "session_internal",
+          "merge_policy": {
+            "policy": "set_union"
+          },
+          "default": null
+        }
+      ]
+    }
+  },
+  {
+    "event": "variable_assigned",
+    "value": {
+      "name": "counter",
+      "scope": {
+        "kind": "run"
+      },
+      "style_run": "run-1",
+      "prior_version": 0,
+      "version": 1,
+      "value": {
+        "type": "unsigned_integer",
+        "value": 42
+      },
+      "value_hash": "280427e5503c84187e5300074a03702011603f6345b02c19129f608b3efe4804"
+    }
+  },
+  {
+    "event": "branch_scope_created",
+    "value": {
+      "branch_id": "b1",
+      "policy": "isolated"
+    }
+  },
+  {
+    "event": "variable_assigned",
+    "value": {
+      "name": "notes",
+      "scope": {
+        "kind": "branch",
+        "id": {
+          "branch_id": "b1"
+        }
+      },
+      "style_run": "run-1",
+      "prior_version": 0,
+      "version": 1,
+      "value": {
+        "type": "list",
+        "value": [
+          {
+            "type": "string",
+            "value": "note-a"
+          }
+        ]
+      },
+      "value_hash": "9cb2fd558586b9a04250e14d689ae6ce1a6d94f41094726d04e80f49c28e7dcb"
+    }
+  },
+  {
+    "event": "variable_merged",
+    "value": {
+      "name": "notes",
+      "scope": {
+        "kind": "run"
+      },
+      "policy": {
+        "policy": "set_union"
+      },
+      "contributors": [
+        "b1"
+      ],
+      "version": 1,
+      "value": {
+        "type": "list",
+        "value": [
+          {
+            "type": "string",
+            "value": "note-a"
+          }
+        ]
+      },
+      "value_hash": "9cb2fd558586b9a04250e14d689ae6ce1a6d94f41094726d04e80f49c28e7dcb"
+    }
+  },
+  {
+    "event": "branch_scope_closed",
+    "value": {
+      "branch_id": "b1"
+    }
+  }
+]

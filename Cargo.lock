@@ -907,7 +907,9 @@ version = "0.1.0"
 dependencies = [
  "agentmod-event-model",
  "agentmod-event-pipeline",
+ "agentmod-expression-engine",
  "agentmod-graph-engine",
+ "agentmod-graph-state",
  "agentmod-primitives",
  "agentmod-runtime-data",
  "agentmod-session-style-sdk",

@@ -624,10 +624,22 @@ impl GraphState {
     ///
     /// Returns [`GraphStateError::InconsistentEvent`] when the event cannot be
     /// applied exactly to the current state.
+    /// Applies a canonical event during replay.
+    ///
+    /// This is the raw mutation surface used by the replay reducer. Events
+    /// are validated exactly (declared variables, types, sizes, version
+    /// continuity, value hashes, scope existence) and the state fails closed
+    /// on tampering. Prefer [`GraphStateReducer`] for stream-level replay
+    /// ordering; direct callers must ensure initialization precedes use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GraphStateError::InconsistentEvent`] when the event cannot be
+    /// applied exactly to the current state.
     // The reducer is deliberately one exhaustive match: each arm mirrors the
     // committing operation exactly, and splitting it would hide ordering bugs.
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn apply_event(&mut self, event: &GraphStateEvent) -> Result<(), GraphStateError> {
+    pub fn apply_event(&mut self, event: &GraphStateEvent) -> Result<(), GraphStateError> {
         match event {
             GraphStateEvent::VariablesInitialized {
                 session_id,

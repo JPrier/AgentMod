@@ -64,7 +64,7 @@ pub mod audit_outcome {
 }
 
 /// Dependency-owned plugin classification.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyPluginClass {
     /// Blocking interceptor.
@@ -86,7 +86,7 @@ pub enum DependencyPluginClass {
 }
 
 /// Dependency-owned entrypoint.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DependencyEntrypoint {
     /// Executable.
     pub program: String,
@@ -95,7 +95,7 @@ pub struct DependencyEntrypoint {
 }
 
 /// Dependency-owned configuration schema.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DependencyConfigurationSchema {
     /// ID.
     pub id: String,
@@ -108,7 +108,7 @@ pub struct DependencyConfigurationSchema {
 }
 
 /// Dependency-owned graph node executor declaration.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DependencyNodeExecutor {
     /// Executor ID.
     pub executor_id: String,
@@ -139,7 +139,7 @@ pub struct DependencyNodeExecutor {
 }
 
 /// Dependency-owned memory declaration.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DependencyMemoryDeclaration {
     /// Scopes.
     pub scopes: BTreeSet<String>,
@@ -150,7 +150,7 @@ pub struct DependencyMemoryDeclaration {
 }
 
 /// Dependency-owned compaction declaration.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DependencyCompactionDeclaration {
     /// Strategy ID.
     pub strategy_id: String,
@@ -161,7 +161,7 @@ pub struct DependencyCompactionDeclaration {
 }
 
 /// Dependency-owned context transform boundary.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DependencyContextTransformBoundary {
     /// Before memory retrieval.
@@ -179,7 +179,7 @@ pub enum DependencyContextTransformBoundary {
 }
 
 /// Dependency-owned context transform declaration.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DependencyContextTransform {
     /// Transform ID.
     pub transform_id: String,
@@ -196,7 +196,7 @@ pub struct DependencyContextTransform {
 }
 
 /// Dependency-owned observer delivery semantics.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum DependencyObserverDelivery {
     /// Best effort.
@@ -213,7 +213,7 @@ pub enum DependencyObserverDelivery {
 }
 
 /// Dependency-owned manifest.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DependencyManifest {
     /// Schema version.
     pub schema_version: u16,
@@ -524,7 +524,8 @@ pub struct DependencyObservationResult {
 }
 
 /// Plugin status.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DependencyPluginStatus {
     /// Active.
     Active,
@@ -748,6 +749,14 @@ struct ObserverWork {
 struct PersistedState {
     version: u32,
     value: Value,
+}
+
+/// Durable catalog entry restored by a fresh host after an idle restart.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PersistedPluginRecord {
+    manifest: DependencyManifest,
+    configuration: Value,
+    status: DependencyPluginStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -1126,6 +1135,89 @@ impl IsolatedPluginDependency {
         )
         .await
     }
+
+    async fn persist_loaded_catalog(&self) -> Result<(), PluginDependencyError> {
+        let plugins = self.plugins.lock().await;
+        let mut records = Vec::with_capacity(plugins.len());
+        for plugin in plugins.values() {
+            records.push(PersistedPluginRecord {
+                manifest: plugin.manifest.clone(),
+                configuration: plugin.configuration.clone(),
+                status: *plugin.status.read().await,
+            });
+        }
+        persist_json(&self.config.state_root.join("loaded.json"), &records).await
+    }
+
+    /// Restores the durable plugin catalog after a host restart so that a
+    /// lazily restarted host needs no retained process while dormant but still
+    /// serves every activated plugin.
+    ///
+    /// Failed restores (for example an executable that is no longer approved)
+    /// are quarantined so the runtime fails closed instead of invoking an
+    /// unavailable plugin.
+    pub async fn restore_loaded_plugins(&self) -> Result<usize, PluginDependencyError> {
+        let records =
+            load_json::<Vec<PersistedPluginRecord>>(&self.config.state_root.join("loaded.json"))
+                .await?
+                .unwrap_or_default();
+        let mut restored: usize = 0;
+        for record in records {
+            if let Err(error) =
+                validate_executable(&record.manifest.entrypoint.program, &self.config).await
+            {
+                let _ = error;
+                self.audit(DependencyAudit {
+                    plugin_id: record.manifest.id.clone(),
+                    invocation_id: None,
+                    operation: "restore".to_owned(),
+                    outcome: audit_outcome::QUARANTINED.to_owned(),
+                    attempts: 1,
+                })
+                .await;
+                self.plugins.lock().await.insert(
+                    record.manifest.id.clone(),
+                    LoadedPlugin {
+                        manifest: record.manifest.clone(),
+                        configuration: record.configuration,
+                        status: Arc::new(RwLock::new(DependencyPluginStatus::Quarantined)),
+                        observer: None,
+                        observer_depth: Arc::new(AtomicU64::new(0)),
+                        dropped: Arc::new(AtomicU64::new(0)),
+                    },
+                );
+                continue;
+            }
+            let depth = Arc::new(AtomicU64::new(0));
+            let dropped = Arc::new(AtomicU64::new(0));
+            let observer = if record.manifest.class == DependencyPluginClass::Observer {
+                let (sender, receiver) = mpsc::channel(self.config.observer_queue_capacity);
+                tokio::spawn(observer_worker(
+                    record.manifest.clone(),
+                    receiver,
+                    Arc::clone(&depth),
+                    self.config.max_response_bytes,
+                    self.clone(),
+                ));
+                Some(sender)
+            } else {
+                None
+            };
+            self.plugins.lock().await.insert(
+                record.manifest.id.clone(),
+                LoadedPlugin {
+                    manifest: record.manifest.clone(),
+                    configuration: record.configuration,
+                    status: Arc::new(RwLock::new(record.status)),
+                    observer,
+                    observer_depth: depth,
+                    dropped,
+                },
+            );
+            restored = restored.saturating_add(1);
+        }
+        Ok(restored)
+    }
 }
 
 #[async_trait]
@@ -1286,6 +1378,7 @@ impl PluginDependencyPort for IsolatedPluginDependency {
                 dropped,
             },
         );
+        self.persist_loaded_catalog().await?;
         let audit = DependencyAudit {
             plugin_id: request.manifest.id.clone(),
             invocation_id: None,

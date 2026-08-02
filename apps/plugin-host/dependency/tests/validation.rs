@@ -3,9 +3,9 @@
 use std::collections::BTreeSet;
 
 use agentmod_plugin_host_dependency::{
-    DependencyConfigurationSchema, DependencyEntrypoint,
-    DependencyManifest, DependencyObserverDelivery, DependencyPluginClass,
-    IsolatedPluginDependency, PluginDependencyConfig, PluginDependencyError, PluginDependencyPort,
+    DependencyConfigurationSchema, DependencyEntrypoint, DependencyManifest,
+    DependencyObserverDelivery, DependencyPluginClass, IsolatedPluginDependency,
+    PluginDependencyConfig, PluginDependencyError, PluginDependencyPort,
 };
 
 #[tokio::test]

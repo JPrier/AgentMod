@@ -827,3 +827,40 @@ async fn wrong_class_operations_are_rejected() {
         .await;
     assert!(matches!(result, Err(PluginDependencyError::WrongClass)));
 }
+#[tokio::test]
+async fn loaded_catalog_restores_after_host_restart() {
+    let root = tempfile::tempdir().expect("root");
+    {
+        let dependency = IsolatedPluginDependency::new(dependency_config(root.path()))
+            .await
+            .expect("dependency");
+        load_plugin(
+            &dependency,
+            manifest_base("fixture.restored", DependencyPluginClass::GraphNode),
+        )
+        .await;
+        assert!(
+            root.path().join("state/loaded.json.gen-0.json").exists()
+                || std::fs::read_dir(root.path().join("state"))
+                    .expect("state dir")
+                    .any(|entry| entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("loaded.json.gen-"))
+        );
+    }
+    // A fresh host over the same state root restores the durable catalog and
+    // can execute nodes without a new activation request.
+    let dependency = IsolatedPluginDependency::new(dependency_config(root.path()))
+        .await
+        .expect("restarted dependency");
+    let restored = dependency.restore_loaded_plugins().await.expect("restore");
+    assert_eq!(restored, 1);
+    let record = dependency
+        .get("fixture.restored".to_owned())
+        .await
+        .expect("record");
+    assert_eq!(record.manifest.class, DependencyPluginClass::GraphNode);
+    assert_eq!(record.status, DependencyPluginStatus::Active);
+}

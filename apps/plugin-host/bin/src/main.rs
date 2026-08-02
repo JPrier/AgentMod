@@ -61,12 +61,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         })
         .await?,
     );
+    let restored_plugins = dependency.restore_loaded_plugins().await?;
     let recovered = dependency.recover_deliveries().await?;
     eprintln!(
         "{}",
         serde_json::json!({
-            "event": "plugin_host.startup_delivery_recovery",
-            "requeued": recovered,
+            "event": "plugin_host.startup_recovery",
+            "restored_plugins": restored_plugins,
+            "requeued_deliveries": recovered,
         })
     );
     let service = Arc::new(PluginHostService::new(PluginLogic::new(PluginData::new(

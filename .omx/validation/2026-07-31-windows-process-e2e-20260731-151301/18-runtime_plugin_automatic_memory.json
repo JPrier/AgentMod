@@ -1,0 +1,14 @@
+{
+  "index": 18,
+  "name": "18-runtime_plugin_automatic_memory",
+  "script": "runtime_plugin_automatic_memory.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_plugin_automatic_memory.ps1",
+  "exit_code": 124,
+  "status": "failed",
+  "elapsed_ms": 62000,
+  "started_at": "2026-07-31T19:26:38.8219806Z",
+  "ended_at": "2026-07-31T19:27:40.8219806Z",
+  "log": "18-runtime_plugin_automatic_memory.log",
+  "termination": "validator timeout after repeated hang; exact test-owned runtime and scheduler processes stopped",
+  "failure": "PowerShell NativeCommandError at CLI doctor: runtime transport is unavailable"
+}

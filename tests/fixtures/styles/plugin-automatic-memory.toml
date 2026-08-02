@@ -1,0 +1,138 @@
+schema_version = 1
+kind = "custom"
+required_capabilities = ["approval", "memory.fixture", "model"]
+allowed_tool_groups = []
+allowed_providers = ["deterministic-mock"]
+allowed_plugins = ["fixture.automatic-memory"]
+
+[identity]
+id = "__STYLE_ID__"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[graph]
+kind = "inline"
+source = '''
+format_version = 1
+entry = "respond"
+
+[budget]
+max_steps = 16
+max_tokens = 250000
+max_cost_micros = 25000000
+max_duration_ms = 900000
+
+[declarations]
+capabilities = ["model"]
+tools = []
+providers = ["deterministic-mock"]
+
+[[variables]]
+name = "model_disposition"
+type = { kind = "enum", values = ["response_complete", "tool_requests"] }
+scope = "run"
+producer = "respond"
+consumers = []
+mutability = "mutable"
+max_size_bytes = 64
+security_classification = "internal"
+
+[[variables]]
+name = "model_result"
+type = { kind = "node_result_reference" }
+scope = "run"
+producer = "respond"
+consumers = ["done"]
+mutability = "mutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[nodes]]
+id = "respond"
+kind = "model_call"
+provider = "deterministic-mock"
+write_variables = ["model_disposition", "model_result"]
+retry_limit = 1
+configuration = { type = "model_request", disposition_output = "model_disposition", result_output = "model_result" }
+
+[[nodes]]
+id = "done"
+kind = "complete_turn"
+read_variables = ["model_result"]
+configuration = { type = "complete_turn", result_reference_variable = "model_result", cleanup = "discard_projection" }
+
+[[edges]]
+from = "respond"
+to = "done"
+'''
+
+[memory]
+provider = "__PROVIDER_ID__"
+scopes = ["session"]
+retrieval_timing = "never"
+max_items = 1
+max_injected_bytes = 1024
+write_policy = "turn_completion"
+injection_location = "none"
+
+[memory.plugin]
+plugin_id = "fixture.automatic-memory"
+plugin_version = "1.0.0"
+provider_id = "__PROVIDER_ID__"
+provider_version = "1.0.0"
+declaration_hash = "__DECLARATION_HASH__"
+configuration_reference = "6e46dd10defc9b56c29a6ec56b508c21f54c08192194e4df25bf36f0c9c3c279"
+
+[memory.query]
+source = "current_input"
+include_active_artifacts = false
+include_style_context = false
+max_query_bytes = 0
+
+[compaction]
+strategy = "none"
+reserved_context_tokens = 0
+max_provider_projection_tokens = 0
+preserve_unresolved_tasks = true
+preserve_active_processes = true
+preservation_requirements = [
+  "system_instructions",
+  "current_input",
+  "pending_control_state",
+  "artifact_references",
+  "memory_provenance",
+  "active_graph_state",
+  "tool_call_correlation",
+]
+
+[approvals]
+default = "ask"
+groups = {}
+
+[budgets]
+max_iterations = 2
+max_steps = 16
+max_tokens = 250000
+max_cost_micros = 25000000
+max_duration_ms = 900000
+
+[child_agents]
+max_children = 0
+max_concurrent = 0
+max_depth = 0
+per_child_token_budget = 0
+
+[retry]
+max_attempts = 2
+initial_backoff_ms = 0
+max_backoff_ms = 0
+retryable_failures = ["provider.unavailable"]
+
+[termination]
+allowed_outcomes = ["complete_turn", "fail"]
+on_hard_limit = "fail"
+require_explicit_terminal_node = true
+
+[selection]
+requires_explicit_selection = true
+model_may_select = false

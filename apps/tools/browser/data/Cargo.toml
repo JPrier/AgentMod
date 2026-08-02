@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-browser-host-dependency = { path = "../dependency" }
+agentmod-browser-host-dependency = { version = "0.1.0", path = "../dependency" }
 async-trait.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

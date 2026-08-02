@@ -1,0 +1,383 @@
+schema_version = 1
+kind = "custom"
+required_capabilities = [
+  "agents",
+  "approval",
+  "artifacts",
+  "context",
+  "events",
+  "model",
+  "scheduling",
+  "tools",
+]
+allowed_tool_groups = ["filesystem"]
+allowed_providers = ["deterministic-mock"]
+allowed_plugins = ["runtime.security"]
+
+[identity]
+id = "user-graph-a"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[harness]
+id = "native"
+required_capabilities = [
+  "cancellation",
+  "streaming",
+  "structured_context_replacement",
+  "token_usage",
+  "tool_calls",
+]
+
+[graph]
+kind = "inline"
+source = '''
+format_version = 1
+entry = "context"
+
+[budget]
+max_steps = 64
+max_tokens = 10000
+max_cost_micros = 1000000
+max_duration_ms = 60000
+
+[declarations]
+capabilities = [
+  "agents",
+  "approval",
+  "artifacts",
+  "context",
+  "events",
+  "model",
+  "scheduling",
+  "tools",
+]
+tools = ["filesystem.read"]
+providers = ["deterministic-mock"]
+events = ["user.graph_a.progress"]
+
+[[variables]]
+name = "ready"
+type = { kind = "boolean" }
+scope = "run"
+producer = "runtime"
+consumers = ["route"]
+mutability = "immutable"
+max_size_bytes = 64
+security_classification = "internal"
+
+[[variables]]
+name = "mock_scenario"
+type = { kind = "string" }
+scope = "run"
+producer = "runtime"
+consumers = ["model"]
+mutability = "immutable"
+max_size_bytes = 128
+security_classification = "internal"
+
+[[variables]]
+name = "mock_text"
+type = { kind = "string" }
+scope = "run"
+producer = "runtime"
+consumers = ["model"]
+mutability = "immutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[variables]]
+name = "approval_result"
+type = { kind = "approval_result" }
+scope = "branch"
+producer = "approve"
+consumers = ["approve"]
+mutability = "immutable"
+max_size_bytes = 64
+security_classification = "internal"
+
+[[variables]]
+name = "tool_result"
+type = { kind = "tool_result_reference" }
+scope = "branch"
+producer = "read-tool"
+consumers = ["read-tool"]
+mutability = "immutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[variables]]
+name = "artifact_result"
+type = { kind = "artifact_reference" }
+scope = "branch"
+producer = "save-artifact"
+consumers = ["save-artifact"]
+mutability = "immutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[variables]]
+name = "iteration"
+type = { kind = "map", value_type = { kind = "boolean" }, max_entries = 2 }
+scope = "run"
+producer = "bounded-loop"
+consumers = ["loop-check"]
+mutability = "mutable"
+max_size_bytes = 128
+security_classification = "internal"
+
+[[variables]]
+name = "resolved_at"
+type = { kind = "timestamp" }
+scope = "run"
+producer = "durable-delay"
+consumers = ["finish"]
+mutability = "immutable"
+max_size_bytes = 64
+security_classification = "internal"
+
+[[variables]]
+name = "resolved_duration"
+type = { kind = "duration" }
+scope = "run"
+producer = "durable-delay"
+consumers = ["finish"]
+mutability = "immutable"
+max_size_bytes = 64
+security_classification = "internal"
+
+[[variables]]
+name = "delay_result"
+type = { kind = "node_result_reference" }
+scope = "run"
+producer = "durable-delay"
+consumers = ["finish"]
+mutability = "immutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[nodes]]
+id = "context"
+kind = "context_transform"
+configuration = { type = "context_transform", strategy = "preserve_history" }
+
+[[nodes]]
+id = "model"
+kind = "model_call"
+provider = "deterministic-mock"
+read_variables = ["mock_scenario", "mock_text"]
+retry_limit = 1
+
+[[nodes]]
+id = "route"
+kind = "conditional_branch"
+read_variables = ["ready"]
+
+[[nodes]]
+id = "fanout"
+kind = "parallel_branch"
+configuration = { type = "parallel_branch", max_parallelism = 2, max_queue_depth = 2, join_target = "join", join_policy = "all" }
+
+[[nodes]]
+id = "approve"
+kind = "user_approval"
+read_variables = ["approval_result"]
+write_variables = ["approval_result"]
+configuration = { type = "user_approval", action_summary = { kind = "static", value = "approve arbitrary Graph A filesystem read" } }
+
+[[nodes]]
+id = "read-tool"
+kind = "tool_execution_gate"
+tool = "filesystem.read"
+write_variables = ["tool_result"]
+configuration = { type = "tool_execution", arguments = { kind = "static", value = { path = "README.md" } } }
+
+[[nodes]]
+id = "save-artifact"
+kind = "persist_artifact"
+write_variables = ["artifact_result"]
+configuration = { type = "persist_artifact", content = { kind = "static_json", value = { graph = "A", branch = "artifact" } }, mime_type = "application/json", security = "private", retention = "session" }
+
+[[nodes]]
+id = "join"
+kind = "join_results"
+configuration = { type = "join_results", required = ["approval-tool", "artifact"], minimum_successes = 2, failure_policy = "wait_required", ordering_policy = "member_id", timeout_ms = 10000, cancellation_propagates = true, result_projection = "node_references", artifact_collection = "all" }
+
+[[nodes]]
+id = "bounded-loop"
+kind = "loop"
+write_variables = ["iteration"]
+max_iterations = 2
+
+[[nodes]]
+id = "loop-check"
+kind = "conditional_branch"
+read_variables = ["iteration"]
+
+[[nodes]]
+id = "emit-progress"
+kind = "emit_event"
+configuration = { type = "emit_event", event_type = "user.graph_a.progress", payload = { phase = "loop" }, metadata = { graph = "A" } }
+
+[[nodes]]
+id = "durable-delay"
+kind = "delay"
+write_variables = ["resolved_at", "resolved_duration", "delay_result"]
+configuration = { type = "delay", resolution = { kind = "duration", duration_ms = 750 }, cancellation = "cancel_continuation" }
+
+[[nodes]]
+id = "finish"
+kind = "complete_session"
+read_variables = ["resolved_at", "resolved_duration", "delay_result"]
+
+[[nodes]]
+id = "invalid-input"
+kind = "fail"
+
+[[edges]]
+from = "context"
+to = "model"
+
+[[edges]]
+from = "model"
+to = "route"
+
+[[edges]]
+from = "route"
+to = "fanout"
+condition = "ready == true"
+
+[[edges]]
+from = "route"
+to = "invalid-input"
+condition = "ready == false"
+
+[[edges]]
+from = "fanout"
+to = "approve"
+label = "approval-tool"
+
+[[edges]]
+from = "fanout"
+to = "save-artifact"
+label = "artifact"
+
+[[edges]]
+from = "approve"
+to = "read-tool"
+condition = "approval_result == \"approved\""
+
+[[edges]]
+from = "read-tool"
+to = "join"
+
+[[edges]]
+from = "save-artifact"
+to = "join"
+
+[[edges]]
+from = "join"
+to = "bounded-loop"
+
+[[edges]]
+from = "bounded-loop"
+to = "loop-check"
+
+[[edges]]
+from = "loop-check"
+to = "emit-progress"
+condition = "iteration.remaining == true"
+
+[[edges]]
+from = "emit-progress"
+to = "bounded-loop"
+
+[[edges]]
+from = "loop-check"
+to = "durable-delay"
+condition = "iteration.remaining == false"
+
+[[edges]]
+from = "durable-delay"
+to = "finish"
+'''
+
+[[interceptors]]
+id = "runtime-style-policy"
+owner = "runtime.security"
+event = "action.proposed"
+stage = 10
+priority = 100
+before = []
+after = []
+supported_decisions = [
+  "continue",
+  "replace",
+  "reject",
+  "require_approval",
+  "cancel",
+]
+required_capabilities = ["approval"]
+
+[memory]
+provider = "none"
+scopes = []
+retrieval_timing = "never"
+max_items = 0
+max_injected_bytes = 0
+write_policy = "never"
+injection_location = "none"
+
+[memory.query]
+source = "current_input"
+include_active_artifacts = false
+include_style_context = false
+max_query_bytes = 16384
+
+[compaction]
+strategy = "none"
+reserved_context_tokens = 0
+max_provider_projection_tokens = 0
+preserve_unresolved_tasks = true
+preserve_active_processes = true
+preservation_requirements = [
+  "system_instructions",
+  "current_input",
+  "pending_control_state",
+  "artifact_references",
+  "memory_provenance",
+  "active_graph_state",
+  "tool_call_correlation",
+]
+
+[approvals]
+default = "allow"
+groups = {}
+
+[budgets]
+max_iterations = 4
+max_steps = 64
+max_tokens = 10000
+max_cost_micros = 1000000
+max_duration_ms = 60000
+
+[child_agents]
+max_children = 0
+max_concurrent = 0
+max_depth = 0
+per_child_token_budget = 0
+
+[retry]
+max_attempts = 2
+initial_backoff_ms = 10
+max_backoff_ms = 100
+retryable_failures = ["provider.unavailable"]
+
+[termination]
+allowed_outcomes = ["complete_session", "fail"]
+on_hard_limit = "fail"
+require_explicit_terminal_node = true
+
+[selection]
+requires_explicit_selection = true
+model_may_select = false

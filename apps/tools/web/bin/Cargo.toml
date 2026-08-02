@@ -8,17 +8,17 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
-agentmod-web-host-data = { path = "../data" }
-agentmod-web-host-dependency = { path = "../dependency" }
-agentmod-web-host-logic = { path = "../logic" }
-agentmod-web-host-service = { path = "../service" }
+agentmod-tool-protocol = { version = "0.1.0", path = "../../../../protocols/tool-protocol" }
+agentmod-web-host-data = { version = "0.1.0", path = "../data" }
+agentmod-web-host-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-web-host-logic = { version = "0.1.0", path = "../logic" }
+agentmod-web-host-service = { version = "0.1.0", path = "../service" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
 
 [dev-dependencies]
-agentmod-primitives = { path = "../../../../core/primitives" }
-agentmod-protocol-support = { path = "../../../../core/protocol-support" }
+agentmod-primitives = { version = "0.1.0", path = "../../../../core/primitives" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../../../core/protocol-support" }
 tempfile.workspace = true
 uuid.workspace = true
 

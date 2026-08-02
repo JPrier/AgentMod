@@ -174,6 +174,16 @@ mod tests {
         > {
             unreachable!("loading is not exposed by this storage-only endpoint")
         }
+
+        fn load_optional_continuation(
+            &self,
+            _query: agentmod_runtime_logic::continuation::LoadContinuationQuery,
+        ) -> Result<
+            Option<agentmod_runtime_logic::continuation::LoadContinuationResult>,
+            ContinuationLogicError,
+        > {
+            unreachable!("loading is not exposed by this storage-only endpoint")
+        }
     }
 
     fn service() -> ContinuationService<MockLogic> {

@@ -12,16 +12,16 @@ name = "agentmod-filesystem-host"
 path = "src/main.rs"
 
 [dependencies]
-agentmod-filesystem-host-data = { path = "../data" }
-agentmod-filesystem-host-dependency = { path = "../dependency" }
-agentmod-filesystem-host-logic = { path = "../logic" }
-agentmod-filesystem-host-service = { path = "../service" }
-agentmod-protocol-support = { path = "../../../../core/protocol-support" }
-agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+agentmod-filesystem-host-data = { version = "0.1.0", path = "../data" }
+agentmod-filesystem-host-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-filesystem-host-logic = { version = "0.1.0", path = "../logic" }
+agentmod-filesystem-host-service = { version = "0.1.0", path = "../service" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../../../core/protocol-support" }
+agentmod-tool-protocol = { version = "0.1.0", path = "../../../../protocols/tool-protocol" }
 serde_json.workspace = true
 
 [dev-dependencies]
-agentmod-primitives = { path = "../../../../core/primitives" }
+agentmod-primitives = { version = "0.1.0", path = "../../../../core/primitives" }
 tempfile.workspace = true
 
 [lints]

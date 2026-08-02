@@ -120,8 +120,18 @@ try {
         if ($visible -ne "alpha beta live-cli") {
             throw "unexpected streamed provider output: $visible"
         }
-        if ($terminal[0].last_committed_sequence -ne 19) {
-            throw "terminal item did not report the full committed turn"
+        $journalPath = Join-Path $runRoot (
+            "sessions\" + $created.session_id + "\events.jsonl"
+        )
+        $journal = @(Get-Content -LiteralPath $journalPath)
+        $lastJournalEvent = $journal[-1] | ConvertFrom-Json
+        $lastStreamSequence = ($events | Measure-Object `
+            -Property committed_sequence -Maximum).Maximum
+        if ($terminal[0].last_committed_sequence -ne $journal.Count -or
+            $lastStreamSequence -gt $terminal[0].last_committed_sequence -or
+            $lastJournalEvent.event.metadata.event_type -ne
+                "memory.write_completed") {
+            throw "terminal item did not report the exact committed journal head"
         }
         Write-Output "runtime live CLI streaming JSON E2E passed"
     }

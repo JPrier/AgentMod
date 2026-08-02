@@ -8,18 +8,21 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-event-model = { path = "../../../core/event-model" }
-agentmod-event-pipeline = { path = "../../../core/event-pipeline" }
-agentmod-graph-engine = { path = "../../../core/graph-engine" }
-agentmod-primitives = { path = "../../../core/primitives" }
-agentmod-runtime-data = { path = "../data" }
-agentmod-session-style-sdk = { path = "../../../sdk/session-style-sdk" }
+agentmod-event-model = { version = "0.1.0", path = "../../../core/event-model" }
+agentmod-event-pipeline = { version = "0.1.0", path = "../../../core/event-pipeline" }
+agentmod-expression-engine = { version = "0.1.0", path = "../../../core/expression-engine" }
+agentmod-graph-engine = { version = "0.1.0", path = "../../../core/graph-engine" }
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
+agentmod-runtime-data = { version = "0.1.0", path = "../data" }
+agentmod-session-style-sdk = { version = "0.1.0", path = "../../../sdk/session-style-sdk" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 semver = "1.0"
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
+url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

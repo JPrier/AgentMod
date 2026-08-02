@@ -9,22 +9,27 @@ mod parsing;
 mod selection;
 mod validation;
 
-pub use builtins::{built_in_manifest, built_in_manifest_for_version, declarative_graph_manifest};
+pub use builtins::{
+    built_in_manifest, built_in_manifest_for_version, built_in_versions, declarative_graph_manifest,
+};
 pub use model::{
     ApprovalDecision, ApprovalDefaults, BuiltInStyle, ChildAgentLimits, ChildCancellationBehavior,
-    ChildJoinBehavior, ChildMemoryAccess, ChildWorkspaceMode, CompactionPreservationRequirement,
-    CompactionSelection, CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource,
-    HarnessSelection, InterceptorDeclaration, MemoryInjectionLocation, MemoryQueryConstruction,
-    MemoryQuerySource, MemoryRetrievalTiming, MemoryScope, MemorySelection, MemoryWritePolicy,
+    ChildJoinBehavior, ChildMemoryAccess, ChildWorkspaceMergePolicy, ChildWorkspaceMode,
+    CompactionPreservationRequirement, CompactionSelection, CompactionStrategy,
+    ContextTransformLifecycle, ContextTransformSelection, DecisionCapability, ExecutionBudgets,
+    GraphSource, HarnessSelection, InterceptorDeclaration, MemoryInjectionLocation,
+    MemoryQueryConstruction, MemoryQuerySource, MemoryRetrievalTiming, MemoryScope,
+    MemorySelection, MemoryWritePolicy, PluginCompactorSelection, PluginMemorySelection,
     RetryPolicy, SessionStyleManifest, StyleIdentity, StyleKind, TerminationOutcome,
     TerminationPolicy, TopLevelSelection,
 };
 pub use parsing::{ManifestFormat, ManifestParseError, parse_json, parse_toml, to_json, to_toml};
 pub use selection::{
-    ComponentSelectionError, ExecutionBudgetOverrides, select_compaction_strategy,
-    select_execution_budgets, select_memory_provider,
+    ComponentSelectionError, ExecutionBudgetOverrides, select_child_session_restrictions,
+    select_compaction_strategy, select_execution_budgets, select_memory_provider,
 };
 pub use validation::{
+    AvailableContextTransform, AvailablePluginCompactor, AvailablePluginMemoryProvider,
     CURRENT_STYLE_SCHEMA_VERSION, CompileContext, CompiledSessionStyle, Diagnostic,
     DiagnosticSeverity, StyleCacheKey, StyleCompileError, StyleCompilerLimits, compile_style,
     compile_style_set,

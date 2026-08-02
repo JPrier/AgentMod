@@ -2,12 +2,13 @@
 
 use std::{
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use fs2::FileExt;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -103,7 +104,7 @@ impl MemoryDependencyPort for NoMemoryDependency {
     ) -> Result<DependencyMemoryWriteResponse, MemoryDependencyError> {
         validate_write(&request)?;
         Ok(DependencyMemoryWriteResponse {
-            id: Uuid::now_v7().to_string(),
+            id: memory_record_id(&request)?,
             retained: false,
         })
     }
@@ -125,13 +126,31 @@ impl MemoryDependencyPort for NoMemoryDependency {
 #[derive(Clone, Debug)]
 pub struct FileMemoryDependency {
     path: PathBuf,
+    post_persist_delay: Duration,
 }
 
 impl FileMemoryDependency {
     /// Creates a file-backed adapter. The parent is created lazily.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            post_persist_delay: Duration::ZERO,
+        }
+    }
+
+    /// Delays a newly persisted terminal response after the exact record is
+    /// durable. This supports deterministic process crash-cut validation.
+    #[must_use]
+    pub fn with_post_persist_delay(mut self, delay: Duration) -> Self {
+        self.post_persist_delay = delay;
+        self
+    }
+
+    /// Returns the configured deterministic post-persist delay.
+    #[must_use]
+    pub const fn post_persist_delay(&self) -> Duration {
+        self.post_persist_delay
     }
 }
 
@@ -149,9 +168,32 @@ impl MemoryDependencyPort for FileMemoryDependency {
             .open(&self.path)
             .map_err(redacted_io)?;
         file.lock_exclusive().map_err(redacted_io)?;
+        repair_file_tail(&self.path, &mut file)?;
+        let id = memory_record_id(&request)?;
+        file.seek(SeekFrom::Start(0)).map_err(redacted_io)?;
+        for line in BufReader::new(&file).lines() {
+            let line = line.map_err(redacted_io)?;
+            if line.len() > RECORD_LIMIT {
+                return Err(MemoryDependencyError::CorruptRecord);
+            }
+            let existing: StoredFileRecord =
+                serde_json::from_str(&line).map_err(|_| MemoryDependencyError::CorruptRecord)?;
+            existing.verify()?;
+            if existing.id == id {
+                if existing.scope != request.scope
+                    || existing.source != request.source
+                    || existing.content != request.content
+                    || existing.created_at_millis != request.created_at_millis
+                {
+                    return Err(MemoryDependencyError::CorruptRecord);
+                }
+                FileExt::unlock(&file).map_err(redacted_io)?;
+                return Ok(DependencyMemoryWriteResponse { id, retained: true });
+            }
+        }
         let record = StoredFileRecord {
             schema_version: 1,
-            id: Uuid::now_v7().to_string(),
+            id,
             scope: request.scope,
             source: request.source,
             content: request.content,
@@ -168,6 +210,9 @@ impl MemoryDependencyPort for FileMemoryDependency {
         file.write_all(&bytes).map_err(redacted_io)?;
         file.sync_data().map_err(redacted_io)?;
         FileExt::unlock(&file).map_err(redacted_io)?;
+        if !self.post_persist_delay.is_zero() {
+            std::thread::sleep(self.post_persist_delay);
+        }
         Ok(DependencyMemoryWriteResponse {
             id: record.id,
             retained: true,
@@ -182,8 +227,14 @@ impl MemoryDependencyPort for FileMemoryDependency {
         if !self.path.exists() {
             return Ok(vec![]);
         }
-        let file = File::open(&self.path).map_err(redacted_io)?;
-        file.lock_shared().map_err(redacted_io)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)
+            .map_err(redacted_io)?;
+        file.lock_exclusive().map_err(redacted_io)?;
+        repair_file_tail(&self.path, &mut file)?;
+        file.seek(SeekFrom::Start(0)).map_err(redacted_io)?;
         let terms = query_terms(&request.query);
         let mut matches = Vec::new();
         for line in BufReader::new(&file).lines() {
@@ -239,13 +290,38 @@ impl MemoryDependencyPort for FileMemoryDependency {
 #[derive(Clone, Debug)]
 pub struct SqliteFtsMemoryDependency {
     path: PathBuf,
+    post_commit_delay: Duration,
 }
 
 impl SqliteFtsMemoryDependency {
     /// Creates an adapter. Schema initialization occurs on first operation.
     #[must_use]
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self {
+            path,
+            post_commit_delay: Duration::ZERO,
+        }
+    }
+
+    /// Delays a terminal response after the exact transaction commit is
+    /// durable. This supports deterministic process crash-cut validation.
+    #[must_use]
+    pub fn with_post_commit_delay(mut self, delay: Duration) -> Self {
+        self.post_commit_delay = delay;
+        self
+    }
+
+    /// Returns the configured deterministic post-commit delay.
+    #[must_use]
+    pub const fn post_commit_delay(&self) -> Duration {
+        self.post_commit_delay
+    }
+
+    fn retained_after_commit(&self, id: String) -> DependencyMemoryWriteResponse {
+        if !self.post_commit_delay.is_zero() {
+            std::thread::sleep(self.post_commit_delay);
+        }
+        DependencyMemoryWriteResponse { id, retained: true }
     }
 
     fn connection(&self) -> Result<Connection, MemoryDependencyError> {
@@ -272,8 +348,41 @@ impl MemoryDependencyPort for SqliteFtsMemoryDependency {
         request: DependencyMemoryWriteRequest,
     ) -> Result<DependencyMemoryWriteResponse, MemoryDependencyError> {
         validate_write(&request)?;
-        let id = Uuid::now_v7().to_string();
-        self.connection()?
+        let id = memory_record_id(&request)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| MemoryDependencyError::Database)?;
+        let existing = transaction
+            .query_row(
+                "SELECT scope, source, content, created_at_millis
+                 FROM memory_fts WHERE id = ?1 LIMIT 1",
+                params![&id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| MemoryDependencyError::Database)?;
+        if let Some((scope, source, content, created_at_millis)) = existing {
+            if scope != request.scope
+                || source != request.source
+                || content != request.content
+                || created_at_millis != request.created_at_millis
+            {
+                return Err(MemoryDependencyError::CorruptRecord);
+            }
+            transaction
+                .commit()
+                .map_err(|_| MemoryDependencyError::Database)?;
+            return Ok(self.retained_after_commit(id));
+        }
+        transaction
             .execute(
                 "INSERT INTO memory_fts
                  (id, scope, source, content, created_at_millis)
@@ -287,7 +396,10 @@ impl MemoryDependencyPort for SqliteFtsMemoryDependency {
                 ],
             )
             .map_err(|_| MemoryDependencyError::Database)?;
-        Ok(DependencyMemoryWriteResponse { id, retained: true })
+        transaction
+            .commit()
+            .map_err(|_| MemoryDependencyError::Database)?;
+        Ok(self.retained_after_commit(id))
     }
 
     fn query(
@@ -370,6 +482,107 @@ impl StoredFileRecord {
     }
 }
 
+enum FileTailRepair {
+    None,
+    AppendTerminator,
+    Truncate { valid_length: u64, invalid: Vec<u8> },
+}
+
+fn repair_file_tail(path: &Path, file: &mut File) -> Result<(), MemoryDependencyError> {
+    file.seek(SeekFrom::Start(0)).map_err(redacted_io)?;
+    let length = file.metadata().map_err(redacted_io)?.len();
+    let repair = {
+        let mut reader = BufReader::new(&mut *file);
+        let mut valid_length = 0_u64;
+        let mut line = Vec::new();
+        let mut repair = FileTailRepair::None;
+        loop {
+            line.clear();
+            let count = reader.read_until(b'\n', &mut line).map_err(redacted_io)?;
+            if count == 0 {
+                break;
+            }
+            let count = u64::try_from(count).map_err(|_| MemoryDependencyError::CorruptRecord)?;
+            let line_end = valid_length
+                .checked_add(count)
+                .ok_or(MemoryDependencyError::CorruptRecord)?;
+            let terminated = line.last() == Some(&b'\n');
+            let mut payload_end = line.len() - usize::from(terminated);
+            if payload_end > 0 && line[payload_end - 1] == b'\r' {
+                payload_end -= 1;
+            }
+            let valid = payload_end <= RECORD_LIMIT
+                && serde_json::from_slice::<StoredFileRecord>(&line[..payload_end])
+                    .is_ok_and(|record| record.verify().is_ok());
+            if valid {
+                if terminated {
+                    valid_length = line_end;
+                    continue;
+                }
+                if line_end != length {
+                    return Err(MemoryDependencyError::CorruptRecord);
+                }
+                repair = FileTailRepair::AppendTerminator;
+                break;
+            }
+            if terminated || line_end != length {
+                return Err(MemoryDependencyError::CorruptRecord);
+            }
+            repair = FileTailRepair::Truncate {
+                valid_length,
+                invalid: line.clone(),
+            };
+            break;
+        }
+        repair
+    };
+
+    match repair {
+        FileTailRepair::None => {}
+        FileTailRepair::AppendTerminator => {
+            file.seek(SeekFrom::End(0)).map_err(redacted_io)?;
+            file.write_all(b"\n").map_err(redacted_io)?;
+            file.sync_data().map_err(redacted_io)?;
+        }
+        FileTailRepair::Truncate {
+            valid_length,
+            invalid,
+        } => {
+            quarantine_memory_tail(path, &invalid)?;
+            file.set_len(valid_length).map_err(redacted_io)?;
+            file.sync_data().map_err(redacted_io)?;
+        }
+    }
+    file.seek(SeekFrom::Start(0)).map_err(redacted_io)?;
+    Ok(())
+}
+
+fn quarantine_memory_tail(path: &Path, invalid: &[u8]) -> Result<(), MemoryDependencyError> {
+    let parent = path.parent().ok_or(MemoryDependencyError::InvalidPath)?;
+    let directory = parent.join("quarantine");
+    fs::create_dir_all(&directory).map_err(redacted_io)?;
+    let digest = blake3::hash(invalid).to_hex();
+    let quarantine = directory.join(format!("memory-tail-{digest}.bin"));
+    match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&quarantine)
+    {
+        Ok(mut file) => {
+            file.write_all(invalid).map_err(redacted_io)?;
+            file.sync_all().map_err(redacted_io)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if fs::read(quarantine).map_err(redacted_io)? == invalid {
+                Ok(())
+            } else {
+                Err(MemoryDependencyError::CorruptRecord)
+            }
+        }
+        Err(error) => Err(redacted_io(error)),
+    }
+}
+
 fn validate_write(request: &DependencyMemoryWriteRequest) -> Result<(), MemoryDependencyError> {
     if request.scope.is_empty() || request.source.is_empty() || request.content.trim().is_empty() {
         return Err(MemoryDependencyError::InvalidInput);
@@ -378,6 +591,23 @@ fn validate_write(request: &DependencyMemoryWriteRequest) -> Result<(), MemoryDe
         return Err(MemoryDependencyError::ContentTooLarge);
     }
     Ok(())
+}
+
+fn memory_record_id(
+    request: &DependencyMemoryWriteRequest,
+) -> Result<String, MemoryDependencyError> {
+    let encoded = serde_json::to_vec(&(
+        "agentmod.memory-record.v1",
+        &request.scope,
+        &request.source,
+        &request.content,
+        request.created_at_millis,
+    ))
+    .map_err(|_| MemoryDependencyError::Serialization)?;
+    let hash = blake3::hash(&encoded);
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hash.as_bytes()[..16]);
+    Ok(Uuid::from_bytes(bytes).hyphenated().to_string())
 }
 
 fn validate_query(request: &DependencyMemoryQueryRequest) -> Result<(), MemoryDependencyError> {
@@ -523,5 +753,118 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].content, "canonical session context");
         assert!(matches[0].score.is_some());
+    }
+
+    #[test]
+    fn exact_memory_writes_are_idempotent_for_file_and_sqlite() {
+        let root = tempfile::tempdir().expect("root");
+        let file_path = root.path().join("memory.jsonl");
+        let file = FileMemoryDependency::new(file_path.clone());
+        let sqlite = SqliteFtsMemoryDependency::new(root.path().join("memory.sqlite3"));
+        let request = DependencyMemoryWriteRequest {
+            scope: String::from("session:s1"),
+            source: String::from("runtime.turn_completion"),
+            content: String::from("bounded canonical memory"),
+            created_at_millis: 7,
+        };
+        let first_file = file.write(request.clone()).expect("first file write");
+        let second_file = file.write(request.clone()).expect("replayed file write");
+        assert_eq!(first_file, second_file);
+        assert_eq!(
+            BufReader::new(File::open(file_path).expect("file"))
+                .lines()
+                .count(),
+            1
+        );
+
+        let first_sqlite = sqlite.write(request.clone()).expect("first sqlite write");
+        let second_sqlite = sqlite.write(request).expect("replayed sqlite write");
+        assert_eq!(first_sqlite, second_sqlite);
+        assert_eq!(
+            sqlite
+                .query(DependencyMemoryQueryRequest {
+                    scope: String::from("session:s1"),
+                    query: String::from("bounded canonical"),
+                    limit: 10,
+                })
+                .expect("query")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn durable_memory_delay_configuration_is_explicit_for_file_and_sqlite() {
+        let root = tempfile::tempdir().expect("root");
+        let delay = Duration::from_millis(37);
+        let file = FileMemoryDependency::new(root.path().join("memory.jsonl"))
+            .with_post_persist_delay(delay);
+        let sqlite = SqliteFtsMemoryDependency::new(root.path().join("memory.sqlite3"))
+            .with_post_commit_delay(delay);
+
+        assert_eq!(file.post_persist_delay(), delay);
+        assert_eq!(sqlite.post_commit_delay(), delay);
+    }
+
+    #[test]
+    fn file_memory_quarantines_only_an_invalid_partial_final_record() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("memory.jsonl");
+        let provider = FileMemoryDependency::new(path.clone());
+        write(&provider, "first durable record", 1);
+        let valid = fs::read(&path).expect("valid bytes");
+        let invalid = br#"{"schema_version":1,"id":"partial"#;
+        let mut file = OpenOptions::new().append(true).open(&path).expect("append");
+        file.write_all(invalid).expect("partial write");
+        file.sync_all().expect("partial durable");
+
+        assert_eq!(query(&provider, "first durable").len(), 1);
+        assert_eq!(fs::read(&path).expect("repaired bytes"), valid);
+        let quarantine = root.path().join("quarantine").join(format!(
+            "memory-tail-{}.bin",
+            blake3::hash(invalid).to_hex()
+        ));
+        assert_eq!(fs::read(quarantine).expect("quarantined tail"), invalid);
+        write(&provider, "second durable record", 2);
+        assert_eq!(query(&provider, "durable record").len(), 2);
+    }
+
+    #[test]
+    fn file_memory_never_repairs_a_corrupt_complete_or_interior_record() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("memory.jsonl");
+        let provider = FileMemoryDependency::new(path.clone());
+        write(&provider, "first durable record", 1);
+        write(&provider, "second durable record", 2);
+        let mut corrupted = fs::read(&path).expect("bytes");
+        corrupted[20] ^= 1;
+        fs::write(&path, &corrupted).expect("corrupt");
+
+        assert_eq!(
+            provider.query(DependencyMemoryQueryRequest {
+                scope: String::from("project:p1"),
+                query: String::from("durable"),
+                limit: 10,
+            }),
+            Err(MemoryDependencyError::CorruptRecord)
+        );
+        assert_eq!(fs::read(&path).expect("unchanged"), corrupted);
+        assert!(!root.path().join("quarantine").exists());
+    }
+
+    #[test]
+    fn file_memory_completes_a_valid_unterminated_final_record() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("memory.jsonl");
+        let provider = FileMemoryDependency::new(path.clone());
+        write(&provider, "fully encoded record", 1);
+        let mut bytes = fs::read(&path).expect("bytes");
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&path, &bytes).expect("remove terminator");
+
+        assert_eq!(query(&provider, "fully encoded").len(), 1);
+        let repaired = fs::read(&path).expect("repaired");
+        assert_eq!(repaired.last(), Some(&b'\n'));
+        assert!(!repaired[..repaired.len() - 1].contains(&b'\n'));
     }
 }

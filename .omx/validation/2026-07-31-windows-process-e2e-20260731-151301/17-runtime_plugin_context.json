@@ -1,0 +1,12 @@
+{
+  "index": 17,
+  "name": "17-runtime_plugin_context",
+  "script": "runtime_plugin_context.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_plugin_context.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 14136,
+  "started_at": "2026-07-31T19:22:42.1630057Z",
+  "ended_at": "2026-07-31T19:22:56.2991261Z",
+  "log": "17-runtime_plugin_context.log"
+}

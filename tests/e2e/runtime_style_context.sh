@@ -5,6 +5,11 @@ repository=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$repository"
 cargo build -p agentmod-runtime -p agentmod-harness -p agentmod-cli
 
+case "${CARGO_TARGET_DIR:-target}" in
+    /*) target_directory=${CARGO_TARGET_DIR:-target} ;;
+    *) target_directory="$repository/${CARGO_TARGET_DIR:-target}" ;;
+esac
+
 run_root=$(mktemp -d "${TMPDIR:-/tmp}/agentmod-style-context-e2e.XXXXXX")
 workspace="$run_root/workspace"
 style_root="$run_root/styles/user"
@@ -32,29 +37,48 @@ sed \
     >"$style_root/persistent-tight.toml"
 sed \
     -e 's/id = "e2e-persistent-file"/id = "e2e-persistent-context-node"/' \
+    -e 's/entry = "respond"/entry = "prepare-context"/' \
+    -e 's/required_capabilities = \["approval", "model", "tools"\]/required_capabilities = ["approval", "context", "model", "tools"]/' \
+    -e 's/capabilities = \["model", "tools"\]/capabilities = ["context", "model", "tools"]/' \
     -e 's/retrieval_timing = "before_model_request"/retrieval_timing = "context_node"/' \
+    -e '/^\[\[nodes\]\]$/ { N; /id = "respond"/i\
+[[nodes]]\
+id = "prepare-context"\
+kind = "context_transform"\
+configuration = { type = "context_transform", strategy = "fresh" }\
+}' \
+    -e '/^\[\[edges\]\]$/ { N; /from = "respond"/i\
+[[edges]]\
+from = "prepare-context"\
+to = "respond"\
+}' \
     tests/fixtures/styles/persistent-file-none.toml \
     >"$style_root/persistent-context-node.toml"
 
 export AGENTMOD_RUNTIME_ENDPOINT="$run_root/runtime.sock"
 export AGENTMOD_RUNTIME_AUTH_TOKEN="0123456789abcdef0123456789abcdef0123456789abcdef"
-export AGENTMOD_HARNESS_PROGRAM="$repository/target/debug/agentmod-harness"
-runtime="$repository/target/debug/agentmod-runtime"
-cli="$repository/target/debug/agentmod"
+export AGENTMOD_HARNESS_PROGRAM="$target_directory/debug/agentmod-harness"
+runtime="$target_directory/debug/agentmod-runtime"
+cli="$target_directory/debug/agentmod"
+succeeded=false
 
 cleanup() {
     if [ -n "${daemon_pid:-}" ]; then
         kill "$daemon_pid" 2>/dev/null || true
         wait "$daemon_pid" 2>/dev/null || true
     fi
-    case "$run_root" in
-        "${TMPDIR:-/tmp}"/agentmod-style-context-e2e.*)
-            rm -rf -- "$run_root"
-            ;;
-        *)
-            echo "refusing to remove unexpected E2E root: $run_root" >&2
-            ;;
-    esac
+    if [ "$succeeded" = true ]; then
+        case "$run_root" in
+            "${TMPDIR:-/tmp}"/agentmod-style-context-e2e.*)
+                rm -rf -- "$run_root"
+                ;;
+            *)
+                echo "refusing to remove unexpected E2E root: $run_root" >&2
+                ;;
+        esac
+    else
+        echo "preserved failed E2E root: $run_root" >&2
+    fi
 }
 trap cleanup EXIT INT TERM
 
@@ -100,7 +124,7 @@ isolated_file_id=$(create_session e2e-persistent-file)
 sqlite_id=$(create_session e2e-persistent-sqlite)
 bounded_file_id=$(create_session e2e-persistent-file-bounded)
 tight_id=$(create_session e2e-persistent-tight)
-unsupported_timing_id=$(create_session e2e-persistent-context-node)
+context_node_id=$(create_session e2e-persistent-context-node)
 none_id=$(create_session e2e-persistent-none)
 none_compaction_id=$(create_session e2e-persistent-none)
 sliding_id=$(create_session e2e-persistent-sliding)
@@ -109,7 +133,7 @@ test -n "$isolated_file_id"
 test -n "$sqlite_id"
 test -n "$bounded_file_id"
 test -n "$tight_id"
-test -n "$unsupported_timing_id"
+test -n "$context_node_id"
 test -n "$none_id"
 test -n "$none_compaction_id"
 test -n "$sliding_id"
@@ -143,6 +167,15 @@ AGENTMOD_TEST_MEMORY_CREATED_AT_MS=1002 \
         seed_file_memory_for_process_e2e -- --ignored --exact
 AGENTMOD_TEST_MEMORY_PROVIDER=file \
 AGENTMOD_TEST_MEMORY_PATH="$run_root/memory/file.jsonl" \
+AGENTMOD_TEST_MEMORY_SCOPE="session:$context_node_id" \
+AGENTMOD_TEST_MEMORY_SOURCE="context-node-e2e-fixture" \
+AGENTMOD_TEST_MEMORY_CONTENT="orchid memory probe retrieved at the generic context node" \
+AGENTMOD_TEST_MEMORY_CREATED_AT_MS=1004 \
+    cargo test -p agentmod-runtime-dependency --locked \
+        --test e2e_memory_seed \
+        seed_file_memory_for_process_e2e -- --ignored --exact
+AGENTMOD_TEST_MEMORY_PROVIDER=file \
+AGENTMOD_TEST_MEMORY_PATH="$run_root/memory/file.jsonl" \
 AGENTMOD_TEST_MEMORY_SCOPE="session:$bounded_file_id" \
 AGENTMOD_TEST_MEMORY_SOURCE="bounded-e2e-two" \
 AGENTMOD_TEST_MEMORY_CONTENT="orchid probe second bounded record" \
@@ -150,7 +183,6 @@ AGENTMOD_TEST_MEMORY_CREATED_AT_MS=1003 \
     cargo test -p agentmod-runtime-dependency --locked \
         --test e2e_memory_seed \
         seed_file_memory_for_process_e2e -- --ignored --exact
-
 file_turn=$("$cli" run "orchid memory probe" --session "$file_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="context-output"' --json)
@@ -168,6 +200,10 @@ sqlite_turn=$("$cli" run "orchid memory probe" --session "$sqlite_id" \
     --session "$bounded_file_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="bounded-output"' --json >/dev/null
+context_node_turn=$("$cli" run "orchid memory probe" \
+    --session "$context_node_id" \
+    --option 'mock_scenario="streaming_text"' \
+    --option 'mock_text="context-node-output"' --json)
 if "$cli" run "oversized-current-input-$(printf '%01024d' 0)" \
     --session "$tight_id" \
     --option 'mock_scenario="streaming_text"' --json >/dev/null 2>&1
@@ -175,16 +211,11 @@ then
     echo "oversized first projection was dispatched" >&2
     exit 1
 fi
-if "$cli" run "unsupported timing must fail preflight" \
-    --session "$unsupported_timing_id" \
-    --option 'mock_scenario="streaming_text"' --json >/dev/null 2>&1
-then
-    echo "unsupported retrieval timing executed" >&2
-    exit 1
-fi
 printf '%s' "$file_turn" | grep -F '"text":"alpha "' >/dev/null
 printf '%s' "$file_turn" | grep -F '"text":"beta "' >/dev/null
 printf '%s' "$file_turn" | grep -F '"text":"context-output"' >/dev/null
+printf '%s' "$context_node_turn" |
+    grep -F '"text":"context-node-output"' >/dev/null
 test "$file_turn" = "$none_turn" ||
     {
         # Sequence identities differ; visible event streams must not.
@@ -201,7 +232,7 @@ isolated_file_journal="$run_root/sessions/$isolated_file_id/events.jsonl"
 sqlite_journal="$run_root/sessions/$sqlite_id/events.jsonl"
 bounded_file_journal="$run_root/sessions/$bounded_file_id/events.jsonl"
 tight_journal="$run_root/sessions/$tight_id/events.jsonl"
-unsupported_timing_journal="$run_root/sessions/$unsupported_timing_id/events.jsonl"
+context_node_journal="$run_root/sessions/$context_node_id/events.jsonl"
 grep -F '"event_type":"context.projection_replaced"' "$file_journal" |
     grep -F '"method":"memory:file"' |
     grep -F '"kind":"retrieved_memory"' |
@@ -235,7 +266,15 @@ if grep -F '"event_type":"model.request_proposed"' "$tight_journal" >/dev/null; 
     echo "oversized projection crossed the provider proposal boundary" >&2
     exit 1
 fi
-test "$(wc -l <"$unsupported_timing_journal" | tr -d ' ')" -eq 1
+context_replacement=$(grep -F '"event_type":"context.projection_replaced"' \
+    "$context_node_journal" | grep -F '"method":"generic_fresh_context"')
+printf '%s' "$context_replacement" |
+    grep -F '"kind":"retrieved_memory"' |
+    grep -F '"query":"orchid memory probe"' |
+    grep -F "\"scope\":\"session:$context_node_id\"" |
+    grep -F '"source":"context-node-e2e-fixture"' >/dev/null
+test "$(printf '%s' "$context_replacement" |
+    grep -o '"kind":"retrieved_memory"' | wc -l | tr -d ' ')" -eq 1
 
 file_proposal=$(grep -F '"event_type":"model.request_proposed"' \
     "$file_journal" | tail -n 1)
@@ -259,6 +298,31 @@ proposal_line=$(grep -n -m 1 -F \
     cut -d: -f1)
 test "$memory_line" -lt "$proposal_line"
 
+context_start_line=$(grep -n -m 1 -F '"event_type":"context.boundary_started"' \
+    "$context_node_journal" | grep -F '"boundary":"context_node"' |
+    cut -d: -f1)
+context_phase_line=$(grep -n -m 1 -F '"event_type":"context.phase_started"' \
+    "$context_node_journal" | grep -F '"boundary":"context_node"' |
+    grep -F '"phase":"memory"' | cut -d: -f1)
+context_replacement_line=$(grep -n -m 1 -F \
+    '"method":"generic_fresh_context"' "$context_node_journal" |
+    cut -d: -f1)
+context_complete_line=$(grep -n -m 1 -F \
+    '"event_type":"context.boundary_completed"' "$context_node_journal" |
+    grep -F '"boundary":"context_node"' | cut -d: -f1)
+context_proposal_line=$(grep -n -m 1 -F \
+    '"event_type":"model.request_proposed"' "$context_node_journal" |
+    cut -d: -f1)
+test -n "$context_start_line"
+test -n "$context_phase_line"
+test -n "$context_replacement_line"
+test -n "$context_complete_line"
+test -n "$context_proposal_line"
+test "$context_start_line" -lt "$context_phase_line"
+test "$context_phase_line" -lt "$context_replacement_line"
+test "$context_replacement_line" -lt "$context_complete_line"
+test "$context_complete_line" -lt "$context_proposal_line"
+
 # Restart and prove style-selected memory routes reconstruct from durable state.
 kill "$daemon_pid"
 wait "$daemon_pid"
@@ -278,6 +342,8 @@ done
     grep -F '"provider":"file"' >/dev/null
 "$cli" session inspect "$sqlite_id" --json |
     grep -F '"provider":"sqlite-fts"' >/dev/null
+"$cli" session inspect "$context_node_id" --json |
+    grep -F '"provider":"file"' >/dev/null
 "$cli" session inspect "$none_id" --json |
     grep -F '"provider":"none"' >/dev/null
 "$cli" run "orchid memory probe" --session "$file_id" \
@@ -286,12 +352,33 @@ done
 "$cli" run "orchid memory probe" --session "$sqlite_id" \
     --option 'mock_scenario="streaming_text"' \
     --option 'mock_text="sqlite-after-restart"' --json >/dev/null
+"$cli" run "orchid memory probe" --session "$context_node_id" \
+    --option 'mock_scenario="streaming_text"' \
+    --option 'mock_text="context-node-after-restart"' --json >/dev/null
 "$cli" session inspect "$file_id" --json |
     grep -F '"source":"process-e2e-fixture"' |
     grep -F '"injection_event":"' >/dev/null
 "$cli" session inspect "$sqlite_id" --json |
     grep -F '"source":"sqlite-e2e-fixture"' |
     grep -F '"injection_event":"' >/dev/null
+context_after_restart=$("$cli" session inspect "$context_node_id" --json)
+printf '%s' "$context_after_restart" |
+    grep -F '"source":"context-node-e2e-fixture"' >/dev/null
+test "$(printf '%s' "$context_after_restart" |
+    grep -o '"kind":"retrieved_memory"' | wc -l | tr -d ' ')" -eq 1
+test "$(grep -F '"event_type":"context.boundary_started"' \
+    "$context_node_journal" | grep -c -F '"boundary":"context_node"')" -eq 2
+test "$(grep -F '"event_type":"context.phase_started"' \
+    "$context_node_journal" | grep -F '"boundary":"context_node"' |
+    grep -c -F '"phase":"memory"')" -eq 2
+test "$(grep -F '"event_type":"context.boundary_completed"' \
+    "$context_node_journal" | grep -c -F '"boundary":"context_node"')" -eq 2
+test "$(grep -c -F '"event_type":"model.request_proposed"' \
+    "$context_node_journal")" -eq 2
+test "$(grep -F '"event_type":"context.boundary_completed"' \
+    "$context_node_journal" | grep -F '"boundary":"context_node"' |
+    sed -n 's/.*"run_id":"\([^"]*\)".*/\1/p' | sort -u | wc -l |
+    tr -d ' ')" -eq 2
 
 # Branch the memory-backed projection into an explicit no-memory style.
 parent_before=$("$cli" session inspect "$file_id" --json)
@@ -398,4 +485,5 @@ test -n "$serialized_bytes"
 test "$estimated_tokens" -le 7168
 test "$serialized_bytes" -le 16777216
 
+succeeded=true
 echo "runtime style-selected memory/compaction process E2E passed"

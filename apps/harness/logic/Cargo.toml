@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-harness-data = { path = "../data" }
+agentmod-harness-data = { version = "0.1.0", path = "../data" }
 thiserror.workspace = true
 
 [lints]

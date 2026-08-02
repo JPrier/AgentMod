@@ -1,0 +1,131 @@
+format_version = 1
+entry = "fresh-context"
+
+[budget]
+max_steps = 500
+max_tokens = 750000
+max_cost_micros = 75000000
+max_duration_ms = 2700000
+
+[declarations]
+capabilities = ["artifacts", "context", "model", "tools"]
+tools = ["filesystem.edit", "git.diff", "process.run"]
+providers = ["deterministic-mock"]
+
+[[variables]]
+name = "model_disposition"
+type = { kind = "enum", values = ["response_complete", "tool_requests"] }
+scope = "run"
+producer = "research"
+consumers = ["tool-batch"]
+mutability = "mutable"
+max_size_bytes = 64
+security_classification = "internal"
+
+[[variables]]
+name = "model_result"
+type = { kind = "node_result_reference" }
+scope = "run"
+producer = "research"
+consumers = ["tool-batch"]
+mutability = "mutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[variables]]
+name = "worker_receipt"
+type = { kind = "node_result_reference" }
+scope = "run"
+producer = "tool-batch"
+consumers = ["persist-evidence"]
+mutability = "mutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[variables]]
+name = "evidence_artifact"
+type = { kind = "artifact_reference" }
+scope = "run"
+producer = "persist-evidence"
+consumers = ["repeat", "done"]
+mutability = "mutable"
+max_size_bytes = 512
+security_classification = "confidential"
+
+[[variables]]
+name = "iteration"
+type = { kind = "map", value_type = { kind = "boolean" }, max_entries = 1 }
+scope = "run"
+producer = "repeat"
+consumers = ["repeat"]
+mutability = "mutable"
+max_size_bytes = 128
+security_classification = "internal"
+
+[[nodes]]
+id = "fresh-context"
+kind = "context_transform"
+configuration = { type = "context_transform", strategy = "fresh" }
+
+[[nodes]]
+id = "research"
+kind = "model_call"
+provider = "deterministic-mock"
+write_variables = ["model_disposition", "model_result"]
+retry_limit = 2
+configuration = { type = "model_request", disposition_output = "model_disposition", result_output = "model_result", inputs = { worker_phase = { kind = "static", value = "canonical_tool_evidence" } } }
+
+[[nodes]]
+id = "tool-batch"
+kind = "tool_execution_gate"
+read_variables = ["model_disposition", "model_result"]
+write_variables = ["worker_receipt"]
+read_scopes = ["workspace"]
+configuration = { type = "provider_tool_batch_execution", request_reference_variable = "model_result", disposition_variable = "model_disposition", maximum_calls = 1, allowed_tools = ["filesystem.edit", "git.diff", "process.run"] }
+
+[[nodes]]
+id = "persist-evidence"
+kind = "persist_artifact"
+read_variables = ["worker_receipt"]
+write_variables = ["evidence_artifact"]
+configuration = { type = "persist_artifact", content = { kind = "node_result_projection", reference_variable = "worker_receipt" }, mime_type = "application/vnd.agentmod.worker-evidence+json", security = "private", retention = "session" }
+
+[[nodes]]
+id = "repeat"
+kind = "loop"
+read_variables = ["iteration", "evidence_artifact"]
+write_variables = ["iteration"]
+max_iterations = 4
+
+[[nodes]]
+id = "done"
+kind = "complete_session"
+read_variables = ["evidence_artifact"]
+
+[[edges]]
+from = "fresh-context"
+to = "research"
+
+[[edges]]
+from = "research"
+to = "tool-batch"
+
+[[edges]]
+from = "tool-batch"
+to = "persist-evidence"
+
+[[edges]]
+from = "persist-evidence"
+to = "repeat"
+
+[[edges]]
+from = "repeat"
+to = "fresh-context"
+condition = "iteration.remaining == true"
+label = "continue"
+
+[[edges]]
+from = "repeat"
+to = "done"
+condition = "iteration.remaining == false"
+label = "complete"

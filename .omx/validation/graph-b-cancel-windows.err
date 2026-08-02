@@ -1,0 +1,8 @@
+   Compiling agentmod-runtime v0.1.0 (C:\Users\jkpri\AgentMod\apps\runtime\bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.49s
+[31;1mException: [0mC:\Users\jkpri\AgentMod\tests\e2e\runtime_arbitrary_graph_b.ps1:50[0m
+[31;1m[0m[36;1mLine |[0m
+[31;1m[0m[36;1m[36;1m  50 | [0m             [36;1mthrow ([0m
+[31;1m[0m[36;1m[36;1m[0m[36;1m[0m[36;1m     | [31;1m             ~~~~~~~[0m
+[31;1m[0m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m     | [31;1mCLI failed (1): agentmod approval resolve 019fb71f-fc11-7fd1-b880-87c6a6939bef[0m
+[31;1m[0m[36;1m[36;1m[0m[36;1m[0m[36;1m[31;1m[31;1m[36;1m[31;1m[36;1m     | [31;1mcab41e8a-1539-e729-2fe0-64f2a4a1bb93 approve --json CLI operation failed: approval runtime data is unavailable[0m

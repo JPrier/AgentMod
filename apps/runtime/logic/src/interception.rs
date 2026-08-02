@@ -7,7 +7,7 @@ use agentmod_event_pipeline::{
 
 use crate::{
     action::ActionProposal,
-    permission::{PermissionDecision, PermissionEffect, PermissionPolicy, evaluate_permissions},
+    permission::{PermissionDecision, PermissionEffect, PermissionPolicy},
 };
 
 /// Mandatory broad stage of a blocking handler.
@@ -152,6 +152,27 @@ pub async fn intercept_action(
     user_policy: &PermissionPolicy,
     mandatory_policy: &PermissionPolicy,
 ) -> InterceptionResult {
+    intercept_action_with_user_policies(
+        original,
+        style_pipeline,
+        plugin_pipeline,
+        capabilities,
+        &[user_policy],
+        mandatory_policy,
+    )
+    .await
+}
+
+/// Runs both interceptor stages, every non-relaxing user-policy layer, and the
+/// final mandatory policy gate.
+pub async fn intercept_action_with_user_policies(
+    original: ActionProposal,
+    style_pipeline: &BlockingPipeline<ActionProposal>,
+    plugin_pipeline: &BlockingPipeline<ActionProposal>,
+    capabilities: ActionCapabilities,
+    user_policies: &[&PermissionPolicy],
+    mandatory_policy: &PermissionPolicy,
+) -> InterceptionResult {
     let style_report = style_pipeline.execute(original.clone(), capabilities).await;
     let mut audit = audit_report(InterceptorScope::SessionStyle, &style_report);
     let after_style = match terminal_from_report(style_report) {
@@ -178,7 +199,11 @@ pub async fn intercept_action(
         }
     };
 
-    let permission = evaluate_permissions(&final_proposal, user_policy, mandatory_policy);
+    let permission = crate::permission::evaluate_layered_permissions(
+        &final_proposal,
+        user_policies,
+        mandatory_policy,
+    );
     let outcome = match permission.effect {
         PermissionEffect::Allow => InterceptionOutcome::Approved {
             executable: final_proposal,

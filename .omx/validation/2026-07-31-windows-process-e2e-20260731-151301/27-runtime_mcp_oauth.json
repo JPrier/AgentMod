@@ -1,0 +1,12 @@
+{
+  "index": 27,
+  "name": "27-runtime_mcp_oauth",
+  "script": "runtime_mcp_oauth.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_mcp_oauth.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 107357,
+  "started_at": "2026-07-31T19:29:57.2720569Z",
+  "ended_at": "2026-07-31T19:31:44.6341792Z",
+  "log": "27-runtime_mcp_oauth.log"
+}

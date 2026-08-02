@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 agent-client-protocol.workspace = true
-agentmod-acp-logic = { path = "../logic" }
+agentmod-acp-logic = { version = "0.1.0", path = "../logic" }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

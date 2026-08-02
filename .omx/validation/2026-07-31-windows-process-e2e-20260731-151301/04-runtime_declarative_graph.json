@@ -1,0 +1,12 @@
+{
+  "index": 4,
+  "name": "04-runtime_declarative_graph",
+  "script": "runtime_declarative_graph.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_declarative_graph.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 55300,
+  "started_at": "2026-07-31T19:14:33.8566938Z",
+  "ended_at": "2026-07-31T19:15:29.1571539Z",
+  "log": "04-runtime_declarative_graph.log"
+}

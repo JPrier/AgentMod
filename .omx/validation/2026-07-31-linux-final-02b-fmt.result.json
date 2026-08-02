@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "step_id": "02b-fmt",
+  "command": "cargo fmt --all -- --check",
+  "arguments": [
+    "fmt",
+    "--all",
+    "--",
+    "--check"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 2.683151866,
+  "started_at_utc": "2026-07-31T12:49:53+00:00",
+  "completed_at_utc": "2026-07-31T12:49:55+00:00",
+  "source_head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "source_working_tree_dirty": true,
+  "isolated_copy_root": "/tmp/agentmod-linux-final-20260731-02b.YmqECu",
+  "cargo_target_dir": "/tmp/agentmod-linux-final-20260731-02b.YmqECu/.cargo-target",
+  "stdout_path": ".omx/validation/2026-07-31-linux-final-02b-fmt.stdout.log",
+  "stderr_path": ".omx/validation/2026-07-31-linux-final-02b-fmt.stderr.log"
+}

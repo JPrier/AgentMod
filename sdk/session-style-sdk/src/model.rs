@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use agentmod_primitives::ContentHash;
 use serde::{Deserialize, Serialize};
 
 /// Complete versioned session-style manifest.
@@ -31,6 +32,9 @@ pub struct SessionStyleManifest {
     /// Plugin IDs permitted in the style.
     #[serde(default)]
     pub allowed_plugins: Vec<String>,
+    /// Ordered exact plugin context transforms applied before model requests.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_transforms: Vec<ContextTransformSelection>,
     /// Harness selection and capability requirements.
     #[serde(default)]
     pub harness: HarnessSelection,
@@ -50,6 +54,35 @@ pub struct SessionStyleManifest {
     pub termination: TerminationPolicy,
     /// Top-level style selection policy.
     pub selection: TopLevelSelection,
+}
+
+/// Immutable selection of one plugin-provided context transform.
+///
+/// Vector order in [`SessionStyleManifest::context_transforms`] is execution
+/// order and is retained byte-for-byte in the compiled style contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextTransformSelection {
+    /// Exact allowed and activated plugin identity.
+    pub plugin_id: String,
+    /// Exact transform declaration identity within the plugin.
+    pub transform_id: String,
+    /// Exact selected semantic version; compatible substitution is prohibited.
+    pub version: String,
+    /// Hash of the exact authoritative plugin declaration.
+    pub declaration_hash: ContentHash,
+    /// Runtime lifecycle boundary at which the transform executes.
+    pub lifecycle: ContextTransformLifecycle,
+    /// Hash of the exact immutable adapter configuration.
+    pub configuration_reference: ContentHash,
+}
+
+/// Supported context-transform lifecycle boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextTransformLifecycle {
+    /// Apply after canonical context construction and before a model request.
+    BeforeModelRequest,
 }
 
 /// Harness selected by a style and the capabilities execution requires.
@@ -183,6 +216,9 @@ pub enum DecisionCapability {
 pub struct MemorySelection {
     /// Provider ID, including `none`.
     pub provider: String,
+    /// Exact plugin-provided implementation, when the provider is external.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginMemorySelection>,
     /// Searchable scopes.
     #[serde(default)]
     pub scopes: Vec<MemoryScope>,
@@ -202,6 +238,24 @@ pub struct MemorySelection {
     /// Provider-projection location for approved retrieved records.
     #[serde(default)]
     pub injection_location: MemoryInjectionLocation,
+}
+
+/// Immutable selection of one plugin-provided memory implementation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginMemorySelection {
+    /// Exact allowed and activated plugin identity.
+    pub plugin_id: String,
+    /// Exact selected plugin semantic version.
+    pub plugin_version: String,
+    /// Memory-provider declaration identity within the plugin.
+    pub provider_id: String,
+    /// Exact selected provider semantic version.
+    pub provider_version: String,
+    /// Hash of the exact authoritative provider declaration.
+    pub declaration_hash: ContentHash,
+    /// Hash of the exact immutable adapter configuration.
+    pub configuration_reference: ContentHash,
 }
 
 /// Memory retrieval lifecycle boundary.
@@ -315,6 +369,9 @@ pub enum MemoryScope {
 pub struct CompactionSelection {
     /// Selected strategy.
     pub strategy: CompactionStrategy,
+    /// Exact plugin-provided implementation, when the strategy is `plugin`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<PluginCompactorSelection>,
     /// Token threshold, when the strategy is automatic.
     pub trigger_tokens: Option<u64>,
     /// Tokens reserved for provider output and runtime-required context.
@@ -333,6 +390,24 @@ pub struct CompactionSelection {
     /// Typed provider-projection records a compactor must retain.
     #[serde(default = "default_compaction_preservation_requirements")]
     pub preservation_requirements: Vec<CompactionPreservationRequirement>,
+}
+
+/// Immutable selection of one plugin-provided compactor implementation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginCompactorSelection {
+    /// Exact allowed and activated plugin identity.
+    pub plugin_id: String,
+    /// Exact selected plugin semantic version.
+    pub plugin_version: String,
+    /// Compactor declaration identity within the plugin.
+    pub compactor_id: String,
+    /// Exact selected compactor semantic version.
+    pub compactor_version: String,
+    /// Hash of the exact authoritative compactor declaration.
+    pub declaration_hash: ContentHash,
+    /// Hash of the exact immutable adapter configuration.
+    pub configuration_reference: ContentHash,
 }
 
 /// Provider-projection records which a compaction strategy must retain.
@@ -379,6 +454,8 @@ pub enum CompactionStrategy {
     ArtifactHandoff,
     /// Evict large tool output projections.
     ToolOutputEviction,
+    /// Invoke the exact plugin compactor selected by the immutable style.
+    Plugin,
     /// Disable compaction.
     None,
 }
@@ -440,6 +517,9 @@ pub struct ChildAgentLimits {
     /// Workspace isolation selected for every child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_mode: Option<ChildWorkspaceMode>,
+    /// Explicit merge policy required by branch workspaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_merge_policy: Option<ChildWorkspaceMergePolicy>,
     /// Explicit custom workspace locator when that mode is selected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_workspace: Option<String>,
@@ -449,6 +529,12 @@ pub struct ChildAgentLimits {
     /// Whether a child inherits the parent model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherit_model: Option<bool>,
+    /// Whether a child inherits the parent's exact authenticated MCP bootstrap.
+    ///
+    /// An omitted value is semantically `false`, preserving historical style
+    /// manifests and their canonical hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit_mcp: Option<bool>,
     /// Maximum provider-context contribution for one child.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_budget_tokens: Option<u64>,
@@ -484,8 +570,24 @@ pub enum ChildWorkspaceMode {
     IndependentGitWorktree,
     /// Each child receives a temporary workspace copy.
     TemporaryCopy,
+    /// Each child receives a bounded runtime-owned filesystem copy.
+    IsolatedCopy,
+    /// Each child receives an owned Git worktree with explicit merge policy.
+    BranchWorkspace,
     /// The style provides an explicit custom workspace locator.
     ExplicitCustomWorkspace,
+}
+
+/// Immutable integration policy for a branch child workspace.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChildWorkspaceMergePolicy {
+    /// No implicit merge; an explicit reviewed action is required.
+    ManualReview,
+    /// A reviewed fast-forward action may be proposed separately.
+    ReviewedFastForward,
+    /// A reviewed three-way merge action may be proposed separately.
+    ReviewedThreeWay,
 }
 
 /// Memory visibility granted to a child.

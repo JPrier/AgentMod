@@ -8,15 +8,19 @@ use async_trait::async_trait;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
     process::Stdio,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout, Command},
-    sync::{Mutex, mpsc},
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
@@ -162,6 +166,9 @@ pub struct HarnessDependencyConfig {
     pub request_timeout: Duration,
     pub frame_pacing: Duration,
     pub authorization_key: [u8; 32],
+    pub maximum_connections: usize,
+    pub maximum_pending_connections: usize,
+    pub test_gate_root: Option<PathBuf>,
 }
 struct Connection {
     child: Child,
@@ -171,7 +178,9 @@ struct Connection {
 #[derive(Clone)]
 pub struct ProcessHarnessDependency {
     config: Arc<HarnessDependencyConfig>,
-    connection: Arc<Mutex<Option<Connection>>>,
+    connections: Arc<Mutex<Vec<Connection>>>,
+    connection_capacity: Arc<Semaphore>,
+    pending_connections: Arc<AtomicUsize>,
     cancellations: Arc<Mutex<CancellationRegistry>>,
 }
 
@@ -219,12 +228,18 @@ impl ProcessHarnessDependency {
             || config.request_timeout.is_zero()
             || config.frame_pacing > Duration::from_secs(5)
             || config.authorization_key == [0_u8; 32]
+            || config.maximum_connections == 0
+            || config.maximum_connections > 64
+            || config.maximum_pending_connections > 1_024
         {
             return Err(HarnessDependencyError::InvalidConfiguration);
         }
+        let maximum_connections = config.maximum_connections;
         Ok(Self {
             config: Arc::new(config),
-            connection: Arc::new(Mutex::new(None)),
+            connections: Arc::new(Mutex::new(Vec::new())),
+            connection_capacity: Arc::new(Semaphore::new(maximum_connections)),
+            pending_connections: Arc::new(AtomicUsize::new(0)),
             cancellations: Arc::new(Mutex::new(CancellationRegistry::default())),
         })
     }
@@ -244,6 +259,9 @@ impl ProcessHarnessDependency {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        if let Some(root) = &self.config.test_gate_root {
+            c.env("AGENTMOD_HARNESS_TEST_GATE_ROOT", root);
+        }
         let mut child = c.spawn().map_err(|_| HarnessDependencyError::Unavailable)?;
         let stdin = child
             .stdin
@@ -259,28 +277,67 @@ impl ProcessHarnessDependency {
             stdout: BufReader::new(stdout),
         })
     }
+
+    async fn acquire_connection_permit(
+        &self,
+    ) -> Result<OwnedSemaphorePermit, HarnessDependencyError> {
+        if let Ok(permit) = self.connection_capacity.clone().try_acquire_owned() {
+            return Ok(permit);
+        }
+        self.pending_connections
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                (pending < self.config.maximum_pending_connections).then_some(pending + 1)
+            })
+            .map_err(|_| HarnessDependencyError::TooManyPendingConnections)?;
+        let permit = timeout(
+            self.config.request_timeout,
+            self.connection_capacity.clone().acquire_owned(),
+        )
+        .await;
+        self.pending_connections.fetch_sub(1, Ordering::AcqRel);
+        permit
+            .map_err(|_| HarnessDependencyError::Timeout)?
+            .map_err(|_| HarnessDependencyError::Unavailable)
+    }
+
+    async fn take_connection(&self) -> Result<Connection, HarnessDependencyError> {
+        if let Some(connection) = self.connections.lock().await.pop() {
+            Ok(connection)
+        } else {
+            self.connect()
+        }
+    }
+
+    async fn release_connection(&self, connection: Connection) {
+        self.connections.lock().await.push(connection);
+    }
+
+    async fn discard_connection(mut connection: Connection) {
+        let _ = connection.child.start_kill();
+        let _ = connection.child.wait().await;
+    }
+
     async fn once(
         &self,
         command: &DependencyCommand,
         cancellation: Option<CancellationToken>,
     ) -> Result<DependencyReply, HarnessDependencyError> {
-        let mut guard = self.connection.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.connect()?);
-        }
-        let c = guard.as_mut().ok_or(HarnessDependencyError::Unavailable)?;
         let mut bytes = serde_json::to_vec(&self.to_wire(command)?)
             .map_err(|_| HarnessDependencyError::Protocol)?;
         bytes.push(b'\n');
-        c.stdin
-            .write_all(&bytes)
-            .await
-            .map_err(|_| HarnessDependencyError::Transport)?;
-        c.stdin
-            .flush()
-            .await
-            .map_err(|_| HarnessDependencyError::Transport)?;
-        timeout(self.config.request_timeout, async {
+        let _permit = self.acquire_connection_permit().await?;
+        let mut connection = self.take_connection().await?;
+        let result = timeout(self.config.request_timeout, async {
+            connection
+                .stdin
+                .write_all(&bytes)
+                .await
+                .map_err(|_| HarnessDependencyError::Transport)?;
+            connection
+                .stdin
+                .flush()
+                .await
+                .map_err(|_| HarnessDependencyError::Transport)?;
             let mut events = Vec::new();
             loop {
                 let reply = if let Some(cancellation) = &cancellation {
@@ -290,10 +347,10 @@ impl ProcessHarnessDependency {
                             events.push(DependencyEvent::Cancelled);
                             return Ok(DependencyReply::Events(events));
                         }
-                        reply = read_frame(&mut c.stdout, self.config.maximum_frame_bytes) => reply?,
+                        reply = read_frame(&mut connection.stdout, self.config.maximum_frame_bytes) => reply?,
                     }
                 } else {
-                    read_frame(&mut c.stdout, self.config.maximum_frame_bytes).await?
+                    read_frame(&mut connection.stdout, self.config.maximum_frame_bytes).await?
                 };
                 let reply: wire::HarnessReply =
                     serde_json::from_slice(&reply).map_err(|_| HarnessDependencyError::Protocol)?;
@@ -310,7 +367,18 @@ impl ProcessHarnessDependency {
             }
         })
         .await
-        .map_err(|_| HarnessDependencyError::Timeout)?
+        .map_err(|_| HarnessDependencyError::Timeout)?;
+        let cancelled = matches!(
+            &result,
+            Ok(DependencyReply::Events(events))
+                if matches!(events.last(), Some(DependencyEvent::Cancelled))
+        );
+        if result.is_ok() && !cancelled {
+            self.release_connection(connection).await;
+        } else {
+            Self::discard_connection(connection).await;
+        }
+        result
     }
 
     async fn stream_once(
@@ -319,25 +387,22 @@ impl ProcessHarnessDependency {
         cancellation: Option<CancellationToken>,
         sender: &mpsc::Sender<Result<DependencyEvent, HarnessDependencyError>>,
     ) -> Result<(), HarnessDependencyError> {
-        let mut guard = self.connection.lock().await;
-        if guard.is_none() {
-            *guard = Some(self.connect()?);
-        }
-        let connection = guard.as_mut().ok_or(HarnessDependencyError::Unavailable)?;
         let mut bytes = serde_json::to_vec(&self.to_wire(command)?)
             .map_err(|_| HarnessDependencyError::Protocol)?;
         bytes.push(b'\n');
-        connection
-            .stdin
-            .write_all(&bytes)
-            .await
-            .map_err(|_| HarnessDependencyError::Transport)?;
-        connection
-            .stdin
-            .flush()
-            .await
-            .map_err(|_| HarnessDependencyError::Transport)?;
-        timeout(self.config.request_timeout, async {
+        let _permit = self.acquire_connection_permit().await?;
+        let mut connection = self.take_connection().await?;
+        let result = timeout(self.config.request_timeout, async {
+            connection
+                .stdin
+                .write_all(&bytes)
+                .await
+                .map_err(|_| HarnessDependencyError::Transport)?;
+            connection
+                .stdin
+                .flush()
+                .await
+                .map_err(|_| HarnessDependencyError::Transport)?;
             loop {
                 let frame = if let Some(cancellation) = &cancellation {
                     tokio::select! {
@@ -398,7 +463,14 @@ impl ProcessHarnessDependency {
             }
         })
         .await
-        .map_err(|_| HarnessDependencyError::Timeout)?
+        .map_err(|_| HarnessDependencyError::Timeout)?;
+        let cancelled = cancellation.is_some_and(|token| token.is_cancelled());
+        if result.is_ok() && !cancelled {
+            self.release_connection(connection).await;
+        } else {
+            Self::discard_connection(connection).await;
+        }
+        result
     }
 
     fn to_wire(
@@ -537,7 +609,8 @@ impl HarnessDependencyPort for ProcessHarnessDependency {
     }
 
     async fn shutdown(&self) {
-        if let Some(mut c) = self.connection.lock().await.take() {
+        let connections = std::mem::take(&mut *self.connections.lock().await);
+        for mut c in connections {
             let _ = c.child.start_kill();
             let _ = c.child.wait().await;
         }
@@ -768,6 +841,8 @@ pub enum HarnessDependencyError {
     UnknownCancellation,
     #[error("harness pending cancellation capacity is exhausted")]
     TooManyPendingCancellations,
+    #[error("harness pending connection capacity is exhausted")]
+    TooManyPendingConnections,
 }
 
 #[cfg(test)]
@@ -782,6 +857,9 @@ mod tests {
             request_timeout: Duration::from_secs(1),
             frame_pacing: Duration::ZERO,
             authorization_key: [7_u8; 32],
+            maximum_connections: 1,
+            maximum_pending_connections: 1,
+            test_gate_root: None,
         })
         .expect("dependency")
     }
@@ -817,6 +895,32 @@ mod tests {
             DependencyEvent::Cancelled
         );
         assert!(stream.next().await.is_none());
-        assert!(dependency.connection.lock().await.is_none());
+        assert!(dependency.connections.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connection_admission_is_bounded_and_applies_backpressure() {
+        let dependency = dependency();
+        let active = dependency
+            .acquire_connection_permit()
+            .await
+            .expect("active connection permit");
+        let waiting_dependency = dependency.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_dependency
+                .acquire_connection_permit()
+                .await
+                .expect("queued connection permit")
+        });
+        while dependency.pending_connections.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            dependency.acquire_connection_permit().await,
+            Err(HarnessDependencyError::TooManyPendingConnections)
+        ));
+        drop(active);
+        drop(waiting.await.expect("queued task"));
+        assert_eq!(dependency.pending_connections.load(Ordering::Acquire), 0);
     }
 }

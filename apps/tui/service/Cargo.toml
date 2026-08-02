@@ -8,13 +8,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-tui-logic = { path = "../logic" }
+agentmod-tui-logic = { version = "0.1.0", path = "../logic" }
 ratatui.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
-agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
 uuid.workspace = true
 
 [lints]

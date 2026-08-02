@@ -1,0 +1,264 @@
+{
+  "style_id": "ephemeral-turn",
+  "style_version": "1.1.0",
+  "kind": "built_in",
+  "built_in_semantic": "ephemeral_turn",
+  "graph": {
+    "format_version": 1,
+    "entry_index": 1,
+    "budget": {
+      "max_steps": 50,
+      "max_tokens": 250000,
+      "max_cost_micros": 25000000,
+      "max_duration_ms": 900000
+    },
+    "declarations": {
+      "capabilities": [
+        "context",
+        "model",
+        "tools"
+      ],
+      "tools": [
+        "filesystem.read"
+      ],
+      "providers": [
+        "mock"
+      ],
+      "events": [],
+      "plugins": []
+    },
+    "variables": [],
+    "nodes": [
+      {
+        "index": 0,
+        "id": "done",
+        "kind": "complete_turn",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 1,
+        "id": "fresh-context",
+        "kind": "context_transform",
+        "configuration": {
+          "type": "context_transform",
+          "strategy": "preserve_history"
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 2,
+        "id": "respond",
+        "kind": "model_call",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": "mock",
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 1,
+        "max_iterations": null
+      },
+      {
+        "index": 3,
+        "id": "tool",
+        "kind": "tool_execution_gate",
+        "configuration": {
+          "type": "tool_execution",
+          "arguments": {
+            "kind": "static",
+            "value": {}
+          }
+        },
+        "condition": null,
+        "tool": "filesystem.read",
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [
+          "workspace"
+        ],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      }
+    ],
+    "edges": [
+      {
+        "from": 1,
+        "to": 2,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 2,
+        "to": 3,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 3,
+        "to": 0,
+        "condition": null,
+        "label": null
+      }
+    ],
+    "cache_key": {
+      "graph_content_hash": "203a8f9caae42d30450c032f73ffcdba037ab60e2fded079062a8eaaf0e1e523",
+      "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+      "capability_set_hash": "740ec0810d6069d7cb3b1338c71fca1a20bea948cc6e94730dc81f165e16435d",
+      "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+      "combined_hash": "def1a2ad32c743c217f1f6c14a0ae84440b23185e095f3b4cfba4ae48086de4e"
+    }
+  },
+  "interceptor_order": [
+    "runtime-style-policy"
+  ],
+  "interceptors": [
+    {
+      "id": "runtime-style-policy",
+      "owner": "runtime.security",
+      "event": "action.proposed",
+      "stage": 10,
+      "priority": 100,
+      "before": [],
+      "after": [],
+      "supported_decisions": [
+        "continue",
+        "replace",
+        "reject",
+        "require_approval",
+        "cancel"
+      ],
+      "required_capabilities": [
+        "approval"
+      ]
+    }
+  ],
+  "required_capabilities": [
+    "approval",
+    "context",
+    "model",
+    "tools"
+  ],
+  "allowed_tool_groups": [
+    "filesystem"
+  ],
+  "allowed_providers": [
+    "mock"
+  ],
+  "allowed_plugins": [
+    "runtime.security"
+  ],
+  "harness": {
+    "id": "native",
+    "required_capabilities": [
+      "cancellation",
+      "streaming",
+      "structured_context_replacement",
+      "token_usage",
+      "tool_calls"
+    ]
+  },
+  "memory": {
+    "provider": "none",
+    "scopes": [],
+    "retrieval_timing": "never",
+    "query": {
+      "source": "current_input",
+      "include_active_artifacts": false,
+      "include_style_context": false,
+      "max_query_bytes": 16384
+    },
+    "max_items": 0,
+    "max_injected_bytes": 0,
+    "write_policy": "never",
+    "injection_location": "none"
+  },
+  "compaction": {
+    "strategy": "none",
+    "trigger_tokens": null,
+    "reserved_context_tokens": 0,
+    "max_provider_projection_tokens": 0,
+    "preserve_unresolved_tasks": true,
+    "preserve_active_processes": true,
+    "preservation_requirements": [
+      "system_instructions",
+      "current_input",
+      "pending_control_state",
+      "artifact_references",
+      "memory_provenance",
+      "active_graph_state",
+      "tool_call_correlation"
+    ]
+  },
+  "approvals": {
+    "default": "ask",
+    "groups": {
+      "filesystem.read": "allow"
+    }
+  },
+  "budgets": {
+    "max_iterations": 32,
+    "max_steps": 1000,
+    "max_tokens": 1000000,
+    "max_cost_micros": 100000000,
+    "max_duration_ms": 3600000
+  },
+  "child_agents": {
+    "max_children": 0,
+    "max_concurrent": 0,
+    "max_depth": 0,
+    "per_child_token_budget": 0
+  },
+  "retry": {
+    "max_attempts": 2,
+    "initial_backoff_ms": 100,
+    "max_backoff_ms": 5000,
+    "retryable_failures": [
+      "provider.rate_limit",
+      "provider.unavailable"
+    ]
+  },
+  "termination": {
+    "allowed_outcomes": [
+      "complete_turn",
+      "fail"
+    ],
+    "on_hard_limit": "fail",
+    "require_explicit_terminal_node": true
+  },
+  "selection": {
+    "requires_explicit_selection": true,
+    "model_may_select": false
+  },
+  "cache_key": {
+    "style_content_hash": "c28950785dcadaffd12861df0b02bac671f82a7a0d9f65a3cda9451def5feeda",
+    "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+    "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+    "capability_set_hash": "ed32eaa3749667657942a541cc1cd92d768c994f382cc55088354c23cfa41df4",
+    "combined_hash": "6c51b4362a0dc60a561ef64f3faa35060a78e2a63d002294c06228a9a04e3b14"
+  }
+}

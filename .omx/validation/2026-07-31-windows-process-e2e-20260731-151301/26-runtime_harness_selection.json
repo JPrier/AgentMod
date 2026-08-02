@@ -1,0 +1,12 @@
+{
+  "index": 26,
+  "name": "26-runtime_harness_selection",
+  "script": "runtime_harness_selection.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_harness_selection.ps1",
+  "exit_code": 0,
+  "status": "passed",
+  "elapsed_ms": 18877,
+  "started_at": "2026-07-31T19:29:28.6013456Z",
+  "ended_at": "2026-07-31T19:29:47.4834929Z",
+  "log": "26-runtime_harness_selection.log"
+}

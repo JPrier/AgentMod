@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "step_id": "03c-tests",
+  "command": "cargo test --workspace --all-targets --all-features --locked",
+  "arguments": [
+    "test",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--locked"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 64.8406275,
+  "started_at_utc": "2026-07-31T12:37:42.0688053+00:00",
+  "completed_at_utc": "2026-07-31T12:38:46.9920524+00:00",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree_dirty": true,
+  "working_tree_porcelain_entries": 338,
+  "stdout_path": ".omx\\validation\\2026-07-31-windows-final-03c-tests.stdout.log",
+  "stderr_path": ".omx\\validation\\2026-07-31-windows-final-03c-tests.stderr.log",
+  "launch_failure": null
+}

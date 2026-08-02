@@ -47,7 +47,7 @@ state_migration_version = 1
 [identity]
 id = "fixture.rewriter"
 version = "1.0.0"
-runtime_api = "^0.1"
+runtime_api = "^1.0"
 
 [entrypoint]
 kind = "process"
@@ -97,7 +97,7 @@ state_migration_version = 1
 [identity]
 id = "fixture.observer"
 version = "1.0.0"
-runtime_api = "^0.1"
+runtime_api = "^1.0"
 
 [entrypoint]
 kind = "process"
@@ -211,6 +211,12 @@ kind = "continue"
             Get-Content -LiteralPath $runtimeErr
             throw "committed event was not delivered to observer"
         }
+        $journal = Get-Content -LiteralPath $journalPath -Raw
+        if ($journal -notmatch "plugin.observer_delivery_proposed" -or
+            $journal -notmatch "plugin.observer_delivery_dispatched" -or
+            $journal -notmatch "plugin.observer_delivery_completed") {
+            throw "observer delivery did not commit proposed/dispatched/completed receipts"
+        }
         $inspection = & $cli session inspect $session.session_id --json |
             ConvertFrom-Json
         if ($inspection.state.style_binding.id -ne "plugin-composed" -or
@@ -218,7 +224,9 @@ kind = "continue"
                 "rewrite-tool" -or
             @($inspection.state.plugins.activated_plugin_ids) -notcontains
                 "fixture.observer" -or
-            @($inspection.state.plugins.invocations).Count -lt 1) {
+            @($inspection.state.plugins.invocations).Count -lt 1 -or
+            ($inspection | ConvertTo-Json -Depth 100) -notmatch
+                '"observer_deliveries"') {
             throw "plugin-composed binding is not inspectable"
         }
 
@@ -265,7 +273,10 @@ kind = "continue"
         }
         $resolvedTemp = (Resolve-Path ([System.IO.Path]::GetTempPath())).Path
         $resolvedRun = (Resolve-Path $runRoot).Path
-        if ($resolvedRun.StartsWith($resolvedTemp) -and
+        if ($env:AGENTMOD_KEEP_PLUGIN_COMPOSITION_E2E -eq "1") {
+            Write-Output "preserved plugin composition E2E root: $resolvedRun"
+        }
+        elseif ($resolvedRun.StartsWith($resolvedTemp) -and
             $resolvedRun -like "*agentmod-plugin-e2e-*") {
             Remove-Item -LiteralPath $resolvedRun -Recurse -Force
         }

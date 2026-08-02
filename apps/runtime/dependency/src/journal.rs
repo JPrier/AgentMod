@@ -31,6 +31,9 @@ pub struct DependencyAppendJournalRequest {
     pub session_directory: PathBuf,
     /// Sequence expected immediately after the current valid tail.
     pub sequence: u64,
+    /// Exact event identity expected at the current valid tail, when the
+    /// caller requires a compare-and-swap append.
+    pub expected_head_event_id: Option<String>,
     /// Event ID used for duplicate detection.
     pub event_id: String,
     /// Exact typed event envelope JSON supplied by runtime data.
@@ -184,6 +187,16 @@ impl JournalDependencyPort for JsonlJournalDependency {
                     expected,
                     actual: request.sequence,
                 });
+            }
+            if let Some(expected_head_event_id) = &request.expected_head_event_id {
+                let actual_head_event_id =
+                    scan.records.last().map(|record| record.event_id.clone());
+                if actual_head_event_id.as_deref() != Some(expected_head_event_id.as_str()) {
+                    return Err(JournalDependencyError::HeadEventIdMismatch {
+                        expected: expected_head_event_id.clone(),
+                        actual: actual_head_event_id,
+                    });
+                }
             }
             if scan
                 .records
@@ -580,6 +593,14 @@ pub enum JournalDependencyError {
         /// Requested sequence.
         actual: u64,
     },
+    /// Compare-and-swap append expected a different event at the valid tail.
+    #[error("journal head event ID mismatch: expected {expected}, received {actual:?}")]
+    HeadEventIdMismatch {
+        /// Exact event identity required by the caller.
+        expected: String,
+        /// Current valid-tail event identity, or no identity for an empty journal.
+        actual: Option<String>,
+    },
     /// An event ID already exists in the journal.
     #[error("duplicate event ID: {0}")]
     DuplicateEventId(String),
@@ -633,6 +654,7 @@ mod tests {
         journal.append(DependencyAppendJournalRequest {
             session_directory: root.to_owned(),
             sequence,
+            expected_head_event_id: None,
             event_id: id.into(),
             event_json: serde_json::to_vec(&serde_json::json!({
                 "metadata": {"sequence": sequence},
@@ -680,6 +702,45 @@ mod tests {
             append(journal, directory.path(), 2, "same"),
             Err(JournalDependencyError::DuplicateEventId("same".into()))
         );
+    }
+
+    #[test]
+    fn compare_append_checks_exact_head_identity_under_the_append_lock() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let journal = JsonlJournalDependency;
+        append(journal, directory.path(), 1, "event-1").expect("first");
+        let request = |expected_head_event_id: &str| DependencyAppendJournalRequest {
+            session_directory: directory.path().to_owned(),
+            sequence: 2,
+            expected_head_event_id: Some(expected_head_event_id.to_owned()),
+            event_id: String::from("event-2"),
+            event_json: serde_json::to_vec(&serde_json::json!({
+                "metadata": {"sequence": 2},
+                "payload": {"fixture": "event-2"}
+            }))
+            .expect("fixture JSON"),
+            durability: DependencyDurability::Full,
+        };
+        assert_eq!(
+            journal.append(request("substituted-head")),
+            Err(JournalDependencyError::HeadEventIdMismatch {
+                expected: String::from("substituted-head"),
+                actual: Some(String::from("event-1")),
+            })
+        );
+        assert_eq!(
+            journal
+                .scan(DependencyScanJournalRequest {
+                    session_directory: directory.path().to_owned(),
+                })
+                .expect("scan after conflict")
+                .records
+                .len(),
+            1
+        );
+        journal
+            .append(request("event-1"))
+            .expect("exact-head append succeeds");
     }
 
     #[test]

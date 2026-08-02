@@ -9,4 +9,4 @@ process = "runtime"
 layer = "logic"
 
 [dependencies]
-fixture-runtime-protocol = { path = "../../../protocols/runtime-protocol" }
+fixture-runtime-protocol = { version = "0.1.0", path = "../../../protocols/runtime-protocol" }

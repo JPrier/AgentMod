@@ -4,8 +4,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
+use agentmod_primitives::SessionId;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -113,6 +115,23 @@ pub trait ContinuationDependencyPort {
         &self,
         request: DependencyTransitionContinuationRequest,
     ) -> Result<DependencyTransitionContinuationResponse, ContinuationDependencyError>;
+
+    /// Lists a bounded set of continuations across all session scopes.
+    ///
+    /// This is used only to recover the exact session-bound graph wait behind
+    /// an opaque cancellation token. Implementations must fail closed rather
+    /// than return a truncated result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContinuationDependencyError`] when bounded cross-session
+    /// lookup is unsupported or storage cannot be read safely.
+    fn list_continuations(
+        &self,
+        _limit: u32,
+    ) -> Result<Vec<DependencyContinuationRecord>, ContinuationDependencyError> {
+        Err(ContinuationDependencyError::LookupUnsupported)
+    }
 }
 
 /// Filesystem-backed continuation store rooted at one session's continuation directory.
@@ -317,6 +336,76 @@ impl ContinuationDependencyPort for FileContinuationDependency {
             })
         })
     }
+
+    fn list_continuations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<DependencyContinuationRecord>, ContinuationDependencyError> {
+        if limit == 0 || limit > 4096 {
+            return Err(ContinuationDependencyError::InvalidLookupLimit);
+        }
+        let root = match fs::read_dir(&self.root) {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(ContinuationDependencyError::Io(error)),
+        };
+        let mut identities = Vec::new();
+        for session in root {
+            let session = session.map_err(ContinuationDependencyError::Io)?;
+            if !session
+                .file_type()
+                .map_err(ContinuationDependencyError::Io)?
+                .is_dir()
+            {
+                continue;
+            }
+            let session_name = session.file_name();
+            let Some(session_id) = session_name.to_str() else {
+                continue;
+            };
+            if SessionId::from_str(session_id).is_err() {
+                continue;
+            }
+            let session_id = session_id.to_owned();
+            let continuation_root = session.path().join("continuations");
+            let entries = match fs::read_dir(continuation_root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(ContinuationDependencyError::Io(error)),
+            };
+            for entry in entries {
+                let entry = entry.map_err(ContinuationDependencyError::Io)?;
+                if !entry
+                    .file_type()
+                    .map_err(ContinuationDependencyError::Io)?
+                    .is_file()
+                    || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+                {
+                    continue;
+                }
+                let id = entry
+                    .path()
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .ok_or(ContinuationDependencyError::InvalidId)?
+                    .to_owned();
+                validate_id(&id)?;
+                identities.push((session_id.clone(), id));
+            }
+        }
+        identities.sort();
+        let limit =
+            usize::try_from(limit).map_err(|_| ContinuationDependencyError::InvalidLookupLimit)?;
+        let mut records = Vec::new();
+        for (session_id, id) in identities {
+            let record = self.read_record(&session_id, &id)?;
+            if records.len() == limit {
+                return Err(ContinuationDependencyError::LookupLimitExceeded);
+            }
+            records.push(record);
+        }
+        Ok(records)
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -475,6 +564,15 @@ pub enum ContinuationDependencyError {
     /// JSON encoding or decoding failed.
     #[error("continuation serialization failed: {0}")]
     Serialization(#[source] serde_json::Error),
+    /// This dependency does not support bounded continuation lookup.
+    #[error("continuation lookup is unsupported")]
+    LookupUnsupported,
+    /// Lookup limit is outside the safe supported range.
+    #[error("continuation lookup limit is invalid")]
+    InvalidLookupLimit,
+    /// More pending continuations exist than the bounded lookup can inspect.
+    #[error("continuation lookup limit exceeded")]
+    LookupLimitExceeded,
 }
 
 #[cfg(test)]
@@ -529,6 +627,108 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_and_expired_terminal_transitions_are_durable_and_idempotent() {
+        for (id, target) in [
+            ("cancelled_1", DependencyContinuationState::Cancelled),
+            ("expired_1", DependencyContinuationState::Expired),
+        ] {
+            let directory = tempfile::tempdir().expect("temp directory");
+            let store = FileContinuationDependency::new(directory.path().into());
+            store
+                .create_continuation(DependencyCreateContinuationRequest {
+                    record: pending(id),
+                })
+                .expect("create");
+            let request = DependencyTransitionContinuationRequest {
+                session_id: "session_1".into(),
+                id: id.into(),
+                expected: DependencyContinuationState::Pending,
+                target,
+            };
+            let first = store
+                .transition_continuation(request.clone())
+                .expect("terminal transition");
+            assert!(first.transitioned);
+            assert_eq!(first.current, target);
+            assert_eq!(first.payload_json, br#"{"kind":"fixture"}"#);
+            let duplicate = store
+                .transition_continuation(request)
+                .expect("idempotent duplicate");
+            assert!(!duplicate.transitioned);
+            assert_eq!(duplicate.current, target);
+            assert_eq!(
+                FileContinuationDependency::new(directory.path().into())
+                    .load_continuation("session_1", id)
+                    .expect("load after restart")
+                    .state,
+                target
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_cross_session_lookup_is_deterministic_and_never_truncates() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = FileContinuationDependency::new(directory.path().into());
+        let mut first = pending("wait_b");
+        first.session_id = uuid::Uuid::from_u128(1).to_string();
+        let mut second = pending("wait_a");
+        second.session_id = uuid::Uuid::from_u128(2).to_string();
+        for record in [first.clone(), second.clone()] {
+            store
+                .create_continuation(DependencyCreateContinuationRequest { record })
+                .expect("create");
+        }
+        assert!(matches!(
+            store.list_continuations(1),
+            Err(ContinuationDependencyError::LookupLimitExceeded)
+        ));
+        assert_eq!(
+            FileContinuationDependency::new(directory.path().into())
+                .list_continuations(2)
+                .expect("lookup after restart"),
+            vec![first, second]
+        );
+    }
+
+    #[test]
+    fn cross_session_lookup_ignores_internal_roots_but_rejects_corrupt_session_records() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = FileContinuationDependency::new(directory.path().into());
+        for reserved in [".process-hosts", ".workspace-leases", "not-a-session"] {
+            let continuation_root = directory.path().join(reserved).join("continuations");
+            fs::create_dir_all(&continuation_root).expect("reserved continuation root");
+            fs::write(continuation_root.join("corrupt.json"), b"not json")
+                .expect("reserved corrupt record");
+        }
+        let mut record = pending("valid_wait");
+        record.session_id = uuid::Uuid::from_u128(3).to_string();
+        store
+            .create_continuation(DependencyCreateContinuationRequest {
+                record: record.clone(),
+            })
+            .expect("valid continuation");
+        assert_eq!(
+            store.list_continuations(1).expect("bounded lookup"),
+            vec![record.clone()]
+        );
+
+        fs::write(
+            directory
+                .path()
+                .join(&record.session_id)
+                .join("continuations")
+                .join("corrupt.json"),
+            b"not json",
+        )
+        .expect("valid-session corrupt record");
+        assert!(matches!(
+            store.list_continuations(2),
+            Err(ContinuationDependencyError::Serialization(_))
+        ));
+    }
+
+    #[test]
     fn rejects_path_like_identifiers_and_conflicting_duplicate_creation() {
         let directory = tempfile::tempdir().expect("temp directory");
         let store = FileContinuationDependency::new(directory.path().into());
@@ -579,5 +779,23 @@ mod tests {
             store.load_continuation("session_1", "tamper"),
             Err(ContinuationDependencyError::Integrity)
         ));
+    }
+
+    #[test]
+    fn preserves_typed_graph_wait_payload_bytes_across_restart() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let store = FileContinuationDependency::new(directory.path().into());
+        let mut record = pending("graph_wait_1");
+        record.wake_condition_json = br#"{"kind":"at","value":123}"#.to_vec();
+        record.payload_json = br#"{"kind":"graph_node_wait","value":{"session_id":"session_1","run_id":"run_1","branch_path":["root"],"node_id":"delay","executor_id":"runtime.delay","executor_version":"1.0.0","executor_source":{"kind":"runtime"},"execution_boundary":"runtime_logic","adapter_configuration_reference":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","execution_plan_hash":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","attempt":1,"loop_iteration":0,"step":2,"transition_target_node_id":"after_delay","compiled_transition_reference":"transition_hash","schedule_id":"schedule_1","cancellation_token":"token_1","cancellation_reference":"cancel_ref_1"}}"#.to_vec();
+        store
+            .create_continuation(DependencyCreateContinuationRequest {
+                record: record.clone(),
+            })
+            .expect("create graph wait");
+        let restored = FileContinuationDependency::new(directory.path().into())
+            .load_continuation("session_1", "graph_wait_1")
+            .expect("load graph wait after restart");
+        assert_eq!(restored, record);
     }
 }

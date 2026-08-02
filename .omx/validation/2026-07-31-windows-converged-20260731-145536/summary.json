@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "platform": "windows",
+  "date": "2026-07-31",
+  "repository": "C:\\Users\\jkpri\\AgentMod",
+  "validation_directory": "C:\\Users\\jkpri\\AgentMod\\.omx\\validation\\2026-07-31-windows-converged-20260731-145536",
+  "github_actions_claimed": false,
+  "macos_applicable": false,
+  "tracked_source_diff": {
+    "before": "55ef14341a2f92c4dbb4569b1ac239762545d1fd",
+    "after": "b53a1d81b682729238f4f90986d675961e1ebdcf",
+    "changed": true,
+    "validation_artifacts_excluded": true,
+    "observed_changed_files": [
+      {
+        "path": "apps/plugin-host/fixture-worker/src/main.rs",
+        "last_write_utc": "2026-07-31T19:00:33Z",
+        "timing": "during 07-cargo-deny, after clippy failure"
+      },
+      {
+        "path": "tests/integration/src/lib.rs",
+        "last_write_utc": "2026-07-31T19:02:00Z",
+        "timing": "after matrix commands, after workspace-test failure"
+      }
+    ]
+  },
+  "overall_status": "failed",
+  "passed_commands": 6,
+  "failed_commands": 2,
+  "commands": [
+    {
+      "name": "01-cargo-fmt",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "elapsed_ms": 3117,
+      "status": "passed",
+      "counts": null,
+      "failure": null,
+      "log": "01-cargo-fmt.log"
+    },
+    {
+      "name": "02-cargo-clippy",
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "exit_code": 101,
+      "elapsed_ms": 7189,
+      "status": "failed",
+      "counts": null,
+      "failure": {
+        "kind": "clippy_lint",
+        "package": "agentmod-plugin-fixture-worker",
+        "file": "apps/plugin-host/fixture-worker/src/main.rs",
+        "line": 241,
+        "function": "node_executor",
+        "lint": "clippy::too_many_lines",
+        "diagnostic": "this function has too many lines (121/100)"
+      },
+      "log": "02-cargo-clippy.log"
+    },
+    {
+      "name": "03-cargo-test-workspace",
+      "command": "cargo test --workspace --all-targets --all-features --locked",
+      "exit_code": 101,
+      "elapsed_ms": 160564,
+      "status": "failed",
+      "counts": {
+        "completed_suites": 43,
+        "passed": 185,
+        "failed": 1,
+        "ignored": 0,
+        "matrix_completed": false
+      },
+      "failure": {
+        "kind": "test_failure",
+        "package": "agentmod-integration-tests",
+        "test": "tests::session_style_registry_binds_exact_styles_and_fails_closed_when_disabled",
+        "file": "tests/integration/src/lib.rs",
+        "line": 135,
+        "diagnostic": "catalog count assertion failed: actual 13, expected 11"
+      },
+      "log": "03-cargo-test-workspace.log"
+    },
+    {
+      "name": "04-cargo-test-doc",
+      "command": "cargo test --workspace --doc --all-features --locked",
+      "exit_code": 0,
+      "elapsed_ms": 22820,
+      "status": "passed",
+      "counts": {
+        "suites": 74,
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "failure": null,
+      "log": "04-cargo-test-doc.log"
+    },
+    {
+      "name": "05-xtask-architecture",
+      "command": "cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml",
+      "exit_code": 0,
+      "elapsed_ms": 8729,
+      "status": "passed",
+      "counts": {
+        "packages_checked": 90,
+        "violations": 0
+      },
+      "failure": null,
+      "log": "05-xtask-architecture.log"
+    },
+    {
+      "name": "06-xtask-architecture-test",
+      "command": "cargo test --locked -p xtask --test architecture",
+      "exit_code": 0,
+      "elapsed_ms": 2486,
+      "status": "passed",
+      "counts": {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      },
+      "failure": null,
+      "log": "06-xtask-architecture-test.log"
+    },
+    {
+      "name": "07-cargo-deny",
+      "command": "cargo deny check",
+      "exit_code": 0,
+      "elapsed_ms": 10429,
+      "status": "passed",
+      "counts": {
+        "advisories": "ok",
+        "bans": "ok",
+        "licenses": "ok",
+        "sources": "ok"
+      },
+      "failure": null,
+      "log": "07-cargo-deny.log"
+    },
+    {
+      "name": "08-cargo-audit",
+      "command": "cargo audit",
+      "exit_code": 0,
+      "elapsed_ms": 2904,
+      "status": "passed_with_allowed_warning",
+      "counts": {
+        "dependencies_scanned": 562,
+        "vulnerabilities": 0,
+        "allowed_warnings": 1
+      },
+      "failure": null,
+      "allowed_warning": {
+        "crate": "fxhash",
+        "version": "0.2.1",
+        "advisory": "RUSTSEC-2025-0057",
+        "classification": "unmaintained"
+      },
+      "log": "08-cargo-audit.log"
+    }
+  ],
+  "source_change_note": "Validation agent made no source/test edits. Two tracked files were changed concurrently after their corresponding checks had already failed; results and logs describe the pre-change snapshots exercised by those commands."
+}

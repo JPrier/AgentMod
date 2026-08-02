@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-primitives = { path = "../../../../core/primitives" }
-agentmod-protocol-support = { path = "../../../../core/protocol-support" }
+agentmod-primitives = { version = "0.1.0", path = "../../../../core/primitives" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../../../core/protocol-support" }
 async-trait.workspace = true
 base64.workspace = true
 blake3.workspace = true

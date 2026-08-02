@@ -1,5 +1,7 @@
 //! Runtime wire contracts. Receiving services must map these into service-owned types.
 
+use std::fmt;
+
 use agentmod_primitives::{ArtifactId, CancellationId, EventId, Sequence, SessionId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -59,6 +61,27 @@ pub enum RuntimeRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budgets: Option<RuntimeExecutionBudgetOverrides>,
     },
+    /// Create a durable session with exact immutable per-session MCP declarations.
+    CreateSessionWithMcp {
+        /// User-supplied workspace text, validated by service and logic.
+        workspace: String,
+        /// Explicit top-level execution style.
+        style: String,
+        /// Optional per-session harness override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        harness: Option<String>,
+        /// Optional per-session memory-provider override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        memory: Option<String>,
+        /// Optional per-session compaction-strategy override.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compaction: Option<String>,
+        /// Optional per-session hard execution-budget overrides.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        budgets: Option<RuntimeExecutionBudgetOverrides>,
+        /// Exact ordered MCP declarations bound to the new session.
+        mcp_servers: Vec<RuntimeMcpServerDeclaration>,
+    },
     /// List sessions without loading their conversations.
     ListSessions {
         /// Maximum results.
@@ -86,6 +109,73 @@ pub enum RuntimeRequest {
         at: Sequence,
         /// Optional explicit child style.
         style: Option<String>,
+    },
+    /// Disable one exact plugin selected by an immutable session style.
+    DisablePlugin {
+        /// Canonical session.
+        session_id: SessionId,
+        /// Exact plugin ID.
+        plugin_id: String,
+        /// Management cancellation lineage.
+        cancellation_id: CancellationId,
+    },
+    /// Re-enable one exact plugin selected by an immutable session style.
+    EnablePlugin {
+        /// Canonical session.
+        session_id: SessionId,
+        /// Exact plugin ID.
+        plugin_id: String,
+        /// Management cancellation lineage.
+        cancellation_id: CancellationId,
+    },
+    /// Quarantine one exact plugin after a policy or integrity finding.
+    QuarantinePlugin {
+        /// Canonical session.
+        session_id: SessionId,
+        /// Exact plugin ID.
+        plugin_id: String,
+        /// Stable redacted reason code.
+        reason_code: String,
+        /// Management cancellation lineage.
+        cancellation_id: CancellationId,
+    },
+    /// Release one exact quarantined plugin.
+    UnquarantinePlugin {
+        /// Canonical session.
+        session_id: SessionId,
+        /// Exact plugin ID.
+        plugin_id: String,
+        /// Management cancellation lineage.
+        cancellation_id: CancellationId,
+    },
+    /// Begin a user-driven MCP OAuth authorization transaction.
+    McpOAuthBegin {
+        /// Canonical session owning the MCP host.
+        session_id: SessionId,
+        /// Exact configured MCP server ID.
+        server_id: String,
+        /// Management cancellation lineage.
+        cancellation_id: CancellationId,
+    },
+    /// Read redacted MCP OAuth state.
+    McpOAuthStatus {
+        /// Canonical session owning the MCP host.
+        session_id: SessionId,
+        /// Exact configured MCP server ID.
+        server_id: String,
+        /// Management cancellation lineage.
+        cancellation_id: CancellationId,
+    },
+    /// Cancel one exact pending MCP OAuth transaction.
+    McpOAuthCancel {
+        /// Canonical session owning the MCP host.
+        session_id: SessionId,
+        /// Exact configured MCP server ID.
+        server_id: String,
+        /// Opaque pending transaction.
+        transaction_id: String,
+        /// Management cancellation lineage.
+        cancellation_id: CancellationId,
     },
     /// Create or update one durable schedule through the runtime.
     UpsertSchedule {
@@ -209,6 +299,58 @@ pub enum RuntimeRequest {
     },
 }
 
+/// Wire-level MCP server declaration. Sensitive values redact their debug output.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeMcpServerDeclaration {
+    /// ACP display name.
+    pub name: String,
+    /// Exact requested transport.
+    pub transport: RuntimeMcpTransportDeclaration,
+}
+
+/// Wire-level MCP transport declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "transport", rename_all = "snake_case")]
+pub enum RuntimeMcpTransportDeclaration {
+    /// Child process speaking MCP over stdio.
+    Stdio {
+        /// Absolute executable path.
+        program: String,
+        /// Exact argument vector.
+        arguments: Vec<String>,
+        /// Exact environment values, redacted from diagnostics.
+        environment: Vec<RuntimeMcpSensitiveEntry>,
+    },
+    /// Streamable HTTP or legacy SSE endpoint.
+    StreamableHttp {
+        /// Secure or loopback endpoint.
+        url: String,
+        /// Whether ACP declared the legacy SSE transport.
+        legacy_sse: bool,
+        /// Exact header values, redacted from diagnostics.
+        headers: Vec<RuntimeMcpSensitiveEntry>,
+    },
+}
+
+/// Sensitive MCP key/value entry transported only across authenticated local IPC.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RuntimeMcpSensitiveEntry {
+    /// Environment variable or HTTP header name.
+    pub name: String,
+    /// Exact transient value.
+    pub value: String,
+}
+
+impl fmt::Debug for RuntimeMcpSensitiveEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeMcpSensitiveEntry")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Wire-owned optional hard execution-budget overrides.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -317,6 +459,49 @@ pub enum RuntimeResponse {
         fork_sequence: Sequence,
         /// Materialized child journal head.
         child_head_sequence: Sequence,
+    },
+    /// Plugin lifecycle transition is canonical.
+    PluginLifecycleChanged {
+        /// Canonical session.
+        session_id: SessionId,
+        /// Exact plugin ID.
+        plugin_id: String,
+        /// Exact selected plugin version.
+        plugin_version: String,
+        /// `active`, `disabled`, or `quarantined`.
+        state: String,
+        /// Terminal canonical event sequence.
+        committed_sequence: Sequence,
+        /// Whether the exact terminal event already existed.
+        replayed: bool,
+    },
+    /// MCP OAuth authorization was started.
+    McpOAuthStarted {
+        /// Exact configured MCP server.
+        server_id: String,
+        /// Opaque pending transaction.
+        transaction_id: String,
+        /// Transient user authorization URL; never committed to session history.
+        authorization_url: String,
+        /// Hash suitable for redacted audit correlation.
+        authorization_url_hash: String,
+        /// Transaction expiry.
+        expires_at_ms: i64,
+    },
+    /// Redacted MCP OAuth status.
+    McpOAuthStatus {
+        /// Exact configured MCP server.
+        server_id: String,
+        /// `unauthorized`, `pending`, `authorized`, or `failed`.
+        status: String,
+        /// Opaque pending transaction.
+        transaction_id: Option<String>,
+        /// Transaction or token expiry.
+        expires_at_ms: Option<i64>,
+        /// Granted non-secret scopes.
+        scopes: Vec<String>,
+        /// Hash of the complete redacted projection.
+        status_hash: String,
     },
     /// Schedule storage result.
     ScheduleStored {
@@ -574,6 +759,13 @@ pub enum RuntimeSchedulePayload {
         /// Opaque continuation identifier.
         continuation_id: String,
     },
+    /// Runtime-owned graph trigger registration with no user message.
+    GraphTrigger {
+        /// Immutable graph run identity.
+        run_id: String,
+        /// Owning graph node.
+        node_id: String,
+    },
 }
 
 /// Runtime-owned schedule projection.
@@ -617,8 +809,27 @@ pub struct RuntimeScheduledExecution {
     /// Unix timestamp when the scheduler durably claimed this occurrence.
     #[serde(default)]
     pub claimed_at_ms: i64,
+    /// Exact non-time observation that caused the scheduler claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<RuntimeScheduleObservation>,
     /// Immutable schedule projection at claim time.
     pub schedule: RuntimeScheduleSpec,
+}
+
+/// Exact trigger observation retained in a scheduled claim.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum RuntimeScheduleObservation {
+    /// Canonical event observation.
+    RuntimeEvent {
+        /// Exact event identity.
+        event_id: String,
+    },
+    /// Process-output observation.
+    ProcessOutput {
+        /// Exact output identity.
+        output_id: String,
+    },
 }
 
 /// Runtime result for one claimed scheduled occurrence.
@@ -819,6 +1030,38 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<RuntimeRequest>(encoded).expect("decode"),
             selected
+        );
+    }
+
+    #[test]
+    fn per_session_mcp_round_trips_but_redacts_sensitive_debug_output() {
+        let request = RuntimeRequest::CreateSessionWithMcp {
+            workspace: String::from("."),
+            style: String::from("persistent-chat"),
+            harness: None,
+            memory: None,
+            compaction: None,
+            budgets: None,
+            mcp_servers: vec![RuntimeMcpServerDeclaration {
+                name: String::from("fixture"),
+                transport: RuntimeMcpTransportDeclaration::Stdio {
+                    program: String::from("/absolute/mcp-server"),
+                    arguments: vec![String::from("--stdio")],
+                    environment: vec![RuntimeMcpSensitiveEntry {
+                        name: String::from("FIXTURE_TOKEN"),
+                        value: String::from("never-log-this-value"),
+                    }],
+                },
+            }],
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("FIXTURE_TOKEN"));
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("never-log-this-value"));
+        let encoded = serde_json::to_vec(&request).expect("encode request");
+        assert_eq!(
+            serde_json::from_slice::<RuntimeRequest>(&encoded).expect("decode request"),
+            request
         );
     }
 

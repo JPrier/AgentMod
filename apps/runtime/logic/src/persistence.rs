@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use agentmod_event_model::{EventClassification, EventEnvelope, EventScope};
 use agentmod_primitives::{ByteCount, ContentHash, EventId, Sequence, SessionId};
 use agentmod_runtime_data::journal::{
-    AppendEventDataRequest, AppendedEventDataRecord, JournalDataError, JournalDurability,
-    JournalEventDataPort, JournalRecoveryStatus, RecoverJournalDataRequest, ScanEventsDataRequest,
+    AppendEventDataRequest, AppendedEventDataRecord, JournalDataError,
+    JournalDependencyFailureCode, JournalDurability, JournalEventDataPort, JournalRecoveryStatus,
+    RecoverJournalDataRequest, ScanEventsDataRequest,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -46,6 +47,28 @@ pub struct CommitSessionEventResult {
     pub journal_checksum: ContentHash,
     /// Journal bytes after commit.
     pub journal_bytes: ByteCount,
+}
+
+/// Logic-owned atomic expected-head append command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompareAppendSessionEventCommand {
+    /// Session directory selected through session data.
+    pub session_directory: PathBuf,
+    /// Exact event identity at the replay cut used to prepare this event.
+    pub expected_head_event_id: EventId,
+    /// Typed runtime-logic committed event.
+    pub event: EventEnvelope<RuntimeCommittedEvent>,
+    /// Business durability policy.
+    pub durability: CommitDurability,
+}
+
+/// Outcome of one atomic expected-head append.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompareAppendSessionEventResult {
+    /// The event was durably appended at the exact expected head.
+    Appended(CommitSessionEventResult),
+    /// The canonical journal advanced before the append acquired its lock.
+    Conflict,
 }
 
 /// Logic-owned load command.
@@ -107,6 +130,18 @@ pub trait SessionPersistenceLogicPort {
         command: CommitSessionEventCommand,
     ) -> Result<CommitSessionEventResult, SessionPersistenceLogicError>;
 
+    /// Atomically commits one typed event only if the exact prior event
+    /// identity still owns the valid journal tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionPersistenceLogicError`] for invalid event authority,
+    /// mapping, or non-conflict data failures.
+    fn compare_append_event(
+        &self,
+        command: CompareAppendSessionEventCommand,
+    ) -> Result<CompareAppendSessionEventResult, SessionPersistenceLogicError>;
+
     /// Loads and purely replays a session.
     ///
     /// # Errors
@@ -144,13 +179,14 @@ impl<D> SessionPersistenceLogic<D> {
     }
 }
 
-impl<D> SessionPersistenceLogicPort for SessionPersistenceLogic<D>
+impl<D> SessionPersistenceLogic<D>
 where
     D: JournalEventDataPort,
 {
-    fn commit_event(
+    fn append_validated(
         &self,
         command: CommitSessionEventCommand,
+        expected_head_event_id: Option<EventId>,
     ) -> Result<CommitSessionEventResult, SessionPersistenceLogicError> {
         command
             .event
@@ -173,6 +209,7 @@ where
             .data
             .append_event(AppendEventDataRequest {
                 session_directory: command.session_directory,
+                expected_head_event_id,
                 event: data_event,
                 durability: match command.durability {
                     CommitDurability::Buffered => JournalDurability::Buffered,
@@ -182,6 +219,37 @@ where
             })
             .map_err(SessionPersistenceLogicError::Data)?;
         Ok(map_append_result(&appended))
+    }
+}
+
+impl<D> SessionPersistenceLogicPort for SessionPersistenceLogic<D>
+where
+    D: JournalEventDataPort,
+{
+    fn commit_event(
+        &self,
+        command: CommitSessionEventCommand,
+    ) -> Result<CommitSessionEventResult, SessionPersistenceLogicError> {
+        self.append_validated(command, None)
+    }
+
+    fn compare_append_event(
+        &self,
+        command: CompareAppendSessionEventCommand,
+    ) -> Result<CompareAppendSessionEventResult, SessionPersistenceLogicError> {
+        let commit = CommitSessionEventCommand {
+            session_directory: command.session_directory,
+            event: command.event,
+            durability: command.durability,
+        };
+        match self.append_validated(commit, Some(command.expected_head_event_id)) {
+            Ok(appended) => Ok(CompareAppendSessionEventResult::Appended(appended)),
+            Err(SessionPersistenceLogicError::Data(JournalDataError::Dependency {
+                code: JournalDependencyFailureCode::SequenceConflict,
+                ..
+            })) => Ok(CompareAppendSessionEventResult::Conflict),
+            Err(error) => Err(error),
+        }
     }
 
     fn load_session(
@@ -350,6 +418,7 @@ mod tests {
 
     struct MockData {
         append_requests: RefCell<Vec<AppendEventDataRequest>>,
+        append_error: RefCell<Option<JournalDataError>>,
         scan_result: RefCell<Option<Result<ScannedEventsDataRecord, JournalDataError>>>,
         recovery_result: RefCell<Option<Result<RecoveredJournalDataRecord, JournalDataError>>>,
     }
@@ -359,6 +428,9 @@ mod tests {
             &self,
             request: AppendEventDataRequest,
         ) -> Result<AppendedEventDataRecord, JournalDataError> {
+            if let Some(error) = self.append_error.borrow_mut().take() {
+                return Err(error);
+            }
             let event_id = request.event.metadata.event_id;
             let sequence = request.event.metadata.sequence;
             let envelope_checksum = request.event.integrity_checksum;
@@ -435,6 +507,7 @@ mod tests {
     fn commit_maps_typed_event_and_durability() {
         let data = MockData {
             append_requests: RefCell::new(vec![]),
+            append_error: RefCell::new(None),
             scan_result: RefCell::new(None),
             recovery_result: RefCell::new(None),
         };
@@ -454,9 +527,66 @@ mod tests {
     }
 
     #[test]
+    fn compare_append_maps_exact_head_and_success_receipt() {
+        let data = MockData {
+            append_requests: RefCell::new(vec![]),
+            append_error: RefCell::new(None),
+            scan_result: RefCell::new(None),
+            recovery_result: RefCell::new(None),
+        };
+        let logic = SessionPersistenceLogic::new(data);
+        let expected_head_event_id = EventId::from_uuid(Uuid::from_u128(99));
+        let result = logic
+            .compare_append_event(CompareAppendSessionEventCommand {
+                session_directory: PathBuf::from("session"),
+                expected_head_event_id,
+                event: created(),
+                durability: CommitDurability::Data,
+            })
+            .expect("compare append");
+        assert!(matches!(
+            result,
+            CompareAppendSessionEventResult::Appended(_)
+        ));
+        let requests = logic.data.append_requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].expected_head_event_id,
+            Some(expected_head_event_id)
+        );
+        assert_eq!(requests[0].durability, JournalDurability::Data);
+    }
+
+    #[test]
+    fn compare_append_maps_only_atomic_head_conflict_to_conflict_outcome() {
+        let data = MockData {
+            append_requests: RefCell::new(vec![]),
+            append_error: RefCell::new(Some(JournalDataError::Dependency {
+                code: JournalDependencyFailureCode::SequenceConflict,
+                message: String::from("stale expected head"),
+            })),
+            scan_result: RefCell::new(None),
+            recovery_result: RefCell::new(None),
+        };
+        let logic = SessionPersistenceLogic::new(data);
+        assert_eq!(
+            logic
+                .compare_append_event(CompareAppendSessionEventCommand {
+                    session_directory: PathBuf::from("session"),
+                    expected_head_event_id: EventId::from_uuid(Uuid::from_u128(99)),
+                    event: created(),
+                    durability: CommitDurability::Full,
+                })
+                .expect("conflict is an outcome"),
+            CompareAppendSessionEventResult::Conflict
+        );
+    }
+
+    #[test]
     fn commit_rejects_metadata_type_that_does_not_match_payload() {
         let data = MockData {
             append_requests: RefCell::new(vec![]),
+            append_error: RefCell::new(None),
             scan_result: RefCell::new(None),
             recovery_result: RefCell::new(None),
         };
@@ -484,6 +614,7 @@ mod tests {
     fn load_maps_and_purely_replays_without_effects() {
         let data = MockData {
             append_requests: RefCell::new(vec![]),
+            append_error: RefCell::new(None),
             scan_result: RefCell::new(Some(Ok(ScannedEventsDataRecord {
                 events: vec![JournalEventDataRecord {
                     event: data_event(),
@@ -509,6 +640,7 @@ mod tests {
     fn recovery_maps_safe_status() {
         let data = MockData {
             append_requests: RefCell::new(vec![]),
+            append_error: RefCell::new(None),
             scan_result: RefCell::new(None),
             recovery_result: RefCell::new(Some(Ok(RecoveredJournalDataRecord {
                 status: JournalRecoveryStatus::TailQuarantined {

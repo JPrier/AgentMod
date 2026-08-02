@@ -1,0 +1,153 @@
+{
+  "schema": "agentmod.validation.linux-converged-final.v1",
+  "date": "2026-07-31",
+  "platform": "Linux via WSL2",
+  "kernel": "Linux 6.6.87.2-microsoft-standard-WSL2 x86_64 GNU/Linux",
+  "tools": {
+    "cargo": "cargo 1.91.1 (ea2d97820 2025-10-10)",
+    "cargo_deny": "cargo-deny 0.20.2",
+    "cargo_audit": "cargo-audit-audit 0.22.2"
+  },
+  "repository": "/mnt/c/Users/jkpri/AgentMod",
+  "cargo_target_dir": "/tmp/agentmod-agentmod-final-target-20260731T190551Z",
+  "log_directory": "/tmp/agentmod-linux-converged-final-20260731T190551Z",
+  "started_at_utc": "2026-07-31T19:07:05Z",
+  "completed_at_utc": "2026-07-31T19:11:20Z",
+  "tracked_diff_excluding_validation_sha256_before": "b582d5f6fb6729d7ab42f36f930ad182e3f5e00430d7f297cf928d17547bbf3d",
+  "tracked_diff_excluding_validation_sha256_after": "b582d5f6fb6729d7ab42f36f930ad182e3f5e00430d7f297cf928d17547bbf3d",
+  "tracked_diff_unchanged": true,
+  "untracked_non_validation_sha256_before": "1e0549e24dccb9eb5a82d60b15ca1e79b16cc404c772711871021f63171018f0",
+  "untracked_non_validation_sha256_after": "1e0549e24dccb9eb5a82d60b15ca1e79b16cc404c772711871021f63171018f0",
+  "untracked_non_validation_count_before": 148,
+  "untracked_non_validation_count_after": 148,
+  "untracked_non_validation_unchanged": true,
+  "tree_unchanged": true,
+  "all_commands_passed": true,
+  "converged_validation_passed": true,
+  "commands": [
+    {
+      "index": 1,
+      "name": "fmt",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "elapsed_ms": 10681,
+      "output": "/tmp/agentmod-linux-converged-final-20260731T190551Z/01-fmt.log",
+      "output_bytes": 0,
+      "output_lines": 0,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 2,
+      "name": "clippy",
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "exit_code": 0,
+      "elapsed_ms": 62882,
+      "output": "/tmp/agentmod-linux-converged-final-20260731T190551Z/02-clippy.log",
+      "output_bytes": 19687,
+      "output_lines": 437,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 3,
+      "name": "test-workspace",
+      "command": "cargo test --workspace --all-targets --all-features --locked",
+      "exit_code": 0,
+      "elapsed_ms": 130589,
+      "output": "/tmp/agentmod-linux-converged-final-20260731T190551Z/03-test-workspace.log",
+      "output_bytes": 155890,
+      "output_lines": 2349,
+      "test_counts": {
+        "passed": 1232,
+        "failed": 0,
+        "ignored": 11
+      }
+    },
+    {
+      "index": 4,
+      "name": "test-doc",
+      "command": "cargo test --workspace --doc --all-features --locked",
+      "exit_code": 0,
+      "elapsed_ms": 13236,
+      "output": "/tmp/agentmod-linux-converged-final-20260731T190551Z/04-test-doc.log",
+      "output_bytes": 11442,
+      "output_lines": 447,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 5,
+      "name": "architecture-command",
+      "command": "cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml",
+      "exit_code": 0,
+      "elapsed_ms": 14151,
+      "output": "/tmp/agentmod-linux-converged-final-20260731T190551Z/05-architecture-command.log",
+      "output_bytes": 798,
+      "output_lines": 20,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 6,
+      "name": "architecture-test",
+      "command": "cargo test --locked -p xtask --test architecture",
+      "exit_code": 0,
+      "elapsed_ms": 4161,
+      "output": "/tmp/agentmod-linux-converged-final-20260731T190551Z/06-architecture-test.log",
+      "output_bytes": 665,
+      "output_lines": 16,
+      "test_counts": {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 7,
+      "name": "deny",
+      "command": "cargo deny check",
+      "exit_code": 0,
+      "elapsed_ms": 5151,
+      "output": "/tmp/agentmod-linux-converged-final-20260731T190551Z/07-deny.log",
+      "output_bytes": 284820,
+      "output_lines": 4466,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 8,
+      "name": "audit",
+      "command": "cargo audit",
+      "exit_code": 0,
+      "elapsed_ms": 1191,
+      "output": "/tmp/agentmod-linux-converged-final-20260731T190551Z/08-audit.log",
+      "output_bytes": 500,
+      "output_lines": 13,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    }
+  ],
+  "limitations": [
+    "macOS was not available and was not run",
+    "No GitHub Actions result is claimed"
+  ]
+}

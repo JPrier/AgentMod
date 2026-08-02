@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "step_id": "02-clippy",
+  "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+  "arguments": [
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "exit_code": 101,
+  "passed": false,
+  "elapsed_seconds": 51.7615368,
+  "started_at_utc": "2026-07-31T12:28:34.4745543+00:00",
+  "completed_at_utc": "2026-07-31T12:29:26.3184325+00:00",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree_dirty": true,
+  "working_tree_porcelain_entries": 337,
+  "stdout_path": ".omx\\validation\\2026-07-31-windows-final-02-clippy.stdout.log",
+  "stderr_path": ".omx\\validation\\2026-07-31-windows-final-02-clippy.stderr.log",
+  "launch_failure": null
+}

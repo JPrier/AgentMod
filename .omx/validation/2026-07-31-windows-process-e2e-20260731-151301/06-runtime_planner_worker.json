@@ -1,0 +1,12 @@
+{
+  "index": 6,
+  "name": "06-runtime_planner_worker",
+  "script": "runtime_planner_worker.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_planner_worker.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 2603,
+  "started_at": "2026-07-31T19:15:37.2644995Z",
+  "ended_at": "2026-07-31T19:15:39.8684064Z",
+  "log": "06-runtime_planner_worker.log"
+}

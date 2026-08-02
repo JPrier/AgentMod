@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use agentmod_primitives::{ArtifactId, ContentHash, Sequence};
+use serde_json::{Value, json};
 use thiserror::Error;
 
 use crate::conversation::{
@@ -35,6 +36,8 @@ pub enum CompactionStrategy {
         entry_id: String,
         /// Immutable context artifact.
         artifact_id: ArtifactId,
+        /// Portable content-addressed artifact-store reference.
+        artifact_reference: String,
         /// Exact artifact content hash.
         content_hash: ContentHash,
         /// Safe label.
@@ -63,6 +66,68 @@ pub struct CompactionPlan {
     pub replacement: Vec<ConversationEntry>,
     /// Complete source/method/artifact provenance.
     pub provenance: ProjectionProvenance,
+}
+
+/// Builds a deterministic, bounded typed summary from the provider projection.
+///
+/// Protected live entries remain separate projection records, so the summary
+/// contains only replaceable history. The newest complete typed records are
+/// retained; older records are represented by an exact count instead of being
+/// truncated into invalid JSON.
+///
+/// # Errors
+///
+/// Returns [`CompactionError`] when the byte bound cannot contain the summary
+/// envelope or a conversation entry cannot be serialized.
+pub fn bounded_typed_summary(
+    source: &[ConversationEntry],
+    max_bytes: usize,
+) -> Result<String, CompactionError> {
+    let replaceable = source
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| !is_protected(entry))
+        .map(|(index, entry)| {
+            serde_json::to_value(entry)
+                .map(|entry| json!({"source_index": index, "entry": entry}))
+                .map_err(|_| CompactionError::SummaryEncoding)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut retained = Vec::<Value>::new();
+    for entry in replaceable.iter().rev() {
+        retained.insert(0, entry.clone());
+        let candidate = typed_summary_envelope(source.len(), &replaceable, &retained);
+        if encoded_json_len(&candidate)? > max_bytes {
+            retained.remove(0);
+            break;
+        }
+    }
+    let summary = typed_summary_envelope(source.len(), &replaceable, &retained);
+    let encoded = serde_json::to_string(&summary).map_err(|_| CompactionError::SummaryEncoding)?;
+    if encoded.len() > max_bytes {
+        return Err(CompactionError::SummaryBoundTooSmall);
+    }
+    Ok(encoded)
+}
+
+fn typed_summary_envelope(
+    source_entry_count: usize,
+    replaceable: &[Value],
+    retained: &[Value],
+) -> Value {
+    json!({
+        "schema": "agentmod.context-summary.v1",
+        "source_entry_count": source_entry_count,
+        "replaceable_entry_count": replaceable.len(),
+        "omitted_entry_count": replaceable.len().saturating_sub(retained.len()),
+        "entries": retained,
+    })
+}
+
+fn encoded_json_len(value: &Value) -> Result<usize, CompactionError> {
+    serde_json::to_vec(value)
+        .map(|encoded| encoded.len())
+        .map_err(|_| CompactionError::SummaryEncoding)
 }
 
 /// Constructs a deterministic replacement without mutating canonical history.
@@ -120,16 +185,21 @@ pub fn compact_projection(
         CompactionStrategy::ArtifactHandoff {
             entry_id,
             artifact_id,
+            artifact_reference,
             content_hash,
             label,
         } => {
-            if entry_id.trim().is_empty() || label.trim().is_empty() {
+            if entry_id.trim().is_empty()
+                || artifact_reference.trim().is_empty()
+                || label.trim().is_empty()
+            {
                 return Err(CompactionError::InvalidArtifactHandoff);
             }
             let mut replacement = protected_entries(source);
             replacement.push(ConversationEntry::ArtifactReference(ArtifactEntry {
                 id: ConversationEntryId(entry_id),
                 artifact_id,
+                artifact_reference: Some(artifact_reference),
                 content_hash,
                 mime_type: "application/vnd.agentmod.context+json".into(),
                 label,
@@ -295,6 +365,12 @@ pub enum CompactionError {
     /// Summary ID and content must be non-empty.
     #[error("summary compaction requires a non-empty ID and summary")]
     InvalidSummary,
+    /// Typed-summary encoding failed.
+    #[error("typed summary could not be encoded")]
+    SummaryEncoding,
+    /// The configured typed-summary bound cannot contain its envelope.
+    #[error("typed summary byte bound is too small")]
+    SummaryBoundTooSmall,
     /// Summary needs a source event range.
     #[error("summary compaction has no source event range")]
     MissingSourceRange,
@@ -408,6 +484,74 @@ mod tests {
             plan.provenance.source_range,
             Some((Sequence::FIRST, sequence(2)))
         );
+        assert_eq!(state.history().len(), 2);
+    }
+
+    #[test]
+    fn bounded_summary_retains_newest_complete_typed_entries_deterministically() {
+        let source = (1..=12)
+            .map(|index| user(&format!("message-{index}-{}", "x".repeat(80)), index))
+            .collect::<Vec<_>>();
+        let first = bounded_typed_summary(&source, 640).expect("bounded summary");
+        let second = bounded_typed_summary(&source, 640).expect("same summary");
+        assert_eq!(first, second);
+        assert!(first.len() <= 640);
+
+        let decoded: Value = serde_json::from_str(&first).expect("typed JSON");
+        assert_eq!(decoded["schema"], "agentmod.context-summary.v1");
+        assert_eq!(decoded["source_entry_count"], 12);
+        assert!(
+            decoded["omitted_entry_count"]
+                .as_u64()
+                .is_some_and(|count| count > 0)
+        );
+        let retained = decoded["entries"].as_array().expect("entries");
+        assert!(!retained.is_empty());
+        assert_eq!(retained.last().expect("latest")["source_index"], 11);
+        assert_eq!(
+            retained.last().expect("latest")["entry"],
+            serde_json::to_value(source.last().expect("source")).expect("entry")
+        );
+    }
+
+    #[test]
+    fn bounded_summary_fails_closed_when_envelope_does_not_fit() {
+        assert_eq!(
+            bounded_typed_summary(&[user("one", 1)], 1),
+            Err(CompactionError::SummaryBoundTooSmall)
+        );
+    }
+
+    #[test]
+    fn artifact_handoff_projects_exact_logical_and_portable_identity() {
+        let artifact_id = ArtifactId::from_uuid(Uuid::from_u128(9));
+        let content_hash = ContentHash::digest(b"canonical context document");
+        let artifact_reference = format!("artifact:blake3:{}", content_hash.to_hex());
+        let state = state(vec![user("u1", 1), user("u2", 2)]);
+        let plan = compact_projection(
+            &state,
+            CompactionStrategy::ArtifactHandoff {
+                entry_id: String::from("context-artifact"),
+                artifact_id,
+                artifact_reference: artifact_reference.clone(),
+                content_hash,
+                label: String::from("complete provider context"),
+            },
+            context(),
+        )
+        .expect("artifact handoff");
+        let [ConversationEntry::ArtifactReference(artifact)] = plan.replacement.as_slice() else {
+            panic!("one typed artifact reference")
+        };
+        assert_eq!(artifact.artifact_id, artifact_id);
+        assert_eq!(
+            artifact.artifact_reference.as_deref(),
+            Some(artifact_reference.as_str())
+        );
+        assert_eq!(artifact.content_hash, content_hash);
+        assert_eq!(artifact.mime_type, "application/vnd.agentmod.context+json");
+        assert_eq!(plan.provenance.method, "artifact_handoff");
+        assert_eq!(plan.provenance.artifact_id, Some(artifact_id));
         assert_eq!(state.history().len(), 2);
     }
 

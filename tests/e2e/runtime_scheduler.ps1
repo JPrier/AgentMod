@@ -5,14 +5,15 @@ $runRoot = $null
 $daemon = $null
 Push-Location $repository
 try {
-    cargo build -p agentmod-runtime -p agentmod-harness `
-        -p agentmod-scheduler -p agentmod-cli
+    cargo build --locked -p agentmod-runtime -p agentmod-harness `
+        -p agentmod-scheduler -p agentmod-cli -p agentmod-tui
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
     $runtime = (Resolve-Path "target\debug\agentmod-runtime.exe").Path
     $harness = (Resolve-Path "target\debug\agentmod-harness.exe").Path
     $scheduler = (Resolve-Path "target\debug\agentmod-scheduler.exe").Path
     $cli = (Resolve-Path "target\debug\agentmod.exe").Path
+    $tui = (Resolve-Path "target\debug\agentmod-tui.exe").Path
     $runRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
         "agentmod-runtime-scheduler-e2e-" + [guid]::NewGuid().ToString("N")
     )
@@ -49,16 +50,19 @@ try {
     Wait-Runtime
     $created = & $cli session create --workspace $workspace `
         --style persistent-chat --json | ConvertFrom-Json
-    $stored = & $cli schedule add "daily-driver" `
-        --session $created.session_id `
-        --prompt "execute scheduled development work" `
-        --at-ms 0 --json | ConvertFrom-Json
-    if ($stored.schedule_id -ne "daily-driver" -or $stored.replayed) {
-        throw "schedule was not stored"
+    $stored = @(
+        & $tui --smoke-command (
+            "/schedule-once daily-driver 0 execute scheduled development work"
+        ) 2>&1
+    ) -join [Environment]::NewLine
+    if ($LASTEXITCODE -ne 0 -or
+        $stored -notmatch "schedule daily-driver stored") {
+        throw "TUI schedule was not stored: $stored"
     }
-    $listed = & $cli schedule list --json | ConvertFrom-Json
-    if (@($listed.schedules).Count -ne 1) {
-        throw "runtime schedule listing failed"
+    $listed = @(& $tui --smoke-command "/schedules" 2>&1) -join `
+        [Environment]::NewLine
+    if ($LASTEXITCODE -ne 0 -or $listed -notmatch "status=1 schedules") {
+        throw "TUI runtime schedule listing failed: $listed"
     }
     $journalPath = Join-Path $runRoot (
         "sessions\" + $created.session_id + "\events.jsonl"
@@ -119,6 +123,10 @@ try {
     $terminalMarker = Join-Path $env:AGENTMOD_SCHEDULER_ROOT (
         "executions\" + $executionId + ".succeeded"
     )
+    for ($attempt = 0; $attempt -lt 50 -and
+        -not (Test-Path -LiteralPath $terminalMarker); $attempt++) {
+        Start-Sleep -Milliseconds 100
+    }
     if (-not (Test-Path -LiteralPath $terminalMarker)) {
         throw "scheduled occurrence was not durably completed"
     }
@@ -146,7 +154,10 @@ try {
         }
         if (@($eventDeliveryEvents | Where-Object {
             $_.metadata.event_type -eq "scheduler.fired"
-        }).Count -eq 2) {
+        }).Count -eq 2 -and
+            @($eventDeliveryEvents | Where-Object {
+                $_.metadata.event_type -eq "model.response_completed"
+            }).Count -eq 3) {
             $eventDeliveryRan = $true
             break
         }
@@ -201,7 +212,10 @@ try {
         }
         if (@($eventsAfter | Where-Object {
             $_.metadata.event_type -eq "scheduler.fired"
-        }).Count -eq 3) {
+        }).Count -eq 3 -and
+            @($eventsAfter | Where-Object {
+                $_.metadata.event_type -eq "model.response_completed"
+            }).Count -eq 4) {
             $deferredRan = $true
             break
         }
@@ -233,7 +247,17 @@ try {
     if (@($afterRestart.runs).Count -ne 0) {
         throw "completed occurrence executed again after restart"
     }
-    Write-Output "runtime-owned time, event, and deferred continuation schedule E2E passed"
+    $removed = @(
+        & $tui --smoke-command "/schedule-remove daily-driver" 2>&1
+    ) -join [Environment]::NewLine
+    if ($LASTEXITCODE -ne 0 -or
+        $removed -notmatch "schedule daily-driver removed") {
+        throw "TUI schedule removal failed: $removed"
+    }
+    Write-Output (
+        "runtime-owned time, event, deferred continuation, and TUI " +
+        "schedule management E2E passed"
+    )
 }
 finally {
     if ($null -ne $daemon -and -not $daemon.HasExited) {

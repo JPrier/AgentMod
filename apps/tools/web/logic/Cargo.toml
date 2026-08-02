@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-web-host-data = { path = "../data" }
+agentmod-web-host-data = { version = "0.1.0", path = "../data" }
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

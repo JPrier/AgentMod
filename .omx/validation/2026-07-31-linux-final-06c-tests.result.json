@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "step_id": "06c-tests",
+  "command": "cargo test --workspace --all-targets --all-features --locked",
+  "arguments": [
+    "test",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--locked"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 106.844429385,
+  "started_at_utc": "2026-07-31T12:56:32+00:00",
+  "completed_at_utc": "2026-07-31T12:58:19+00:00",
+  "source_head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "source_working_tree_dirty": true,
+  "isolated_copy_root": "/tmp/agentmod-linux-final-20260731-04c.qHmzg5",
+  "cargo_target_dir": "/tmp/agentmod-linux-final-20260731-04c.qHmzg5/.cargo-target",
+  "stdout_path": ".omx/validation/2026-07-31-linux-final-06c-tests.stdout.log",
+  "stderr_path": ".omx/validation/2026-07-31-linux-final-06c-tests.stderr.log"
+}

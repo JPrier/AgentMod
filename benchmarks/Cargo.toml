@@ -9,11 +9,11 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-agentmod-event-model = { path = "../core/event-model" }
-agentmod-expression-engine = { path = "../core/expression-engine" }
-agentmod-graph-engine = { path = "../core/graph-engine" }
-agentmod-primitives = { path = "../core/primitives" }
-agentmod-protocol-support = { path = "../core/protocol-support" }
+agentmod-event-model = { version = "0.1.0", path = "../core/event-model" }
+agentmod-expression-engine = { version = "0.1.0", path = "../core/expression-engine" }
+agentmod-graph-engine = { version = "0.1.0", path = "../core/graph-engine" }
+agentmod-primitives = { version = "0.1.0", path = "../core/primitives" }
+agentmod-protocol-support = { version = "0.1.0", path = "../core/protocol-support" }
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true

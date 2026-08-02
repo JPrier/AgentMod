@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "step_id": "21-mcp-stdio-alt-target",
+  "command": "cargo test -p agentmod-mcp-host-dependency --test stdio --all-features --locked",
+  "arguments": [
+    "test",
+    "-p",
+    "agentmod-mcp-host-dependency",
+    "--test",
+    "stdio",
+    "--all-features",
+    "--locked"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 24.9803321,
+  "started_at_utc": "2026-07-31T12:53:40.3822054+00:00",
+  "completed_at_utc": "2026-07-31T12:54:05.5054152+00:00",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree_dirty": true,
+  "working_tree_porcelain_entries": 339,
+  "stdout_path": ".omx\\validation\\2026-07-31-windows-final-21-mcp-stdio-alt-target.stdout.log",
+  "stderr_path": ".omx\\validation\\2026-07-31-windows-final-21-mcp-stdio-alt-target.stderr.log",
+  "launch_failure": null
+}

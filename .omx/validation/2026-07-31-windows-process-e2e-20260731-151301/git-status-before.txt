@@ -1,0 +1,366 @@
+ M .omx/state/ralph.json
+ M Cargo.lock
+ M Cargo.toml
+ M STATUS.md
+ M apps/acp/ARCHITECTURE.md
+ M apps/acp/bin/Cargo.toml
+ M apps/acp/data/Cargo.toml
+ M apps/acp/data/src/lib.rs
+ M apps/acp/dependency/Cargo.toml
+ M apps/acp/dependency/src/lib.rs
+ M apps/acp/logic/Cargo.toml
+ M apps/acp/logic/src/lib.rs
+ M apps/acp/service/Cargo.toml
+ M apps/acp/service/src/lib.rs
+ M apps/cli/bin/Cargo.toml
+ M apps/cli/data/Cargo.toml
+ M apps/cli/data/src/lib.rs
+ M apps/cli/dependency/Cargo.toml
+ M apps/cli/dependency/src/lib.rs
+ M apps/cli/logic/Cargo.toml
+ M apps/cli/logic/src/lib.rs
+ M apps/cli/service/Cargo.toml
+ M apps/cli/service/src/lib.rs
+ M apps/harness/bin/Cargo.toml
+ M apps/harness/data/Cargo.toml
+ M apps/harness/dependency/src/execution.rs
+ M apps/harness/logic/Cargo.toml
+ M apps/harness/service/Cargo.toml
+ M apps/plugin-host/bin/Cargo.toml
+ M apps/plugin-host/bin/src/main.rs
+ M apps/plugin-host/data/Cargo.toml
+ M apps/plugin-host/data/src/lib.rs
+ M apps/plugin-host/dependency/Cargo.toml
+ M apps/plugin-host/dependency/src/lib.rs
+ M apps/plugin-host/dependency/tests/validation.rs
+ M apps/plugin-host/fixture-worker/Cargo.toml
+ M apps/plugin-host/fixture-worker/src/main.rs
+ M apps/plugin-host/logic/Cargo.toml
+ M apps/plugin-host/logic/src/lib.rs
+ M apps/plugin-host/service/Cargo.toml
+ M apps/plugin-host/service/src/lib.rs
+ M apps/runtime/bin/Cargo.toml
+ M apps/runtime/bin/src/main.rs
+ M apps/runtime/data/Cargo.toml
+ M apps/runtime/data/src/artifact.rs
+ M apps/runtime/data/src/continuation.rs
+ M apps/runtime/data/src/journal.rs
+ M apps/runtime/data/src/lib.rs
+ M apps/runtime/data/src/memory.rs
+ M apps/runtime/data/src/node_executor.rs
+ M apps/runtime/data/src/plugin.rs
+ M apps/runtime/data/src/registry.rs
+ M apps/runtime/data/src/scheduler.rs
+ M apps/runtime/data/src/style.rs
+ M apps/runtime/data/src/tool.rs
+ M apps/runtime/dependency/Cargo.toml
+ M apps/runtime/dependency/src/artifact.rs
+ M apps/runtime/dependency/src/continuation.rs
+ M apps/runtime/dependency/src/harness.rs
+ M apps/runtime/dependency/src/journal.rs
+ M apps/runtime/dependency/src/lib.rs
+ M apps/runtime/dependency/src/memory.rs
+ M apps/runtime/dependency/src/plugin.rs
+ M apps/runtime/dependency/src/process_tool.rs
+ M apps/runtime/dependency/src/receipt.rs
+ M apps/runtime/dependency/src/registry.rs
+ M apps/runtime/dependency/src/scheduler.rs
+ M apps/runtime/dependency/src/supervised.rs
+ M apps/runtime/dependency/src/tool.rs
+ M apps/runtime/logic/Cargo.toml
+ M apps/runtime/logic/src/action.rs
+ M apps/runtime/logic/src/artifact.rs
+ M apps/runtime/logic/src/child_session.rs
+ M apps/runtime/logic/src/compaction.rs
+ M apps/runtime/logic/src/continuation.rs
+ M apps/runtime/logic/src/conversation.rs
+ M apps/runtime/logic/src/history.rs
+ M apps/runtime/logic/src/interception.rs
+ M apps/runtime/logic/src/introspection.rs
+ M apps/runtime/logic/src/lib.rs
+ M apps/runtime/logic/src/node_executor.rs
+ M apps/runtime/logic/src/permission.rs
+ M apps/runtime/logic/src/persistence.rs
+ M apps/runtime/logic/src/plugin.rs
+ M apps/runtime/logic/src/projection.rs
+ M apps/runtime/logic/src/registry.rs
+ M apps/runtime/logic/src/scheduler.rs
+ M apps/runtime/logic/src/session.rs
+ M apps/runtime/logic/src/style.rs
+ M apps/runtime/logic/src/style_executor.rs
+ M apps/runtime/logic/src/tool.rs
+ M apps/runtime/logic/src/turn.rs
+ M apps/runtime/service/Cargo.toml
+ M apps/runtime/service/src/continuation.rs
+ M apps/runtime/service/src/lib.rs
+ M apps/runtime/service/src/local_rpc.rs
+ M apps/runtime/service/src/turn.rs
+ M apps/scheduler/ARCHITECTURE.md
+ M apps/scheduler/bin/Cargo.toml
+ M apps/scheduler/data/Cargo.toml
+ M apps/scheduler/data/src/lib.rs
+ M apps/scheduler/dependency/src/lib.rs
+ M apps/scheduler/logic/Cargo.toml
+ M apps/scheduler/logic/src/lib.rs
+ M apps/scheduler/service/Cargo.toml
+ M apps/scheduler/service/src/lib.rs
+ M apps/tools/browser/bin/Cargo.toml
+ M apps/tools/browser/data/Cargo.toml
+ M apps/tools/browser/dependency/Cargo.toml
+ M apps/tools/browser/logic/Cargo.toml
+ M apps/tools/browser/service/Cargo.toml
+ M apps/tools/filesystem/bin/Cargo.toml
+ M apps/tools/filesystem/data/Cargo.toml
+ M apps/tools/filesystem/dependency/Cargo.toml
+ M apps/tools/filesystem/logic/Cargo.toml
+ M apps/tools/filesystem/service/Cargo.toml
+ M apps/tools/git/bin/Cargo.toml
+ M apps/tools/git/data/Cargo.toml
+ M apps/tools/git/dependency/Cargo.toml
+ M apps/tools/git/logic/Cargo.toml
+ M apps/tools/git/service/Cargo.toml
+ M apps/tools/lsp/bin/Cargo.toml
+ M apps/tools/lsp/data/Cargo.toml
+ M apps/tools/lsp/dependency/src/lib.rs
+ M apps/tools/lsp/logic/Cargo.toml
+ M apps/tools/lsp/service/Cargo.toml
+ M apps/tools/mcp/ARCHITECTURE.md
+ M apps/tools/mcp/bin/Cargo.toml
+ M apps/tools/mcp/bin/src/main.rs
+ M apps/tools/mcp/data/Cargo.toml
+ M apps/tools/mcp/data/src/lib.rs
+ M apps/tools/mcp/dependency/Cargo.toml
+ M apps/tools/mcp/dependency/src/lib.rs
+ M apps/tools/mcp/dependency/tests/stdio.rs
+ M apps/tools/mcp/logic/Cargo.toml
+ M apps/tools/mcp/logic/src/lib.rs
+ M apps/tools/mcp/service/Cargo.toml
+ M apps/tools/mcp/service/src/lib.rs
+ M apps/tools/process/bin/Cargo.toml
+ M apps/tools/process/data/Cargo.toml
+ M apps/tools/process/dependency/Cargo.toml
+ M apps/tools/process/dependency/src/lib.rs
+ M apps/tools/process/logic/Cargo.toml
+ M apps/tools/process/service/Cargo.toml
+ M apps/tools/web/bin/Cargo.toml
+ M apps/tools/web/data/Cargo.toml
+ M apps/tools/web/dependency/Cargo.toml
+ M apps/tools/web/logic/Cargo.toml
+ M apps/tools/web/service/Cargo.toml
+ M apps/tui/ARCHITECTURE.md
+ M apps/tui/bin/Cargo.toml
+ M apps/tui/bin/src/main.rs
+ M apps/tui/data/Cargo.toml
+ M apps/tui/data/src/lib.rs
+ M apps/tui/dependency/Cargo.toml
+ M apps/tui/dependency/src/lib.rs
+ M apps/tui/logic/Cargo.toml
+ M apps/tui/logic/src/lib.rs
+ M apps/tui/service/Cargo.toml
+ M apps/tui/service/src/lib.rs
+ M benchmarks/Cargo.toml
+ M core/continuation/Cargo.toml
+ M core/event-model/Cargo.toml
+ M core/event-model/src/lib.rs
+ M core/graph-engine/Cargo.toml
+ M core/graph-engine/src/lib.rs
+ M core/protocol-support/Cargo.toml
+ M deny.toml
+ M docs/architecture/context-model.md
+ M docs/architecture/overview.md
+ M docs/architecture/plugin-system.md
+ M docs/architecture/process-boundaries.md
+ M docs/architecture/protocols.md
+ M docs/architecture/provider-system.md
+ M docs/architecture/session-styles.md
+ M docs/guides/creating-a-plugin.md
+ M docs/guides/creating-a-session-style.md
+ M docs/guides/using-mcp.md
+ M docs/reference/cli.md
+ M docs/reference/plugin-sdk.md
+ M docs/reference/rpc.md
+ M docs/reference/session-style-format.md
+ M docs/requirements/traceability.toml
+ M protocols/harness-protocol/Cargo.toml
+ M protocols/plugin-protocol/Cargo.toml
+ M protocols/plugin-protocol/src/lib.rs
+ M protocols/runtime-protocol/Cargo.toml
+ M protocols/runtime-protocol/src/lib.rs
+ M protocols/scheduler-protocol/src/lib.rs
+ M protocols/tool-protocol/Cargo.toml
+ M sdk/plugin-sdk/Cargo.toml
+ M sdk/plugin-sdk/src/lib.rs
+ M sdk/plugin-sdk/src/model.rs
+ M sdk/plugin-sdk/src/validation.rs
+ M sdk/plugin-sdk/tests/manifest.rs
+ M sdk/session-style-sdk/Cargo.toml
+ M sdk/session-style-sdk/src/builtins.rs
+ M sdk/session-style-sdk/src/lib.rs
+ M sdk/session-style-sdk/src/model.rs
+ M sdk/session-style-sdk/src/parsing.rs
+ M sdk/session-style-sdk/src/selection.rs
+ M sdk/session-style-sdk/src/validation.rs
+ M sdk/session-style-sdk/tests/style.rs
+ M tests/architecture/intentional-violations/apps/runtime/dependency/Cargo.toml
+ M tests/architecture/intentional-violations/apps/runtime/logic/Cargo.toml
+ M tests/architecture/intentional-violations/apps/runtime/service/Cargo.toml
+ M tests/e2e/runtime_cli.ps1
+ M tests/e2e/runtime_cli.sh
+ M tests/e2e/runtime_declarative_graph.ps1
+ M tests/e2e/runtime_declarative_graph.sh
+ M tests/e2e/runtime_ephemeral_turn.ps1
+ M tests/e2e/runtime_ephemeral_turn.sh
+ M tests/e2e/runtime_harness_selection.ps1
+ M tests/e2e/runtime_harness_selection.sh
+ M tests/e2e/runtime_planner_worker.ps1
+ M tests/e2e/runtime_planner_worker.sh
+ M tests/e2e/runtime_plugin_composition.ps1
+ M tests/e2e/runtime_plugin_composition.sh
+ M tests/e2e/runtime_process_restart.ps1
+ M tests/e2e/runtime_process_restart.sh
+ M tests/e2e/runtime_research_loop.ps1
+ M tests/e2e/runtime_research_loop.sh
+ M tests/e2e/runtime_scheduler.ps1
+ M tests/e2e/runtime_scheduler.sh
+ M tests/e2e/runtime_style_registry.ps1
+ M tests/e2e/runtime_style_registry.sh
+ M tests/e2e/runtime_tool_loop.ps1
+ M tests/e2e/runtime_tool_loop.sh
+ M tests/e2e/runtime_tui_smoke.sh
+ M tests/fixtures/mcp_stdio_server.rs
+ M tests/integration/Cargo.toml
+ M tests/integration/src/lib.rs
+ M xtask/Cargo.toml
+?? .omx/validation/
+?? apps/plugin-host/bin/tests/
+?? apps/plugin-host/fixture-worker/tests/
+?? apps/runtime/data/src/cancellation.rs
+?? apps/runtime/data/src/child_message.rs
+?? apps/runtime/data/src/fixture_file.rs
+?? apps/runtime/data/src/local.rs
+?? apps/runtime/data/src/mcp_oauth.rs
+?? apps/runtime/data/src/plugin_receipt.rs
+?? apps/runtime/data/src/provider_receipt.rs
+?? apps/runtime/data/src/workspace.rs
+?? apps/runtime/dependency/src/cancellation.rs
+?? apps/runtime/dependency/src/fixture_file.rs
+?? apps/runtime/dependency/src/plugin_receipt.rs
+?? apps/runtime/dependency/src/provider_completion_receipt.rs
+?? apps/runtime/dependency/src/workspace.rs
+?? apps/runtime/dependency/tests/scheduler_process.rs
+?? apps/runtime/logic/src/canonical_variable_coordinator.rs
+?? apps/runtime/logic/src/canonical_variables.rs
+?? apps/runtime/logic/src/child_graph_ancillary_policy.rs
+?? apps/runtime/logic/src/child_graph_application.rs
+?? apps/runtime/logic/src/child_graph_continuation.rs
+?? apps/runtime/logic/src/child_graph_execution.rs
+?? apps/runtime/logic/src/child_graph_turn.rs
+?? apps/runtime/logic/src/child_message_execution.rs
+?? apps/runtime/logic/src/effect_output.rs
+?? apps/runtime/logic/src/information_flow.rs
+?? apps/runtime/logic/src/mcp_oauth.rs
+?? apps/runtime/logic/src/node_execution.rs
+?? apps/runtime/logic/src/parallel_driver.rs
+?? apps/runtime/logic/src/parallel_execution.rs
+?? apps/runtime/logic/src/parallel_turn.rs
+?? apps/runtime/logic/src/plugin_authorization.rs
+?? apps/runtime/logic/src/plugin_automatic_memory.rs
+?? apps/runtime/logic/src/plugin_context_operation.rs
+?? apps/runtime/logic/src/plugin_context_turn.rs
+?? apps/runtime/logic/src/plugin_lifecycle.rs
+?? apps/runtime/logic/src/plugin_observer.rs
+?? apps/runtime/logic/src/plugin_outcome.rs
+?? apps/runtime/logic/src/plugin_schema.rs
+?? apps/runtime/logic/src/plugin_state_turn.rs
+?? apps/runtime/logic/src/plugin_turn.rs
+?? apps/runtime/logic/src/scoped_task.rs
+?? apps/runtime/logic/src/variable_turn.rs
+?? apps/runtime/logic/src/workspace.rs
+?? apps/runtime/service/src/artifact.rs
+?? apps/runtime/service/src/mcp_oauth.rs
+?? apps/tools/mcp/dependency/src/oauth.rs
+?? apps/tools/mcp/dependency/tests/oauth.rs
+?? docs/architecture/generic-child-graph-nodes.md
+?? docs/architecture/generic-child-graph-turn.md
+?? docs/architecture/generic-effect-output.md
+?? docs/architecture/plugin-node-state-persistence.md
+?? docs/benchmarks/2026-07-31-current-kernel-and-journal-stress.md
+?? memory/
+?? scheduler/
+?? sdk/session-style-sdk/src/planner_worker_1_3.toml
+?? sdk/session-style-sdk/src/planner_worker_1_4.toml
+?? sdk/session-style-sdk/src/research_loop_1_3.toml
+?? style-cache/
+?? tests/e2e/__pycache__/
+?? tests/e2e/artifact_handoff_finalize_e2e.py
+?? tests/e2e/plugin_node_executor.ps1
+?? tests/e2e/plugin_node_executor.sh
+?? tests/e2e/runtime_acp_mcp_branch.ps1
+?? tests/e2e/runtime_acp_mcp_branch.sh
+?? tests/e2e/runtime_acp_mcp_branch_driver.py
+?? tests/e2e/runtime_acp_mcp_http_sse.ps1
+?? tests/e2e/runtime_acp_mcp_http_sse.sh
+?? tests/e2e/runtime_acp_mcp_http_sse_driver.py
+?? tests/e2e/runtime_acp_rich_content.ps1
+?? tests/e2e/runtime_acp_rich_content.sh
+?? tests/e2e/runtime_arbitrary_graph_a.ps1
+?? tests/e2e/runtime_arbitrary_graph_a.sh
+?? tests/e2e/runtime_arbitrary_graph_b.ps1
+?? tests/e2e/runtime_arbitrary_graph_b.sh
+?? tests/e2e/runtime_arbitrary_graph_b_cancellation.ps1
+?? tests/e2e/runtime_arbitrary_graph_b_cancellation.sh
+?? tests/e2e/runtime_arbitrary_graph_c.ps1
+?? tests/e2e/runtime_arbitrary_graph_c.sh
+?? tests/e2e/runtime_arbitrary_graph_schedule.ps1
+?? tests/e2e/runtime_arbitrary_graph_schedule.sh
+?? tests/e2e/runtime_artifact_handoff.ps1
+?? tests/e2e/runtime_artifact_handoff.sh
+?? tests/e2e/runtime_artifact_handoff_finalize.ps1
+?? tests/e2e/runtime_artifact_handoff_finalize.sh
+?? tests/e2e/runtime_automatic_memory.ps1
+?? tests/e2e/runtime_automatic_memory.sh
+?? tests/e2e/runtime_child_mcp_inheritance.ps1
+?? tests/e2e/runtime_child_mcp_inheritance.sh
+?? tests/e2e/runtime_child_mcp_inheritance_driver.py
+?? tests/e2e/runtime_harness_overlap.ps1
+?? tests/e2e/runtime_harness_overlap.sh
+?? tests/e2e/runtime_iteration_memory.ps1
+?? tests/e2e/runtime_iteration_memory.sh
+?? tests/e2e/runtime_mcp_oauth.ps1
+?? tests/e2e/runtime_mcp_oauth.sh
+?? tests/e2e/runtime_planner_worker_1_4.ps1
+?? tests/e2e/runtime_planner_worker_1_4.sh
+?? tests/e2e/runtime_plugin_automatic_memory.ps1
+?? tests/e2e/runtime_plugin_automatic_memory.sh
+?? tests/e2e/runtime_plugin_context.ps1
+?? tests/e2e/runtime_plugin_context.sh
+?? tests/e2e/runtime_plugin_lifecycle.ps1
+?? tests/e2e/runtime_plugin_lifecycle.sh
+?? tests/e2e/runtime_session_completion_memory.ps1
+?? tests/e2e/runtime_session_completion_memory.sh
+?? tests/e2e/runtime_sqlite_memory_crash.ps1
+?? tests/e2e/runtime_sqlite_memory_crash.sh
+?? tests/e2e/runtime_tui_rich_attachments.ps1
+?? tests/e2e/runtime_tui_rich_attachments.sh
+?? tests/e2e/runtime_tui_rich_attachments_driver.py
+?? tests/e2e/runtime_typed_summary.ps1
+?? tests/e2e/runtime_typed_summary.sh
+?? tests/e2e/session_completion_memory_e2e.py
+?? tests/e2e/sqlite_memory_crash_e2e.py
+?? tests/fixtures/mcp_http_sse_server.py
+?? tests/fixtures/mcp_oauth_server.py
+?? tests/fixtures/plugins/arbitrary-graph-c-node.toml
+?? tests/fixtures/plugins/automatic-memory.toml
+?? tests/fixtures/plugins/plugin-compaction.toml
+?? tests/fixtures/plugins/plugin-context.toml
+?? tests/fixtures/styles/arbitrary-graph-a.toml
+?? tests/fixtures/styles/arbitrary-graph-b.toml
+?? tests/fixtures/styles/arbitrary-graph-c.toml
+?? tests/fixtures/styles/arbitrary-graph-schedule.toml
+?? tests/fixtures/styles/graph-b-worker.toml
+?? tests/fixtures/styles/plugin-automatic-memory.toml
+?? tests/fixtures/styles/plugin-context-iteration.toml
+?? tests/fixtures/styles/plugin-context.toml
+?? tests/fixtures/styles/session-completion-memory.toml
+?? tests/independent-harness/
+?? tests/integration/tests/

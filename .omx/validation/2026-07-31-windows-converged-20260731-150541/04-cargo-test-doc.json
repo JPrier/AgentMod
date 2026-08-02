@@ -1,0 +1,8 @@
+{
+  "name": "04-cargo-test-doc",
+  "command": "cargo test --workspace --doc --all-features --locked",
+  "exit_code": 0,
+  "elapsed_ms": 24153,
+  "started_at": "2026-07-31T19:09:05.9046327Z",
+  "ended_at": "2026-07-31T19:09:30.0664159Z"
+}

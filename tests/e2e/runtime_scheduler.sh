@@ -3,13 +3,14 @@ set -euo pipefail
 
 repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repository"
-cargo build -p agentmod-runtime -p agentmod-harness -p agentmod-scheduler -p agentmod-cli
+cargo build --locked -p agentmod-runtime -p agentmod-harness -p agentmod-scheduler -p agentmod-cli -p agentmod-tui
 
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/agentmod-runtime-scheduler-e2e.XXXXXX")"
 runtime="$repository/target/debug/agentmod-runtime"
 harness="$repository/target/debug/agentmod-harness"
 scheduler="$repository/target/debug/agentmod-scheduler"
 cli="$repository/target/debug/agentmod"
+tui="$repository/target/debug/agentmod-tui"
 daemon_pid=""
 cleanup() {
   if [[ -n "$daemon_pid" ]]; then kill "$daemon_pid" 2>/dev/null || true; fi
@@ -38,8 +39,11 @@ start_runtime() {
 start_runtime
 created="$("$cli" session create --workspace "$run_root/workspace" --style persistent-chat --json)"
 session_id="$(printf '%s' "$created" | sed -n 's/.*"session_id":"\([^"]*\)".*/\1/p')"
-"$cli" schedule add daily-driver --session "$session_id" \
-  --prompt "execute scheduled development work" --at-ms 0 --json >/dev/null
+stored="$("$tui" --smoke-command \
+  "/schedule-once daily-driver 0 execute scheduled development work")"
+printf '%s' "$stored" | grep -F 'schedule daily-driver stored' >/dev/null
+listed="$("$tui" --smoke-command /schedules)"
+printf '%s' "$listed" | grep -F 'status=1 schedules' >/dev/null
 journal="$run_root/sessions/$session_id/events.jsonl"
 for _ in $(seq 1 50); do
   if [[ -f "$journal" ]] &&
@@ -52,6 +56,12 @@ done
 test "$(grep -c '"event_type":"scheduler.fired"' "$journal")" -eq 1
 test "$(grep -c '"event_type":"model.response_completed"' "$journal")" -eq 1
 execution_id="$(sed -n 's/.*"execution_id":"\([0-9a-f]*\)".*/\1/p' "$journal" | head -n 1)"
+for _ in $(seq 1 50); do
+  if [[ -f "$run_root/scheduler/executions/$execution_id.succeeded" ]]; then
+    break
+  fi
+  sleep 0.1
+done
 test -f "$run_root/scheduler/executions/$execution_id.succeeded"
 manual="$("$cli" schedule run --limit 4 --json)"
 printf '%s' "$manual" | grep -q '"runs":\[\]'
@@ -61,7 +71,8 @@ printf '%s' "$manual" | grep -q '"runs":\[\]'
   --on-event model.response_completed --json >/dev/null
 "$cli" run "emit one runtime event" --session "$session_id" --json >/dev/null
 for _ in $(seq 1 50); do
-  if [[ "$(grep -c '"event_type":"scheduler.fired"' "$journal" || true)" -eq 2 ]]; then
+  if [[ "$(grep -c '"event_type":"scheduler.fired"' "$journal" || true)" -eq 2 ]] &&
+    [[ "$(grep -c '"event_type":"model.response_completed"' "$journal" || true)" -eq 3 ]]; then
     break
   fi
   sleep 0.1
@@ -92,7 +103,8 @@ wait "$daemon_pid" 2>/dev/null || true
 daemon_pid=""
 start_runtime
 for _ in $(seq 1 100); do
-  if [[ "$(grep -c '"event_type":"scheduler.fired"' "$journal" || true)" -eq 3 ]]; then
+  if [[ "$(grep -c '"event_type":"scheduler.fired"' "$journal" || true)" -eq 3 ]] &&
+    [[ "$(grep -c '"event_type":"model.response_completed"' "$journal" || true)" -eq 4 ]]; then
     break
   fi
   sleep 0.1
@@ -103,4 +115,6 @@ continuation="$run_root/sessions/$session_id/continuations/$deferred_continuatio
 grep -q '"state":"resumed"' "$continuation"
 after="$("$cli" schedule run --limit 4 --json)"
 printf '%s' "$after" | grep -q '"runs":\[\]'
-echo "runtime-owned time, event, and deferred continuation schedule E2E passed"
+removed="$("$tui" --smoke-command "/schedule-remove daily-driver")"
+printf '%s' "$removed" | grep -F 'schedule daily-driver removed' >/dev/null
+echo "runtime-owned time, event, deferred continuation, and TUI schedule management E2E passed"

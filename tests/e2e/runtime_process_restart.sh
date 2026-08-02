@@ -5,9 +5,9 @@ repository=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$repository"
 cargo build -p agentmod-runtime -p agentmod-harness \
     -p agentmod-filesystem-host -p agentmod-process-host \
-    -p agentmod-scheduler -p agentmod-cli
+    -p agentmod-scheduler -p agentmod-cli -p agentmod-tui
 
-run_root=$(mktemp -d "${TMPDIR:-/tmp}/agentmod-process-restart-e2e.XXXXXX")
+run_root=$(mktemp -d "${TMPDIR:-/tmp}/am-process-e2e.XXXXXX")
 workspace="$run_root/workspace"
 mkdir -p "$workspace"
 fixture="$run_root/agentmod-interactive"
@@ -15,7 +15,7 @@ cat >"$run_root/interactive.rs" <<'RUST'
 use std::io::{self, BufRead, Write};
 fn main() {
     std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::thread::sleep(std::time::Duration::from_secs(180));
         std::process::exit(124);
     });
     println!("ready");
@@ -42,7 +42,10 @@ export AGENTMOD_PROCESS_IDLE_TIMEOUT_MS=750
 export AGENTMOD_PERMISSION_MODE=allow
 cli="$repository/target/debug/agentmod"
 runtime="$repository/target/debug/agentmod-runtime"
+tui="$repository/target/debug/agentmod-tui"
 process_action_sequence=0
+last_process_response=
+succeeded=false
 
 cleanup() {
     if [ -n "${daemon_pid:-}" ]; then
@@ -50,7 +53,16 @@ cleanup() {
         wait "$daemon_pid" 2>/dev/null || true
     fi
     pkill -f "^$fixture$" 2>/dev/null || true
-    rm -rf -- "$run_root"
+    case "$run_root" in
+        "${TMPDIR:-/tmp}"/am-process-e2e.*)
+            if [ "$succeeded" = true ]; then
+                rm -rf -- "$run_root"
+            else
+                echo "retained failed process restart E2E root: $run_root" >&2
+            fi
+            ;;
+        *) echo "refusing unexpected process restart E2E root: $run_root" >&2 ;;
+    esac
 }
 trap cleanup EXIT INT TERM
 
@@ -73,13 +85,18 @@ process_action() {
     tool=$2
     arguments=$3
     process_action_sequence=$((process_action_sequence + 1))
-    "$cli" run "execute deterministic process action" \
+    response=$("$cli" run "execute deterministic process action" \
         --session "$session" \
         --option 'mock_scenario="process_action"' \
         --option "mock_process_tool=$tool" \
         --option "mock_process_arguments=$arguments" \
         --option "mock_process_call_id=process-action-$process_action_sequence" \
-        --json >/dev/null
+        --json)
+    last_process_response=$response
+    if printf '%s' "$response" | grep -F '"event":"failed"' >/dev/null; then
+        printf 'process action %s failed: %s\n' "$tool" "$response" >&2
+        exit 1
+    fi
 }
 
 start_runtime
@@ -91,6 +108,11 @@ process_action "$session_id" process.start_pty \
     "{\"executable\":\"$fixture\",\"arguments\":[],\"working_directory\":null,\"environment\":{},\"timeout_ms\":null,\"output_limit_bytes\":65536,\"cleanup\":\"retain\",\"terminal\":{\"columns\":80,\"rows\":24,\"pixel_width\":0,\"pixel_height\":0}}"
 
 process_root="$workspace/.agentmod/process-logs"
+if [ ! -d "$process_root" ]; then
+    printf 'process.start_pty did not create process logs: %s\n' \
+        "$last_process_response" >&2
+    exit 1
+fi
 process_count=$(find "$process_root" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ')
 [ "$process_count" = 1 ]
 process_id=$(find "$process_root" -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
@@ -154,4 +176,8 @@ done
 [ "$(grep -c '"event_type":"process.reconciliation_started"' "$journal")" = 2 ]
 [ "$(grep -c '"event_type":"process.reconciliation_completed"' "$journal")" = 2 ]
 grep -F '"status":"live"' "$journal" >/dev/null
+resources=$("$tui" --smoke-session-command "$session_id" /resources)
+printf '%s' "$resources" | grep -F "selected=$session_id" >/dev/null
+printf '%s' "$resources" | grep -F 'resources=0/0/2' >/dev/null
+succeeded=true
 echo "runtime restart preserved one PTY, delivered output once, and committed exit without redispatch"

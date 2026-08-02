@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-lsp-host-data = { path = "../data" }
+agentmod-lsp-host-data = { version = "0.1.0", path = "../data" }
 thiserror.workspace = true
 
 [lints]

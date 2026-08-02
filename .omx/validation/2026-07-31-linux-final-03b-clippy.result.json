@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "step_id": "03b-clippy",
+  "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+  "arguments": [
+    "clippy",
+    "--workspace",
+    "--all-targets",
+    "--all-features",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 51.854291357,
+  "started_at_utc": "2026-07-31T12:50:00+00:00",
+  "completed_at_utc": "2026-07-31T12:50:52+00:00",
+  "source_head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "source_working_tree_dirty": true,
+  "isolated_copy_root": "/tmp/agentmod-linux-final-20260731-02b.YmqECu",
+  "cargo_target_dir": "/tmp/agentmod-linux-final-20260731-02b.YmqECu/.cargo-target",
+  "stdout_path": ".omx/validation/2026-07-31-linux-final-03b-clippy.stdout.log",
+  "stderr_path": ".omx/validation/2026-07-31-linux-final-03b-clippy.stderr.log"
+}

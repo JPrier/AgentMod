@@ -9,4 +9,4 @@ process = "runtime"
 layer = "dependency"
 
 [dependencies]
-fixture-runtime-logic = { path = "../logic" }
+fixture-runtime-logic = { version = "0.1.0", path = "../logic" }

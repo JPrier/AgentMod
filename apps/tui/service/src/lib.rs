@@ -65,19 +65,34 @@ impl<L: TuiLogicPort> TuiService<L> {
         self.logic.bootstrap().map_err(map_logic)?;
         self.logic.insert_text(command);
         self.logic.submit_editor().map_err(map_logic)?;
-        let state = self.logic.state();
-        Ok(format!(
-            "status={} selected={} sessions={} style_details={}",
-            state.status,
-            state
-                .selected()
-                .map_or_else(|| String::from("none"), |session| session.id.to_string()),
-            state.sessions.len(),
-            state.selected_style_inspection.as_ref().map_or_else(
-                || String::from("none"),
-                |inspection| format!("{}@{}", inspection.summary.id, inspection.summary.version)
-            )
-        ))
+        Ok(smoke_command_output(self.logic.state()))
+    }
+
+    /// Selects one exact canonical session and executes one command-palette
+    /// action without entering raw-terminal mode.
+    ///
+    /// This bounded process diagnostic uses the same session-selection,
+    /// history reload, command submission, and runtime request path as the
+    /// fullscreen frontend. The requested identity is checked both when the
+    /// session is selected and after the command completes.
+    pub fn smoke_session_command(
+        mut self,
+        session_id: &str,
+        command: &str,
+    ) -> Result<String, TuiServiceError> {
+        if !command.trim_start().starts_with('/') {
+            return Err(TuiServiceError::InvalidSmokeCommand);
+        }
+        self.logic.bootstrap().map_err(map_logic)?;
+        self.logic
+            .select_session_exact(session_id)
+            .map_err(map_logic)?;
+        self.logic.insert_text(command);
+        self.logic.submit_editor().map_err(map_logic)?;
+        self.logic
+            .select_session_exact(session_id)
+            .map_err(map_logic)?;
+        Ok(smoke_command_output(self.logic.state()))
     }
 
     /// Executes one normal runtime turn without entering raw-terminal mode.
@@ -88,25 +103,55 @@ impl<L: TuiLogicPort> TuiService<L> {
         self.logic.bootstrap().map_err(map_logic)?;
         self.logic.insert_text(prompt);
         self.logic.submit_editor().map_err(map_logic)?;
-        let deadline = Instant::now() + Duration::from_secs(15);
-        while self.logic.state().is_streaming() {
-            self.logic.poll_runtime().map_err(map_logic)?;
-            if Instant::now() >= deadline {
-                return Err(TuiServiceError::TurnTimeout);
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        complete_smoke_turn(&mut self.logic)
+    }
+
+    /// Loads bounded workspace attachments through the command palette and
+    /// submits one rich turn without entering raw-terminal mode.
+    pub fn smoke_attachment_turn(
+        mut self,
+        prompt: &str,
+        paths: &[String],
+    ) -> Result<String, TuiServiceError> {
+        if paths.is_empty()
+            || paths
+                .iter()
+                .any(|path| path.trim().is_empty() || path.contains(['\r', '\n']))
+        {
+            return Err(TuiServiceError::InvalidSmokeAttachments);
         }
-        let assistant = self
-            .logic
-            .state()
-            .transcript
-            .iter()
-            .filter(|entry| entry.role == TranscriptRole::Assistant)
-            .map(|entry| entry.text.as_str())
-            .collect::<String>();
+        self.logic.bootstrap().map_err(map_logic)?;
+        for path in paths {
+            self.logic.insert_text(&format!("/attach {path}"));
+            self.logic.submit_editor().map_err(map_logic)?;
+        }
+        let attached = self.logic.state().attachments.len();
+        self.logic.insert_text(prompt);
+        self.logic.submit_editor().map_err(map_logic)?;
+        let pending_after_submit = self.logic.state().attachments.len();
+        complete_smoke_turn(&mut self.logic).map(|output| {
+            format!("{output} attachments={attached} pending_after_submit={pending_after_submit}")
+        })
+    }
+
+    /// Watches the selected session's authenticated canonical-event
+    /// subscription without entering raw-terminal mode.
+    pub fn smoke_watch(mut self, duration: Duration) -> Result<String, TuiServiceError> {
+        if duration.is_zero() || duration > Duration::from_secs(60) {
+            return Err(TuiServiceError::InvalidWatchDuration);
+        }
+        self.logic.bootstrap().map_err(map_logic)?;
+        let initial_events = self.logic.state().timeline.len();
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            self.logic.poll_runtime().map_err(map_logic)?;
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let final_events = self.logic.state().timeline.len();
         Ok(format!(
-            "status={} assistant={assistant}",
-            self.logic.state().status
+            "status={} initial_events={initial_events} final_events={final_events} events_delta={}",
+            self.logic.state().status,
+            final_events.saturating_sub(initial_events)
         ))
     }
 
@@ -222,6 +267,56 @@ impl<L: TuiLogicPort> TuiService<L> {
     }
 }
 
+fn complete_smoke_turn<L: TuiLogicPort>(logic: &mut L) -> Result<String, TuiServiceError> {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while logic.state().is_streaming() {
+        logic.poll_runtime().map_err(map_logic)?;
+        if Instant::now() >= deadline {
+            return Err(TuiServiceError::TurnTimeout);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let assistant = logic
+        .state()
+        .transcript
+        .iter()
+        .filter(|entry| entry.role == TranscriptRole::Assistant)
+        .map(|entry| entry.text.as_str())
+        .collect::<String>();
+    Ok(format!(
+        "status={} assistant={assistant}",
+        logic.state().status
+    ))
+}
+
+fn smoke_command_output(state: &TuiState) -> String {
+    format!(
+        "status={} selected={} sessions={} style_details={} mcp={} resources={}/{}/{} attachments={}",
+        state.status,
+        state
+            .selected()
+            .map_or_else(|| String::from("none"), |session| session.id.to_string()),
+        state.sessions.len(),
+        state.selected_style_inspection.as_ref().map_or_else(
+            || String::from("none"),
+            |inspection| format!("{}@{}", inspection.summary.id, inspection.summary.version)
+        ),
+        state.mcp_oauth.last().map_or_else(
+            || String::from("none"),
+            |value| format!(
+                "{}:{}:{}",
+                value.server_id,
+                value.status,
+                value.transaction_id.as_deref().unwrap_or("none")
+            )
+        ),
+        state.artifact_resources.len(),
+        state.child_resources.len(),
+        state.process_resources.len(),
+        state.attachments.len()
+    )
+}
+
 fn control_view(code: KeyCode) -> Option<View> {
     match code {
         KeyCode::Char('1') => Some(View::Chat),
@@ -230,7 +325,9 @@ fn control_view(code: KeyCode) -> Option<View> {
         KeyCode::Char('4') => Some(View::Graph),
         KeyCode::Char('5') => Some(View::Styles),
         KeyCode::Char('6') => Some(View::Harnesses),
-        KeyCode::Char('7') => Some(View::Help),
+        KeyCode::Char('7') => Some(View::Schedules),
+        KeyCode::Char('8') => Some(View::Plugins),
+        KeyCode::Char('9') => Some(View::Help),
         _ => None,
     }
 }
@@ -254,6 +351,10 @@ fn render(frame: &mut Frame<'_>, state: &TuiState) {
         View::Graph => render_graph(frame, state, content),
         View::Styles => render_styles(frame, state, content),
         View::Harnesses => render_harnesses(frame, state, content),
+        View::Schedules => render_schedules(frame, state, content),
+        View::Plugins => render_plugins(frame, state, content),
+        View::Mcp => render_mcp(frame, state, content),
+        View::RuntimeResources => render_runtime_resources(frame, state, content),
         View::Help => render_help(frame, content),
     }
     render_editor(frame, state, editor);
@@ -278,6 +379,10 @@ fn render_header(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
         "Graph",
         "Styles",
         "Harnesses",
+        "Schedules",
+        "Plugins",
+        "MCP",
+        "Runtime",
         "Help",
     ])
     .select(match state.view {
@@ -287,7 +392,11 @@ fn render_header(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
         View::Graph => 3,
         View::Styles => 4,
         View::Harnesses => 5,
-        View::Help => 6,
+        View::Schedules => 6,
+        View::Plugins => 7,
+        View::Mcp => 8,
+        View::RuntimeResources => 9,
+        View::Help => 10,
     })
     .block(
         Block::new()
@@ -726,10 +835,271 @@ fn render_harnesses(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
     );
 }
 
+fn render_schedules(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+    let lines = if state.schedules.is_empty() {
+        vec![Line::from("No durable schedules.")]
+    } else {
+        state
+            .schedules
+            .iter()
+            .flat_map(|schedule| {
+                [
+                    Line::from(Span::styled(
+                        format!(
+                            "{} · {} · session {}",
+                            schedule.schedule_id,
+                            if schedule.active {
+                                "active"
+                            } else {
+                                "inactive"
+                            },
+                            short_id(&schedule.session_id.to_string())
+                        ),
+                        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(format!("  {} · {}", schedule.trigger, schedule.payload)),
+                ]
+            })
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" Durable schedules · /schedules "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_plugins(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+    let activated = state
+        .style_introspection
+        .as_ref()
+        .and_then(|value| value.pointer("/pipeline/activated_plugin_ids"))
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| String::from("none"));
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("Activated by immutable style: {activated}"),
+            Style::new().fg(Color::Cyan),
+        )),
+        Line::default(),
+    ];
+    if state.plugin_lifecycle.is_empty() {
+        lines.push(Line::from(
+            "No lifecycle change issued by this frontend instance.",
+        ));
+    } else {
+        for plugin in &state.plugin_lifecycle {
+            let replay = if plugin.replayed { " · replayed" } else { "" };
+            lines.push(Line::from(format!(
+                "{}@{} · {} · sequence {}{}",
+                plugin.plugin_id,
+                plugin.plugin_version,
+                plugin.state,
+                plugin.committed_sequence.get(),
+                replay
+            )));
+        }
+    }
+    lines.extend([
+        Line::default(),
+        Line::from("/plugin-disable <id> · /plugin-enable <id>"),
+        Line::from("/plugin-quarantine <id> <reason-code> · /plugin-unquarantine <id>"),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" Session plugin lifecycle "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_mcp(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Explicit user management through the authenticated runtime OAuth endpoint.",
+            Style::new().fg(Color::Cyan),
+        )),
+        Line::default(),
+    ];
+    if state.mcp_oauth.is_empty() {
+        lines.push(Line::from(
+            "No MCP OAuth operation issued by this frontend instance.",
+        ));
+    } else {
+        for value in &state.mcp_oauth {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{} · {} · transaction={} · expires={}",
+                    value.server_id,
+                    value.status,
+                    value.transaction_id.as_deref().unwrap_or("none"),
+                    value
+                        .expires_at_ms
+                        .map_or_else(|| String::from("none"), |value| value.to_string())
+                ),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(format!(
+                "  scopes={} · status-hash={} · authorization-hash={}",
+                bounded_text(&value.scopes.join(","), 256),
+                value.status_hash.as_deref().unwrap_or("pending"),
+                value.authorization_url_hash.as_deref().unwrap_or("none")
+            )));
+            if let Some(url) = &value.authorization_url {
+                lines.push(Line::from(Span::styled(
+                    format!("  authorize: {}", bounded_text(url, 512)),
+                    Style::new().fg(Color::Green),
+                )));
+            }
+        }
+    }
+    lines.extend([
+        Line::default(),
+        Line::from("/mcp-oauth-begin <server-id> · /mcp-oauth-status <server-id>"),
+        Line::from("/mcp-oauth-cancel <server-id> <transaction-id>"),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" MCP OAuth management · /mcp "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn render_runtime_resources(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
+    const MAX_VISIBLE_ROWS: usize = 128;
+    let mut lines = vec![Line::from(Span::styled(
+        "Canonical replay only; this view never contacts a tool host.",
+        Style::new().fg(Color::Cyan),
+    ))];
+    lines.push(resource_heading(
+        "Artifacts",
+        state.artifact_resources.len(),
+        MAX_VISIBLE_ROWS,
+    ));
+    lines.extend(
+        state
+            .artifact_resources
+            .iter()
+            .take(MAX_VISIBLE_ROWS)
+            .map(|value| {
+                Line::from(format!(
+                    "{} · {} · {} · {} bytes · {} · {}",
+                    bounded_text(&value.execution_id, 48),
+                    bounded_text(&value.node_id, 48),
+                    value.state,
+                    value.byte_size,
+                    value.mime_type,
+                    value
+                        .artifact_reference
+                        .as_deref()
+                        .unwrap_or("no reference")
+                ))
+            }),
+    );
+    lines.push(resource_heading(
+        "Children",
+        state.child_resources.len(),
+        MAX_VISIBLE_ROWS,
+    ));
+    lines.extend(
+        state
+            .child_resources
+            .iter()
+            .take(MAX_VISIBLE_ROWS)
+            .map(|value| {
+                Line::from(format!(
+                    "{} · task={} · {} · {} · workspace={} · session={}",
+                    bounded_text(&value.execution_id, 48),
+                    bounded_text(&value.task_id, 48),
+                    value.state,
+                    value.child_style,
+                    value.workspace_mode,
+                    value.child_session_id.as_deref().unwrap_or("none")
+                ))
+            }),
+    );
+    lines.push(resource_heading(
+        "Process recovery",
+        state.process_resources.len(),
+        MAX_VISIBLE_ROWS,
+    ));
+    lines.extend(
+        state
+            .process_resources
+            .iter()
+            .take(MAX_VISIBLE_ROWS)
+            .map(|value| {
+                Line::from(format!(
+                    "{} · call={} · {} · sequence {}→{}",
+                    bounded_text(&value.process_id, 64),
+                    bounded_text(&value.call_id, 48),
+                    value.status.as_deref().unwrap_or("pending"),
+                    value.started_at,
+                    value
+                        .completed_at
+                        .map_or_else(|| String::from("pending"), |value| value.to_string())
+                ))
+            }),
+    );
+    lines.extend([
+        Line::default(),
+        Line::from(Span::styled(
+            "LSP management unavailable: runtime exposes no stable canonical LSP projection.",
+            Style::new().fg(Color::Yellow),
+        )),
+        Line::from(Span::styled(
+            "Rich input: /attach loads bounded workspace images, audio, and .bin blobs.",
+            Style::new().fg(Color::Green),
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" Runtime resources · /runtime "))
+            .wrap(Wrap { trim: true }),
+        area,
+    );
+}
+
+fn resource_heading(label: &str, count: usize, maximum: usize) -> Line<'static> {
+    let omitted = count.saturating_sub(maximum);
+    Line::from(Span::styled(
+        if omitted == 0 {
+            format!("{label} ({count})")
+        } else {
+            format!("{label} ({count}; {omitted} omitted)")
+        },
+        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn bounded_text(value: &str, maximum_chars: usize) -> String {
+    if value.chars().count() <= maximum_chars {
+        value.to_owned()
+    } else {
+        format!(
+            "{}…",
+            value
+                .chars()
+                .take(maximum_chars.saturating_sub(1))
+                .collect::<String>()
+        )
+    }
+}
+
 fn render_help(frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(
         Paragraph::new(vec![
-            Line::from("Ctrl+1…7 views · Tab cycle · Alt+↑/↓ sessions · Ctrl+R refresh"),
+            Line::from("Ctrl+1…9 core views · Tab cycles all views · Alt+↑/↓ sessions · Ctrl+R refresh"),
             Line::from("Enter send · Shift+Enter newline · ↑/↓ prompt history"),
             Line::from("Ctrl+C cancel active generation · Ctrl+Q or Esc quit"),
             Line::default(),
@@ -741,6 +1111,21 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
             Line::from("/budget <style-default|iterations steps tokens cost-micros duration-ms>"),
             Line::from(
                 "/model <id>  /provider <id>  /chat  /events  /context  /graph  /help  /cancel",
+            ),
+            Line::from(
+                "/attach <path>  /attachments  /attachment-remove <index>  /attachments-clear",
+            ),
+            Line::from(
+                "/plugins  /plugin-disable <id>  /plugin-enable <id>  /plugin-quarantine <id> <reason>",
+            ),
+            Line::from("/plugin-unquarantine <id>"),
+            Line::from("/mcp  /mcp-oauth-begin <server>  /mcp-oauth-status <server>"),
+            Line::from("/mcp-oauth-cancel <server> <transaction>  /runtime  /resources"),
+            Line::from(
+                "/schedules  /schedule-once <id> <unix-ms> <prompt>  /schedule-remove <id>",
+            ),
+            Line::from(
+                "/schedule-interval <id> <starts-ms> <every-ms> <prompt>  /schedule-event <id> <type> <prompt>",
             ),
             Line::from("/approve  /deny  /quit"),
             Line::default(),
@@ -754,9 +1139,14 @@ fn render_help(frame: &mut Frame<'_>, area: Rect) {
 
 fn render_editor(frame: &mut Frame<'_>, state: &TuiState, area: Rect) {
     let title = if state.is_streaming() {
-        " Prompt · generating "
+        String::from(" Prompt · generating ")
+    } else if state.attachments.is_empty() {
+        String::from(" Prompt · Enter send · Shift+Enter newline ")
     } else {
-        " Prompt · Enter send · Shift+Enter newline "
+        format!(
+            " Prompt · {} attachments · Enter send · /attachments lists ",
+            state.attachments.len()
+        )
     };
     frame.render_widget(
         Paragraph::new(state.editor.as_str())
@@ -849,7 +1239,11 @@ const fn next_view(view: View) -> View {
         View::Context => View::Graph,
         View::Graph => View::Styles,
         View::Styles => View::Harnesses,
-        View::Harnesses => View::Help,
+        View::Harnesses => View::Schedules,
+        View::Schedules => View::Plugins,
+        View::Plugins => View::Mcp,
+        View::Mcp => View::RuntimeResources,
+        View::RuntimeResources => View::Help,
         View::Help => View::Chat,
     }
 }
@@ -862,7 +1256,11 @@ const fn previous_view(view: View) -> View {
         View::Graph => View::Context,
         View::Styles => View::Graph,
         View::Harnesses => View::Styles,
-        View::Help => View::Harnesses,
+        View::Schedules => View::Harnesses,
+        View::Plugins => View::Schedules,
+        View::Mcp => View::Plugins,
+        View::RuntimeResources => View::Mcp,
+        View::Help => View::RuntimeResources,
     }
 }
 
@@ -898,20 +1296,28 @@ pub enum TuiServiceError {
     /// A noninteractive diagnostic turn exceeded its fixed safety bound.
     #[error("TUI diagnostic turn timed out")]
     TurnTimeout,
+    /// A noninteractive subscription watch exceeded its supported bound.
+    #[error("TUI smoke watch duration must be between 1 ms and 60 seconds")]
+    InvalidWatchDuration,
     /// The command diagnostic accepts only command-palette input.
     #[error("TUI command diagnostic requires a slash command")]
     InvalidSmokeCommand,
+    /// Attachment smoke mode needs at least one bounded, single-line path.
+    #[error("TUI attachment diagnostic requires one or more single-line paths")]
+    InvalidSmokeAttachments,
 }
 
 #[cfg(test)]
 mod tests {
     use agentmod_tui_logic::{
-        HarnessSummary, StyleAvailability, StyleSourceKind, StyleSummary, TranscriptEntry,
-        TranscriptRole, TuiState, View,
+        ArtifactResourceSummary, AttachmentKind, AttachmentSummary, ChildResourceSummary,
+        HarnessSummary, McpOAuthSummary, ProcessResourceSummary, ScheduleSummary,
+        StyleAvailability, StyleSourceKind, StyleSummary, TranscriptEntry, TranscriptRole,
+        TuiState, View,
     };
     use ratatui::{Terminal, backend::TestBackend};
 
-    use super::render;
+    use super::{bounded_text, render};
 
     #[test]
     fn dashboard_renders_core_interactive_surfaces() {
@@ -1036,6 +1442,155 @@ mod tests {
         assert!(screen.contains("Harness catalog"));
         assert!(screen.contains("fixture@1.0.0"));
         assert!(screen.contains("streaming"));
+    }
+
+    #[test]
+    fn schedule_catalog_renders_runtime_owned_trigger_and_payload() {
+        let backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut state = TuiState::default();
+        state.view = View::Schedules;
+        state.schedules.push(ScheduleSummary {
+            schedule_id: String::from("nightly"),
+            session_id: agentmod_primitives::SessionId::from_uuid(uuid::Uuid::nil()),
+            trigger: String::from("from 1000 every 500 ms"),
+            payload: String::from("prompt run checks"),
+            active: true,
+        });
+
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("render");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("Durable schedules"));
+        assert!(screen.contains("nightly"));
+        assert!(screen.contains("from 1000 every 500 ms"));
+        assert!(screen.contains("prompt run checks"));
+    }
+
+    #[test]
+    fn mcp_view_renders_only_bounded_redacted_state_and_transient_authorization_url() {
+        let backend = TestBackend::new(150, 32);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut state = TuiState::default();
+        state.view = View::Mcp;
+        state.mcp_oauth.push(McpOAuthSummary {
+            server_id: String::from("fixture_mcp"),
+            status: String::from("pending"),
+            transaction_id: Some(String::from("transaction-1")),
+            expires_at_ms: Some(10_000),
+            scopes: vec![String::from("tools.read")],
+            status_hash: Some("a".repeat(64)),
+            authorization_url: Some(String::from(
+                "https://identity.example.test/authorize?fixture=1",
+            )),
+            authorization_url_hash: Some("b".repeat(64)),
+        });
+
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("render");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("MCP OAuth management"));
+        assert!(screen.contains("fixture_mcp"));
+        assert!(screen.contains("transaction-1"));
+        assert!(screen.contains("https://identity.example.test/authorize"));
+        assert!(screen.contains("/mcp-oauth-cancel"));
+    }
+
+    #[test]
+    fn runtime_resources_view_is_replay_only_and_marks_unavailable_surfaces() {
+        let backend = TestBackend::new(160, 36);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut state = TuiState::default();
+        state.view = View::RuntimeResources;
+        state.artifact_resources.push(ArtifactResourceSummary {
+            execution_id: String::from("artifact-execution"),
+            node_id: String::from("persist"),
+            state: String::from("completed"),
+            mime_type: String::from("text/markdown"),
+            byte_size: 42,
+            artifact_reference: Some(String::from("artifact:blake3:fixture")),
+        });
+        state.child_resources.push(ChildResourceSummary {
+            execution_id: String::from("child-execution"),
+            task_id: String::from("task-1"),
+            state: String::from("completed"),
+            child_style: String::from("ephemeral-turn@1.2.0"),
+            workspace_mode: String::from("shared_read_only"),
+            child_session_id: Some(String::from("00000000-0000-0000-0000-000000000001")),
+            summary: Some(String::from("done")),
+        });
+        state.process_resources.push(ProcessResourceSummary {
+            call_id: String::from("call-1"),
+            process_id: String::from("process-1"),
+            status: Some(String::from("live")),
+            started_at: 7,
+            completed_at: Some(8),
+        });
+
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("render");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("Canonical replay only"));
+        assert!(screen.contains("artifact-execution"));
+        assert!(screen.contains("shared_read_only"));
+        assert!(screen.contains("process-1"));
+        assert!(screen.contains("LSP management unavailable"));
+        assert!(screen.contains("Rich input: /attach loads bounded workspace"));
+    }
+
+    #[test]
+    fn help_and_editor_render_attachment_commands_and_pending_status() {
+        let backend = TestBackend::new(160, 36);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut state = TuiState::default();
+        state.view = View::Help;
+        state.attachments.push(AttachmentSummary {
+            name: String::from("pixel.png"),
+            mime_type: String::from("image/png"),
+            kind: AttachmentKind::Image,
+            byte_size: 12,
+        });
+        terminal
+            .draw(|frame| render(frame, &state))
+            .expect("render");
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(screen.contains("/attach <path>"));
+        assert!(screen.contains("/attachment-remove <index>"));
+        assert!(screen.contains("1 attachments"));
+    }
+
+    #[test]
+    fn bounded_rendering_truncates_unicode_by_character() {
+        let value = bounded_text(&"🦀".repeat(600), 32);
+        assert!(value.ends_with('…'));
+        assert_eq!(value.chars().count(), 32);
     }
 
     #[test]

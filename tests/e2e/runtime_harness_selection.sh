@@ -3,19 +3,31 @@ set -euo pipefail
 
 repository="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repository"
-cargo build -p agentmod-runtime -p agentmod-harness -p agentmod-cli
-
-runtime="$repository/target/debug/agentmod-runtime"
-harness="$repository/target/debug/agentmod-harness"
-cli="$repository/target/debug/agentmod"
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/agentmod-harness-e2e.XXXXXX")"
+target_dir="$run_root/target"
+export CARGO_TARGET_DIR="$target_dir"
+cargo build --locked -p agentmod-runtime -p agentmod-harness \
+  -p agentmod-independent-harness-fixture -p agentmod-scheduler -p agentmod-cli
+if cargo tree --locked -p agentmod-independent-harness-fixture \
+  --edges normal --prefix none |
+  grep -Eq 'agentmod-harness-(service|logic|data|dependency)'; then
+  echo "independent harness fixture depends on native harness internals" >&2
+  exit 1
+fi
+
+runtime="$target_dir/debug/agentmod-runtime"
+harness="$target_dir/debug/agentmod-harness"
+independent_harness="$target_dir/debug/agentmod-independent-harness-fixture"
+scheduler="$target_dir/debug/agentmod-scheduler"
+cli="$target_dir/debug/agentmod"
 workspace="$run_root/workspace"
 mkdir -p "$workspace" "$run_root/styles/user"
 cp "$repository/tests/fixtures/styles/fixture-harness-chat.toml" "$run_root/styles/user/"
 export AGENTMOD_RUNTIME_ENDPOINT="$run_root/runtime.sock"
 export AGENTMOD_RUNTIME_AUTH_TOKEN="0123456789abcdef0123456789abcdef0123456789abcdef"
 export AGENTMOD_HARNESS_PROGRAM="$harness"
-export AGENTMOD_FIXTURE_HARNESS_PROGRAM="$harness"
+export AGENTMOD_FIXTURE_HARNESS_PROGRAM="$independent_harness"
+export AGENTMOD_SCHEDULER_PROGRAM="$scheduler"
 daemon=""
 
 cleanup() {
@@ -30,7 +42,10 @@ cleanup() {
 trap cleanup EXIT
 
 start_runtime() {
-  "$runtime" serve >"$run_root/runtime.stdout.log" 2>"$run_root/runtime.stderr.log" &
+  (
+    cd "$run_root"
+    exec "$runtime" serve
+  ) >"$run_root/runtime.stdout.log" 2>"$run_root/runtime.stderr.log" &
   daemon=$!
   for _ in $(seq 1 100); do
     if "$cli" doctor --json >/dev/null 2>&1; then return; fi
@@ -67,8 +82,10 @@ if "$cli" session create --workspace "$workspace" --style fixture-harness-incomp
   exit 1
 fi
 
-for item in "$native_id:native:native-ok" "$fixture_id:fixture:fixture-ok"; do
-  IFS=: read -r session_id harness_id output <<<"$item"
+for item in \
+  "$native_id|native|native-ok|native-ok" \
+  "$fixture_id|fixture|fixture-ok|independent-harness:fixture-ok"; do
+  IFS='|' read -r session_id harness_id output expected <<<"$item"
   inspection="$("$cli" session inspect "$session_id" --json)"
   python3 - "$inspection" "$harness_id" <<'PY'
 import json, sys
@@ -80,6 +97,7 @@ PY
   "$cli" run "run through $harness_id" --session "$session_id" \
     --option 'mock_scenario="streaming_text"' --option "mock_text=\"$output\"" --json >/dev/null
   grep -q "\"harness\":\"$harness_id\"" "$run_root/sessions/$session_id/events.jsonl"
+  grep -q "$expected" "$run_root/sessions/$session_id/events.jsonl"
 done
 
 stop_runtime
@@ -93,4 +111,6 @@ assert state["style_compatibility"]["status"] == "compatible"
 PY
 "$cli" run "fixture after restart" --session "$fixture_id" \
   --option 'mock_scenario="streaming_text"' --option 'mock_text="fixture-restarted"' --json >/dev/null
-echo "runtime harness registry/selection/capability/restart E2E passed"
+grep -q "independent-harness:fixture-restarted" \
+  "$run_root/sessions/$fixture_id/events.jsonl"
+echo "runtime independent-harness selection/capability/restart E2E passed"

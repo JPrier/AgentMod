@@ -1,0 +1,12 @@
+{
+  "index": 1,
+  "name": "01-runtime_style_registry",
+  "script": "runtime_style_registry.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_style_registry.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 53057,
+  "started_at": "2026-07-31T19:13:24.6124062Z",
+  "ended_at": "2026-07-31T19:14:17.6729068Z",
+  "log": "01-runtime_style_registry.log"
+}

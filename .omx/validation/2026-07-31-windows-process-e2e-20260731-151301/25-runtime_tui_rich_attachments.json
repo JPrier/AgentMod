@@ -1,0 +1,12 @@
+{
+  "index": 25,
+  "name": "25-runtime_tui_rich_attachments",
+  "script": "runtime_tui_rich_attachments.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_tui_rich_attachments.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 7190,
+  "started_at": "2026-07-31T19:29:12.6823466Z",
+  "ended_at": "2026-07-31T19:29:19.8777097Z",
+  "log": "25-runtime_tui_rich_attachments.log"
+}

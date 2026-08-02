@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "evidence_kind": "journal_dependency_stress",
+  "captured_at_utc": "2026-07-31T11:52:07+00:00",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree": {
+    "dirty": true,
+    "porcelain_entries": 334
+  },
+  "platform": {
+    "os": "Ubuntu 24.04.3 LTS under WSL2 kernel 6.6.87.2-microsoft-standard-WSL2",
+    "target": "x86_64-unknown-linux-gnu",
+    "cpu": "AMD Ryzen 7 5800X3D 8-Core Processor",
+    "physical_cores": 8,
+    "logical_processors": 16,
+    "rustc": "1.91.1 (ed61e7d7e 2025-11-07)",
+    "cargo": "1.91.1 (ea2d97820 2025-10-10)"
+  },
+  "command": "cargo test --release --locked -p agentmod-integration-tests --test runtime_journal_stress -- --nocapture",
+  "scope": "filesystem JSONL journal dependency with buffered durability; not runtime/process throughput",
+  "workloads": [
+    {
+      "test": "concurrent_cas_journal_append_preserves_one_complete_chain",
+      "writers": 8,
+      "appends_per_writer": 50,
+      "accepted_appends": 400
+    },
+    {
+      "test": "many_independent_session_journals_remain_isolated",
+      "sessions": 32,
+      "events_per_session": 25,
+      "accepted_appends": 800
+    }
+  ],
+  "outcome": {
+    "passed": true,
+    "passed_tests": 2,
+    "failed_tests": 0,
+    "terminal_summary": "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out"
+  },
+  "timing": {
+    "cargo_reported_test_seconds": 0.87,
+    "command_wall_ms": 167600,
+    "command_wall_precision_ms": 100,
+    "release_build_reported": "2m 46s"
+  }
+}

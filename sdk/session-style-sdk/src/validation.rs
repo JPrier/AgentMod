@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ApprovalDefaults, BuiltInStyle, ChildAgentLimits, ChildWorkspaceMode, CompactionSelection,
-    CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource, InterceptorDeclaration,
-    MemoryInjectionLocation, MemoryRetrievalTiming, MemorySelection, MemoryWritePolicy,
-    RetryPolicy, SessionStyleManifest, StyleKind, TerminationOutcome, TerminationPolicy,
-    TopLevelSelection,
+    CompactionStrategy, ContextTransformLifecycle, ContextTransformSelection, DecisionCapability,
+    ExecutionBudgets, GraphSource, InterceptorDeclaration, MemoryInjectionLocation,
+    MemoryRetrievalTiming, MemorySelection, MemoryWritePolicy, PluginCompactorSelection,
+    PluginMemorySelection, RetryPolicy, SessionStyleManifest, StyleKind, TerminationOutcome,
+    TerminationPolicy, TopLevelSelection,
 };
 
 /// Current session-style manifest schema.
@@ -29,6 +30,8 @@ pub struct StyleCompilerLimits {
     pub max_collection_items: usize,
     /// Maximum interceptor registrations.
     pub max_interceptors: usize,
+    /// Maximum ordered plugin context transforms.
+    pub max_context_transforms: usize,
     /// Maximum memory records injected.
     pub max_memory_items: u32,
     /// Maximum injected memory bytes.
@@ -60,6 +63,7 @@ impl Default for StyleCompilerLimits {
         Self {
             max_collection_items: 256,
             max_interceptors: 256,
+            max_context_transforms: 64,
             max_memory_items: 1_024,
             max_memory_bytes: 16 * 1024 * 1024,
             max_iterations: 10_000,
@@ -91,6 +95,12 @@ pub struct CompileContext {
     pub providers: BTreeSet<String>,
     /// Available plugin IDs.
     pub plugins: BTreeSet<String>,
+    /// Exact context-transform declarations in the authoritative plugin catalog.
+    pub context_transforms: Vec<AvailableContextTransform>,
+    /// Exact memory-provider declarations in the authoritative plugin catalog.
+    pub plugin_memory_providers: Vec<AvailablePluginMemoryProvider>,
+    /// Exact compactor declarations in the authoritative plugin catalog.
+    pub plugin_compactors: Vec<AvailablePluginCompactor>,
     /// Available memory provider IDs.
     pub memory_providers: BTreeSet<String>,
     /// Available compaction strategy IDs.
@@ -99,6 +109,59 @@ pub struct CompileContext {
     pub supported_decisions: BTreeSet<DecisionCapability>,
     /// Content-addressed graph references supplied without SDK I/O.
     pub graph_references: BTreeMap<String, String>,
+}
+
+/// Exact available plugin context-transform declaration.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AvailableContextTransform {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Transform declaration identity.
+    pub transform_id: String,
+    /// Exact transform semantic version.
+    pub version: String,
+    /// Hash of the exact declaration.
+    pub declaration_hash: ContentHash,
+    /// Supported lifecycle boundary.
+    pub lifecycle: ContextTransformLifecycle,
+}
+
+/// Exact available plugin memory-provider declaration.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AvailablePluginMemoryProvider {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact activated plugin semantic version.
+    pub plugin_version: String,
+    /// Memory-provider declaration identity within the plugin.
+    pub provider_id: String,
+    /// Exact provider semantic version.
+    pub provider_version: String,
+    /// Hash of the exact declaration.
+    pub declaration_hash: ContentHash,
+    /// Exact canonical plugin configuration hash.
+    pub configuration_reference: ContentHash,
+    /// Whether this declaration exposes the retrieval operation.
+    pub has_retrieve: bool,
+    /// Whether this declaration exposes the write operation.
+    pub has_write: bool,
+}
+
+/// Exact available plugin compactor declaration.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct AvailablePluginCompactor {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact activated plugin semantic version.
+    pub plugin_version: String,
+    /// Compactor declaration identity within the plugin.
+    pub compactor_id: String,
+    /// Exact compactor semantic version.
+    pub compactor_version: String,
+    /// Hash of the exact declaration.
+    pub declaration_hash: ContentHash,
+    /// Exact canonical plugin configuration hash.
+    pub configuration_reference: ContentHash,
 }
 
 /// Validation severity.
@@ -205,6 +268,9 @@ pub struct CompiledSessionStyle {
     pub allowed_providers: Vec<String>,
     /// Allowed plugins.
     pub allowed_plugins: Vec<String>,
+    /// Ordered exact plugin context transforms.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_transforms: Vec<ContextTransformSelection>,
     /// Harness selection and required capabilities.
     pub harness: crate::HarnessSelection,
     /// Memory selection.
@@ -257,14 +323,9 @@ pub fn compile_style(
     validate_availability(manifest, context, &root, &mut diagnostics);
     validate_harness(manifest, &root, &mut diagnostics);
     validate_interceptors(manifest, context, limits, &root, &mut diagnostics);
-    validate_memory(&manifest.memory, context, limits, &root, &mut diagnostics);
-    validate_compaction(
-        &manifest.compaction,
-        context,
-        manifest.budgets.max_tokens,
-        &root,
-        &mut diagnostics,
-    );
+    validate_context_transforms(manifest, context, limits, &root, &mut diagnostics);
+    validate_memory(manifest, context, limits, &root, &mut diagnostics);
+    validate_compaction(manifest, context, &root, &mut diagnostics);
     validate_approvals(&manifest.approvals, &root, &mut diagnostics);
     validate_budgets(manifest.budgets, limits, &root, &mut diagnostics);
     validate_children(
@@ -313,6 +374,7 @@ pub fn compile_style(
         allowed_tool_groups: sorted(&manifest.allowed_tool_groups),
         allowed_providers: sorted(&manifest.allowed_providers),
         allowed_plugins: sorted(&manifest.allowed_plugins),
+        context_transforms: manifest.context_transforms.clone(),
         harness: manifest.harness.clone(),
         memory: manifest.memory.clone(),
         compaction: manifest.compaction.clone(),
@@ -774,13 +836,93 @@ fn map_ordering_error(diagnostic: &CompileDiagnostic, root: &str) -> Diagnostic 
     }
 }
 
-fn validate_memory(
-    memory: &MemorySelection,
+fn validate_context_transforms(
+    manifest: &SessionStyleManifest,
     context: &CompileContext,
     limits: StyleCompilerLimits,
     root: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    if manifest.context_transforms.len() > limits.max_context_transforms {
+        diagnostics.push(bounds(root, "context_transforms"));
+    }
+    let mut seen = BTreeSet::new();
+    for (index, selection) in manifest.context_transforms.iter().enumerate() {
+        let path = format!("{root}.context_transforms[{index}]");
+        if !is_name(&selection.plugin_id)
+            || !is_name(&selection.transform_id)
+            || Version::parse(&selection.version).is_err()
+        {
+            diagnostics.push(error(
+                "STYLE032",
+                &path,
+                "context transform identity or exact version is invalid",
+                "use stable lowercase plugin/transform IDs and a complete semantic version",
+            ));
+        }
+        if !seen.insert((
+            selection.plugin_id.as_str(),
+            selection.transform_id.as_str(),
+        )) {
+            diagnostics.push(error(
+                "STYLE033",
+                &path,
+                "context transform is selected more than once",
+                "select each plugin transform once; vector order already defines execution order",
+            ));
+        }
+        if !manifest
+            .allowed_plugins
+            .iter()
+            .any(|plugin| plugin == &selection.plugin_id)
+        {
+            diagnostics.push(error(
+                "STYLE034",
+                format!("{path}.plugin_id"),
+                format!(
+                    "context transform plugin `{}` is not allowed by the immutable style",
+                    selection.plugin_id
+                ),
+                "add the exact plugin ID to allowed_plugins or remove the transform",
+            ));
+        }
+        let exact_matches = context
+            .context_transforms
+            .iter()
+            .filter(|available| {
+                available.plugin_id == selection.plugin_id
+                    && available.transform_id == selection.transform_id
+                    && available.version == selection.version
+                    && available.declaration_hash == selection.declaration_hash
+                    && available.lifecycle == selection.lifecycle
+            })
+            .count();
+        if exact_matches != 1 {
+            diagnostics.push(error(
+                "STYLE035",
+                &path,
+                format!(
+                    "exact context transform `{}:{}` version {} with declaration {} at {:?} is unavailable or ambiguous",
+                    selection.plugin_id,
+                    selection.transform_id,
+                    selection.version,
+                    selection.declaration_hash,
+                    selection.lifecycle
+                ),
+                "activate the exact declared plugin transform; compatible version or hash substitution is not permitted",
+            ));
+        }
+    }
+}
+
+fn validate_memory(
+    manifest: &SessionStyleManifest,
+    context: &CompileContext,
+    limits: StyleCompilerLimits,
+    root: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let memory = &manifest.memory;
     validate_unique_values(
         &memory.scopes,
         &format!("{root}.memory.scopes"),
@@ -791,10 +933,14 @@ fn validate_memory(
         && memory.max_injected_bytes <= limits.max_memory_bytes;
     let valid_disabled = !disabled
         || (memory.scopes.is_empty() && memory.max_items == 0 && memory.max_injected_bytes == 0);
-    let valid_enabled = disabled
-        || (context.memory_providers.contains(&memory.provider)
-            && memory.max_items > 0
-            && memory.max_injected_bytes > 0);
+    let plugin_selected = memory.plugin.is_some();
+    let provider_available = if plugin_selected {
+        true
+    } else {
+        context.memory_providers.contains(&memory.provider)
+    };
+    let valid_enabled =
+        disabled || (provider_available && memory.max_items > 0 && memory.max_injected_bytes > 0);
     if !is_name(&memory.provider) || !valid_bounds || !valid_disabled || !valid_enabled {
         diagnostics.push(error(
             "STYLE017",
@@ -821,21 +967,32 @@ fn validate_memory(
             "use never/never/none for disabled memory; active retrieval requires a bounded query and injection location",
         ));
     }
+    if let Some(selection) = &memory.plugin {
+        validate_plugin_memory_selection(
+            manifest,
+            selection,
+            context,
+            retrieves,
+            memory.write_policy != MemoryWritePolicy::Never,
+            root,
+            diagnostics,
+        );
+    }
 }
 
 fn validate_compaction(
-    compaction: &CompactionSelection,
+    manifest: &SessionStyleManifest,
     context: &CompileContext,
-    max_tokens: u64,
     root: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let compaction = &manifest.compaction;
+    let max_tokens = manifest.budgets.max_tokens;
     validate_unique_values(
         &compaction.preservation_requirements,
         &format!("{root}.compaction.preservation_requirements"),
         diagnostics,
     );
-    let strategy = compaction_name(compaction.strategy);
     let disabled = compaction.strategy == CompactionStrategy::None;
     let valid_trigger = if disabled {
         compaction.trigger_tokens.is_none()
@@ -844,7 +1001,11 @@ fn validate_compaction(
             .trigger_tokens
             .is_some_and(|value| value > 0 && value <= max_tokens)
     };
-    if !context.compaction_strategies.contains(strategy)
+    let strategy_available = compaction.strategy == CompactionStrategy::Plugin
+        || context
+            .compaction_strategies
+            .contains(compaction_name(compaction.strategy));
+    if !strategy_available
         || !valid_trigger
         || (!disabled
             && (!compaction.preserve_unresolved_tasks || !compaction.preserve_active_processes))
@@ -870,6 +1031,181 @@ fn validate_compaction(
             format!("{root}.compaction"),
             "compaction context budgets are inconsistent with the provider projection bound",
             "use zero context controls for none, or reserve fewer tokens than a bounded projection within the style token budget",
+        ));
+    }
+    match (compaction.strategy, &compaction.plugin) {
+        (CompactionStrategy::Plugin, Some(selection)) => {
+            validate_plugin_compactor_selection(
+                manifest,
+                selection,
+                context,
+                root,
+                diagnostics,
+            );
+        }
+        (CompactionStrategy::Plugin, None) => diagnostics.push(error(
+            "STYLE040",
+            format!("{root}.compaction.plugin"),
+            "plugin compaction strategy has no exact plugin compactor selection",
+            "select one exact plugin, compactor version, declaration hash, and configuration reference",
+        )),
+        (_, Some(_)) => diagnostics.push(error(
+            "STYLE040",
+            format!("{root}.compaction.plugin"),
+            "a built-in compaction strategy cannot retain a plugin compactor selection",
+            "remove the plugin selection or select the plugin strategy explicitly",
+        )),
+        (_, None) => {}
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the booleans are the already-validated lifecycle policy requirements"
+)]
+fn validate_plugin_memory_selection(
+    manifest: &SessionStyleManifest,
+    selection: &PluginMemorySelection,
+    context: &CompileContext,
+    requires_retrieve: bool,
+    requires_write: bool,
+    root: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let path = format!("{root}.memory.plugin");
+    if !is_name(&selection.plugin_id)
+        || !is_name(&selection.provider_id)
+        || Version::parse(&selection.plugin_version).is_err()
+        || Version::parse(&selection.provider_version).is_err()
+        || selection.provider_id != manifest.memory.provider
+        || manifest.memory.provider == "none"
+    {
+        diagnostics.push(error(
+            "STYLE036",
+            &path,
+            "plugin memory identity, exact version, or provider selection is invalid",
+            "use stable IDs, complete semantic versions, and make memory.provider equal the selected plugin provider",
+        ));
+    }
+    if !manifest
+        .allowed_plugins
+        .iter()
+        .any(|plugin| plugin == &selection.plugin_id)
+    {
+        diagnostics.push(error(
+            "STYLE037",
+            format!("{path}.plugin_id"),
+            format!(
+                "memory plugin `{}` is not allowed by the immutable style",
+                selection.plugin_id
+            ),
+            "add the exact plugin ID to allowed_plugins or remove the plugin memory selection",
+        ));
+    }
+    let exact_matches = context
+        .plugin_memory_providers
+        .iter()
+        .filter(|available| plugin_memory_matches(selection, available))
+        .collect::<Vec<_>>();
+    if exact_matches.len() != 1 {
+        diagnostics.push(error(
+            "STYLE038",
+            &path,
+            format!(
+                "exact plugin memory provider `{}@{}:{}` version {} with declaration {} is unavailable or ambiguous",
+                selection.plugin_id,
+                selection.plugin_version,
+                selection.provider_id,
+                selection.provider_version,
+                selection.declaration_hash
+            ),
+            "activate the exact declared plugin memory provider once; compatible version or hash substitution is not permitted",
+        ));
+        return;
+    }
+    let available = exact_matches[0];
+    if (requires_retrieve && !available.has_retrieve) || (requires_write && !available.has_write) {
+        diagnostics.push(error(
+            "STYLE039",
+            &path,
+            "plugin memory lifecycle policy requires an operation the exact declaration does not expose",
+            "select a declaration with every required retrieve/write operation or disable the corresponding lifecycle policy",
+        ));
+    }
+}
+
+fn plugin_memory_matches(
+    selection: &PluginMemorySelection,
+    available: &AvailablePluginMemoryProvider,
+) -> bool {
+    available.plugin_id == selection.plugin_id
+        && available.plugin_version == selection.plugin_version
+        && available.provider_id == selection.provider_id
+        && available.provider_version == selection.provider_version
+        && available.declaration_hash == selection.declaration_hash
+        && available.configuration_reference == selection.configuration_reference
+}
+
+fn validate_plugin_compactor_selection(
+    manifest: &SessionStyleManifest,
+    selection: &PluginCompactorSelection,
+    context: &CompileContext,
+    root: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let path = format!("{root}.compaction.plugin");
+    if !is_name(&selection.plugin_id)
+        || !is_name(&selection.compactor_id)
+        || Version::parse(&selection.plugin_version).is_err()
+        || Version::parse(&selection.compactor_version).is_err()
+    {
+        diagnostics.push(error(
+            "STYLE041",
+            &path,
+            "plugin compactor identity or exact version is invalid",
+            "use stable plugin/compactor IDs and complete semantic versions",
+        ));
+    }
+    if !manifest
+        .allowed_plugins
+        .iter()
+        .any(|plugin| plugin == &selection.plugin_id)
+    {
+        diagnostics.push(error(
+            "STYLE042",
+            format!("{path}.plugin_id"),
+            format!(
+                "compactor plugin `{}` is not allowed by the immutable style",
+                selection.plugin_id
+            ),
+            "add the exact plugin ID to allowed_plugins or remove the plugin compactor selection",
+        ));
+    }
+    let exact_matches = context
+        .plugin_compactors
+        .iter()
+        .filter(|available| {
+            available.plugin_id == selection.plugin_id
+                && available.plugin_version == selection.plugin_version
+                && available.compactor_id == selection.compactor_id
+                && available.compactor_version == selection.compactor_version
+                && available.declaration_hash == selection.declaration_hash
+                && available.configuration_reference == selection.configuration_reference
+        })
+        .count();
+    if exact_matches != 1 {
+        diagnostics.push(error(
+            "STYLE043",
+            &path,
+            format!(
+                "exact plugin compactor `{}@{}:{}` version {} with declaration {} is unavailable or ambiguous",
+                selection.plugin_id,
+                selection.plugin_version,
+                selection.compactor_id,
+                selection.compactor_version,
+                selection.declaration_hash
+            ),
+            "activate the exact declared plugin compactor once; compatible version or hash substitution is not permitted",
         ));
     }
 }
@@ -939,9 +1275,11 @@ fn validate_children(
             && children.per_child_token_budget == 0
             && children.child_style.is_none()
             && children.workspace_mode.is_none()
+            && children.workspace_merge_policy.is_none()
             && children.custom_workspace.is_none()
             && children.inherit_provider.is_none()
             && children.inherit_model.is_none()
+            && children.inherit_mcp.is_none()
             && children.context_budget_tokens.is_none()
             && children.per_child_cost_budget_micros.is_none()
             && children.tool_groups.is_empty()
@@ -961,14 +1299,23 @@ fn validate_children(
     let workspace_valid = match (
         children.workspace_mode,
         children.custom_workspace.as_deref(),
+        children.workspace_merge_policy,
     ) {
-        (Some(ChildWorkspaceMode::ExplicitCustomWorkspace), Some(path)) => !path.trim().is_empty(),
-        (Some(mode), None) => mode != ChildWorkspaceMode::ExplicitCustomWorkspace,
-        (None | Some(_), Some(_)) | (None, None) => false,
+        (Some(ChildWorkspaceMode::ExplicitCustomWorkspace), Some(path), None) => {
+            !path.trim().is_empty()
+        }
+        (Some(ChildWorkspaceMode::BranchWorkspace), None, Some(_)) => true,
+        (Some(mode), None, None) => !matches!(
+            mode,
+            ChildWorkspaceMode::ExplicitCustomWorkspace | ChildWorkspaceMode::BranchWorkspace
+        ),
+        _ => false,
     };
     let tool_groups_valid = children.tool_groups.iter().all(|group| {
         !group.trim().is_empty() && allowed_tool_groups.iter().any(|allowed| allowed == group)
     });
+    let mcp_inheritance_valid = children.inherit_mcp != Some(true)
+        || children.tool_groups.iter().any(|group| group == "mcp");
     let valid_enabled = disabled
         || (children.max_children <= limits.max_children
             && children.max_concurrent > 0
@@ -982,6 +1329,7 @@ fn validate_children(
             && workspace_valid
             && children.inherit_provider.is_some()
             && children.inherit_model.is_some()
+            && mcp_inheritance_valid
             && children
                 .context_budget_tokens
                 .is_some_and(|budget| budget > 0 && budget <= children.per_child_token_budget)
@@ -1139,7 +1487,11 @@ fn compile_and_validate_graph(
     root: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<ExecutableGraph> {
-    let definition = match GraphDefinition::parse(source, limits.graph) {
+    let mut graph_limits = limits.graph;
+    if exact_legacy_unconfigured_artifact_manifest(manifest) {
+        graph_limits.allow_legacy_unconfigured_artifact_persistence = true;
+    }
+    let definition = match GraphDefinition::parse(source, graph_limits) {
         Ok(definition) => definition,
         Err(error) => {
             diagnostics.push(graph_error(root, &error));
@@ -1155,7 +1507,7 @@ fn compile_and_validate_graph(
             runtime_api_version: context.runtime_api_version.clone(),
             capability_set: context.capabilities.clone(),
         },
-        limits.graph,
+        graph_limits,
     ) {
         Ok(graph) => Some(graph),
         Err(error) => {
@@ -1163,6 +1515,13 @@ fn compile_and_validate_graph(
             None
         }
     }
+}
+
+fn exact_legacy_unconfigured_artifact_manifest(manifest: &SessionStyleManifest) -> bool {
+    manifest.built_in_semantic == Some(BuiltInStyle::ResearchLoop)
+        && manifest.identity.version == "1.1.0"
+        && crate::built_in_manifest_for_version(BuiltInStyle::ResearchLoop, "1.1.0").as_ref()
+            == Some(manifest)
 }
 
 fn validate_graph_availability(
@@ -1333,6 +1692,7 @@ fn compaction_name(strategy: CompactionStrategy) -> &'static str {
         CompactionStrategy::Summary => "summary",
         CompactionStrategy::ArtifactHandoff => "artifact_handoff",
         CompactionStrategy::ToolOutputEviction => "tool_output_eviction",
+        CompactionStrategy::Plugin => "plugin",
         CompactionStrategy::None => "none",
     }
 }

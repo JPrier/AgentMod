@@ -1,0 +1,8 @@
+{
+  "name": "06-xtask-architecture-test",
+  "command": "cargo test --locked -p xtask --test architecture",
+  "exit_code": 0,
+  "elapsed_ms": 496,
+  "started_at": "2026-07-31T19:09:56.0436070Z",
+  "ended_at": "2026-07-31T19:09:56.5443570Z"
+}

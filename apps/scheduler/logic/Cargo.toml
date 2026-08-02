@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-scheduler-data = { path = "../data" }
+agentmod-scheduler-data = { version = "0.1.0", path = "../data" }
 thiserror.workspace = true
 
 [lints]

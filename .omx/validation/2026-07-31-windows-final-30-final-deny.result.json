@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "step_id": "30-final-deny",
+  "command": "cargo deny check",
+  "arguments": [
+    "deny",
+    "check"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 5.2249813,
+  "started_at_utc": "2026-07-31T13:06:29.6575802+00:00",
+  "completed_at_utc": "2026-07-31T13:06:34.9654256+00:00",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree_dirty": true,
+  "working_tree_porcelain_entries": 339,
+  "stdout_path": ".omx\\validation\\2026-07-31-windows-final-30-final-deny.stdout.log",
+  "stderr_path": ".omx\\validation\\2026-07-31-windows-final-30-final-deny.stderr.log",
+  "launch_failure": null
+}

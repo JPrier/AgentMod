@@ -43,6 +43,23 @@ enum BootstrapTransport {
     StreamableHttp {
         url: String,
         bearer_token_environment: Option<String>,
+        #[serde(default)]
+        header_environments: BTreeMap<String, String>,
+    },
+    LegacySse {
+        url: String,
+        #[serde(default)]
+        header_environments: BTreeMap<String, String>,
+    },
+    #[serde(rename = "streamable_http_oauth")]
+    StreamableHttpOAuth {
+        url: String,
+        authorization_server: String,
+        client_id: String,
+        client_secret_environment: Option<String>,
+        redirect_uri: String,
+        #[serde(default)]
+        scopes: Vec<String>,
     },
 }
 
@@ -75,9 +92,33 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 BootstrapTransport::StreamableHttp {
                     url,
                     bearer_token_environment,
+                    header_environments,
                 } => DependencyTransportConfig::StreamableHttp {
                     url,
                     bearer_token_environment,
+                    header_environments,
+                },
+                BootstrapTransport::LegacySse {
+                    url,
+                    header_environments,
+                } => DependencyTransportConfig::LegacySse {
+                    url,
+                    header_environments,
+                },
+                BootstrapTransport::StreamableHttpOAuth {
+                    url,
+                    authorization_server,
+                    client_id,
+                    client_secret_environment,
+                    redirect_uri,
+                    scopes,
+                } => DependencyTransportConfig::StreamableHttpOAuth {
+                    url,
+                    authorization_server,
+                    client_id,
+                    client_secret_environment,
+                    redirect_uri,
+                    scopes,
                 },
             },
         })
@@ -98,6 +139,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
         http_state_root: std::env::var_os("AGENTMOD_MCP_HTTP_STATE_ROOT")
             .map(std::path::PathBuf::from)
             .ok_or("AGENTMOD_MCP_HTTP_STATE_ROOT is required")?,
+        oauth_state_root: std::env::var_os("AGENTMOD_MCP_OAUTH_STATE_ROOT")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("AGENTMOD_MCP_HTTP_STATE_ROOT")
+                    .map(std::path::PathBuf::from)
+                    .map(|root| root.join("oauth"))
+            })
+            .ok_or("MCP OAuth state root is required")?,
+        oauth_encryption_key_hex: std::env::var("AGENTMOD_MCP_OAUTH_KEY").ok(),
     })?;
     let shutdown = dependency.clone();
     let service = Arc::new(McpHostService::new(McpLogic::new(McpData::new(dependency))));
@@ -209,5 +259,32 @@ fn failed(code: &str) -> ToolHostEvent {
         code: code.to_owned(),
         message: "MCP host request was rejected".to_owned(),
         retryable: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_transport_uses_public_bootstrap_spelling() {
+        let parsed: Vec<BootstrapServer> = serde_json::from_str(
+            r#"[{
+                "id":"protected",
+                "active":true,
+                "transport":"streamable_http_oauth",
+                "url":"https://mcp.example/resource",
+                "authorization_server":"https://login.example",
+                "client_id":"client",
+                "client_secret_environment":null,
+                "redirect_uri":"http://127.0.0.1:49152/callback",
+                "scopes":["tools.read"]
+            }]"#,
+        )
+        .expect("public OAuth spelling");
+        assert!(matches!(
+            parsed[0].transport,
+            BootstrapTransport::StreamableHttpOAuth { .. }
+        ));
     }
 }

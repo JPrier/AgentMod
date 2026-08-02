@@ -1,0 +1,19 @@
+{
+  "schema": "agentmod.validation-result.v1",
+  "status": "passed",
+  "recorded_at": "2026-07-30T17:42:49.6707637-04:00",
+  "base_head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "implementation_descriptor": "7c073235e0868895a5a36200903b1c559c780a53",
+  "platform": "windows-x86_64",
+  "toolchain": "rustc 1.91.1; cargo 1.91.1; PowerShell 7.6.3",
+  "command": "pwsh -NoProfile -File tests/e2e/runtime_artifact_handoff.ps1",
+  "result": "runtime artifact-handoff compaction/restart/replay E2E passed",
+  "assertions": [
+    "one exact proposed/approved/dispatched/completed artifact lifecycle was retained",
+    "the projection and replacement envelope bind the same content-addressed object",
+    "the full canonical context document is stored under the session context-artifact root",
+    "canonical conversation history contains no fabricated artifact message",
+    "daemon replacement retained the exact execution plan and portable artifact reference",
+    "pure replay did not query storage, append events, or recompute the handoff"
+  ]
+}

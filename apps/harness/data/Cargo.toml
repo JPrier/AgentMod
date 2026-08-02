@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-harness-dependency = { path = "../dependency" }
+agentmod-harness-dependency = { version = "0.1.0", path = "../dependency" }
 thiserror.workspace = true
 
 [lints]

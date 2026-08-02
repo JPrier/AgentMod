@@ -1,0 +1,113 @@
+schema_version = 1
+category = "memory"
+scope = "session"
+classification = "blocking"
+trust = "approved_third_party"
+isolation = "process"
+required_capabilities = []
+provided_capabilities = ["memory.fixture"]
+subscribed_events = []
+timeout_ms = 10000
+state_migration_version = 1
+
+[identity]
+id = "fixture.plugin-context"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[entrypoint]
+kind = "process"
+program = "__PLUGIN_PROGRAM__"
+args = __PLUGIN_ARGS__
+
+[authorities]
+read = ["invocation_state"]
+proposed_write = []
+
+[permissions]
+tools = []
+network = []
+
+[ordering]
+stage = 0
+priority = 0
+before = []
+after = []
+
+[configuration]
+schema_id = "fixture.plugin-context.config"
+schema_version = 1
+required = false
+
+[configuration.source]
+kind = "inline_json"
+document = '{"type":"object","additionalProperties":false}'
+
+[failure_policy]
+kind = "reject"
+
+[[memory_providers]]
+provider_id = "fixture.context-memory.success"
+version = "1.0.0"
+runtime_api = "^1.0"
+capabilities = ["memory.fixture"]
+
+[memory_providers.retrieve]
+handler = "memory_retrieve"
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object","required":["items"]}'
+timeout_ms = 500
+idempotency = "idempotent"
+state_scope = "session"
+external_effects = false
+
+[memory_providers.retrieve.failure_policy]
+kind = "reject"
+
+[memory_providers.retrieve.required_permissions]
+tools = []
+network = []
+
+[[memory_providers]]
+provider_id = "fixture.context-memory.invalid"
+version = "1.0.0"
+runtime_api = "^1.0"
+capabilities = ["memory.fixture"]
+
+[memory_providers.retrieve]
+handler = "invalid_memory_retrieve"
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object","required":["items"]}'
+timeout_ms = 500
+idempotency = "idempotent"
+state_scope = "session"
+external_effects = false
+
+[memory_providers.retrieve.failure_policy]
+kind = "reject"
+
+[memory_providers.retrieve.required_permissions]
+tools = []
+network = []
+
+[[memory_providers]]
+provider_id = "fixture.context-memory.timeout"
+version = "1.0.0"
+runtime_api = "^1.0"
+capabilities = ["memory.fixture"]
+
+[memory_providers.retrieve]
+handler = "timeout_memory_retrieve"
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object","required":["items"]}'
+timeout_ms = 50
+idempotency = "idempotent"
+state_scope = "session"
+external_effects = false
+
+[memory_providers.retrieve.failure_policy]
+kind = "reject"
+
+[memory_providers.retrieve.required_permissions]
+tools = []
+network = []

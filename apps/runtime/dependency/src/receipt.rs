@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::tool::{
-    DependencyToolCommand, DependencyToolEvent, DependencyToolReceipt, ToolHostDependencyError,
+    DependencyToolCommand, DependencyToolEvent, DependencyToolReceipt,
+    DependencyWorkspaceAuthorization, ToolHostDependencyError,
 };
 
 const RECEIPT_VERSION: u32 = 2;
@@ -62,6 +63,12 @@ impl ToolReceiptDependency {
     #[must_use]
     pub const fn post_persist_delay(&self) -> Duration {
         self.post_persist_delay
+    }
+
+    /// Returns the canonical sessions root for adjacent dependency-owned
+    /// authorization indexes.
+    pub(crate) fn sessions_root(&self) -> &Path {
+        &self.sessions_root
     }
 
     /// Loads a verified terminal receipt matching the exact request.
@@ -255,6 +262,8 @@ struct ReceiptPayload {
     workspace: PathBuf,
     arguments: serde_json::Value,
     cancellation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workspace_authorization: Option<DependencyWorkspaceAuthorization>,
     request_digest: ContentHash,
     events: Vec<DependencyToolEvent>,
 }
@@ -273,6 +282,7 @@ impl ReceiptPayload {
             workspace: command.workspace.clone(),
             arguments: command.arguments.clone(),
             cancellation_id: command.cancellation_id.clone(),
+            workspace_authorization: command.workspace_authorization.clone(),
             request_digest: request_digest(command)?,
             events,
         })
@@ -321,12 +331,13 @@ impl ReceiptPayload {
             tool: self.tool.clone(),
             arguments: self.arguments.clone(),
             cancellation_id: self.cancellation_id.clone(),
+            workspace_authorization: self.workspace_authorization.clone(),
         })
     }
 }
 
 fn request_digest(command: &DependencyToolCommand) -> Result<ContentHash, ToolHostDependencyError> {
-    serde_json::to_vec(&(
+    let legacy = (
         &command.execution_id,
         &command.session_id,
         command.workspace.to_string_lossy(),
@@ -334,9 +345,14 @@ fn request_digest(command: &DependencyToolCommand) -> Result<ContentHash, ToolHo
         &command.tool,
         &command.arguments,
         &command.cancellation_id,
-    ))
-    .map(|bytes| ContentHash::digest(&bytes))
-    .map_err(|_| ToolHostDependencyError::ReceiptCorrupt)
+    );
+    let bytes = match &command.workspace_authorization {
+        Some(authorization) => serde_json::to_vec(&(legacy, authorization)),
+        None => serde_json::to_vec(&legacy),
+    };
+    bytes
+        .map(|bytes| ContentHash::digest(&bytes))
+        .map_err(|_| ToolHostDependencyError::ReceiptCorrupt)
 }
 
 fn validate_terminal_events(
@@ -417,6 +433,7 @@ mod tests {
                 tool: "filesystem.write".into(),
                 arguments: serde_json::json!({"path":"a.txt","content":"done"}),
                 cancellation_id: Uuid::from_u128(2).to_string(),
+                workspace_authorization: None,
             },
         )
     }

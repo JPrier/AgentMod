@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "step_id": "03a2-integration-lib",
+  "command": "cargo test --locked -p agentmod-integration-tests --lib --all-features",
+  "arguments": [
+    "test",
+    "--locked",
+    "-p",
+    "agentmod-integration-tests",
+    "--lib",
+    "--all-features"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 5.2201751,
+  "started_at_utc": "2026-07-31T12:35:47.1572807+00:00",
+  "completed_at_utc": "2026-07-31T12:35:52.4691356+00:00",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree_dirty": true,
+  "working_tree_porcelain_entries": 338,
+  "stdout_path": ".omx\\validation\\2026-07-31-windows-final-03a2-integration-lib.stdout.log",
+  "stderr_path": ".omx\\validation\\2026-07-31-windows-final-03a2-integration-lib.stderr.log",
+  "launch_failure": null
+}

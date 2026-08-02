@@ -1,0 +1,141 @@
+{
+  "schema": "agentmod.validation.linux-converged.v1",
+  "date": "2026-07-31",
+  "platform": "Linux via WSL2",
+  "repository": "/mnt/c/Users/jkpri/AgentMod",
+  "cargo_target_dir": "/tmp/agentmod-agentmod-final-target-20260731",
+  "started_at_utc": "2026-07-31T18:57:41Z",
+  "completed_at_utc": "2026-07-31T19:00:44Z",
+  "tracked_diff_sha256_before": "56eecc99602c681d31a507b74954d6399226058152d3182699f22f71b6a89950",
+  "tracked_diff_sha256_after": "82b57132655abca921d85bfad4a0afbff6ba64e799897d91ad60d57046d3b839",
+  "tracked_files_sha256_before": "51bbe7c817cbac6eb8e5a2eff768ba98ddccc39a099e28b50f1dc2954684252a",
+  "tracked_files_sha256_after": "ee8c692306c1515971033b5aad329a46ce67d4fd6cec6f1651aa85d444770cc1",
+  "tracked_source_unchanged": false,
+  "all_passed": false,
+  "commands": [
+    {
+      "index": 1,
+      "name": "fmt",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "elapsed_ms": 13123,
+      "output": "/tmp/agentmod-linux-converged-20260731-01-fmt.log",
+      "output_bytes": 0,
+      "output_lines": 0,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 2,
+      "name": "clippy",
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "exit_code": 101,
+      "elapsed_ms": 25231,
+      "output": "/tmp/agentmod-linux-converged-20260731-02-clippy.log",
+      "output_bytes": 14866,
+      "output_lines": 390,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 3,
+      "name": "test-workspace",
+      "command": "cargo test --workspace --all-targets --all-features --locked",
+      "exit_code": 101,
+      "elapsed_ms": 96814,
+      "output": "/tmp/agentmod-linux-converged-20260731-03-test-workspace.log",
+      "output_bytes": 42879,
+      "output_lines": 853,
+      "test_counts": {
+        "passed": 185,
+        "failed": 1,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 4,
+      "name": "test-doc",
+      "command": "cargo test --workspace --doc --all-features --locked",
+      "exit_code": 0,
+      "elapsed_ms": 13406,
+      "output": "/tmp/agentmod-linux-converged-20260731-04-test-doc.log",
+      "output_bytes": 11442,
+      "output_lines": 447,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 5,
+      "name": "architecture-command",
+      "command": "cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml",
+      "exit_code": 0,
+      "elapsed_ms": 14610,
+      "output": "/tmp/agentmod-linux-converged-20260731-05-architecture-command.log",
+      "output_bytes": 790,
+      "output_lines": 20,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 6,
+      "name": "architecture-test",
+      "command": "cargo test --locked -p xtask --test architecture",
+      "exit_code": 0,
+      "elapsed_ms": 4250,
+      "output": "/tmp/agentmod-linux-converged-20260731-06-architecture-test.log",
+      "output_bytes": 657,
+      "output_lines": 16,
+      "test_counts": {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 7,
+      "name": "deny",
+      "command": "cargo deny check",
+      "exit_code": 0,
+      "elapsed_ms": 5519,
+      "output": "/tmp/agentmod-linux-converged-20260731-07-deny.log",
+      "output_bytes": 284820,
+      "output_lines": 4466,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "index": 8,
+      "name": "audit",
+      "command": "cargo audit",
+      "exit_code": 0,
+      "elapsed_ms": 1416,
+      "output": "/tmp/agentmod-linux-converged-20260731-08-audit.log",
+      "output_bytes": 500,
+      "output_lines": 13,
+      "test_counts": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    }
+  ],
+  "limitations": [
+    "macOS was not available and was not run",
+    "No GitHub Actions result is claimed"
+  ]
+}

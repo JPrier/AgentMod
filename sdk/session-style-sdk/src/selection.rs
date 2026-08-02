@@ -1,11 +1,14 @@
 //! SDK-owned component selection transforms for per-session style bindings.
 
+use std::collections::BTreeSet;
+
 use agentmod_graph_engine::{CompilerLimits as GraphCompilerLimits, GraphDefinition};
 
 use crate::GraphSource;
 use crate::{
-    CompactionStrategy, ExecutionBudgets, MemoryInjectionLocation, MemoryQueryConstruction,
-    MemoryRetrievalTiming, MemoryScope, MemoryWritePolicy, SessionStyleManifest,
+    ChildMemoryAccess, CompactionStrategy, ExecutionBudgets, MemoryInjectionLocation,
+    MemoryQueryConstruction, MemoryRetrievalTiming, MemoryScope, MemoryWritePolicy,
+    SessionStyleManifest,
 };
 
 /// Optional caller-selected hard limits for one immutable session binding.
@@ -35,9 +38,85 @@ impl ExecutionBudgetOverrides {
     }
 }
 
+/// Applies the complete immutable restriction set inherited by one child
+/// session before compilation and execution-plan binding.
+///
+/// This transform deliberately updates the manifest, rather than only a
+/// runtime binding projection, so restart compatibility checks can recompile
+/// the exact retained descriptor without silently rebinding the child.
+///
+/// # Errors
+///
+/// Returns [`ComponentSelectionError`] when the selected budgets cannot be
+/// applied to the graph manifest.
+pub fn select_child_session_restrictions(
+    manifest: &mut SessionStyleManifest,
+    tool_groups: &BTreeSet<String>,
+    memory_access: ChildMemoryAccess,
+    budgets: ExecutionBudgetOverrides,
+    inherited_provider: Option<&str>,
+) -> Result<(), ComponentSelectionError> {
+    manifest
+        .allowed_tool_groups
+        .retain(|group| tool_groups.contains(group));
+    match memory_access {
+        ChildMemoryAccess::None => select_memory_provider(manifest, "none"),
+        ChildMemoryAccess::ReadOnly => {
+            manifest.memory.write_policy = MemoryWritePolicy::Never;
+        }
+        ChildMemoryAccess::ReadWrite => {}
+    }
+    if let Some(provider) = inherited_provider {
+        select_inherited_provider(manifest, provider)?;
+    }
+    if budgets.is_empty() {
+        Ok(())
+    } else {
+        select_execution_budgets(manifest, budgets)
+    }
+}
+
+fn select_inherited_provider(
+    manifest: &mut SessionStyleManifest,
+    provider: &str,
+) -> Result<(), ComponentSelectionError> {
+    if provider.is_empty()
+        || provider.len() > 128
+        || !provider.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+    {
+        return Err(ComponentSelectionError::InvalidInheritedProvider(
+            provider.to_owned(),
+        ));
+    }
+    let GraphSource::Inline { source } = &mut manifest.graph else {
+        return Err(ComponentSelectionError::InvalidGraph(String::from(
+            "provider inheritance requires an inline graph",
+        )));
+    };
+    let mut graph = GraphDefinition::parse(source, GraphCompilerLimits::default())
+        .map_err(|error| ComponentSelectionError::InvalidGraph(error.to_string()))?;
+    graph.declarations.providers.clear();
+    graph.declarations.providers.insert(provider.to_owned());
+    for node in &mut graph.nodes {
+        if matches!(
+            node.kind,
+            agentmod_graph_engine::NodeKind::ModelCall | agentmod_graph_engine::NodeKind::Review
+        ) {
+            node.provider = Some(provider.to_owned());
+        }
+    }
+    manifest.allowed_providers = vec![provider.to_owned()];
+    *source = toml::to_string(&graph)
+        .map_err(|error| ComponentSelectionError::InvalidGraph(error.to_string()))?;
+    Ok(())
+}
+
 /// Applies a memory-provider override while retaining the style's lifecycle
 /// policy whenever it already selected active memory.
 pub fn select_memory_provider(manifest: &mut SessionStyleManifest, provider: &str) {
+    manifest.memory.plugin = None;
     if provider == "none" {
         manifest.memory.provider = String::from("none");
         manifest.memory.scopes.clear();
@@ -84,6 +163,7 @@ pub fn select_compaction_strategy(
             ));
         }
     };
+    manifest.compaction.plugin = None;
     if strategy == CompactionStrategy::None {
         manifest.compaction.strategy = strategy;
         manifest.compaction.trigger_tokens = None;
@@ -220,6 +300,8 @@ pub enum ComponentSelectionError {
     UnknownCompaction(String),
     /// A previously compiled inline graph could not be transformed.
     InvalidGraph(String),
+    /// Inherited provider identity is outside the bounded SDK identifier model.
+    InvalidInheritedProvider(String),
 }
 
 impl std::fmt::Display for ComponentSelectionError {
@@ -233,6 +315,9 @@ impl std::fmt::Display for ComponentSelectionError {
                     formatter,
                     "style graph cannot accept budget overrides: {detail}"
                 )
+            }
+            Self::InvalidInheritedProvider(provider) => {
+                write!(formatter, "inherited provider `{provider}` is invalid")
             }
         }
     }

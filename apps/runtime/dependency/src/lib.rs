@@ -1,7 +1,9 @@
 //! Runtime-owned external adapters.
 
 pub mod artifact;
+pub mod cancellation;
 pub mod continuation;
+pub mod fixture_file;
 pub mod harness;
 pub mod harness_registry;
 pub mod identity;
@@ -9,7 +11,9 @@ pub mod journal;
 pub mod local_rpc;
 pub mod memory;
 pub mod plugin;
+pub mod plugin_receipt;
 pub mod process_tool;
+pub mod provider_completion_receipt;
 pub mod receipt;
 pub mod registry;
 pub mod scheduler;
@@ -17,6 +21,7 @@ pub mod snapshot;
 pub mod style;
 pub mod supervised;
 pub mod tool;
+pub mod workspace;
 
 use std::path::{Path, PathBuf};
 
@@ -128,6 +133,7 @@ impl scheduler::RuntimeSchedulerDependencyPort for LocalRuntimeDependencies {
 
     fn fire_runtime_event(
         &self,
+        _source_session_id: &str,
         _event_id: &str,
         _event_type: &str,
     ) -> Result<
@@ -139,6 +145,7 @@ impl scheduler::RuntimeSchedulerDependencyPort for LocalRuntimeDependencies {
 
     fn fire_process_output(
         &self,
+        _source_session_id: &str,
         _output_id: &str,
         _process_id: &str,
         _output: &str,

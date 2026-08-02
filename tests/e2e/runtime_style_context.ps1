@@ -6,9 +6,24 @@ try {
     cargo build -p agentmod-runtime -p agentmod-harness -p agentmod-cli
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
-    $runtime = (Resolve-Path "target\debug\agentmod-runtime.exe").Path
-    $harness = (Resolve-Path "target\debug\agentmod-harness.exe").Path
-    $cli = (Resolve-Path "target\debug\agentmod.exe").Path
+    $targetDirectory = if ([string]::IsNullOrWhiteSpace($env:CARGO_TARGET_DIR)) {
+        Join-Path $repository "target"
+    }
+    elseif ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+        $env:CARGO_TARGET_DIR
+    }
+    else {
+        Join-Path $repository $env:CARGO_TARGET_DIR
+    }
+    $runtime = (Resolve-Path (
+        Join-Path $targetDirectory "debug\agentmod-runtime.exe"
+    )).Path
+    $harness = (Resolve-Path (
+        Join-Path $targetDirectory "debug\agentmod-harness.exe"
+    )).Path
+    $cli = (Resolve-Path (
+        Join-Path $targetDirectory "debug\agentmod.exe"
+    )).Path
     $runRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
         "agentmod-style-context-e2e-" + [guid]::NewGuid().ToString("N")
     )
@@ -51,18 +66,49 @@ try {
     Set-Content -LiteralPath (
         Join-Path $styleRoot "persistent-tight.toml"
     ) -Value $tightProjectionStyle -NoNewline
-    $unsupportedTimingStyle = (
+    $contextNodeStyle = (
         Get-Content tests\fixtures\styles\persistent-file-none.toml -Raw
     ).Replace(
         'id = "e2e-persistent-file"',
         'id = "e2e-persistent-context-node"'
     ).Replace(
+        'entry = "respond"',
+        'entry = "prepare-context"'
+    ).Replace(
+        'required_capabilities = ["approval", "model", "tools"]',
+        'required_capabilities = ["approval", "context", "model", "tools"]'
+    ).Replace(
+        'capabilities = ["model", "tools"]',
+        'capabilities = ["context", "model", "tools"]'
+    ).Replace(
         'retrieval_timing = "before_model_request"',
         'retrieval_timing = "context_node"'
     )
+    $contextNodeStyle = $contextNodeStyle -replace (
+        '\[\[nodes\]\]\r?\nid = "respond"'
+    ), ((@(
+        '[[nodes]]',
+        'id = "prepare-context"',
+        'kind = "context_transform"',
+        'configuration = { type = "context_transform", strategy = "fresh" }',
+        '',
+        '[[nodes]]',
+        'id = "respond"'
+    ) -join [Environment]::NewLine))
+    $contextNodeStyle = $contextNodeStyle -replace (
+        '\[\[edges\]\]\r?\nfrom = "respond"\r?\nto = "tool"'
+    ), ((@(
+        '[[edges]]',
+        'from = "prepare-context"',
+        'to = "respond"',
+        '',
+        '[[edges]]',
+        'from = "respond"',
+        'to = "tool"'
+    ) -join [Environment]::NewLine))
     Set-Content -LiteralPath (
         Join-Path $styleRoot "persistent-context-node.toml"
-    ) -Value $unsupportedTimingStyle -NoNewline
+    ) -Value $contextNodeStyle -NoNewline
 
     $env:AGENTMOD_RUNTIME_ENDPOINT = (
         "\\.\pipe\agentmod-style-context-e2e-" +
@@ -73,6 +119,7 @@ try {
     )
     $env:AGENTMOD_HARNESS_PROGRAM = $harness
     $runtimeStderr = Join-Path $runRoot "runtime.stderr.log"
+    $succeeded = $false
 
     function Read-Journal($sessionId) {
         $path = Join-Path $runRoot ("sessions\" + $sessionId + "\events.jsonl")
@@ -169,7 +216,7 @@ try {
             --style e2e-persistent-file-bounded --json | ConvertFrom-Json
         $tightSession = & $cli session create --workspace $workspace `
             --style e2e-persistent-tight --json | ConvertFrom-Json
-        $unsupportedTimingSession = & $cli session create --workspace $workspace `
+        $contextNodeSession = & $cli session create --workspace $workspace `
             --style e2e-persistent-context-node --json | ConvertFrom-Json
         $noneSession = & $cli session create --workspace $workspace `
             --style e2e-persistent-none --json | ConvertFrom-Json
@@ -194,6 +241,10 @@ try {
         Seed-Memory "file" (Join-Path $runRoot "memory\file.jsonl") `
             ("session:" + $boundedFileSession.session_id) "bounded-e2e-two" `
             "orchid probe second bounded record" 1003
+        Seed-Memory "file" (Join-Path $runRoot "memory\file.jsonl") `
+            ("session:" + $contextNodeSession.session_id) `
+            "context-node-e2e-fixture" `
+            "orchid memory probe retrieved at the generic context node" 1004
 
         $fileTurn = & $cli run "orchid memory probe" `
             --session $fileSession.session_id `
@@ -216,6 +267,11 @@ try {
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="bounded-output"' --json | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "bounded memory turn failed" }
+        $contextNodeTurn = & $cli run "orchid memory probe" `
+            --session $contextNodeSession.session_id `
+            --option 'mock_scenario="streaming_text"' `
+            --option 'mock_text="context-node-output"' --json | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0) { throw "context-node memory turn failed" }
         $savedErrorPreference = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
@@ -223,19 +279,12 @@ try {
                 --session $tightSession.session_id `
                 --option 'mock_scenario="streaming_text"' --json 2>$null | Out-Null
             $oversizedExit = $LASTEXITCODE
-            & $cli run "unsupported timing must fail preflight" `
-                --session $unsupportedTimingSession.session_id `
-                --option 'mock_scenario="streaming_text"' --json 2>$null | Out-Null
-            $unsupportedExit = $LASTEXITCODE
         }
         finally {
             $ErrorActionPreference = $savedErrorPreference
         }
         if ($oversizedExit -eq 0) {
             throw "oversized first projection was dispatched instead of failing closed"
-        }
-        if ($unsupportedExit -eq 0) {
-            throw "unsupported context-node timing executed without a lifecycle hook"
         }
         $global:LASTEXITCODE = 0
         if ($LASTEXITCODE -ne 0) { throw "memory comparison turns failed" }
@@ -246,6 +295,11 @@ try {
         if ($fileText -ne $noneText -or
             $fileText -ne "alpha beta context-output") {
             throw "deterministic provider behavior changed across memory selections"
+        }
+        $contextNodeText = @($contextNodeTurn.events |
+            Where-Object event -eq "text" | ForEach-Object text) -join ""
+        if ($contextNodeText -ne "alpha beta context-node-output") {
+            throw "context-node timing changed deterministic provider output"
         }
 
         $fileInspection = & $cli session inspect $fileSession.session_id --json |
@@ -314,15 +368,21 @@ try {
         if ((Events-Of-Type $tightJournal "model.request_proposed").Count -ne 0) {
             throw "oversized first projection crossed the provider proposal boundary"
         }
-        $unsupportedJournal = @(Read-Journal $unsupportedTimingSession.session_id)
-        if ($unsupportedJournal.Count -ne 1) {
-            $unsupportedTypes = @($unsupportedJournal | ForEach-Object {
-                $_.event.metadata.event_type
-            }) -join ","
-            throw (
-                "unsupported retrieval timing mutated the journal during preflight: " +
-                $unsupportedTypes
-            )
+        $contextNodeInspection = & $cli session inspect `
+            $contextNodeSession.session_id --json | ConvertFrom-Json
+        $contextNodeRetrieved = @(
+            $contextNodeInspection.state.conversation.provider_projection |
+                Where-Object kind -eq "retrieved_memory"
+        )
+        if ($contextNodeRetrieved.Count -ne 1 -or
+            $contextNodeRetrieved[0].content.provider -ne "file" -or
+            $contextNodeRetrieved[0].content.query -ne "orchid memory probe" -or
+            $contextNodeRetrieved[0].content.scope -ne (
+                "session:" + $contextNodeSession.session_id
+            ) -or
+            $contextNodeRetrieved[0].content.source -ne
+                "context-node-e2e-fixture") {
+            throw "context-node memory injection lost scoped provenance"
         }
         $memoryIndex = -1
         $currentInputIndex = -1
@@ -364,6 +424,44 @@ try {
             throw "memory projection was not committed before model proposal"
         }
 
+        $contextNodeJournal = Read-Journal $contextNodeSession.session_id
+        $contextStarts = @(Events-Of-Type $contextNodeJournal `
+            "context.boundary_started" | Where-Object {
+                $_.event.payload.payload.identity.boundary -eq "context_node" -and
+                $_.event.payload.payload.identity.node_id -eq "prepare-context"
+            })
+        $contextPhases = @(Events-Of-Type $contextNodeJournal `
+            "context.phase_started" | Where-Object {
+                $_.event.payload.payload.identity.boundary.boundary -eq
+                    "context_node" -and
+                $_.event.payload.payload.identity.phase -eq "memory"
+            })
+        $contextReplacements = @(Events-Of-Type $contextNodeJournal `
+            "context.projection_replaced" | Where-Object {
+                $_.event.payload.payload.provenance.method -eq
+                    "generic_fresh_context"
+            })
+        $contextCompletes = @(Events-Of-Type $contextNodeJournal `
+            "context.boundary_completed" | Where-Object {
+                $_.event.payload.payload.identity.boundary -eq "context_node" -and
+                $_.event.payload.payload.identity.node_id -eq "prepare-context"
+            })
+        $contextProposal = (Events-Of-Type $contextNodeJournal `
+            "model.request_proposed")[0]
+        if ($contextStarts.Count -ne 1 -or $contextPhases.Count -ne 1 -or
+            $contextReplacements.Count -ne 1 -or $contextCompletes.Count -ne 1 -or
+            $null -eq $contextProposal -or
+            $contextStarts[0].event.metadata.sequence -ge
+                $contextPhases[0].event.metadata.sequence -or
+            $contextPhases[0].event.metadata.sequence -ge
+                $contextReplacements[0].event.metadata.sequence -or
+            $contextReplacements[0].event.metadata.sequence -ge
+                $contextCompletes[0].event.metadata.sequence -or
+            $contextCompletes[0].event.metadata.sequence -ge
+                $contextProposal.event.metadata.sequence) {
+            throw "context-node canonical lifecycle or provider ordering is invalid"
+        }
+
         # Restart with all three provider selections dormant. Inspection and a
         # subsequent retrieval must reconstruct selection and provenance from
         # durable metadata/events rather than retained process state.
@@ -377,6 +475,7 @@ try {
             @($fileSession.session_id, "file"),
             @($isolatedFileSession.session_id, "file"),
             @($sqliteSession.session_id, "sqlite-fts"),
+            @($contextNodeSession.session_id, "file"),
             @($noneSession.session_id, "none")
         )) {
             $afterRestart = & $cli session inspect $expected[0] --json |
@@ -394,6 +493,12 @@ try {
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="sqlite-after-restart"' --json | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "sqlite memory turn after restart failed" }
+        & $cli run "orchid memory probe" --session $contextNodeSession.session_id `
+            --option 'mock_scenario="streaming_text"' `
+            --option 'mock_text="context-node-after-restart"' --json | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "context-node memory turn after restart failed"
+        }
         $fileAfterRestart = & $cli session inspect $fileSession.session_id --json |
             ConvertFrom-Json
         $sqliteAfterRestart = & $cli session inspect $sqliteSession.session_id --json |
@@ -421,6 +526,40 @@ try {
                 $sqliteRestartMemory[0].content.injection_event
             )) {
             throw "sqlite memory retrieval did not recover after restart"
+        }
+        $contextNodeAfterRestart = & $cli session inspect `
+            $contextNodeSession.session_id --json | ConvertFrom-Json
+        $contextRestartMemory = @(
+            $contextNodeAfterRestart.state.conversation.provider_projection |
+                Where-Object kind -eq "retrieved_memory"
+        )
+        $contextNodeJournal = Read-Journal $contextNodeSession.session_id
+        $contextStarts = @(Events-Of-Type $contextNodeJournal `
+            "context.boundary_started" | Where-Object {
+                $_.event.payload.payload.identity.boundary -eq "context_node"
+            })
+        $contextPhases = @(Events-Of-Type $contextNodeJournal `
+            "context.phase_started" | Where-Object {
+                $_.event.payload.payload.identity.boundary.boundary -eq
+                    "context_node" -and
+                $_.event.payload.payload.identity.phase -eq "memory"
+            })
+        $contextCompletes = @(Events-Of-Type $contextNodeJournal `
+            "context.boundary_completed" | Where-Object {
+                $_.event.payload.payload.identity.boundary -eq "context_node"
+            })
+        $contextProposals = @(Events-Of-Type $contextNodeJournal `
+            "model.request_proposed")
+        $contextRunIds = @($contextCompletes | ForEach-Object {
+            $_.event.payload.payload.identity.run_id
+        } | Sort-Object -Unique)
+        if ($contextRestartMemory.Count -ne 1 -or
+            $contextRestartMemory[0].content.source -ne
+                "context-node-e2e-fixture" -or
+            $contextStarts.Count -ne 2 -or $contextPhases.Count -ne 2 -or
+            $contextCompletes.Count -ne 2 -or $contextProposals.Count -ne 2 -or
+            $contextRunIds.Count -ne 2) {
+            throw "context-node replay duplicated or lost canonical effects"
         }
 
         # A branch inherits the parent's explicit projection at the fork, then
@@ -566,6 +705,7 @@ try {
         Write-Output (
             "runtime style-selected memory/compaction process E2E passed"
         )
+        $succeeded = $true
     }
     finally {
         foreach ($name in @(
@@ -582,7 +722,7 @@ try {
             Stop-Process -Id $daemon.Id -Force
             $daemon.WaitForExit()
         }
-        if (Test-Path -LiteralPath $runRoot) {
+        if ($succeeded -and (Test-Path -LiteralPath $runRoot)) {
             $resolvedTemp = (Resolve-Path ([System.IO.Path]::GetTempPath())).Path
             $resolvedRun = (Resolve-Path $runRoot).Path
             if ($resolvedRun.StartsWith($resolvedTemp) -and
@@ -591,6 +731,9 @@ try {
                 )) {
                 Remove-Item -LiteralPath $resolvedRun -Recurse -Force
             }
+        }
+        elseif (-not $succeeded) {
+            Write-Warning "preserved failed E2E root: $runRoot"
         }
     }
 }

@@ -51,6 +51,7 @@ termination, and explicit-selection policy. For example:
 schema_version = 1
 kind = "custom"
 required_capabilities = ["model"]
+allowed_plugins = ["fixture.context"]
 
 [identity]
 id = "example"
@@ -69,6 +70,14 @@ required_capabilities = [
 [graph]
 kind = "inline"
 source = '''...graph TOML...'''
+
+[[context_transforms]]
+plugin_id = "fixture.context"
+transform_id = "fixture.redact"
+version = "1.0.0"
+declaration_hash = "1111111111111111111111111111111111111111111111111111111111111111"
+lifecycle = "before_model_request"
+configuration_reference = "2222222222222222222222222222222222222222222222222222222222222222"
 
 [memory]
 provider = "file"
@@ -110,6 +119,7 @@ child_style = "ephemeral-turn@1.1.0"
 workspace_mode = "shared_read_only"
 inherit_provider = true
 inherit_model = true
+inherit_mcp = false
 context_budget_tokens = 12000
 per_child_cost_budget_micros = 250000
 tool_groups = []
@@ -125,13 +135,48 @@ Memory retrieval timing is one of `never`, `turn_start`,
 Injection location is `none`, `before_conversation`, `after_conversation`,
 `before_current_input`, or `context_artifact`. Write policy is `never`,
 `explicit_only`, `turn_completion`, `iteration_completion`, or
-`session_completion`.
+`session_completion`. `turn_completion` is live for approved first-party file
+and SQLite providers with canonical proposal, approval, dispatch, and completion
+events plus exact-idempotency recovery. `session_completion` binds the exact
+successful lifecycle event and can retain bounded canonical terminal node and
+artifact evidence even when no assistant message exists; failed sessions do not
+write. `iteration_completion` binds every exact successful loop transition,
+including its node IDs, counters, canonical sequence, and event checksum, to a
+distinct versioned write identity. Its bounded typed content contains only that
+iteration's conversation delta and canonical node/artifact references. An
+An automatic-memory `ask` decision creates a durable, exact approval
+continuation. Native and plugin payloads use separate identity domains; approval
+resumes only the bound action digest, denial is terminal without dispatch, and
+duplicate resolution is effect-free. Both paths are restart-tested on Windows
+and Ubuntu/WSL2. Every retained entry carries a bounded runtime-owned
+information-flow class, and common credential/path/URL/handle detection rejects
+the whole projection before proposal. Broader semantic DLP remains a production
+limitation.
+
+`context_transforms` is an ordered immutable selection, not a discovery query.
+Each entry must name a plugin in `allowed_plugins` and match exactly one
+runtime-advertised transform declaration by plugin ID, transform ID, semantic
+version, declaration hash, and lifecycle. The current live lifecycle is
+`before_model_request`; selected transforms run in vector order between memory
+retrieval and compaction. `configuration_reference` is the content hash of the
+exact style-owned adapter configuration. Restart never selects a newer
+compatible version or another declaration. Missing or changed declarations
+fail live validation, while a retained terminal receipt can finish an already
+dispatched invocation without querying the plugin again. Current transforms
+must be idempotent and declare no external effects. Runtime logic validates the
+bounded typed replacement, preservation requirements, and mandatory policy
+before committing a canonical provider-projection replacement.
 
 Built-in compaction strategies are `none`, `sliding_window`, `summary`,
-`artifact_handoff`, and `tool_output_eviction`. The runtime
-currently executes no compaction, sliding window, and tool-output eviction.
-Typed summary and artifact handoff are accepted by the compiler but fail
-clearly at runtime unless approved summary or handoff material exists.
+`artifact_handoff`, and `tool_output_eviction`; all five execute in the live
+runtime. Typed summary is runtime-derived deterministically from canonical
+typed projection entries and remains bounded by the compiled projection
+budget. Artifact handoff stores a deterministic, content-addressed
+`agentmod.context-artifact.v1` document with secret/session handling, commits a
+durable artifact outbox plus exact replacement approval, and projects only the
+typed logical ID, portable artifact reference, hash, MIME type, and label to the
+provider. Replay is storage-free, while a later live provider effect verifies
+the exact retained object before dispatch.
 
 Calling clients may request a memory-provider or compaction-strategy override
 when creating a session. This produces a newly compiled immutable binding; it
@@ -147,11 +192,15 @@ delay/schedule, event/artifact operations, and terminal outcomes. Compilation
 validates structure, reachability, termination, bounded cycles, declarations,
 parallel writes, retries, budgets, and constrained expressions.
 
-Compilation itself does not execute nodes. The runtime generic executor
-currently supports persistent-chat, ephemeral-turn, research-loop, and the
-bounded built-in declarative fixture. The remaining declared node kinds are not
-all live runtime operations yet; validation success therefore does not imply
-that every graph is currently executable.
+Compilation itself does not execute nodes. Runtime admission resolves every
+compiled node exactly once through the immutable node-executor registry,
+persists the selected executor identity and registry/plan hashes, and validates
+graph, capability, parallel/recovery, permission, and budget semantics. Generic
+execution dispatches arbitrary admitted graphs from those exact persisted
+resolutions; it does not require a built-in style or complete-topology adapter
+classification. Unsupported node semantics still fail admission with stable
+diagnostics, and historical built-in plan generations retain explicit
+versioned compatibility adapters.
 
 Set every child-agent field to zero and omit the extended fields to disable
 children. An enabled policy must declare every extended field shown above.
@@ -164,11 +213,24 @@ behavior is `cascade`, `detach`, or `wait`. Child budgets must fit within the
 parent style budgets, and child tool groups must be a subset of the style's
 allowed tool groups.
 
+`inherit_mcp` is one explicit, style-wide child policy switch; omission and
+`false` both produce an empty child MCP binding. `true` copies only the exact
+sanitized MCP binding of the immediate parent, and is valid only when both the
+parent style and the child tool grant contain the `mcp` group and the parent
+binding has a nonempty authenticated configuration reference. It does not
+implicitly authorize grandchildren: a child that may create another child must
+make its own explicit policy selection. Child creation and exact recovery fail
+closed if the retained binding, tool gate, origin, or MCP binding differs.
+
 The complete child policy was added in `persistent-chat@1.1.0` and
 `planner-worker@1.1.0`. Style bindings are exact and immutable, so the runtime
 does not substitute `1.1.0` for a persisted `1.0.0` binding. An unavailable old
 version produces a compatibility error until the caller performs an explicit
 migration or branches with a selected replacement style.
+`planner-worker@1.4.0` selects runtime-owned `branch_workspace` leases with
+manual review, exact child filesystem/process/Git tool groups, evidence-aware
+integration/reviewer executors, and the exact Research v1.3 child style. Earlier
+planner-worker versions remain available and are never silently upgraded.
 
 `harness.id` is a stable runtime harness-registry ID.
 `required_capabilities` uses lower-case identifiers such as `streaming`,

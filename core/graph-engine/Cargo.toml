@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-expression-engine = { path = "../expression-engine" }
-agentmod-primitives = { path = "../primitives" }
+agentmod-expression-engine = { version = "0.1.0", path = "../expression-engine" }
+agentmod-primitives = { version = "0.1.0", path = "../primitives" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

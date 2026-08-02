@@ -1,0 +1,12 @@
+{
+  "index": 23,
+  "name": "23-runtime_artifact_handoff_finalize",
+  "script": "runtime_artifact_handoff_finalize.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_artifact_handoff_finalize.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 1352,
+  "started_at": "2026-07-31T19:28:50.9359047Z",
+  "ended_at": "2026-07-31T19:28:52.2938940Z",
+  "log": "23-runtime_artifact_handoff_finalize.log"
+}

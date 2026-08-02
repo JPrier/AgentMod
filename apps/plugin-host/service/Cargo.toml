@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-plugin-host-logic = { path = "../logic" }
-agentmod-plugin-protocol = { path = "../../../protocols/plugin-protocol" }
+agentmod-plugin-host-logic = { version = "0.1.0", path = "../logic" }
+agentmod-plugin-protocol = { version = "0.1.0", path = "../../../protocols/plugin-protocol" }
 serde_json.workspace = true
 thiserror.workspace = true
 

@@ -1,0 +1,107 @@
+schema_version = 1
+category = "compaction"
+scope = "session"
+classification = "blocking"
+trust = "approved_third_party"
+isolation = "process"
+required_capabilities = []
+provided_capabilities = ["compaction.fixture"]
+subscribed_events = []
+timeout_ms = 10000
+state_migration_version = 1
+
+[identity]
+id = "fixture.plugin-compactor"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[entrypoint]
+kind = "process"
+program = "__PLUGIN_PROGRAM__"
+args = __PLUGIN_ARGS__
+
+[authorities]
+read = ["invocation_state"]
+proposed_write = []
+
+[permissions]
+tools = []
+network = []
+
+[ordering]
+stage = 0
+priority = 0
+before = []
+after = []
+
+[configuration]
+schema_id = "fixture.plugin-compactor.config"
+schema_version = 1
+required = false
+
+[configuration.source]
+kind = "inline_json"
+document = '{"type":"object","additionalProperties":false}'
+
+[failure_policy]
+kind = "reject"
+
+[[compactors]]
+compactor_id = "fixture.context-compactor.success"
+version = "1.0.0"
+runtime_api = "^1.0"
+handler = "compaction"
+capabilities = ["compaction.fixture"]
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object","required":["replacement","replacement_hash"]}'
+timeout_ms = 500
+idempotency = "idempotent"
+state_scope = "session"
+external_effects = false
+
+[compactors.failure_policy]
+kind = "reject"
+
+[compactors.required_permissions]
+tools = []
+network = []
+
+[[compactors]]
+compactor_id = "fixture.context-compactor.invalid"
+version = "1.0.0"
+runtime_api = "^1.0"
+handler = "invalid_compaction"
+capabilities = ["compaction.fixture"]
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object","required":["replacement","replacement_hash"]}'
+timeout_ms = 500
+idempotency = "idempotent"
+state_scope = "session"
+external_effects = false
+
+[compactors.failure_policy]
+kind = "reject"
+
+[compactors.required_permissions]
+tools = []
+network = []
+
+[[compactors]]
+compactor_id = "fixture.context-compactor.timeout"
+version = "1.0.0"
+runtime_api = "^1.0"
+handler = "timeout_compaction"
+capabilities = ["compaction.fixture"]
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object","required":["replacement","replacement_hash"]}'
+timeout_ms = 50
+idempotency = "idempotent"
+state_scope = "session"
+external_effects = false
+
+[compactors.failure_policy]
+kind = "reject"
+
+[compactors.required_permissions]
+tools = []
+network = []

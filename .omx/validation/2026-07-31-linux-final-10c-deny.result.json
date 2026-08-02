@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "step_id": "10c-deny",
+  "command": "cargo deny check",
+  "arguments": [
+    "deny",
+    "check"
+  ],
+  "exit_code": 101,
+  "passed": false,
+  "elapsed_seconds": 0.059790549,
+  "started_at_utc": "2026-07-31T12:59:02+00:00",
+  "completed_at_utc": "2026-07-31T12:59:02+00:00",
+  "source_head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "source_working_tree_dirty": true,
+  "isolated_copy_root": "/tmp/agentmod-linux-final-20260731-04c.qHmzg5",
+  "cargo_target_dir": "/tmp/agentmod-linux-final-20260731-04c.qHmzg5/.cargo-target",
+  "stdout_path": ".omx/validation/2026-07-31-linux-final-10c-deny.stdout.log",
+  "stderr_path": ".omx/validation/2026-07-31-linux-final-10c-deny.stderr.log"
+}

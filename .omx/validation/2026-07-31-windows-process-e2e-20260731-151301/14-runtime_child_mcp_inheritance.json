@@ -1,0 +1,12 @@
+{
+  "index": 14,
+  "name": "14-runtime_child_mcp_inheritance",
+  "script": "runtime_child_mcp_inheritance.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_child_mcp_inheritance.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 42923,
+  "started_at": "2026-07-31T19:21:52.6190122Z",
+  "ended_at": "2026-07-31T19:22:35.5421864Z",
+  "log": "14-runtime_child_mcp_inheritance.log"
+}

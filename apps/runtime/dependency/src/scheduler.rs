@@ -17,8 +17,8 @@ use std::{
 };
 
 use agentmod_scheduler_protocol::{
-    CURRENT_PROTOCOL_VERSION, SchedulePayload, ScheduleSpec, ScheduleTrigger, ScheduledExecution,
-    SchedulerCommand, SchedulerResponse,
+    CURRENT_PROTOCOL_VERSION, ScheduleObservation, SchedulePayload, ScheduleSpec, ScheduleTrigger,
+    ScheduledExecution, SchedulerCommand, SchedulerResponse,
 };
 use thiserror::Error;
 
@@ -40,8 +40,17 @@ pub enum DependencyScheduleTrigger {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DependencySchedulePayload {
-    Prompt { prompt: String },
-    Continuation { continuation_id: String },
+    Prompt {
+        prompt: String,
+    },
+    Continuation {
+        continuation_id: String,
+    },
+    /// Runtime-owned graph trigger registration with no synthesized prompt.
+    GraphTrigger {
+        run_id: String,
+        node_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,7 +75,14 @@ pub struct DependencyScheduledExecution {
     pub execution_id: String,
     pub scheduled_for_ms: i64,
     pub claimed_at_ms: i64,
+    pub observation: Option<DependencyScheduleObservation>,
     pub schedule: DependencyRuntimeSchedule,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DependencyScheduleObservation {
+    RuntimeEvent { event_id: String },
+    ProcessOutput { output_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,11 +113,13 @@ pub trait RuntimeSchedulerDependencyPort: Send + Sync {
     }
     fn fire_runtime_event(
         &self,
+        source_session_id: &str,
         event_id: &str,
         event_type: &str,
     ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError>;
     fn fire_process_output(
         &self,
+        source_session_id: &str,
         output_id: &str,
         process_id: &str,
         output: &str,
@@ -286,10 +304,12 @@ impl RuntimeSchedulerDependencyPort for ProcessSchedulerDependency {
 
     fn fire_runtime_event(
         &self,
+        source_session_id: &str,
         event_id: &str,
         event_type: &str,
     ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
         match self.request(&SchedulerCommand::FireRuntimeEvent {
+            source_session_id: source_session_id.to_owned(),
             event_id: event_id.to_owned(),
             event_type: event_type.to_owned(),
         })? {
@@ -302,11 +322,13 @@ impl RuntimeSchedulerDependencyPort for ProcessSchedulerDependency {
 
     fn fire_process_output(
         &self,
+        source_session_id: &str,
         output_id: &str,
         process_id: &str,
         output: &str,
     ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
         match self.request(&SchedulerCommand::FireProcessOutput {
+            source_session_id: source_session_id.to_owned(),
             output_id: output_id.to_owned(),
             process_id: process_id.to_owned(),
             output: output.to_owned(),
@@ -432,6 +454,9 @@ fn to_wire_schedule(value: DependencyRuntimeSchedule) -> ScheduleSpec {
             DependencySchedulePayload::Continuation { continuation_id } => {
                 SchedulePayload::Continuation { continuation_id }
             }
+            DependencySchedulePayload::GraphTrigger { run_id, node_id } => {
+                SchedulePayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
     }
@@ -474,6 +499,9 @@ fn from_wire_schedule(value: ScheduleSpec) -> DependencyRuntimeSchedule {
             SchedulePayload::Continuation { continuation_id } => {
                 DependencySchedulePayload::Continuation { continuation_id }
             }
+            SchedulePayload::GraphTrigger { run_id, node_id } => {
+                DependencySchedulePayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
     }
@@ -484,6 +512,14 @@ fn from_wire_execution(value: ScheduledExecution) -> DependencyScheduledExecutio
         execution_id: value.execution_id,
         scheduled_for_ms: value.scheduled_for_ms,
         claimed_at_ms: value.claimed_at_ms,
+        observation: value.observation.map(|observation| match observation {
+            ScheduleObservation::RuntimeEvent { event_id } => {
+                DependencyScheduleObservation::RuntimeEvent { event_id }
+            }
+            ScheduleObservation::ProcessOutput { output_id } => {
+                DependencyScheduleObservation::ProcessOutput { output_id }
+            }
+        }),
         schedule: from_wire_schedule(value.schedule),
     }
 }

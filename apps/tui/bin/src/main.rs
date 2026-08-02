@@ -45,6 +45,7 @@ fn main() -> ExitCode {
                 .smoke_turn(&prompt)
                 .map(|output| println!("{output}"))
         }
+        Some("--smoke-attachment-turn") => smoke_attachment_turn(service, arguments),
         Some("--smoke-command") => {
             let command = arguments.collect::<Vec<_>>().join(" ");
             if command.trim().is_empty() {
@@ -53,6 +54,37 @@ fn main() -> ExitCode {
             }
             service
                 .smoke_command(&command)
+                .map(|output| println!("{output}"))
+        }
+        Some("--smoke-session-command") => {
+            let Some(session_id) = arguments.next() else {
+                eprintln!("--smoke-session-command requires a session ID and command");
+                return ExitCode::from(2);
+            };
+            let command = arguments.collect::<Vec<_>>().join(" ");
+            if command.trim().is_empty() {
+                eprintln!("--smoke-session-command requires a session ID and command");
+                return ExitCode::from(2);
+            }
+            service
+                .smoke_session_command(&session_id, &command)
+                .map(|output| println!("{output}"))
+        }
+        Some("--smoke-watch") => {
+            let Some(milliseconds) = arguments.next() else {
+                eprintln!("--smoke-watch requires a duration in milliseconds");
+                return ExitCode::from(2);
+            };
+            if arguments.next().is_some() {
+                eprintln!("--smoke-watch accepts exactly one duration");
+                return ExitCode::from(2);
+            }
+            let Ok(milliseconds) = milliseconds.parse::<u64>() else {
+                eprintln!("--smoke-watch duration must be an integer");
+                return ExitCode::from(2);
+            };
+            service
+                .smoke_watch(Duration::from_millis(milliseconds))
                 .map(|output| println!("{output}"))
         }
         Some(argument) => {
@@ -68,6 +100,17 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn smoke_attachment_turn(
+    service: TuiService<TuiLogic<TuiData<LocalRuntimeDependency>>>,
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<(), agentmod_tui_service::TuiServiceError> {
+    let prompt = arguments.next().unwrap_or_default();
+    let paths = arguments.collect::<Vec<_>>();
+    service
+        .smoke_attachment_turn(&prompt, &paths)
+        .map(|output| println!("{output}"))
 }
 
 #[cfg(windows)]

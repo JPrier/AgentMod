@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-scheduler-logic = { path = "../logic" }
-agentmod-scheduler-protocol = { path = "../../../protocols/scheduler-protocol" }
+agentmod-scheduler-logic = { version = "0.1.0", path = "../logic" }
+agentmod-scheduler-protocol = { version = "0.1.0", path = "../../../protocols/scheduler-protocol" }
 thiserror.workspace = true
 
 [lints]

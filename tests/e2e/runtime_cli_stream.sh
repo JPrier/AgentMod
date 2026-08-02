@@ -62,11 +62,13 @@ printf '%s\n' "$first_line" >"$run_root/items.jsonl"
 cat <&3 >>"$run_root/items.jsonl"
 wait "$turn_pid"
 
-python3 - "$run_root/items.jsonl" <<'PY'
+python3 - "$run_root/items.jsonl" \
+    "$run_root/sessions/$session_id/events.jsonl" <<'PY'
 import json
 import sys
 
 items = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+journal = [json.loads(line) for line in open(sys.argv[2], encoding="utf-8") if line.strip()]
 events = [item for item in items if item["command"] == "run_event"]
 terminal = [item for item in items if item["command"] == "run_complete"]
 assert events[0]["event"]["event"] == "started"
@@ -79,7 +81,10 @@ visible = "".join(
     if event["event"]["event"] == "text"
 )
 assert visible == "alpha beta live-cli", visible
-assert terminal[0]["last_committed_sequence"] == 19
+assert terminal[0]["last_committed_sequence"] == len(journal)
+assert max(sequences) <= terminal[0]["last_committed_sequence"]
+assert journal[-1]["event"]["metadata"]["event_type"] == \
+    "memory.write_completed"
 PY
 
 printf 'runtime live CLI streaming JSON E2E passed\n'

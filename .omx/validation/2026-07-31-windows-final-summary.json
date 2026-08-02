@@ -1,0 +1,96 @@
+{
+  "schema_version": 1,
+  "platform": "windows-x86_64-msvc",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree_dirty": true,
+  "working_tree_porcelain_entries": 338,
+  "completed_at_utc": "2026-07-31T12:42:25.3493508+00:00",
+  "passed": true,
+  "authoritative_gates": [
+    {
+      "gate": "format",
+      "step_id": "09-final-fmt",
+      "command": "cargo fmt --all -- --check",
+      "elapsed_seconds": 2.9310925,
+      "result": ".omx/validation/2026-07-31-windows-final-09-final-fmt.result.json"
+    },
+    {
+      "gate": "clippy",
+      "step_id": "10-final-clippy",
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "elapsed_seconds": 24.0859187,
+      "result": ".omx/validation/2026-07-31-windows-final-10-final-clippy.result.json"
+    },
+    {
+      "gate": "workspace_tests",
+      "step_id": "03c-tests",
+      "command": "cargo test --workspace --all-targets --all-features --locked",
+      "elapsed_seconds": 64.8406275,
+      "result_groups": 116,
+      "passed_tests": 1156,
+      "result": ".omx/validation/2026-07-31-windows-final-03c-tests.result.json"
+    },
+    {
+      "gate": "documentation_tests",
+      "step_id": "04-docs",
+      "command": "cargo test --workspace --doc --all-features --locked",
+      "elapsed_seconds": 17.6695679,
+      "result_groups": 74,
+      "passed_tests": 0,
+      "result": ".omx/validation/2026-07-31-windows-final-04-docs.result.json"
+    },
+    {
+      "gate": "architecture",
+      "step_id": "05b-architecture-command",
+      "command": "cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml",
+      "elapsed_seconds": 6.469767,
+      "packages_checked": 90,
+      "violations": 0,
+      "result": ".omx/validation/2026-07-31-windows-final-05b-architecture-command.result.json"
+    },
+    {
+      "gate": "architecture_negative_tests",
+      "step_id": "06-architecture-test",
+      "command": "cargo test --locked -p xtask --test architecture",
+      "elapsed_seconds": 0.7688986,
+      "passed_tests": 2,
+      "result": ".omx/validation/2026-07-31-windows-final-06-architecture-test.result.json"
+    },
+    {
+      "gate": "dependency_policy",
+      "step_id": "07-deny",
+      "command": "cargo deny check",
+      "elapsed_seconds": 12.8024352,
+      "advisories": "ok",
+      "bans": "ok",
+      "licenses": "ok",
+      "sources": "ok",
+      "result": ".omx/validation/2026-07-31-windows-final-07-deny.result.json"
+    },
+    {
+      "gate": "rustsec_audit",
+      "step_id": "08-audit",
+      "command": "cargo audit",
+      "elapsed_seconds": 3.1593407,
+      "known_vulnerabilities": 0,
+      "allowed_warnings": [
+        "RUSTSEC-2025-0057: fxhash 0.2.1 unmaintained"
+      ],
+      "result": ".omx/validation/2026-07-31-windows-final-08-audit.result.json"
+    }
+  ],
+  "focused_confirmation": [
+    "03a2-integration-lib",
+    "03b2-runtime-data",
+    "05a1-data-workspace",
+    "05a2-logic-workspace"
+  ],
+  "superseded_failed_attempts": [
+    "02-clippy",
+    "02b-clippy",
+    "03-tests",
+    "03a-integration-lib",
+    "03b-tests",
+    "05-architecture-command"
+  ]
+}

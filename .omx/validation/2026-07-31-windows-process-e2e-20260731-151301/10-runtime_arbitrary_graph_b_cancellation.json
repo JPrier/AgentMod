@@ -1,0 +1,12 @@
+{
+  "index": 10,
+  "name": "10-runtime_arbitrary_graph_b_cancellation",
+  "script": "runtime_arbitrary_graph_b_cancellation.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_arbitrary_graph_b_cancellation.ps1",
+  "exit_code": 0,
+  "status": "passed",
+  "elapsed_ms": 28664,
+  "started_at": "2026-07-31T19:20:24.9817554Z",
+  "ended_at": "2026-07-31T19:20:53.6459219Z",
+  "log": "10-runtime_arbitrary_graph_b_cancellation.log"
+}

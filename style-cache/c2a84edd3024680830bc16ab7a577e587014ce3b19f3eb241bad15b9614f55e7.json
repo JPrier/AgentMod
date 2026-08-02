@@ -1,0 +1,373 @@
+{
+  "style_id": "research-loop",
+  "style_version": "1.1.0",
+  "kind": "built_in",
+  "built_in_semantic": "research_loop",
+  "graph": {
+    "format_version": 1,
+    "entry_index": 1,
+    "budget": {
+      "max_steps": 500,
+      "max_tokens": 750000,
+      "max_cost_micros": 75000000,
+      "max_duration_ms": 2700000
+    },
+    "declarations": {
+      "capabilities": [
+        "artifacts",
+        "context",
+        "model",
+        "tools"
+      ],
+      "tools": [
+        "filesystem.read"
+      ],
+      "providers": [
+        "mock"
+      ],
+      "events": [],
+      "plugins": []
+    },
+    "variables": [],
+    "nodes": [
+      {
+        "index": 0,
+        "id": "done",
+        "kind": "complete_session",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 1,
+        "id": "fresh-context",
+        "kind": "context_transform",
+        "configuration": {
+          "type": "context_transform",
+          "strategy": "preserve_history"
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 2,
+        "id": "persist",
+        "kind": "persist_artifact",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 3,
+        "id": "repeat",
+        "kind": "loop",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": 16
+      },
+      {
+        "index": 4,
+        "id": "research",
+        "kind": "model_call",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": "mock",
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 2,
+        "max_iterations": null
+      },
+      {
+        "index": 5,
+        "id": "tool",
+        "kind": "tool_execution_gate",
+        "configuration": {
+          "type": "tool_execution",
+          "arguments": {
+            "kind": "static",
+            "value": {}
+          }
+        },
+        "condition": null,
+        "tool": "filesystem.read",
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [
+          "workspace"
+        ],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      }
+    ],
+    "edges": [
+      {
+        "from": 1,
+        "to": 4,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 2,
+        "to": 3,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 3,
+        "to": 0,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "completion"
+                  },
+                  {
+                    "segment": "key",
+                    "value": "criteria_met"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "boolean",
+                "value": true
+              }
+            }
+          }
+        },
+        "label": "complete"
+      },
+      {
+        "from": 3,
+        "to": 1,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "completion"
+                  },
+                  {
+                    "segment": "key",
+                    "value": "criteria_met"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "boolean",
+                "value": false
+              }
+            }
+          }
+        },
+        "label": "continue"
+      },
+      {
+        "from": 4,
+        "to": 5,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 5,
+        "to": 2,
+        "condition": null,
+        "label": null
+      }
+    ],
+    "cache_key": {
+      "graph_content_hash": "1decfe3aadffc6e199b60f032705531ddb4ec823941726fa57fb219420ba205c",
+      "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+      "capability_set_hash": "740ec0810d6069d7cb3b1338c71fca1a20bea948cc6e94730dc81f165e16435d",
+      "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+      "combined_hash": "1cb713ad9bd3b5ba56af4ee4b9e6ec6c55c609b6815aae8160b54be594e4f559"
+    }
+  },
+  "interceptor_order": [
+    "runtime-style-policy"
+  ],
+  "interceptors": [
+    {
+      "id": "runtime-style-policy",
+      "owner": "runtime.security",
+      "event": "action.proposed",
+      "stage": 10,
+      "priority": 100,
+      "before": [],
+      "after": [],
+      "supported_decisions": [
+        "continue",
+        "replace",
+        "reject",
+        "require_approval",
+        "cancel"
+      ],
+      "required_capabilities": [
+        "approval"
+      ]
+    }
+  ],
+  "required_capabilities": [
+    "approval",
+    "artifacts",
+    "context",
+    "model",
+    "tools"
+  ],
+  "allowed_tool_groups": [
+    "filesystem"
+  ],
+  "allowed_providers": [
+    "mock"
+  ],
+  "allowed_plugins": [
+    "runtime.security"
+  ],
+  "harness": {
+    "id": "native",
+    "required_capabilities": [
+      "cancellation",
+      "streaming",
+      "structured_context_replacement",
+      "token_usage",
+      "tool_calls"
+    ]
+  },
+  "memory": {
+    "provider": "file",
+    "scopes": [
+      "session",
+      "project"
+    ],
+    "retrieval_timing": "iteration_start",
+    "query": {
+      "source": "session_goal",
+      "include_active_artifacts": true,
+      "include_style_context": true,
+      "max_query_bytes": 32768
+    },
+    "max_items": 64,
+    "max_injected_bytes": 524288,
+    "write_policy": "iteration_completion",
+    "injection_location": "before_current_input"
+  },
+  "compaction": {
+    "strategy": "none",
+    "trigger_tokens": null,
+    "reserved_context_tokens": 0,
+    "max_provider_projection_tokens": 0,
+    "preserve_unresolved_tasks": true,
+    "preserve_active_processes": true,
+    "preservation_requirements": [
+      "system_instructions",
+      "current_input",
+      "pending_control_state",
+      "artifact_references",
+      "memory_provenance",
+      "active_graph_state",
+      "tool_call_correlation"
+    ]
+  },
+  "approvals": {
+    "default": "ask",
+    "groups": {
+      "filesystem.read": "allow"
+    }
+  },
+  "budgets": {
+    "max_iterations": 16,
+    "max_steps": 1000,
+    "max_tokens": 1000000,
+    "max_cost_micros": 100000000,
+    "max_duration_ms": 3600000
+  },
+  "child_agents": {
+    "max_children": 0,
+    "max_concurrent": 0,
+    "max_depth": 0,
+    "per_child_token_budget": 0
+  },
+  "retry": {
+    "max_attempts": 4,
+    "initial_backoff_ms": 100,
+    "max_backoff_ms": 5000,
+    "retryable_failures": [
+      "provider.rate_limit",
+      "provider.unavailable"
+    ]
+  },
+  "termination": {
+    "allowed_outcomes": [
+      "complete_session",
+      "fail"
+    ],
+    "on_hard_limit": "fail",
+    "require_explicit_terminal_node": true
+  },
+  "selection": {
+    "requires_explicit_selection": true,
+    "model_may_select": false
+  },
+  "cache_key": {
+    "style_content_hash": "4df10d7ea07306da14dc6735af520d37f3fb8ccf6136ebeca99dd378817a1bf2",
+    "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+    "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+    "capability_set_hash": "ed32eaa3749667657942a541cc1cd92d768c994f382cc55088354c23cfa41df4",
+    "combined_hash": "c2a84edd3024680830bc16ab7a577e587014ce3b19f3eb241bad15b9614f55e7"
+  }
+}

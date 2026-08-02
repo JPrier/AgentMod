@@ -3,11 +3,24 @@ $ErrorActionPreference = "Stop"
 $repository = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Push-Location $repository
 try {
-    cargo build -p agentmod-runtime -p agentmod-harness -p agentmod-cli
+    cargo build --locked -p agentmod-runtime -p agentmod-harness `
+        -p agentmod-independent-harness-fixture -p agentmod-scheduler `
+        -p agentmod-cli
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
+    $dependencyTree = cargo tree --locked `
+        -p agentmod-independent-harness-fixture --edges normal --prefix none
+    if ($LASTEXITCODE -ne 0 -or
+        ($dependencyTree -join "`n") -match
+            "agentmod-harness-(service|logic|data|dependency)") {
+        throw "independent harness fixture depends on native harness internals"
+    }
 
     $runtime = (Resolve-Path "target\debug\agentmod-runtime.exe").Path
     $harness = (Resolve-Path "target\debug\agentmod-harness.exe").Path
+    $independentHarness = (
+        Resolve-Path "target\debug\agentmod-independent-harness-fixture.exe"
+    ).Path
+    $scheduler = (Resolve-Path "target\debug\agentmod-scheduler.exe").Path
     $cli = (Resolve-Path "target\debug\agentmod.exe").Path
     $runRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
         "agentmod-harness-e2e-" + [guid]::NewGuid().ToString("N")
@@ -26,7 +39,8 @@ try {
         "0123456789abcdef0123456789abcdef0123456789abcdef"
     )
     $env:AGENTMOD_HARNESS_PROGRAM = $harness
-    $env:AGENTMOD_FIXTURE_HARNESS_PROGRAM = $harness
+    $env:AGENTMOD_FIXTURE_HARNESS_PROGRAM = $independentHarness
+    $env:AGENTMOD_SCHEDULER_PROGRAM = $scheduler
     $daemon = $null
 
     function Start-TestRuntime {
@@ -85,8 +99,13 @@ try {
         }
 
         foreach ($session in @(
-            @($native.session_id, "native", "native-ok"),
-            @($fixture.session_id, "fixture", "fixture-ok")
+            @($native.session_id, "native", "native-ok", "native-ok"),
+            @(
+                $fixture.session_id,
+                "fixture",
+                "fixture-ok",
+                "independent-harness:fixture-ok"
+            )
         )) {
             $inspection = & $cli session inspect $session[0] --json | ConvertFrom-Json
             if ($inspection.state.style_binding.harness -ne $session[1] -or
@@ -106,6 +125,12 @@ try {
             if ($journal -notmatch ('"harness":"' + $session[1] + '"')) {
                 throw "canonical model request did not retain harness identity"
             }
+            if (-not $journal.Contains($session[3])) {
+                throw (
+                    "selected $($session[1]) harness did not emit " +
+                    "expected output $($session[3])"
+                )
+            }
         }
 
         Stop-TestRuntime $daemon
@@ -119,7 +144,19 @@ try {
             --option 'mock_scenario="streaming_text"' `
             --option 'mock_text="fixture-restarted"' --json | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "fixture harness did not resume after restart" }
-        Write-Output "runtime harness registry/selection/capability/restart E2E passed"
+        $restartedJournal = Get-Content -LiteralPath (
+            Join-Path $runRoot (
+                "sessions\" + $fixture.session_id + "\events.jsonl"
+            )
+        ) -Raw
+        if (-not $restartedJournal.Contains(
+            "independent-harness:fixture-restarted"
+        )) {
+            throw "independent fixture output was not retained after restart"
+        }
+        Write-Output (
+            "runtime independent-harness selection/capability/restart E2E passed"
+        )
     }
     finally {
         Stop-TestRuntime $daemon
@@ -134,6 +171,12 @@ try {
     }
 }
 finally {
+    Remove-Item Env:AGENTMOD_HARNESS_PROGRAM -ErrorAction SilentlyContinue
+    Remove-Item Env:AGENTMOD_FIXTURE_HARNESS_PROGRAM `
+        -ErrorAction SilentlyContinue
+    Remove-Item Env:AGENTMOD_SCHEDULER_PROGRAM -ErrorAction SilentlyContinue
+    Remove-Item Env:AGENTMOD_RUNTIME_ENDPOINT -ErrorAction SilentlyContinue
+    Remove-Item Env:AGENTMOD_RUNTIME_AUTH_TOKEN -ErrorAction SilentlyContinue
     Pop-Location
 }
 $global:LASTEXITCODE = 0

@@ -44,6 +44,255 @@ pub struct PluginManifest {
     pub timeout_ms: u64,
     /// Plugin-owned state migration version.
     pub state_migration_version: u32,
+    /// Exact graph-node executors exported by this plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub node_executors: Vec<NodeExecutorManifest>,
+    /// Exact provider-projection context transforms exported by this plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_transforms: Vec<ContextTransformManifest>,
+    /// Exact memory-provider implementations exported by this plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub memory_providers: Vec<MemoryProviderManifest>,
+    /// Exact provider-projection compactors exported by this plugin.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compactors: Vec<CompactorManifest>,
+}
+
+/// Recovery declaration shared by isolated memory and compaction operations.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginOperationIdempotency {
+    /// The exact operation may be safely repeated with the same invocation ID.
+    Idempotent,
+    /// An ambiguous operation must not be automatically repeated.
+    NonIdempotent,
+}
+
+/// Exact retrieval operation exported by one plugin memory provider.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRetrieveManifest {
+    /// Stable isolated-process handler name.
+    pub handler: String,
+    /// Bounded inline JSON Schema for the runtime-owned retrieval request.
+    pub input_schema: String,
+    /// Bounded inline JSON Schema for the proposed memory-item collection.
+    pub output_schema: String,
+    /// Per-invocation timeout, bounded by the containing plugin timeout.
+    pub timeout_ms: u64,
+    /// Retrieval-specific failure behavior.
+    pub failure_policy: FailurePolicy,
+    /// Whether an ambiguous retrieval may be repeated.
+    pub idempotency: PluginOperationIdempotency,
+    /// Permissions required by retrieval, bounded by the plugin declaration.
+    pub required_permissions: PermissionManifest,
+    /// Maximum state scope readable by retrieval.
+    pub state_scope: PluginScope,
+    /// Whether retrieval can perform external effects.
+    pub external_effects: bool,
+}
+
+/// Exact write operation exported by one plugin memory provider.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryWriteManifest {
+    /// Stable isolated-process handler name.
+    pub handler: String,
+    /// Bounded inline JSON Schema for the approved runtime write request.
+    pub input_schema: String,
+    /// Bounded inline JSON Schema for the terminal provider receipt.
+    pub output_schema: String,
+    /// Per-invocation timeout, bounded by the containing plugin timeout.
+    pub timeout_ms: u64,
+    /// Write-specific failure behavior.
+    pub failure_policy: FailurePolicy,
+    /// Whether an ambiguous write may be repeated.
+    pub idempotency: PluginOperationIdempotency,
+    /// Permissions required by the write, bounded by the plugin declaration.
+    pub required_permissions: PermissionManifest,
+    /// Maximum state scope readable by the write.
+    pub state_scope: PluginScope,
+    /// Whether this explicitly declared write can perform external effects.
+    pub external_effects: bool,
+}
+
+/// Exact plugin-provided memory implementation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MemoryProviderManifest {
+    /// Stable provider implementation ID.
+    pub provider_id: String,
+    /// Exact provider semantic version.
+    pub version: String,
+    /// Semantic runtime API requirement for this provider.
+    pub runtime_api: String,
+    /// Capabilities resolved by this provider.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Required pure retrieval operation.
+    pub retrieve: MemoryRetrieveManifest,
+    /// Optional explicitly declared consequential write operation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write: Option<MemoryWriteManifest>,
+}
+
+impl MemoryProviderManifest {
+    /// Returns the deterministic complete declaration bytes a registry hashes.
+    ///
+    /// Every declaration field participates because serialization starts at
+    /// the complete strongly typed provider declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error if canonical JSON encoding fails.
+    pub fn declaration_hash_input(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+}
+
+/// Exact plugin-provided provider-projection compactor.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactorManifest {
+    /// Stable compactor implementation ID.
+    pub compactor_id: String,
+    /// Exact compactor semantic version.
+    pub version: String,
+    /// Semantic runtime API requirement for this compactor.
+    pub runtime_api: String,
+    /// Stable isolated-process handler name.
+    pub handler: String,
+    /// Capabilities resolved by this compactor.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Bounded inline JSON Schema for canonical projection input.
+    pub input_schema: String,
+    /// Bounded inline JSON Schema for the replacement proposal.
+    pub output_schema: String,
+    /// Per-invocation timeout, bounded by the containing plugin timeout.
+    pub timeout_ms: u64,
+    /// Compactor-specific failure behavior.
+    pub failure_policy: FailurePolicy,
+    /// Whether an ambiguous compaction may be repeated.
+    pub idempotency: PluginOperationIdempotency,
+    /// Permissions required by compaction, bounded by the plugin declaration.
+    pub required_permissions: PermissionManifest,
+    /// Maximum state scope readable by compaction.
+    pub state_scope: PluginScope,
+    /// Whether this compactor can perform external effects.
+    pub external_effects: bool,
+}
+
+impl CompactorManifest {
+    /// Returns the deterministic complete declaration bytes a registry hashes.
+    ///
+    /// Every declaration field participates because serialization starts at
+    /// the complete strongly typed compactor declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns a serialization error if canonical JSON encoding fails.
+    pub fn declaration_hash_input(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(self)
+    }
+}
+
+/// Lifecycle boundary supported by an exact plugin context transform.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextTransformLifecycle {
+    /// Transform the bounded provider projection immediately before a model request.
+    BeforeModelRequest,
+}
+
+/// Recovery declaration for a plugin context-transform invocation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextTransformIdempotency {
+    /// The exact pure invocation may be safely repeated with the same invocation ID.
+    Idempotent,
+    /// An ambiguous invocation must not be automatically repeated.
+    NonIdempotent,
+}
+
+/// Exact plugin-provided provider-projection transform declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextTransformManifest {
+    /// Stable transform implementation ID.
+    pub transform_id: String,
+    /// Exact transform semantic version.
+    pub version: String,
+    /// Semantic runtime API requirement for this transform.
+    pub runtime_api: String,
+    /// Stable isolated-process handler name.
+    pub handler: String,
+    /// Exact lifecycle boundary at which the transform may run.
+    pub lifecycle: ContextTransformLifecycle,
+    /// Capabilities resolved by this transform.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Bounded inline JSON Schema for the transform input.
+    pub input_schema: String,
+    /// Bounded inline JSON Schema for the proposed provider projection.
+    pub output_schema: String,
+    /// Per-invocation timeout, bounded by the containing plugin timeout.
+    pub timeout_ms: u64,
+    /// Transform-specific failure behavior.
+    pub failure_policy: FailurePolicy,
+    /// Whether an ambiguous invocation may be repeated.
+    pub idempotency: ContextTransformIdempotency,
+    /// Permissions required by this transform, bounded by the plugin declaration.
+    pub required_permissions: PermissionManifest,
+    /// Maximum state scope readable by this transform.
+    pub state_scope: PluginScope,
+    /// Whether the transform may perform or propose external effects.
+    pub external_effects: bool,
+}
+
+/// Exact plugin-provided graph-node executor declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeExecutorManifest {
+    /// Stable executor implementation ID.
+    pub executor_id: String,
+    /// Exact executor semantic version.
+    pub version: String,
+    /// Semantic runtime API requirement for this executor.
+    pub runtime_api: String,
+    /// Serialized graph node kind handled by this executor.
+    pub node_kind: String,
+    /// Stable isolated-process handler name.
+    pub handler: String,
+    /// Capabilities resolved by this executor.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Bounded inline JSON Schema for node input.
+    pub input_schema: String,
+    /// Bounded inline JSON Schema for the proposed outcome.
+    pub output_schema: String,
+    /// Per-invocation timeout, bounded by the plugin timeout.
+    pub timeout_ms: u64,
+    /// Executor-specific failure behavior.
+    pub failure_policy: FailurePolicy,
+    /// Whether an invocation may be safely repeated after an ambiguous transport result.
+    pub idempotency: NodeExecutorIdempotency,
+    /// Permissions required by this executor, bounded by the plugin declaration.
+    pub required_permissions: PermissionManifest,
+    /// Maximum state scope readable by this executor.
+    pub state_scope: PluginScope,
+    /// Whether the executor can propose externally consequential actions.
+    pub external_effects: bool,
+}
+
+/// Recovery declaration for a plugin node invocation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeExecutorIdempotency {
+    /// The exact invocation may be safely repeated with the same invocation ID.
+    Idempotent,
+    /// An ambiguous invocation must not be automatically repeated.
+    NonIdempotent,
 }
 
 /// Stable plugin identity and version compatibility declaration.

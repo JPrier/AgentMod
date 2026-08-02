@@ -9,9 +9,9 @@
 )]
 
 use agentmod_runtime_dependency::scheduler::{
-    DependencyRuntimeSchedule, DependencySchedulePayload, DependencyScheduleStoreResult,
-    DependencyScheduleTrigger, DependencyScheduledExecution, RuntimeSchedulerDependencyError,
-    RuntimeSchedulerDependencyPort,
+    DependencyRuntimeSchedule, DependencyScheduleObservation, DependencySchedulePayload,
+    DependencyScheduleStoreResult, DependencyScheduleTrigger, DependencyScheduledExecution,
+    RuntimeSchedulerDependencyError, RuntimeSchedulerDependencyPort,
 };
 use thiserror::Error;
 
@@ -33,8 +33,17 @@ pub enum ScheduleDataTrigger {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ScheduleDataPayload {
-    Prompt { prompt: String },
-    Continuation { continuation_id: String },
+    Prompt {
+        prompt: String,
+    },
+    Continuation {
+        continuation_id: String,
+    },
+    /// Runtime-owned graph trigger registration with no synthesized prompt.
+    GraphTrigger {
+        run_id: String,
+        node_id: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,7 +68,14 @@ pub struct ScheduledExecutionDataRecord {
     pub execution_id: String,
     pub scheduled_for_ms: i64,
     pub claimed_at_ms: i64,
+    pub observation: Option<ScheduleDataObservation>,
     pub schedule: RuntimeScheduleDataRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScheduleDataObservation {
+    RuntimeEvent { event_id: String },
+    ProcessOutput { output_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -92,11 +108,13 @@ pub trait RuntimeScheduleDataPort: Send + Sync {
     }
     fn fire_runtime_event(
         &self,
+        source_session_id: &str,
         event_id: &str,
         event_type: &str,
     ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError>;
     fn fire_process_output(
         &self,
+        source_session_id: &str,
         output_id: &str,
         process_id: &str,
         output: &str,
@@ -157,23 +175,25 @@ impl<D: RuntimeSchedulerDependencyPort> RuntimeScheduleDataPort for crate::Runti
 
     fn fire_runtime_event(
         &self,
+        source_session_id: &str,
         event_id: &str,
         event_type: &str,
     ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError> {
         self.dependency
-            .fire_runtime_event(event_id, event_type)
+            .fire_runtime_event(source_session_id, event_id, event_type)
             .map(|values| values.into_iter().map(from_execution).collect())
             .map_err(RuntimeScheduleDataError::Dependency)
     }
 
     fn fire_process_output(
         &self,
+        source_session_id: &str,
         output_id: &str,
         process_id: &str,
         output: &str,
     ) -> Result<Vec<ScheduledExecutionDataRecord>, RuntimeScheduleDataError> {
         self.dependency
-            .fire_process_output(output_id, process_id, output)
+            .fire_process_output(source_session_id, output_id, process_id, output)
             .map(|values| values.into_iter().map(from_execution).collect())
             .map_err(RuntimeScheduleDataError::Dependency)
     }
@@ -226,6 +246,9 @@ fn to_dependency_schedule(value: RuntimeScheduleDataRecord) -> DependencyRuntime
             ScheduleDataPayload::Continuation { continuation_id } => {
                 DependencySchedulePayload::Continuation { continuation_id }
             }
+            ScheduleDataPayload::GraphTrigger { run_id, node_id } => {
+                DependencySchedulePayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
     }
@@ -268,6 +291,9 @@ fn from_dependency_schedule(value: DependencyRuntimeSchedule) -> RuntimeSchedule
             DependencySchedulePayload::Continuation { continuation_id } => {
                 ScheduleDataPayload::Continuation { continuation_id }
             }
+            DependencySchedulePayload::GraphTrigger { run_id, node_id } => {
+                ScheduleDataPayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
     }
@@ -278,6 +304,14 @@ fn from_execution(value: DependencyScheduledExecution) -> ScheduledExecutionData
         execution_id: value.execution_id,
         scheduled_for_ms: value.scheduled_for_ms,
         claimed_at_ms: value.claimed_at_ms,
+        observation: value.observation.map(|observation| match observation {
+            DependencyScheduleObservation::RuntimeEvent { event_id } => {
+                ScheduleDataObservation::RuntimeEvent { event_id }
+            }
+            DependencyScheduleObservation::ProcessOutput { output_id } => {
+                ScheduleDataObservation::ProcessOutput { output_id }
+            }
+        }),
         schedule: from_dependency_schedule(value.schedule),
     }
 }

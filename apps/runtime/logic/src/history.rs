@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use agentmod_event_model::{
-    ArtifactReference, EventClassification, EventEnvelope, EventMetadata, EventOrigin, EventScope,
+    ArtifactIdentifier, ArtifactReference, EventClassification, EventEnvelope, EventMetadata,
+    EventOrigin, EventScope,
 };
 use agentmod_primitives::{ArtifactId, ContentHash, EventId, Sequence, SessionId, Version};
 use agentmod_runtime_data::{
@@ -11,8 +12,9 @@ use agentmod_runtime_data::{
     journal::{JournalDataError, JournalEventDataPort, ScanEventsDataRequest},
     node_executor::NodeExecutorDataPort,
     registry::{
-        BranchArtifactDataRecord, BranchEventDataRecord, CreateBranchDataRequest,
-        PrepareSessionDataRequest, SessionRegistryDataError, SessionRegistryDataPort,
+        BranchArtifactDataRecord, BranchEventDataRecord, BranchMcpBootstrapData,
+        CreateBranchDataRequest, PrepareSessionDataRequest, SessionRegistryDataError,
+        SessionRegistryDataPort,
     },
 };
 use serde::Serialize;
@@ -20,7 +22,7 @@ use thiserror::Error;
 
 use crate::{
     conversation::{ArtifactEntry, ConversationEntry, ConversationEntryId, ProjectionProvenance},
-    node_executor::{RuntimeExecutabilityError, validate_runtime_executability},
+    node_executor::{RuntimeExecutabilityError, bind_runtime_execution_plan},
     session::{
         ContextProjectionReplacedEvent, ConversationEntryCommittedEvent, RuntimeCommittedEvent,
         SessionBranchedEvent, SessionCreatedEvent, SessionReducerError, SessionState,
@@ -290,12 +292,16 @@ where
             session_id: command.parent_session_id,
             at: Some(command.at),
         })?;
-        let style_binding = command
-            .style_binding
-            .or_else(|| inspection.state.style_binding.clone())
-            .ok_or(SessionHistoryLogicError::MissingStyleBinding)?;
+        let inherited_style_binding = inspection.state.style_binding.clone();
+        let mcp_bootstrap = branch_mcp_bootstrap(
+            command.style_binding.as_ref(),
+            inherited_style_binding.as_ref(),
+            command.parent_session_id,
+        )?;
+        let mut style_binding =
+            branch_style_binding(command.style_binding, inherited_style_binding)?;
         validate_style_binding(&style_binding)?;
-        validate_runtime_executability(&self.data, &style_binding)
+        bind_runtime_execution_plan(&self.data, &mut style_binding)
             .map_err(SessionHistoryLogicError::RuntimeExecutability)?;
         let style = style_binding.id.clone();
         let prepared = self
@@ -403,6 +409,7 @@ where
                 compiled_style_json: style_binding.compiled_style_json.clone(),
                 parent_session_id: command.parent_session_id,
                 fork_sequence: command.at.get(),
+                mcp_bootstrap,
                 events,
                 artifacts,
             })
@@ -529,6 +536,7 @@ where
     let artifact_entry = ConversationEntry::ArtifactReference(ArtifactEntry {
         id: ConversationEntryId(format!("branch-context:{artifact_id}")),
         artifact_id,
+        artifact_reference: None,
         content_hash,
         mime_type: String::from("application/vnd.agentmod.branch-context+json"),
         label: String::from("complete parent context at branch point"),
@@ -541,7 +549,7 @@ where
             entry: artifact_entry.clone(),
         }),
         vec![ArtifactReference {
-            id: artifact_id,
+            id: ArtifactIdentifier::from(artifact_id),
             content_hash,
         }],
     )?);
@@ -575,7 +583,7 @@ where
             context_phase: None,
         }),
         vec![ArtifactReference {
-            id: artifact_id,
+            id: ArtifactIdentifier::from(artifact_id),
             content_hash,
         }],
     )?);
@@ -663,6 +671,125 @@ fn validate_style_binding(style: &SessionStyleBinding) -> Result<(), SessionHist
     }
 }
 
+/// Selects the immutable style binding for a branch without accidentally
+/// migrating a legacy parent binding.  Supplying a replacement binding is the
+/// explicit branch-with-recompiled-style migration path; inheriting requires
+/// the parent's exact persisted node-execution contract.
+fn branch_style_binding(
+    replacement: Option<SessionStyleBinding>,
+    inherited: Option<SessionStyleBinding>,
+) -> Result<SessionStyleBinding, SessionHistoryLogicError> {
+    if let Some(replacement) = replacement {
+        return Ok(replacement);
+    }
+    let inherited = inherited.ok_or(SessionHistoryLogicError::MissingStyleBinding)?;
+    if inherited.execution_plan.is_none() || inherited.execution_plan_hash.is_none() {
+        return Err(SessionHistoryLogicError::ExecutionPlanMigrationRequired);
+    }
+    Ok(inherited)
+}
+
+fn branch_mcp_bootstrap(
+    replacement: Option<&SessionStyleBinding>,
+    inherited: Option<&SessionStyleBinding>,
+    parent_session_id: SessionId,
+) -> Result<BranchMcpBootstrapData, SessionHistoryLogicError> {
+    let selected = replacement
+        .or(inherited)
+        .ok_or(SessionHistoryLogicError::MissingStyleBinding)?;
+    let selected_has_bootstrap = selected.mcp.configuration_reference.is_some();
+    if !selected_has_bootstrap {
+        if selected.mcp.servers.is_empty() {
+            return Ok(BranchMcpBootstrapData::None);
+        }
+        return Err(SessionHistoryLogicError::McpBootstrapMigrationRequired);
+    }
+    let inherited = inherited.ok_or(SessionHistoryLogicError::McpBootstrapMigrationRequired)?;
+    if replacement.is_some() && selected.mcp != inherited.mcp {
+        return Err(SessionHistoryLogicError::McpBootstrapMigrationRequired);
+    }
+    if inherited.mcp.configuration_reference.is_none() || inherited.mcp != selected.mcp {
+        return Err(SessionHistoryLogicError::McpBootstrapMigrationRequired);
+    }
+    Ok(BranchMcpBootstrapData::InheritExact {
+        source_session_id: parent_session_id,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use agentmod_runtime_data::node_executor::RuntimeNodeExecutorData;
+    use agentmod_session_style_sdk::BuiltInStyle;
+
+    use super::{
+        BranchMcpBootstrapData, SessionHistoryLogicError, bind_runtime_execution_plan,
+        branch_mcp_bootstrap, branch_style_binding,
+    };
+
+    #[test]
+    fn inherited_planless_binding_requires_explicit_branch_migration() {
+        let mut inherited = crate::style_executor::tests::binding(BuiltInStyle::PersistentChat);
+        inherited.execution_plan = None;
+        inherited.execution_plan_hash = None;
+
+        assert!(matches!(
+            branch_style_binding(None, Some(inherited)),
+            Err(SessionHistoryLogicError::ExecutionPlanMigrationRequired)
+        ));
+    }
+
+    #[test]
+    fn explicit_planless_replacement_compiles_and_binds_as_authorized_branch_migration() {
+        let mut replacement = crate::style_executor::tests::binding(BuiltInStyle::PersistentChat);
+        replacement.execution_plan = None;
+        replacement.execution_plan_hash = None;
+
+        let mut selected =
+            branch_style_binding(Some(replacement), None).expect("replacement binding");
+        let registry = RuntimeNodeExecutorData::native().expect("native registry");
+        bind_runtime_execution_plan(&registry, &mut selected).expect("compile replacement plan");
+        assert!(selected.execution_plan.is_some());
+        assert!(selected.execution_plan_hash.is_some());
+    }
+
+    #[test]
+    fn branch_mcp_bootstrap_requires_exact_inheritance_or_explicit_none() {
+        let parent_session_id = agentmod_primitives::SessionId::from_uuid(uuid::Uuid::from_u128(7));
+        let empty = crate::style_executor::tests::binding(BuiltInStyle::PersistentChat);
+        assert_eq!(
+            branch_mcp_bootstrap(None, Some(&empty), parent_session_id).expect("empty binding"),
+            BranchMcpBootstrapData::None
+        );
+        assert_eq!(
+            branch_mcp_bootstrap(Some(&empty), None, parent_session_id)
+                .expect("explicit non-MCP migration"),
+            BranchMcpBootstrapData::None
+        );
+
+        let mut inherited = empty.clone();
+        inherited.mcp.configuration_reference = Some(String::from("session-mcp:blake3:exact"));
+        assert_eq!(
+            branch_mcp_bootstrap(None, Some(&inherited), parent_session_id)
+                .expect("exact inheritance"),
+            BranchMcpBootstrapData::InheritExact {
+                source_session_id: parent_session_id,
+            }
+        );
+
+        let mut substituted = inherited.clone();
+        substituted.mcp.declaration_hash = agentmod_primitives::ContentHash::digest(b"substituted");
+        assert!(matches!(
+            branch_mcp_bootstrap(Some(&substituted), Some(&inherited), parent_session_id),
+            Err(SessionHistoryLogicError::McpBootstrapMigrationRequired)
+        ));
+        assert_eq!(
+            branch_mcp_bootstrap(Some(&empty), Some(&inherited), parent_session_id)
+                .expect("explicit non-inheritance"),
+            BranchMcpBootstrapData::None
+        );
+    }
+}
+
 fn runtime_origin() -> EventOrigin {
     EventOrigin {
         subsystem: String::from("runtime"),
@@ -685,6 +812,14 @@ pub enum SessionHistoryLogicError {
     /// Session predates immutable style binding and needs explicit migration.
     #[error("session has no immutable style binding; select a replacement style explicitly")]
     MissingStyleBinding,
+    /// An inherited legacy binding has no exact persisted execution contract.
+    #[error(
+        "inherited session style has no immutable node-execution plan; select a replacement style explicitly to migrate the branch"
+    )]
+    ExecutionPlanMigrationRequired,
+    /// A branch requested an MCP activation that cannot be copied exactly.
+    #[error("branch MCP bootstrap requires an explicit compatible migration")]
+    McpBootstrapMigrationRequired,
     /// Subscription page bound is zero or excessive.
     #[error("session subscription limit is invalid")]
     InvalidSubscriptionLimit,

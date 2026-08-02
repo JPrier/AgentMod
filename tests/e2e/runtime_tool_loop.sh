@@ -3,7 +3,7 @@ set -eu
 
 repository=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 cd "$repository"
-cargo build -p agentmod-runtime -p agentmod-harness \
+cargo build --locked -p agentmod-runtime -p agentmod-harness \
     -p agentmod-filesystem-host -p agentmod-cli
 
 run_root=$(mktemp -d "${TMPDIR:-/tmp}/agentmod-tool-e2e.XXXXXX")
@@ -42,15 +42,52 @@ created=$("$repository/target/debug/agentmod" session create \
 session_id=$(printf '%s' "$created" | sed -n \
     's/.*"session_id":"\([^"]*\)".*/\1/p')
 test -n "$session_id"
+inspection=$("$repository/target/debug/agentmod" session inspect \
+    "$session_id" --json)
+python3 - "$inspection" <<'PY'
+import json
+import sys
+
+binding = json.loads(sys.argv[1])["state"]["style_binding"]
+assert binding["version"] == "1.2.0"
+tool_batch = [
+    node for node in binding["execution_plan"]["nodes"]
+    if node["node_id"] == "tool-batch"
+]
+assert len(tool_batch) == 1
+assert tool_batch[0]["executor_id"] == "runtime.tool-gate"
+assert tool_batch[0]["executor_version"] == "1.1.0"
+PY
 
 turn=$("$repository/target/debug/agentmod" run "read src/lib.rs and continue" \
     --session "$session_id" --option 'mock_scenario="one_tool_call"' --json)
-printf '%s' "$turn" | grep -F '"last_committed_sequence":27' >/dev/null
 printf '%s' "$turn" | grep -F \
     '"text":"continued after approved runtime decision"' >/dev/null
 
 journal="$run_root/sessions/$session_id/events.jsonl"
-for event_type in model.tool_call_proposed tool.call_proposed tool.call_approved \
+python3 - "$turn" "$journal" <<'PY'
+import json
+import sys
+
+turn = json.loads(sys.argv[1])
+with open(sys.argv[2], encoding="utf-8") as stream:
+    events = [json.loads(line)["event"] for line in stream if line.strip()]
+assert turn["last_committed_sequence"] == events[-1]["metadata"]["sequence"]
+event_types = [event["metadata"]["event_type"] for event in events]
+assert event_types.index("graph.model_tool_batch_suspended") < \
+    event_types.index("graph.provider_tool_batch_bound") < \
+    event_types.index("tool.call_proposed")
+proposals = [
+    event["payload"]["payload"]
+    for event in events
+    if event["metadata"]["event_type"] == "tool.call_proposed"
+]
+assert len(proposals) == 1
+assert proposals[0]["tool"] == "filesystem.read"
+assert proposals[0]["tool"] != "read_file"
+PY
+for event_type in model.tool_call_proposed graph.model_tool_batch_suspended \
+    graph.provider_tool_batch_bound tool.call_proposed tool.call_approved \
     tool.execution_dispatched tool.execution_started tool.execution_completed; do
     grep -F "\"event_type\":\"$event_type\"" "$journal" >/dev/null
 done

@@ -1,0 +1,17 @@
+{
+  "schema": "agentmod.validation-result.v1",
+  "status": "passed",
+  "recorded_at": "2026-07-30T16:59:09.5658794-04:00",
+  "base_head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "implementation_descriptor": "5b151f903c9f4a2de99f2491add7d9b7a535c0c9",
+  "platform": "windows-x86_64",
+  "toolchain": "rustc 1.91.1; cargo 1.91.1; PowerShell 7.6.3",
+  "command": "pwsh -NoProfile -File tests/e2e/runtime_typed_summary.ps1",
+  "result": "runtime typed-summary compaction/restart/replay E2E passed",
+  "assertions": [
+    "typed summary reached the provider through the production runtime/harness/CLI path",
+    "canonical conversation history was not replaced",
+    "daemon replacement retained the exact execution plan",
+    "pure replay did not recompute or mutate context state"
+  ]
+}

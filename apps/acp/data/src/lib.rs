@@ -10,7 +10,9 @@
 )]
 
 use agentmod_acp_dependency::{
-    AcpDependencyError, AcpRuntimeDependencyPort, DependencyTurnEvent, DependencyTurnStreamItem,
+    AcpDependencyError, AcpRuntimeDependencyPort, DependencyCreateSessionRequest,
+    DependencyMcpSensitiveEntry, DependencyMcpServer, DependencyMcpTransport, DependencyTurnEvent,
+    DependencyTurnStreamItem,
 };
 use agentmod_primitives::{CancellationId, SessionId};
 use async_trait::async_trait;
@@ -22,6 +24,50 @@ use tokio::sync::mpsc;
 pub struct SessionDataRecord {
     pub id: SessionId,
     pub workspace: String,
+    pub mcp_declaration_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateSessionDataRequest {
+    pub workspace: String,
+    pub style: String,
+    pub mcp_servers: Vec<SessionMcpServerData>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionMcpServerData {
+    pub name: String,
+    pub transport: SessionMcpTransportData,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionMcpTransportData {
+    Stdio {
+        program: String,
+        arguments: Vec<String>,
+        environment: Vec<SessionMcpSensitiveEntryData>,
+    },
+    StreamableHttp {
+        url: String,
+        legacy_sse: bool,
+        headers: Vec<SessionMcpSensitiveEntryData>,
+    },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct SessionMcpSensitiveEntryData {
+    pub name: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for SessionMcpSensitiveEntryData {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionMcpSensitiveEntryData")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -95,8 +141,7 @@ impl TurnDataStreamSender {
 pub trait AcpDataPort: Send + Sync {
     async fn create_session(
         &self,
-        workspace: String,
-        style: String,
+        request: CreateSessionDataRequest,
     ) -> Result<SessionId, AcpDataError>;
     async fn find_session(
         &self,
@@ -138,11 +183,52 @@ impl<D> AcpData<D> {
 impl<D: AcpRuntimeDependencyPort> AcpDataPort for AcpData<D> {
     async fn create_session(
         &self,
-        workspace: String,
-        style: String,
+        request: CreateSessionDataRequest,
     ) -> Result<SessionId, AcpDataError> {
         self.dependency
-            .create_session(workspace, style)
+            .create_session(DependencyCreateSessionRequest {
+                workspace: request.workspace,
+                style: request.style,
+                mcp_servers: request
+                    .mcp_servers
+                    .into_iter()
+                    .map(|server| DependencyMcpServer {
+                        name: server.name,
+                        transport: match server.transport {
+                            SessionMcpTransportData::Stdio {
+                                program,
+                                arguments,
+                                environment,
+                            } => DependencyMcpTransport::Stdio {
+                                program,
+                                arguments,
+                                environment: environment
+                                    .into_iter()
+                                    .map(|entry| DependencyMcpSensitiveEntry {
+                                        name: entry.name,
+                                        value: entry.value,
+                                    })
+                                    .collect(),
+                            },
+                            SessionMcpTransportData::StreamableHttp {
+                                url,
+                                legacy_sse,
+                                headers,
+                            } => DependencyMcpTransport::StreamableHttp {
+                                url,
+                                legacy_sse,
+                                headers: headers
+                                    .into_iter()
+                                    .map(|entry| DependencyMcpSensitiveEntry {
+                                        name: entry.name,
+                                        value: entry.value,
+                                    })
+                                    .collect(),
+                            },
+                        },
+                    })
+                    .collect(),
+            })
             .await
             .map_err(map_error)
     }
@@ -158,6 +244,7 @@ impl<D: AcpRuntimeDependencyPort> AcpDataPort for AcpData<D> {
                 value.map(|session| SessionDataRecord {
                     id: session.id,
                     workspace: session.workspace,
+                    mcp_declaration_hash: session.mcp_declaration_hash,
                 })
             })
             .map_err(map_error)

@@ -12,11 +12,11 @@ name = "agentmod-lsp-host"
 path = "src/main.rs"
 
 [dependencies]
-agentmod-lsp-host-data = { path = "../data" }
-agentmod-lsp-host-dependency = { path = "../dependency" }
-agentmod-lsp-host-logic = { path = "../logic" }
-agentmod-lsp-host-service = { path = "../service" }
-agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+agentmod-lsp-host-data = { version = "0.1.0", path = "../data" }
+agentmod-lsp-host-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-lsp-host-logic = { version = "0.1.0", path = "../logic" }
+agentmod-lsp-host-service = { version = "0.1.0", path = "../service" }
+agentmod-tool-protocol = { version = "0.1.0", path = "../../../../protocols/tool-protocol" }
 serde_json.workspace = true
 
 [lints]

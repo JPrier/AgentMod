@@ -1,7 +1,8 @@
 //! Tool-protocol endpoints for MCP server management and invocation.
 
 use agentmod_mcp_host_logic::{
-    InvocationKind, InvokeCommand, McpAuthorization, McpLogicError, McpLogicPort,
+    BeginOAuthCommand, InvocationKind, InvokeCommand, McpAuthorization, McpLogicError,
+    McpLogicPort, OAuthStatusKind,
 };
 use agentmod_tool_protocol::{ToolDescriptor, ToolHostCommand, ToolHostEvent};
 use serde::Deserialize;
@@ -36,6 +37,13 @@ struct InvokeRequest {
     name: String,
     #[serde(default)]
     arguments: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OAuthCancelRequest {
+    server_id: String,
+    transaction_id: String,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -162,6 +170,54 @@ impl<L: McpLogicPort> McpHostService<L> {
                             serde_json::from_value(arguments).map_err(invalid)?;
                         self.invoke(call_id, request, authorization).await
                     }
+                    "mcp.oauth.begin" => {
+                        let request: ServerRequest =
+                            serde_json::from_value(arguments).map_err(invalid)?;
+                        let cancellation_id = authorization.cancellation_id.clone();
+                        let value = self
+                            .logic
+                            .begin_oauth(BeginOAuthCommand {
+                                authorization: to_logic_authorization(authorization),
+                                server_id: request.server_id,
+                                cancellation_id,
+                            })
+                            .await
+                            .map_err(map_logic_error)?;
+                        Ok(completed(
+                            call_id,
+                            json!({
+                                "server_id": value.server_id,
+                                "transaction_id": value.transaction_id,
+                                "authorization_url": value.authorization_url,
+                                "expires_at_ms": value.expires_at_ms,
+                                "configuration_hash": value.configuration_hash,
+                            }),
+                        ))
+                    }
+                    "mcp.oauth.status" => {
+                        let request: ServerRequest =
+                            serde_json::from_value(arguments).map_err(invalid)?;
+                        let value = self
+                            .logic
+                            .oauth_status(&request.server_id, to_logic_authorization(authorization))
+                            .await
+                            .map_err(map_logic_error)?;
+                        Ok(completed(call_id, oauth_status_json(&value)))
+                    }
+                    "mcp.oauth.cancel" => {
+                        let request: OAuthCancelRequest =
+                            serde_json::from_value(arguments).map_err(invalid)?;
+                        let value = self
+                            .logic
+                            .cancel_oauth(
+                                &request.server_id,
+                                &request.transaction_id,
+                                to_logic_authorization(authorization),
+                            )
+                            .await
+                            .map_err(map_logic_error)?;
+                        Ok(completed(call_id, oauth_status_json(&value)))
+                    }
                     namespaced if namespaced.starts_with("mcp__") => {
                         let (server_id, name) = parse_namespaced(namespaced)?;
                         self.invoke(
@@ -189,7 +245,7 @@ impl<L: McpLogicPort> McpHostService<L> {
         authorization: ServiceAuthorization,
     ) -> Result<Vec<ToolHostEvent>, McpServiceError> {
         let cancellation_id = authorization.cancellation_id.clone();
-        let value = self
+        let value = match self
             .logic
             .invoke(InvokeCommand {
                 authorization: to_logic_authorization(authorization),
@@ -204,7 +260,18 @@ impl<L: McpLogicPort> McpHostService<L> {
                 cancellation_id,
             })
             .await
-            .map_err(map_logic_error)?;
+        {
+            Ok(value) => value,
+            Err(McpLogicError::Cancelled) => {
+                return Ok(vec![
+                    ToolHostEvent::Started {
+                        call_id: call_id.clone(),
+                    },
+                    ToolHostEvent::Cancelled { call_id },
+                ]);
+            }
+            Err(error) => return Err(map_logic_error(error)),
+        };
         let mut events = vec![ToolHostEvent::Started {
             call_id: call_id.clone(),
         }];
@@ -253,7 +320,7 @@ fn canonical_arguments(tool: &str, arguments: Value) -> Result<Value, McpService
                 Err(McpServiceError::InvalidArguments)
             }
         }
-        "mcp.capabilities" => {
+        "mcp.capabilities" | "mcp.oauth.begin" | "mcp.oauth.status" => {
             let request: ServerRequest = serde_json::from_value(arguments).map_err(invalid)?;
             Ok(json!({"server_id":request.server_id}))
         }
@@ -270,9 +337,32 @@ fn canonical_arguments(tool: &str, arguments: Value) -> Result<Value, McpService
                 "arguments":request.arguments,
             }))
         }
+        "mcp.oauth.cancel" => {
+            let request: OAuthCancelRequest = serde_json::from_value(arguments).map_err(invalid)?;
+            Ok(json!({
+                "server_id":request.server_id,
+                "transaction_id":request.transaction_id,
+            }))
+        }
         namespaced if namespaced.starts_with("mcp__") && arguments.is_object() => Ok(arguments),
         _ => Err(McpServiceError::UnknownTool),
     }
+}
+
+fn oauth_status_json(value: &agentmod_mcp_host_logic::OAuthStatusResult) -> Value {
+    json!({
+        "server_id": value.server_id,
+        "status": match value.status {
+            OAuthStatusKind::Unauthorized => "unauthorized",
+            OAuthStatusKind::Pending => "pending",
+            OAuthStatusKind::Authorized => "authorized",
+            OAuthStatusKind::Failed => "failed",
+        },
+        "transaction_id": value.transaction_id,
+        "expires_at_ms": value.expires_at_ms,
+        "scopes": value.scopes,
+        "configuration_hash": value.configuration_hash,
+    })
 }
 
 fn parse_namespaced(value: &str) -> Result<(String, String), McpServiceError> {
@@ -378,4 +468,20 @@ pub enum McpServiceError {
     /// Logic failed.
     #[error("MCP operation failed")]
     Logic,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oauth_management_is_absent_from_model_discovery() {
+        let discovered = descriptors();
+        assert_eq!(discovered.len(), 3);
+        assert!(
+            discovered
+                .iter()
+                .all(|descriptor| !descriptor.id.starts_with("mcp.oauth."))
+        );
+    }
 }

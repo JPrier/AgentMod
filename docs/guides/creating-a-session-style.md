@@ -29,9 +29,32 @@ Create a session with a registered style using
 persisted as an immutable binding; restart never silently substitutes another
 style.
 
-Compilation validates every declared graph node kind, but runtime execution
-support is currently narrower. Persistent-chat compatible
-`model_call -> tool_execution_gate -> complete_turn` graphs execute through the
-generic executor. Other graph shapes fail before journal mutation until their
-runtime node adapters and recovery paths are implemented. Check `STATUS.md`
-before treating validation success as an execution-availability guarantee.
+Compilation and runtime executability inspection resolve one exact registered
+implementation for every node and persist that immutable execution plan with
+the session. Arbitrary admitted graphs execute through those persisted executor
+identities rather than a style ID, node label, bundled fixture, or complete
+topology classifier. The admitted native set includes conditional and bounded
+loop control flow, parallel branches and joins, model/tool/approval/artifact
+effects, delay and scheduling, user-space event emission, child
+spawn/message/wait/review orchestration, plugin-backed nodes, and terminal or
+structured-failure routes. Cross-platform process matrices cover arbitrary
+control-flow and child-orchestration graphs plus current built-in styles; check
+`STATUS.md` for the exact platform evidence of an individual effect class.
+
+The dedicated `arbitrary-graph-schedule.toml` fixture demonstrates a
+user-supplied one-time `schedule` node that waits for its trigger. Its Windows
+and Linux process scripts verify that `runtime.schedule@1.0.0` and the compiled
+configuration reference are persisted in the immutable plan, schedule creation
+passes through consequential-action policy, the scheduler request and
+continuation survive daemon replacement, the wake resumes exactly once, and
+pure replay performs no live query or duplicate effect. Recurring,
+runtime-event, and process-output graph schedules are supported by the same
+executor but currently have unit/integration rather than arbitrary-graph
+process coverage.
+
+Validation is still fail-closed: every edge, variable dependency, executor,
+capability, permission, budget, parallel merge, and recovery semantic must be
+supported by the live registry. Unsupported nested parallel executor classes or
+malformed regions are rejected before session persistence. Inspect the compiled
+descriptor and its executability diagnostics rather than assuming that an
+unknown future node kind is available.

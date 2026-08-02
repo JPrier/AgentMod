@@ -1,0 +1,474 @@
+{
+  "style_id": "persistent-chat",
+  "style_version": "1.2.0",
+  "kind": "built_in",
+  "built_in_semantic": "persistent_chat",
+  "graph": {
+    "format_version": 1,
+    "entry_index": 1,
+    "budget": {
+      "max_steps": 100,
+      "max_tokens": 250000,
+      "max_cost_micros": 25000000,
+      "max_duration_ms": 900000
+    },
+    "declarations": {
+      "capabilities": [
+        "context",
+        "model",
+        "tools"
+      ],
+      "tools": [
+        "browser.click",
+        "browser.close",
+        "browser.download",
+        "browser.inspect",
+        "browser.navigate",
+        "browser.screenshot",
+        "browser.start",
+        "browser.submit",
+        "browser.type",
+        "filesystem.apply_patch",
+        "filesystem.edit",
+        "filesystem.glob",
+        "filesystem.grep",
+        "filesystem.list",
+        "filesystem.read",
+        "filesystem.write",
+        "git.branch",
+        "git.changed_files",
+        "git.checkpoint_create",
+        "git.checkpoint_restore",
+        "git.diff",
+        "git.dirty",
+        "git.discover",
+        "git.export_patch",
+        "git.status",
+        "git.worktree_cleanup",
+        "git.worktree_create",
+        "http.request",
+        "lsp.code_actions",
+        "lsp.definition",
+        "lsp.diagnostics",
+        "lsp.document_symbols",
+        "lsp.formatting",
+        "lsp.hover",
+        "lsp.project_root",
+        "lsp.references",
+        "lsp.rename",
+        "lsp.signature_help",
+        "lsp.workspace_symbols",
+        "mcp.capabilities",
+        "mcp.invoke",
+        "mcp.server.list",
+        "process.detach",
+        "process.input",
+        "process.interrupt",
+        "process.kill",
+        "process.list",
+        "process.read",
+        "process.reattach",
+        "process.resize",
+        "process.run",
+        "process.run_pty",
+        "process.start",
+        "process.start_pty",
+        "process.wait",
+        "web.fetch",
+        "web.search"
+      ],
+      "providers": [
+        "deterministic-mock"
+      ],
+      "events": [],
+      "plugins": []
+    },
+    "variables": [
+      {
+        "name": "model_disposition",
+        "type": {
+          "kind": "enum",
+          "values": [
+            "response_complete",
+            "tool_requests"
+          ]
+        },
+        "scope": "run",
+        "producer": "respond",
+        "merge_contributors": [],
+        "consumers": [
+          "tool-batch"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 64,
+        "security_classification": "internal"
+      },
+      {
+        "name": "model_result",
+        "type": {
+          "kind": "node_result_reference"
+        },
+        "scope": "run",
+        "producer": "respond",
+        "merge_contributors": [],
+        "consumers": [
+          "tool-batch"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 512,
+        "security_classification": "internal"
+      },
+      {
+        "name": "turn_result",
+        "type": {
+          "kind": "node_result_reference"
+        },
+        "scope": "run",
+        "producer": "tool-batch",
+        "merge_contributors": [],
+        "consumers": [
+          "done"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 512,
+        "security_classification": "internal"
+      }
+    ],
+    "nodes": [
+      {
+        "index": 0,
+        "id": "done",
+        "kind": "complete_turn",
+        "configuration": {
+          "type": "complete_turn",
+          "result_reference_variable": "turn_result",
+          "cleanup": "preserve_projection"
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "turn_result"
+        ],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 1,
+        "id": "prepare-context",
+        "kind": "context_transform",
+        "configuration": {
+          "type": "context_transform",
+          "strategy": "preserve_history"
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 2,
+        "id": "respond",
+        "kind": "model_call",
+        "configuration": {
+          "type": "model_request",
+          "disposition_output": "model_disposition",
+          "result_output": "model_result",
+          "provider_options": {},
+          "json_outputs": {}
+        },
+        "condition": null,
+        "tool": null,
+        "provider": "deterministic-mock",
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [
+          "model_disposition",
+          "model_result"
+        ],
+        "retry_limit": 1,
+        "max_iterations": null
+      },
+      {
+        "index": 3,
+        "id": "tool-batch",
+        "kind": "tool_execution_gate",
+        "configuration": {
+          "type": "provider_tool_batch_execution",
+          "request_reference_variable": "model_result",
+          "disposition_variable": "model_disposition",
+          "maximum_calls": 32,
+          "allowed_tools": [
+            "browser.click",
+            "browser.close",
+            "browser.download",
+            "browser.inspect",
+            "browser.navigate",
+            "browser.screenshot",
+            "browser.start",
+            "browser.submit",
+            "browser.type",
+            "filesystem.apply_patch",
+            "filesystem.edit",
+            "filesystem.glob",
+            "filesystem.grep",
+            "filesystem.list",
+            "filesystem.read",
+            "filesystem.write",
+            "git.branch",
+            "git.changed_files",
+            "git.checkpoint_create",
+            "git.checkpoint_restore",
+            "git.diff",
+            "git.dirty",
+            "git.discover",
+            "git.export_patch",
+            "git.status",
+            "git.worktree_cleanup",
+            "git.worktree_create",
+            "http.request",
+            "lsp.code_actions",
+            "lsp.definition",
+            "lsp.diagnostics",
+            "lsp.document_symbols",
+            "lsp.formatting",
+            "lsp.hover",
+            "lsp.project_root",
+            "lsp.references",
+            "lsp.rename",
+            "lsp.signature_help",
+            "lsp.workspace_symbols",
+            "mcp.capabilities",
+            "mcp.invoke",
+            "mcp.server.list",
+            "process.detach",
+            "process.input",
+            "process.interrupt",
+            "process.kill",
+            "process.list",
+            "process.read",
+            "process.reattach",
+            "process.resize",
+            "process.run",
+            "process.run_pty",
+            "process.start",
+            "process.start_pty",
+            "process.wait",
+            "web.fetch",
+            "web.search"
+          ]
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [
+          "workspace"
+        ],
+        "write_scopes": [],
+        "read_variables": [
+          "model_disposition",
+          "model_result"
+        ],
+        "write_variables": [
+          "turn_result"
+        ],
+        "retry_limit": 0,
+        "max_iterations": null
+      }
+    ],
+    "edges": [
+      {
+        "from": 1,
+        "to": 2,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 2,
+        "to": 3,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 3,
+        "to": 0,
+        "condition": null,
+        "label": null
+      }
+    ],
+    "cache_key": {
+      "graph_content_hash": "6c3a193d3c052ccc874705cfb8ad0a23bf2de3be706450a9de49fb4a92b65c47",
+      "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+      "capability_set_hash": "740ec0810d6069d7cb3b1338c71fca1a20bea948cc6e94730dc81f165e16435d",
+      "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+      "combined_hash": "ae2965e67b7678a50921aadda310309cf3f026b2d098c484026ca4d4994b2b65"
+    }
+  },
+  "interceptor_order": [
+    "runtime-style-policy"
+  ],
+  "interceptors": [
+    {
+      "id": "runtime-style-policy",
+      "owner": "runtime.security",
+      "event": "action.proposed",
+      "stage": 10,
+      "priority": 100,
+      "before": [],
+      "after": [],
+      "supported_decisions": [
+        "continue",
+        "replace",
+        "reject",
+        "require_approval",
+        "cancel"
+      ],
+      "required_capabilities": [
+        "approval"
+      ]
+    }
+  ],
+  "required_capabilities": [
+    "agents",
+    "approval",
+    "context",
+    "model",
+    "tools"
+  ],
+  "allowed_tool_groups": [
+    "browser",
+    "filesystem",
+    "git",
+    "lsp",
+    "mcp",
+    "process",
+    "web"
+  ],
+  "allowed_providers": [
+    "deterministic-mock"
+  ],
+  "allowed_plugins": [
+    "runtime.security"
+  ],
+  "harness": {
+    "id": "native",
+    "required_capabilities": [
+      "cancellation",
+      "streaming",
+      "structured_context_replacement",
+      "token_usage",
+      "tool_calls"
+    ]
+  },
+  "memory": {
+    "provider": "file",
+    "scopes": [
+      "session",
+      "project"
+    ],
+    "retrieval_timing": "turn_start",
+    "query": {
+      "source": "current_input",
+      "include_active_artifacts": true,
+      "include_style_context": true,
+      "max_query_bytes": 16384
+    },
+    "max_items": 32,
+    "max_injected_bytes": 262144,
+    "write_policy": "turn_completion",
+    "injection_location": "before_current_input"
+  },
+  "compaction": {
+    "strategy": "summary",
+    "trigger_tokens": 750000,
+    "reserved_context_tokens": 32000,
+    "max_provider_projection_tokens": 250000,
+    "preserve_unresolved_tasks": true,
+    "preserve_active_processes": true,
+    "preservation_requirements": [
+      "system_instructions",
+      "current_input",
+      "pending_control_state",
+      "artifact_references",
+      "memory_provenance",
+      "active_graph_state",
+      "tool_call_correlation"
+    ]
+  },
+  "approvals": {
+    "default": "ask",
+    "groups": {
+      "filesystem.read": "allow"
+    }
+  },
+  "budgets": {
+    "max_iterations": 32,
+    "max_steps": 1000,
+    "max_tokens": 1000000,
+    "max_cost_micros": 100000000,
+    "max_duration_ms": 3600000
+  },
+  "child_agents": {
+    "max_children": 8,
+    "max_concurrent": 2,
+    "max_depth": 2,
+    "per_child_token_budget": 50000,
+    "child_style": "ephemeral-turn@1.1.0",
+    "workspace_mode": "shared_read_only",
+    "inherit_provider": true,
+    "inherit_model": true,
+    "context_budget_tokens": 32000,
+    "per_child_cost_budget_micros": 5000000,
+    "tool_groups": [
+      "filesystem"
+    ],
+    "memory_access": "read_only",
+    "join_behavior": "all",
+    "cancellation_behavior": "cascade",
+    "reviewer_max_attempts": 4
+  },
+  "retry": {
+    "max_attempts": 2,
+    "initial_backoff_ms": 100,
+    "max_backoff_ms": 5000,
+    "retryable_failures": [
+      "provider.rate_limit",
+      "provider.unavailable"
+    ]
+  },
+  "termination": {
+    "allowed_outcomes": [
+      "complete_turn",
+      "fail"
+    ],
+    "on_hard_limit": "fail",
+    "require_explicit_terminal_node": true
+  },
+  "selection": {
+    "requires_explicit_selection": true,
+    "model_may_select": false
+  },
+  "cache_key": {
+    "style_content_hash": "85b4f13252d9735727e191bf08aac200d08d49321a9aeeead98e5ccbd604e4db",
+    "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+    "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+    "capability_set_hash": "ed32eaa3749667657942a541cc1cd92d768c994f382cc55088354c23cfa41df4",
+    "combined_hash": "e6067117e7cbd78b54dbc16cc6f4c51051d6a47631dbf68ace991baf385f5ee6"
+  }
+}

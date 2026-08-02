@@ -8,6 +8,20 @@ agentmod run "<prompt>" --session <id> [--provider <id>] [--model <id>]
              [--option <key=value>]... [--cancellation-id <uuid>]
              [--json | --stream-json]
 agentmod cancel <cancellation-id> [--reason <text>] [--json]
+agentmod plugin disable <plugin-id> --session <id>
+             [--cancellation-id <uuid>] [--json]
+agentmod plugin enable <plugin-id> --session <id>
+             [--cancellation-id <uuid>] [--json]
+agentmod plugin quarantine <plugin-id> --session <id> --reason <code>
+             [--cancellation-id <uuid>] [--json]
+agentmod plugin unquarantine <plugin-id> --session <id>
+             [--cancellation-id <uuid>] [--json]
+agentmod mcp oauth begin <server-id> --session <id>
+             [--cancellation-id <uuid>] [--json]
+agentmod mcp oauth status <server-id> --session <id>
+             [--cancellation-id <uuid>] [--json]
+agentmod mcp oauth cancel <server-id> <transaction-id> --session <id>
+             [--cancellation-id <uuid>] [--json]
 agentmod harness list [--json]
 agentmod harness inspect <id> [--json]
 agentmod style list [--json]
@@ -38,7 +52,8 @@ agentmod schedule remove <schedule-id> [--json]
 agentmod schedule claim [--limit <count>] [--json]
 agentmod schedule complete <execution-id> [--failed] [--json]
 agentmod schedule run [--limit <count>] [--json]
-agentmod-tui [--smoke | --smoke-turn <prompt> | --smoke-command "<slash-command>"]
+agentmod-tui [--smoke | --smoke-turn <prompt> | --smoke-command "<slash-command>" |
+              --smoke-attachment-turn "<prompt>" <path>...]
 agentmod-acp
 ```
 
@@ -70,6 +85,19 @@ The TUI command palette supports `/branch <sequence> [style]`. Omitting the
 style preserves the parent binding; providing one resolves and validates that
 style through the runtime registry, atomically creates the child, and selects
 it without modifying the parent.
+
+Use `/attach <workspace-path>` to add a bounded image, audio file, or `.bin`
+blob to the next TUI turn. `/attachments` lists the pending metadata,
+`/attachment-remove <one-based-index>` removes one entry, and
+`/attachments-clear` clears the set. Files are opened through a capability-
+relative, no-follow handle and must be regular files inside the selected session
+workspace. The frontend rejects path traversal,
+secret-like input, duplicate/excess attachments, unsupported or
+signature-mismatched MIME, and aggregate content over 512 KiB. Supported types
+are PNG, JPEG, GIF, WebP, WAV, MP3, Ogg, and `application/octet-stream` `.bin`.
+Pending content is base64-bounded and cleared after submission or every actual
+selected-session ID change. Text-only turns keep the existing string wire
+representation.
 
 `run` executes one durable turn in an existing session. Provider options are
 repeatable and accept JSON scalars/objects or plain strings. The bundled offline
@@ -107,6 +135,38 @@ agentmod cancel <uuid> --reason "cancelled by user" --json
 Cancellation preserves visible deltas already received by runtime, commits a
 typed cancellation event, and does not commit a model completion.
 
+Plugin lifecycle commands apply to one exact plugin selected by one immutable
+session style:
+
+```sh
+agentmod plugin disable fixture.plugin --session <session-id> --json
+agentmod plugin enable fixture.plugin --session <session-id> --json
+agentmod plugin quarantine fixture.plugin --session <session-id> \
+  --reason integrity_failure --json
+agentmod plugin unquarantine fixture.plugin --session <session-id> --json
+```
+
+The runtime commits the requested transition before contacting the isolated
+plugin host, verifies the exact version/state/audit response, and then commits
+the terminal lifecycle event. Disabled or quarantined plugins are removed from
+that session's active set; registered invocations are cancelled and future
+turns using the plugin fail closed. Repeating the exact request reconciles the
+canonical result. Changing the action, reason, or selected plugin version is a
+conflict rather than an implicit migration. Supply the same
+`--cancellation-id` when retrying a request whose terminal response may have
+been lost; omitting it creates a fresh cancellation lineage. The TUI exposes
+the same four operations as `/plugin-disable`, `/plugin-enable`,
+`/plugin-quarantine`, and `/plugin-unquarantine` through its ordinary layered
+runtime path.
+
+The checked-in `tests/e2e/runtime_plugin_lifecycle.ps1` and
+`runtime_plugin_lifecycle.sh` suites execute disable/enable and
+quarantine/unquarantine through the real daemon and isolated plugin process on
+Windows and Linux. They verify that the requested event precedes host I/O, an
+exact retry is receipt-only, future turns fail closed while inactive, and an
+in-flight worker cannot produce a late effect. The same matrix exercises the
+TUI lifecycle commands.
+
 Sensitive tools return `awaiting_continuation` under the default interactive
 policy. Resolve that durable request explicitly:
 
@@ -134,6 +194,10 @@ behavior; `AGENTMOD_SCHEDULER_POLL_MS=0` disables that loop.
 headless CLI. `--smoke` validates authenticated health and session-list access
 without changing terminal mode. `--smoke-turn` additionally executes a normal
 provider turn and consumes its committed incremental stream.
+`--smoke-attachment-turn "<prompt>" <path>...` performs the same confined file
+loading, rich-envelope submission, and committed stream handling without
+changing terminal mode. The Windows and WSL/Linux rich-attachment process
+proofs passed on 2026-07-31; macOS was not run.
 
 `agentmod-acp` is the editor-facing Agent Client Protocol v1 stdio process. An
 ACP client launches it with the runtime endpoint and bootstrap token in the
@@ -141,6 +205,15 @@ environment, sends `initialize`, then uses `session/new`, `session/load`,
 `session/prompt`, and `session/cancel`. Agent output is emitted as
 `session/update`; sensitive runtime continuations use
 `session/request_permission`.
+
+For an ACP-created MCP-bound parent, a runtime-managed immediate child inherits
+MCP only when the parent style explicitly sets `child_agents.inherit_mcp = true`
+and the child grant includes `mcp`. ACP `session/load` for that child must use the
+child state's exact immutable workspace and the parent's exact declaration set.
+Default/false policy yields an empty binding; declaration or authenticated
+bootstrap substitution fails closed. Windows and Ubuntu/WSL2 process tests cover
+execution, restart, exact recovery, and replay without duplicate MCP effects.
+They do not establish transitive/grandchild inheritance; macOS was not run.
 
 `session inspect` and `session replay` reconstruct verified state at the journal
 head or an inclusive `--at` sequence. Replay is reducer-only and does not repeat
@@ -155,8 +228,15 @@ harness identity, compiled graph nodes and edges, active/control/previous node
 state, known next transitions and conditional candidates, loop/retry counts,
 remaining step/token/iteration budgets, tool/permission/retry/termination
 configuration, pipeline activity, memory provenance, compaction history,
-child/join/reviewer state, and termination. Remaining cost and duration are
-`null` until those accounting dimensions are canonically retained.
+child/join/reviewer state, and termination. When canonical replay variables are
+present, every transition candidate includes an `eligibility.status` of
+`eligible`, `ineligible`, `missing_input`, or `invalid_expression`; missing
+paths and bounded diagnostics accompany the latter two states. The graph
+variable projection contains declaration/access metadata, assignment state,
+version, and value hash, but never the value itself. Legacy snapshots without a
+canonical variable projection retain conservative conditional candidates.
+Remaining cost and duration are `null` until those accounting dimensions are
+canonically retained.
 
 `session events` is the durable reconnect surface. It returns verified canonical
 events strictly after `--after` (or from sequence 1), bounded to `--limit`
@@ -180,11 +260,16 @@ cargo run -p agentmod-cli -- doctor --json --strict
 cargo run -p agentmod-cli -- harness list --json
 cargo run -p agentmod-cli -- session create --workspace . --style persistent-chat --harness native --json
 cargo run -p agentmod-cli -- session list --json
+cargo run -p agentmod-cli -- mcp oauth begin <server-id> --session <session-id> --json
+cargo run -p agentmod-cli -- mcp oauth status <server-id> --session <session-id> --json
+cargo run -p agentmod-cli -- mcp oauth cancel <server-id> <transaction-id> --session <session-id> --json
 ```
 
 `AGENTMOD_RUNTIME_ENDPOINT` overrides the platform endpoint. The binary name is
-`agentmod`. Interactive chat, resume/rewind, style/plugin/MCP/tool management,
-attachments, and slash commands remain incomplete.
+`agentmod`. Plugin lifecycle management and session-scoped MCP OAuth
+begin/status/cancel are implemented in both CLI and TUI. Interactive CLI chat,
+resume/rewind, general tool management, and a packaged install/update
+experience remain incomplete.
 
 The Windows and Unix runtime/CLI smoke scenarios are automated in
 `tests/e2e/runtime_cli.ps1` and `tests/e2e/runtime_cli.sh`; these include a real

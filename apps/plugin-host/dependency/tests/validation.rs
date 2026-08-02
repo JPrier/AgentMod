@@ -85,5 +85,9 @@ fn manifest(id: &str, class: DependencyPluginClass) -> DependencyManifest {
             required: false,
             inline_json: "{\"type\":\"object\",\"additionalProperties\":false}".to_owned(),
         },
+        node_executors: Vec::new(),
+        context_transforms: Vec::new(),
+        memory_providers: Vec::new(),
+        compactors: Vec::new(),
     }
 }

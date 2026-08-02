@@ -12,10 +12,11 @@ use agentmod_cli_data::{
     BranchSessionDataRequest, CancelTurnDataRequest, CliDataPort, CreateDeferredTurnDataRequest,
     CreateSessionBudgetDataRequest, CreateSessionDataRequest, HarnessDescriptorDataRecord,
     InspectSessionDataRequest, InspectStyleDataRequest, ListSessionsDataRequest,
-    ResolveApprovalDataRequest, RunTurnDataRequest, RunTurnDataStream, RunTurnDataStreamItem,
-    RuntimeHealthDataAvailability, RuntimeHealthDataRequest, ScheduleDataPayload,
-    ScheduleDataRecord, ScheduleDataTrigger, ScheduledExecutionDataRecord, ScheduledRunDataRecord,
-    StyleDataAvailability, StyleDataSourceKind, StyleDiagnosticDataRecord, StyleFileDataRequest,
+    PluginLifecycleActionData, PluginLifecycleDataRequest, ResolveApprovalDataRequest,
+    RunTurnDataRequest, RunTurnDataStream, RunTurnDataStreamItem, RuntimeHealthDataAvailability,
+    RuntimeHealthDataRequest, ScheduleDataPayload, ScheduleDataRecord, ScheduleDataTrigger,
+    ScheduledExecutionDataRecord, ScheduledRunDataRecord, StyleDataAvailability,
+    StyleDataSourceKind, StyleDiagnosticDataRecord, StyleFileDataRequest,
     StyleInspectionDataRecord, StyleSummaryDataRecord, SubscribeSessionDataRequest, TurnDataEvent,
 };
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
@@ -273,6 +274,7 @@ pub enum ScheduleTrigger {
 pub enum SchedulePayload {
     Prompt { prompt: String },
     Continuation { continuation_id: String },
+    GraphTrigger { run_id: String, node_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -461,6 +463,73 @@ pub struct ResolveApprovalResult {
     pub awaiting_continuation: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PluginLifecycleAction {
+    Disable,
+    Enable,
+    Quarantine,
+    Unquarantine,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangePluginLifecycleCommand {
+    pub session_id: SessionId,
+    pub plugin_id: String,
+    pub action: PluginLifecycleAction,
+    pub reason_code: Option<String>,
+    pub cancellation_id: CancellationId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChangePluginLifecycleResult {
+    pub session_id: SessionId,
+    pub plugin_id: String,
+    pub plugin_version: String,
+    pub state: String,
+    pub committed_sequence: Sequence,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpOAuthAction {
+    Begin,
+    Status,
+    Cancel { transaction_id: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManageMcpOAuthCommand {
+    pub session_id: SessionId,
+    pub server_id: String,
+    pub action: McpOAuthAction,
+    pub cancellation_id: CancellationId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpOAuthBeginResult {
+    pub server_id: String,
+    pub transaction_id: String,
+    pub authorization_url: String,
+    pub authorization_url_hash: String,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpOAuthStatusResult {
+    pub server_id: String,
+    pub status: String,
+    pub transaction_id: Option<String>,
+    pub expires_at_ms: Option<i64>,
+    pub scopes: Vec<String>,
+    pub status_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpOAuthResult {
+    Begin(McpOAuthBeginResult),
+    Status(McpOAuthStatusResult),
+}
+
 /// Narrow logic interface consumed by CLI service.
 pub trait CliLogicPort {
     /// Runs the doctor use case.
@@ -551,6 +620,20 @@ pub trait CliLogicPort {
         &self,
         command: ResolveApprovalCommand,
     ) -> Result<ResolveApprovalResult, LogicError>;
+
+    fn change_plugin_lifecycle(
+        &self,
+        _command: ChangePluginLifecycleCommand,
+    ) -> Result<ChangePluginLifecycleResult, LogicError> {
+        Err(LogicError::PluginLifecycleData)
+    }
+
+    fn manage_mcp_oauth(
+        &self,
+        _command: ManageMcpOAuthCommand,
+    ) -> Result<McpOAuthResult, LogicError> {
+        Err(LogicError::McpOAuthData)
+    }
 
     fn list_styles(&self) -> Result<Vec<StyleSummaryResult>, LogicError> {
         Err(LogicError::StyleData)
@@ -960,6 +1043,101 @@ where
             .map_err(|_| LogicError::ApprovalData)
     }
 
+    fn change_plugin_lifecycle(
+        &self,
+        command: ChangePluginLifecycleCommand,
+    ) -> Result<ChangePluginLifecycleResult, LogicError> {
+        if command.plugin_id.is_empty()
+            || command.plugin_id.len() > 256
+            || !matches!(command.action, PluginLifecycleAction::Quarantine)
+                && command.reason_code.is_some()
+            || matches!(command.action, PluginLifecycleAction::Quarantine)
+                && command
+                    .reason_code
+                    .as_ref()
+                    .is_none_or(|reason| reason.is_empty() || reason.len() > 256)
+        {
+            return Err(LogicError::InvalidPluginLifecycleRequest);
+        }
+        self.data
+            .change_plugin_lifecycle(PluginLifecycleDataRequest {
+                session_id: command.session_id,
+                plugin_id: command.plugin_id,
+                action: match command.action {
+                    PluginLifecycleAction::Disable => PluginLifecycleActionData::Disable,
+                    PluginLifecycleAction::Enable => PluginLifecycleActionData::Enable,
+                    PluginLifecycleAction::Quarantine => PluginLifecycleActionData::Quarantine,
+                    PluginLifecycleAction::Unquarantine => PluginLifecycleActionData::Unquarantine,
+                },
+                reason_code: command.reason_code,
+                cancellation_id: command.cancellation_id,
+            })
+            .map(|record| ChangePluginLifecycleResult {
+                session_id: record.session_id,
+                plugin_id: record.plugin_id,
+                plugin_version: record.plugin_version,
+                state: record.state,
+                committed_sequence: record.committed_sequence,
+                replayed: record.replayed,
+            })
+            .map_err(|_| LogicError::PluginLifecycleData)
+    }
+
+    fn manage_mcp_oauth(
+        &self,
+        command: ManageMcpOAuthCommand,
+    ) -> Result<McpOAuthResult, LogicError> {
+        if command.server_id.is_empty()
+            || command.server_id.len() > 64
+            || !command
+                .server_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            || matches!(
+                &command.action,
+                McpOAuthAction::Cancel { transaction_id }
+                    if transaction_id.is_empty() || transaction_id.len() > 256
+            )
+        {
+            return Err(LogicError::InvalidMcpOAuthRequest);
+        }
+        self.data
+            .manage_mcp_oauth(agentmod_cli_data::McpOAuthDataRequest {
+                session_id: command.session_id,
+                server_id: command.server_id,
+                action: match command.action {
+                    McpOAuthAction::Begin => agentmod_cli_data::McpOAuthActionData::Begin,
+                    McpOAuthAction::Status => agentmod_cli_data::McpOAuthActionData::Status,
+                    McpOAuthAction::Cancel { transaction_id } => {
+                        agentmod_cli_data::McpOAuthActionData::Cancel { transaction_id }
+                    }
+                },
+                cancellation_id: command.cancellation_id,
+            })
+            .map(|result| match result {
+                agentmod_cli_data::McpOAuthDataRecord::Begin(value) => {
+                    McpOAuthResult::Begin(McpOAuthBeginResult {
+                        server_id: value.server_id,
+                        transaction_id: value.transaction_id,
+                        authorization_url: value.authorization_url,
+                        authorization_url_hash: value.authorization_url_hash,
+                        expires_at_ms: value.expires_at_ms,
+                    })
+                }
+                agentmod_cli_data::McpOAuthDataRecord::Status(value) => {
+                    McpOAuthResult::Status(McpOAuthStatusResult {
+                        server_id: value.server_id,
+                        status: value.status,
+                        transaction_id: value.transaction_id,
+                        expires_at_ms: value.expires_at_ms,
+                        scopes: value.scopes,
+                        status_hash: value.status_hash,
+                    })
+                }
+            })
+            .map_err(|_| LogicError::McpOAuthData)
+    }
+
     fn upsert_schedule(
         &self,
         schedule: ScheduleCommand,
@@ -1095,6 +1273,8 @@ fn validate_schedule(value: &ScheduleCommand) -> Result<(), LogicError> {
         SchedulePayload::Prompt { prompt } if !prompt.trim().is_empty() => {}
         SchedulePayload::Continuation { continuation_id } if !continuation_id.trim().is_empty() => {
         }
+        SchedulePayload::GraphTrigger { run_id, node_id }
+            if !run_id.trim().is_empty() && !node_id.trim().is_empty() => {}
         _ => return Err(LogicError::InvalidScheduleRequest),
     }
     Ok(())
@@ -1138,6 +1318,9 @@ fn to_data_schedule(value: ScheduleCommand) -> ScheduleDataRecord {
             SchedulePayload::Prompt { prompt } => ScheduleDataPayload::Prompt { prompt },
             SchedulePayload::Continuation { continuation_id } => {
                 ScheduleDataPayload::Continuation { continuation_id }
+            }
+            SchedulePayload::GraphTrigger { run_id, node_id } => {
+                ScheduleDataPayload::GraphTrigger { run_id, node_id }
             }
         },
         active: value.active,
@@ -1203,6 +1386,9 @@ fn from_data_schedule(value: ScheduleDataRecord) -> ScheduleResult {
             ScheduleDataPayload::Prompt { prompt } => SchedulePayload::Prompt { prompt },
             ScheduleDataPayload::Continuation { continuation_id } => {
                 SchedulePayload::Continuation { continuation_id }
+            }
+            ScheduleDataPayload::GraphTrigger { run_id, node_id } => {
+                SchedulePayload::GraphTrigger { run_id, node_id }
             }
         },
         active: value.active,
@@ -1385,6 +1571,14 @@ pub enum LogicError {
     /// Approval runtime data is unavailable.
     #[error("approval runtime data is unavailable")]
     ApprovalData,
+    #[error("plugin lifecycle request is invalid")]
+    InvalidPluginLifecycleRequest,
+    #[error("plugin lifecycle runtime data is unavailable")]
+    PluginLifecycleData,
+    #[error("MCP OAuth management request is invalid")]
+    InvalidMcpOAuthRequest,
+    #[error("MCP OAuth runtime data is unavailable")]
+    McpOAuthData,
     #[error("schedule request is invalid")]
     InvalidScheduleRequest,
     #[error("schedule runtime data is unavailable")]

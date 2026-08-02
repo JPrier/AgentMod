@@ -12,11 +12,11 @@ name = "agentmod-browser-host"
 path = "src/main.rs"
 
 [dependencies]
-agentmod-browser-host-data = { path = "../data" }
-agentmod-browser-host-dependency = { path = "../dependency" }
-agentmod-browser-host-logic = { path = "../logic" }
-agentmod-browser-host-service = { path = "../service" }
-agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+agentmod-browser-host-data = { version = "0.1.0", path = "../data" }
+agentmod-browser-host-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-browser-host-logic = { version = "0.1.0", path = "../logic" }
+agentmod-browser-host-service = { version = "0.1.0", path = "../service" }
+agentmod-tool-protocol = { version = "0.1.0", path = "../../../../protocols/tool-protocol" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
 

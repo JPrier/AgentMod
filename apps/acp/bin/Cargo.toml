@@ -12,11 +12,11 @@ name = "agentmod-acp"
 path = "src/main.rs"
 
 [dependencies]
-agentmod-acp-data = { path = "../data" }
-agentmod-acp-dependency = { path = "../dependency" }
-agentmod-acp-logic = { path = "../logic" }
-agentmod-acp-service = { path = "../service" }
-agentmod-protocol-support = { path = "../../../core/protocol-support" }
+agentmod-acp-data = { version = "0.1.0", path = "../data" }
+agentmod-acp-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-acp-logic = { version = "0.1.0", path = "../logic" }
+agentmod-acp-service = { version = "0.1.0", path = "../service" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../../core/protocol-support" }
 serde_json.workspace = true
 tokio.workspace = true
 

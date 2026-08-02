@@ -1,0 +1,49 @@
+   Compiling serde_derive v1.0.229
+   Compiling async-trait v0.1.91
+   Compiling thiserror v2.0.19
+   Compiling tokio v1.53.1
+   Compiling zerocopy v0.8.55
+   Compiling futures-util v0.3.33
+   Compiling libsqlite3-sys v0.35.0
+   Compiling clap_derive v4.6.4
+   Compiling agentmod-harness-dependency v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/harness/dependency)
+   Compiling rusqlite v0.37.0
+   Compiling agentmod-harness-data v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/harness/data)
+   Compiling agentmod-harness-logic v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/harness/logic)
+   Compiling clap v4.6.4
+   Compiling serde v1.0.229
+   Compiling agentmod-primitives v0.1.0 (/mnt/c/Users/jkpri/AgentMod/core/primitives)
+   Compiling agentmod-scheduler-protocol v0.1.0 (/mnt/c/Users/jkpri/AgentMod/protocols/scheduler-protocol)
+   Compiling agentmod-expression-engine v0.1.0 (/mnt/c/Users/jkpri/AgentMod/core/expression-engine)
+   Compiling agentmod-scheduler-dependency v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/scheduler/dependency)
+   Compiling agentmod-harness-protocol v0.1.0 (/mnt/c/Users/jkpri/AgentMod/protocols/harness-protocol)
+   Compiling agentmod-runtime-protocol v0.1.0 (/mnt/c/Users/jkpri/AgentMod/protocols/runtime-protocol)
+   Compiling agentmod-plugin-protocol v0.1.0 (/mnt/c/Users/jkpri/AgentMod/protocols/plugin-protocol)
+   Compiling agentmod-tool-protocol v0.1.0 (/mnt/c/Users/jkpri/AgentMod/protocols/tool-protocol)
+   Compiling agentmod-event-model v0.1.0 (/mnt/c/Users/jkpri/AgentMod/core/event-model)
+   Compiling agentmod-graph-engine v0.1.0 (/mnt/c/Users/jkpri/AgentMod/core/graph-engine)
+   Compiling agentmod-scheduler-data v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/scheduler/data)
+   Compiling agentmod-scheduler-logic v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/scheduler/logic)
+   Compiling agentmod-harness-service v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/harness/service)
+   Compiling agentmod-scheduler-service v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/scheduler/service)
+   Compiling agentmod-scheduler v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/scheduler/bin)
+   Compiling half v2.7.1
+   Compiling agentmod-event-pipeline v0.1.0 (/mnt/c/Users/jkpri/AgentMod/core/event-pipeline)
+   Compiling tokio-util v0.7.19
+   Compiling agentmod-harness v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/harness/bin)
+   Compiling ciborium-ll v0.2.2
+   Compiling ciborium v0.2.2
+   Compiling agentmod-plugin-sdk v0.1.0 (/mnt/c/Users/jkpri/AgentMod/sdk/plugin-sdk)
+   Compiling agentmod-protocol-support v0.1.0 (/mnt/c/Users/jkpri/AgentMod/core/protocol-support)
+   Compiling agentmod-cli-dependency v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/cli/dependency)
+   Compiling agentmod-session-style-sdk v0.1.0 (/mnt/c/Users/jkpri/AgentMod/sdk/session-style-sdk)
+   Compiling agentmod-runtime-dependency v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/runtime/dependency)
+   Compiling agentmod-cli-data v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/cli/data)
+   Compiling agentmod-cli-logic v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/cli/logic)
+   Compiling agentmod-cli-service v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/cli/service)
+   Compiling agentmod-cli v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/cli/bin)
+   Compiling agentmod-runtime-data v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/runtime/data)
+   Compiling agentmod-runtime-logic v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/runtime/logic)
+   Compiling agentmod-runtime-service v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/runtime/service)
+   Compiling agentmod-runtime v0.1.0 (/mnt/c/Users/jkpri/AgentMod/apps/runtime/bin)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 47.44s

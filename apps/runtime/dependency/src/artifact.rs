@@ -3,6 +3,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -323,6 +324,7 @@ pub trait ArtifactDependencyPort {
 pub struct LocalArtifactDependency {
     root: PathBuf,
     limits: DependencyArtifactLimits,
+    post_finalize_delay: Duration,
 }
 
 impl LocalArtifactDependency {
@@ -346,7 +348,20 @@ impl LocalArtifactDependency {
         fs::create_dir_all(root.join(INCOMPLETE_DIRECTORY)).map_err(io_error)?;
         fs::create_dir_all(root.join(FINALIZING_DIRECTORY)).map_err(io_error)?;
         fs::create_dir_all(root.join(OBJECTS_DIRECTORY)).map_err(io_error)?;
-        Ok(Self { root, limits })
+        Ok(Self {
+            root,
+            limits,
+            post_finalize_delay: Duration::ZERO,
+        })
+    }
+
+    /// Adds a post-finalize observation window used only by process crash-cut
+    /// validation. The immutable object and its parent directory are durable
+    /// before this delay begins.
+    #[must_use]
+    pub const fn with_post_finalize_delay(mut self, delay: Duration) -> Self {
+        self.post_finalize_delay = delay;
+        self
     }
 
     fn incomplete_path(&self, write_id: &ArtifactWriteId) -> PathBuf {
@@ -447,6 +462,9 @@ impl ArtifactDependencyPort for LocalArtifactDependency {
         let result = finalize_transaction(self, &finalizing);
         if result.is_err() {
             let _ = fs::remove_dir_all(&finalizing);
+        }
+        if result.is_ok() && !self.post_finalize_delay.is_zero() {
+            std::thread::sleep(self.post_finalize_delay);
         }
         result
     }
@@ -800,10 +818,8 @@ fn read_metadata(object: &Path) -> Result<DependencyArtifactMetadata, ArtifactDe
     if expected_directory != metadata.content_hash {
         return Err(ArtifactDependencyError::CorruptArtifact);
     }
-    let content_bytes = fs::metadata(object.join(CONTENT_FILE))
-        .map_err(artifact_io_error)?
-        .len();
-    if content_bytes != metadata.byte_size {
+    let (observed_hash, content_bytes) = hash_file(&object.join(CONTENT_FILE))?;
+    if content_bytes != metadata.byte_size || observed_hash != metadata.content_hash {
         return Err(ArtifactDependencyError::CorruptArtifact);
     }
     Ok(metadata)
@@ -1131,6 +1147,26 @@ mod tests {
             DependencyCleanupArtifactsResponse {
                 removed_transactions: 0
             }
+        );
+    }
+
+    #[test]
+    fn inspect_rejects_same_length_content_tampering() {
+        let (_directory, store) = store();
+        let write_id = start(&store, "event-tamper");
+        write(&store, &write_id, b"original");
+        let finalized = store
+            .finalize(DependencyFinalizeArtifactRequest { write_id })
+            .expect("finalize");
+        let hash = finalized.metadata.content_hash.clone();
+        fs::write(store.object_path(&hash).join(CONTENT_FILE), b"tampered")
+            .expect("same-length tamper");
+
+        assert_eq!(
+            store.inspect(DependencyInspectArtifactRequest {
+                artifact_reference: finalized.metadata.artifact_reference,
+            }),
+            Err(ArtifactDependencyError::CorruptArtifact)
         );
     }
 

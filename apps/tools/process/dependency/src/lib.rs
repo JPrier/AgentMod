@@ -29,9 +29,12 @@ use tokio::{
     process::{Child, ChildStdin, Command},
     sync::{Mutex, RwLock, mpsc, oneshot},
     task::JoinHandle,
-    time::{Instant, sleep, sleep_until, timeout},
+    time::{Instant, sleep_until, timeout},
 };
 use uuid::Uuid;
+
+#[cfg(windows)]
+use tokio::time::sleep;
 
 /// Prepares the exact reconnectable process-host endpoint before binding.
 ///
@@ -896,7 +899,7 @@ impl ProcessDependencyPort for TokioProcessDependency {
             &self.config.inherited_environment_allowlist,
         )
         .await?;
-        enforce_executable_policy(&request.executable, &executable, &self.config)?;
+        enforce_executable_policy(&request.executable, &executable.identity_path, &self.config)?;
         let environment = resolve_environment(&request.environment)?;
         self.prune_completed_registry().await;
         enforce_capacity(&self.registry, request.output_limit_bytes, &self.config).await?;
@@ -925,7 +928,7 @@ impl ProcessDependencyPort for TokioProcessDependency {
             owner_id: request.authorization.identity.owner_id.clone(),
             session_id: request.authorization.identity.session_id.clone(),
             executable: request.executable.clone(),
-            resolved_executable: executable.clone(),
+            resolved_executable: executable.identity_path.clone(),
             working_directory: working_directory.clone(),
             lifecycle: DurableLifecycle::Dispatching,
             exit: None,
@@ -963,7 +966,8 @@ impl ProcessDependencyPort for TokioProcessDependency {
             let stdout_file = stdout_file.into_std().await;
             drop(stderr_file);
             match spawn_terminal_process(
-                &executable,
+                &executable.invocation_path,
+                &executable.identity_path,
                 &request.arguments,
                 &working_directory,
                 &environment,
@@ -988,7 +992,7 @@ impl ProcessDependencyPort for TokioProcessDependency {
                 }
             }
         } else {
-            let mut command = Command::new(&executable);
+            let mut command = command_for_resolved_executable(&executable);
             command
                 .args(&request.arguments)
                 .current_dir(&working_directory)
@@ -1011,8 +1015,12 @@ impl ProcessDependencyPort for TokioProcessDependency {
                 }
             };
             let os_process_id = child.id();
-            let os_start_time =
-                mark_durable_running(&durable, &log_directory, os_process_id, &executable)?;
+            let os_start_time = mark_durable_running(
+                &durable,
+                &log_directory,
+                os_process_id,
+                &executable.identity_path,
+            )?;
             let stdout = child
                 .stdout
                 .take()
@@ -1925,23 +1933,44 @@ async fn enforce_capacity(
     }
 }
 
+struct ResolvedExecutable {
+    invocation_path: PathBuf,
+    identity_path: PathBuf,
+}
+
+fn command_for_resolved_executable(executable: &ResolvedExecutable) -> Command {
+    #[cfg(unix)]
+    {
+        let mut command = Command::new(&executable.identity_path);
+        command.arg0(&executable.invocation_path);
+        command
+    }
+    #[cfg(not(unix))]
+    {
+        Command::new(&executable.identity_path)
+    }
+}
+
+fn revalidate_invocation_identity(
+    invocation_path: &Path,
+    identity_path: &Path,
+) -> Result<(), ProcessDependencyError> {
+    let current_identity = std::fs::canonicalize(invocation_path)
+        .map_err(|_| ProcessDependencyError::ExecutableNotFound)?;
+    if same_executable(&current_identity, identity_path) {
+        Ok(())
+    } else {
+        Err(ProcessDependencyError::ExecutableDenied)
+    }
+}
+
 async fn resolve_executable(
     executable: &str,
     inherited: &BTreeSet<String>,
-) -> Result<PathBuf, ProcessDependencyError> {
+) -> Result<ResolvedExecutable, ProcessDependencyError> {
     let candidate = Path::new(executable);
     if candidate.is_absolute() || candidate.components().count() > 1 {
-        let resolved = fs::canonicalize(candidate)
-            .await
-            .map_err(|_| ProcessDependencyError::ExecutableNotFound)?;
-        if fs::metadata(&resolved)
-            .await
-            .map_err(redacted_io)?
-            .is_file()
-        {
-            return Ok(resolved);
-        }
-        return Err(ProcessDependencyError::ExecutableNotFound);
+        return resolve_executable_candidate(candidate).await;
     }
     if !inherited.iter().any(|key| normalize_env_key(key) == "PATH") {
         return Err(ProcessDependencyError::ExecutableNotFound);
@@ -1950,16 +1979,38 @@ async fn resolve_executable(
     for directory in std::env::split_paths(&path) {
         for name in executable_names(executable) {
             let candidate = directory.join(name);
-            if let Ok(resolved) = fs::canonicalize(&candidate).await
-                && fs::metadata(&resolved)
-                    .await
-                    .is_ok_and(|metadata| metadata.is_file())
-            {
+            if let Ok(resolved) = resolve_executable_candidate(&candidate).await {
                 return Ok(resolved);
             }
         }
     }
     Err(ProcessDependencyError::ExecutableNotFound)
+}
+
+async fn resolve_executable_candidate(
+    candidate: &Path,
+) -> Result<ResolvedExecutable, ProcessDependencyError> {
+    let invocation_path = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(redacted_io)?
+            .join(candidate)
+    };
+    let identity_path = fs::canonicalize(&invocation_path)
+        .await
+        .map_err(|_| ProcessDependencyError::ExecutableNotFound)?;
+    if !fs::metadata(&identity_path)
+        .await
+        .map_err(redacted_io)?
+        .is_file()
+    {
+        return Err(ProcessDependencyError::ExecutableNotFound);
+    }
+    Ok(ResolvedExecutable {
+        invocation_path,
+        identity_path,
+    })
 }
 
 fn executable_names(executable: &str) -> Vec<OsString> {
@@ -2153,6 +2204,7 @@ async fn record_from_entry(entry: &RegistryEntry) -> DependencyProcessRecord {
 )]
 fn spawn_terminal_process(
     executable: &Path,
+    executable_identity: &Path,
     arguments: &[String],
     working_directory: &Path,
     environment: &BTreeMap<String, String>,
@@ -2173,6 +2225,10 @@ fn spawn_terminal_process(
     let pair = native_pty_system()
         .openpty(size.portable())
         .map_err(|_| ProcessDependencyError::Terminal)?;
+    // portable-pty derives both the executed path and argv[0] from one field.
+    // Revalidate the alias immediately before spawn so multicall dispatch is
+    // preserved without accepting a target swapped after policy validation.
+    revalidate_invocation_identity(executable, executable_identity)?;
     let mut command = CommandBuilder::new(executable);
     command.args(arguments);
     command.cwd(working_directory);
@@ -2186,7 +2242,8 @@ fn spawn_terminal_process(
         .spawn_command(command)
         .map_err(|_| ProcessDependencyError::Terminal)?;
     let process_id = child.process_id();
-    let start_time = mark_durable_running(&durable, &log_directory, process_id, executable)?;
+    let start_time =
+        mark_durable_running(&durable, &log_directory, process_id, executable_identity)?;
     let reader = pair
         .master
         .try_clone_reader()
@@ -2990,6 +3047,43 @@ mod tests {
             executable_policy: BTreeMap::new(),
             default_executable_policy: DependencyExecutablePolicy::Deny,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn executable_symlink_preserves_multicall_argv_zero_and_canonical_identity() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let target = Path::new("/bin/sh");
+        let alias = root.path().join("cargo-alias");
+        symlink(target, &alias).expect("executable alias");
+
+        let resolved = resolve_executable(alias.to_str().expect("UTF-8 alias"), &BTreeSet::new())
+            .await
+            .expect("resolved alias");
+        assert_eq!(resolved.invocation_path, alias);
+        assert_eq!(
+            resolved.identity_path,
+            std::fs::canonicalize(target).expect("canonical target")
+        );
+        let mut command = command_for_resolved_executable(&resolved);
+        command.args([
+            "-c",
+            "[ \"$(basename \"$0\")\" = cargo-alias ] || exit 41; printf alias-preserved",
+        ]);
+        let output = command.output().await.expect("execute alias");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"alias-preserved");
+
+        let replacement = root.path().join("replacement-target");
+        std::fs::write(&replacement, b"#!/bin/sh\nexit 0\n").expect("replacement fixture");
+        std::fs::remove_file(&alias).expect("remove original alias");
+        symlink(&replacement, &alias).expect("swapped executable alias");
+        assert_eq!(
+            revalidate_invocation_identity(&alias, &resolved.identity_path),
+            Err(ProcessDependencyError::ExecutableDenied)
+        );
     }
 
     #[tokio::test]

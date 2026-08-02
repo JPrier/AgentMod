@@ -41,7 +41,7 @@ state_migration_version = 1
 [identity]
 id = "fixture.rewriter"
 version = "1.0.0"
-runtime_api = "^0.1"
+runtime_api = "^1.0"
 
 [entrypoint]
 kind = "process"
@@ -91,7 +91,7 @@ state_migration_version = 1
 [identity]
 id = "fixture.observer"
 version = "1.0.0"
-runtime_api = "^0.1"
+runtime_api = "^1.0"
 
 [entrypoint]
 kind = "process"
@@ -178,8 +178,12 @@ create_and_run() {
         sleep 0.05
     done
     grep -F "plugin.invocation_completed" "$marker" >/dev/null
+    grep -F '"event_type":"plugin.observer_delivery_proposed"' "$journal" >/dev/null
+    grep -F '"event_type":"plugin.observer_delivery_dispatched"' "$journal" >/dev/null
+    grep -F '"event_type":"plugin.observer_delivery_completed"' "$journal" >/dev/null
     inspection=$("$cli" session inspect "$session_id" --json)
     printf '%s' "$inspection" | grep -F '"fixture.observer"' >/dev/null
+    printf '%s' "$inspection" | grep -F '"observer_deliveries"' >/dev/null
 }
 
 start_runtime

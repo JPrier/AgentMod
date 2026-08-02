@@ -8,9 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-harness-logic = { path = "../logic" }
-agentmod-harness-protocol = { path = "../../../protocols/harness-protocol" }
-agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-harness-logic = { version = "0.1.0", path = "../logic" }
+agentmod-harness-protocol = { version = "0.1.0", path = "../../../protocols/harness-protocol" }
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
 serde_json.workspace = true
 thiserror.workspace = true
 

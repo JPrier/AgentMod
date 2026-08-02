@@ -2,7 +2,7 @@ schema_version = 1
 kind = "custom"
 required_capabilities = ["approval", "model", "tools"]
 allowed_tool_groups = ["filesystem"]
-allowed_providers = ["mock"]
+allowed_providers = ["deterministic-mock"]
 allowed_plugins = ["runtime.security"]
 
 [identity]
@@ -25,12 +25,12 @@ max_duration_ms = 900000
 [declarations]
 capabilities = ["model", "tools"]
 tools = ["filesystem.read"]
-providers = ["mock"]
+providers = ["deterministic-mock"]
 
 [[nodes]]
 id = "respond"
 kind = "model_call"
-provider = "mock"
+provider = "deterministic-mock"
 retry_limit = 1
 
 [[nodes]]

@@ -8,9 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-event-pipeline = { path = "../../core/event-pipeline" }
-agentmod-graph-engine = { path = "../../core/graph-engine" }
-agentmod-primitives = { path = "../../core/primitives" }
+agentmod-event-pipeline = { version = "0.1.0", path = "../../core/event-pipeline" }
+agentmod-graph-engine = { version = "0.1.0", path = "../../core/graph-engine" }
+agentmod-primitives = { version = "0.1.0", path = "../../core/primitives" }
 blake3.workspace = true
 semver = "1.0"
 serde.workspace = true

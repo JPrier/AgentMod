@@ -1,0 +1,22 @@
+[package]
+name = "agentmod-independent-harness-fixture"
+description = "Independent public-protocol harness process used only by AgentMod E2Es"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+agentmod-harness-protocol = { version = "0.1.0", path = "../../protocols/harness-protocol" }
+blake3.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "test-fixture"
+process = "independent-harness"

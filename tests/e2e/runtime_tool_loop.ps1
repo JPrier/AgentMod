@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $repository = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Push-Location $repository
 try {
-    cargo build -p agentmod-runtime -p agentmod-harness `
+    cargo build --locked -p agentmod-runtime -p agentmod-harness `
         -p agentmod-filesystem-host -p agentmod-cli
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
@@ -46,6 +46,18 @@ try {
         $created = & $cli session create --workspace $workspace `
             --style persistent-chat --json | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw "session creation failed" }
+        $inspection = & $cli session inspect $created.session_id --json |
+            ConvertFrom-Json
+        $toolBatch = @(
+            $inspection.state.style_binding.execution_plan.nodes |
+                Where-Object node_id -eq "tool-batch"
+        )
+        if ($inspection.state.style_binding.version -ne "1.2.0" -or
+            $toolBatch.Count -ne 1 -or
+            $toolBatch[0].executor_id -ne "runtime.tool-gate" -or
+            $toolBatch[0].executor_version -ne "1.1.0") {
+            throw "current persistent graph did not bind the canonical tool executor"
+        }
         $turn = & $cli run "read src/lib.rs and continue" `
             --session $created.session_id `
             --option 'mock_scenario="one_tool_call"' --json | ConvertFrom-Json
@@ -70,6 +82,8 @@ try {
         })
         foreach ($required in @(
             "model.tool_call_proposed",
+            "graph.model_tool_batch_suspended",
+            "graph.provider_tool_batch_bound",
             "tool.call_proposed",
             "tool.call_approved",
             "tool.execution_dispatched",
@@ -81,6 +95,28 @@ try {
                 $details = ($journal -join "`n")
                 throw "missing tool lifecycle event: $required`n$details"
             }
+        }
+        $suspendedAt = [array]::IndexOf(
+            $eventTypes, "graph.model_tool_batch_suspended"
+        )
+        $boundAt = [array]::IndexOf(
+            $eventTypes, "graph.provider_tool_batch_bound"
+        )
+        $proposedAt = [array]::IndexOf($eventTypes, "tool.call_proposed")
+        if ($suspendedAt -lt 0 -or $boundAt -le $suspendedAt -or
+            $proposedAt -le $boundAt) {
+            throw "generic provider batch was not bound before tool effects"
+        }
+        $toolProposals = @($journal | ForEach-Object {
+            $frame = $_ | ConvertFrom-Json
+            if ($frame.event.metadata.event_type -eq "tool.call_proposed") {
+                $frame.event.payload.payload
+            }
+        })
+        if ($toolProposals.Count -ne 1 -or
+            $toolProposals[0].tool -ne "filesystem.read" -or
+            $toolProposals[0].tool -eq "read_file") {
+            throw "provider alias was not committed as the canonical tool ID"
         }
         $conversationEntries = @($journal | ForEach-Object {
             $frame = $_ | ConvertFrom-Json

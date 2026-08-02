@@ -1,0 +1,8 @@
+{
+  "name": "08-cargo-audit",
+  "command": "cargo audit",
+  "exit_code": 0,
+  "elapsed_ms": 2904,
+  "started_at": "2026-07-31T19:00:42.3270570Z",
+  "ended_at": "2026-07-31T19:00:45.2375010Z"
+}

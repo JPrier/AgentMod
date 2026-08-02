@@ -1,0 +1,12 @@
+{
+  "index": 5,
+  "name": "05-runtime_research_loop",
+  "script": "runtime_research_loop.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_research_loop.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 8103,
+  "started_at": "2026-07-31T19:15:29.1586304Z",
+  "ended_at": "2026-07-31T19:15:37.2621977Z",
+  "log": "05-runtime_research_loop.log"
+}

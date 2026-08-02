@@ -8,14 +8,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-cli-logic = { path = "../logic" }
-agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-cli-logic = { version = "0.1.0", path = "../logic" }
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
 blake3.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 uuid.workspace = true
 
 [lints]

@@ -36,8 +36,39 @@ The deterministic examples are
 `tests/fixtures/plugins/plugin-composed-style.toml`, and
 `tests/e2e/runtime_plugin_composition.ps1`.
 
-Not yet activated through the runtime are plugin-provided memory, compaction,
-context transforms, tools beyond the existing protocol seam, and management
-endpoints for disablement/quarantine. WASI and trusted in-process entrypoints are
-represented and validated by the SDK but are not accepted by the current
-runtime catalog mapper.
+Exact node executors and ordered context transforms are active through the
+runtime and plugin-host. Protocol version 10 carries typed interceptor, node,
+context, node-state, memory, and compaction operations through the host's
+complete N-tier path. Each cancellable command binds its exact plugin,
+implementation, declaration, immutable configuration, handler, timeout, typed
+input, readable state, and operation identity; the host independently
+recomputes that semantic request hash before registering the active target.
+Eight process tests pass on Windows and Ubuntu/WSL2, including live
+interceptor/node/context/memory preemption and exact node-state replay.
+They also cover disable/quarantine cancellation and rejection of future work.
+State CAS/read is synchronous, so that proof covers authorization, replay, and
+substitution rather than a timing-dependent preemption race. Runtime
+disable/quarantine commands are session-scoped and require the target plugin to
+be explicitly allowed by the immutable style; the canonical lifecycle record
+binds the exact catalog version and action.
+
+Runtime-side plugin memory retrieval and compaction are live through the exact
+immutable selections. Runtime logic owns proposal and application policy,
+commits dispatch before plugin-host entry, validates the bounded typed result,
+and seals a durable terminal receipt before applying a canonical replacement.
+Restart may reduce an exact receipt without loading or redispatching the
+worker, but live plugin composition is revalidated before any later effect.
+Windows and Ubuntu/WSL2 process suites cover turn-start, context-node,
+before-model, and repeated iteration-start retrieval, compaction, invalid
+output, timeout, and duplicate suppression. Each iteration-start invocation
+owns a distinct identity and receipt; sealing the new result binds only the
+entries introduced by that invocation and preserves prior receipt provenance.
+The Windows suite additionally covers the terminal-receipt crash cut, offline
+reduction, live revalidation before the next effect, and unavailable-plugin
+rejection before a new proposal.
+Tools beyond the existing protocol seam remain incomplete. Canonical observer
+turn integration, bounded startup reconciliation of exact pending observer
+deliveries, enable/unquarantine management, and exact startup reconciliation
+of pending lifecycle requests are active. WASI and trusted in-process
+entrypoints are represented and validated by the SDK but are not accepted by
+the current runtime catalog mapper.

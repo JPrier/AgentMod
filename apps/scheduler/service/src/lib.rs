@@ -6,11 +6,11 @@ use std::sync::{
 };
 
 use agentmod_scheduler_logic::{
-    ExecutionResult, ScheduleCommand, SchedulePayload, ScheduleResult, ScheduleTrigger,
-    SchedulerLogicError, SchedulerLogicPort,
+    ExecutionObservation, ExecutionResult, ScheduleCommand, SchedulePayload, ScheduleResult,
+    ScheduleTrigger, SchedulerLogicError, SchedulerLogicPort,
 };
 use agentmod_scheduler_protocol::{
-    CURRENT_PROTOCOL_VERSION, SchedulePayload as WirePayload, ScheduleSpec,
+    CURRENT_PROTOCOL_VERSION, ScheduleObservation, SchedulePayload as WirePayload, ScheduleSpec,
     ScheduleTrigger as WireTrigger, ScheduledExecution, SchedulerCommand, SchedulerResponse,
 };
 use thiserror::Error;
@@ -101,19 +101,21 @@ impl<L: SchedulerLogicPort> SchedulerService<L> {
                 .list_pending_executions(limit)
                 .map_or_else(error, executions),
             SchedulerCommand::FireRuntimeEvent {
+                source_session_id,
                 event_id,
                 event_type,
             } => self
                 .logic
-                .fire_runtime_event(&event_id, &event_type)
+                .fire_runtime_event(&source_session_id, &event_id, &event_type)
                 .map_or_else(error, executions),
             SchedulerCommand::FireProcessOutput {
+                source_session_id,
                 output_id,
                 process_id,
                 output,
             } => self
                 .logic
-                .fire_process_output(&output_id, &process_id, &output)
+                .fire_process_output(&source_session_id, &output_id, &process_id, &output)
                 .map_or_else(error, executions),
             SchedulerCommand::CompleteExecution {
                 execution_id,
@@ -143,6 +145,14 @@ fn executions(values: Vec<ExecutionResult>) -> SchedulerResponse {
                 execution_id: value.execution_id,
                 scheduled_for_ms: value.scheduled_for_ms,
                 claimed_at_ms: value.claimed_at_ms,
+                observation: value.observation.map(|observation| match observation {
+                    ExecutionObservation::RuntimeEvent { event_id } => {
+                        ScheduleObservation::RuntimeEvent { event_id }
+                    }
+                    ExecutionObservation::ProcessOutput { output_id } => {
+                        ScheduleObservation::ProcessOutput { output_id }
+                    }
+                }),
                 schedule: to_wire_schedule(value.schedule),
             })
             .collect(),
@@ -186,6 +196,9 @@ fn to_logic(value: ScheduleSpec) -> ScheduleCommand {
             WirePayload::Continuation { continuation_id } => {
                 SchedulePayload::Continuation { continuation_id }
             }
+            WirePayload::GraphTrigger { run_id, node_id } => {
+                SchedulePayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
     }
@@ -227,6 +240,9 @@ fn to_wire_schedule(value: ScheduleResult) -> ScheduleSpec {
             SchedulePayload::Prompt { prompt } => WirePayload::Prompt { prompt },
             SchedulePayload::Continuation { continuation_id } => {
                 WirePayload::Continuation { continuation_id }
+            }
+            SchedulePayload::GraphTrigger { run_id, node_id } => {
+                WirePayload::GraphTrigger { run_id, node_id }
             }
         },
         active: value.active,
@@ -290,7 +306,9 @@ mod tests {
         ExecutionResult, ScheduleCommand, ScheduleResult, SchedulerLogicError, SchedulerLogicPort,
         StoreResult,
     };
-    use agentmod_scheduler_protocol::{SchedulerCommand, SchedulerResponse};
+    use agentmod_scheduler_protocol::{
+        CURRENT_PROTOCOL_VERSION, SchedulerCommand, SchedulerResponse,
+    };
 
     use super::SchedulerService;
 
@@ -314,11 +332,13 @@ mod tests {
             &self,
             _: &str,
             _: &str,
+            _: &str,
         ) -> Result<Vec<ExecutionResult>, SchedulerLogicError> {
             unreachable!()
         }
         fn fire_process_output(
             &self,
+            _: &str,
             _: &str,
             _: &str,
             _: &str,
@@ -342,12 +362,12 @@ mod tests {
         ));
         assert!(matches!(
             service.handle(SchedulerCommand::Negotiate {
-                protocol_version: 1,
+                protocol_version: CURRENT_PROTOCOL_VERSION,
                 capabilities: vec!["durable_schedules".to_owned()],
                 authentication_token: "a".repeat(32),
             }),
             SchedulerResponse::Negotiated {
-                protocol_version: 1,
+                protocol_version: CURRENT_PROTOCOL_VERSION,
                 ..
             }
         ));
@@ -364,7 +384,7 @@ mod tests {
         let service = SchedulerService::new(MockLogic, "a".repeat(32)).expect("service");
         assert!(matches!(
             service.handle(SchedulerCommand::Negotiate {
-                protocol_version: 1,
+                protocol_version: CURRENT_PROTOCOL_VERSION,
                 capabilities: vec!["durable_schedules".to_owned()],
                 authentication_token: "b".repeat(32),
             }),

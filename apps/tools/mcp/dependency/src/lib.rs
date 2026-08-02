@@ -26,6 +26,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod oauth;
+
 const MCP_VERSION: &str = "2025-06-18";
 const HTTP_RESUME_ATTEMPTS: usize = 3;
 
@@ -47,6 +49,30 @@ pub enum DependencyTransportConfig {
         url: String,
         /// Optional environment variable containing a bearer token.
         bearer_token_environment: Option<String>,
+        /// Header names mapped to environment variables containing exact values.
+        header_environments: BTreeMap<String, String>,
+    },
+    /// Legacy MCP HTTP+SSE transport with a server-advertised POST endpoint.
+    LegacySse {
+        /// Absolute HTTP(S) SSE endpoint.
+        url: String,
+        /// Header names mapped to environment variables containing exact values.
+        header_environments: BTreeMap<String, String>,
+    },
+    /// Streamable HTTP protected by MCP OAuth authorization-code + PKCE.
+    StreamableHttpOAuth {
+        /// Absolute MCP resource endpoint.
+        url: String,
+        /// Exact authorization-server issuer selected by configuration.
+        authorization_server: String,
+        /// Pre-registered OAuth client identifier.
+        client_id: String,
+        /// Optional environment variable containing a confidential-client secret.
+        client_secret_environment: Option<String>,
+        /// Exact registered redirect URI.
+        redirect_uri: String,
+        /// Requested scopes; empty selects the protected-resource advertised set.
+        scopes: Vec<String>,
     },
     /// Deterministic fixture used by network-free tests.
     Mock {
@@ -99,6 +125,10 @@ pub struct McpDependencyConfig {
     pub authorization_replay_root: PathBuf,
     /// Durable Streamable HTTP session, cursor, and pending-request records.
     pub http_state_root: PathBuf,
+    /// Durable checksum-protected OAuth metadata and secret-reference records.
+    pub oauth_state_root: PathBuf,
+    /// Stable hex-encoded OAuth encryption key supplied by secret configuration.
+    pub oauth_encryption_key_hex: Option<String>,
 }
 
 /// Dependency-owned exact action authorization.
@@ -228,6 +258,51 @@ pub struct DependencyServerHealth {
     pub transport: String,
 }
 
+/// Redacted OAuth authorization state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyOAuthStatusKind {
+    /// No authorization exists.
+    Unauthorized,
+    /// An authorization-code transaction awaits completion.
+    Pending,
+    /// A non-expired or refreshable bearer token is stored by reference.
+    Authorized,
+    /// The prior transaction failed closed.
+    Failed,
+}
+
+/// User-facing authorization start result. It never contains a verifier or token.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyOAuthStart {
+    /// Exact server.
+    pub server_id: String,
+    /// Opaque transaction identifier.
+    pub transaction_id: String,
+    /// URL the user opens to authorize.
+    pub authorization_url: String,
+    /// Transaction expiration in Unix milliseconds.
+    pub expires_at_ms: i64,
+    /// Hash of the exact immutable server/OAuth configuration.
+    pub configuration_hash: String,
+}
+
+/// Redacted authorization status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyOAuthStatus {
+    /// Exact server.
+    pub server_id: String,
+    /// Stable state.
+    pub status: DependencyOAuthStatusKind,
+    /// Opaque active transaction, when pending.
+    pub transaction_id: Option<String>,
+    /// Access-token expiry, when known.
+    pub expires_at_ms: Option<i64>,
+    /// Granted non-secret scopes.
+    pub scopes: Vec<String>,
+    /// Hash of the exact immutable server/OAuth configuration.
+    pub configuration_hash: String,
+}
+
 /// Dependency interface consumed by data.
 #[async_trait]
 pub trait McpDependencyPort: Send + Sync {
@@ -247,6 +322,26 @@ pub trait McpDependencyPort: Send + Sync {
         &self,
         request: DependencyInvokeRequest,
     ) -> Result<DependencyInvokeResponse, McpDependencyError>;
+    /// Discovers metadata and creates an exact PKCE-bound authorization transaction.
+    async fn begin_oauth(
+        &self,
+        server_id: &str,
+        cancellation_id: &str,
+        authorization: DependencyAuthorization,
+    ) -> Result<DependencyOAuthStart, McpDependencyError>;
+    /// Reads redacted durable authorization state.
+    async fn oauth_status(
+        &self,
+        server_id: &str,
+        authorization: DependencyAuthorization,
+    ) -> Result<DependencyOAuthStatus, McpDependencyError>;
+    /// Cancels and invalidates a pending transaction.
+    async fn cancel_oauth(
+        &self,
+        server_id: &str,
+        transaction_id: &str,
+        authorization: DependencyAuthorization,
+    ) -> Result<DependencyOAuthStatus, McpDependencyError>;
     /// Cancels an active request.
     async fn cancel(&self, cancellation_id: &str) -> Result<(), McpDependencyError>;
     /// Shuts all child transports down.
@@ -257,6 +352,12 @@ struct StdioConnection {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+}
+
+struct LegacySseConnection {
+    endpoint: String,
+    response: reqwest::Response,
+    buffered: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -293,6 +394,7 @@ struct RuntimeState {
     last_event_id: Option<String>,
     pending_request: Option<PendingHttpRequest>,
     stdio: Option<StdioConnection>,
+    legacy_sse: Option<LegacySseConnection>,
 }
 
 struct Server {
@@ -312,10 +414,36 @@ fn server_identity(
         DependencyTransportConfig::StreamableHttp {
             url,
             bearer_token_environment,
+            header_environments,
         } => json!({
             "transport": "streamable_http",
             "url": url,
             "bearer_token_environment": bearer_token_environment,
+            "header_environments": header_environments,
+        }),
+        DependencyTransportConfig::StreamableHttpOAuth {
+            url,
+            authorization_server,
+            client_id,
+            client_secret_environment,
+            redirect_uri,
+            scopes,
+        } => json!({
+            "transport": "streamable_http_oauth",
+            "url": url,
+            "authorization_server": authorization_server,
+            "client_id": client_id,
+            "client_secret_environment": client_secret_environment,
+            "redirect_uri": redirect_uri,
+            "scopes": scopes,
+        }),
+        DependencyTransportConfig::LegacySse {
+            url,
+            header_environments,
+        } => json!({
+            "transport": "legacy_sse",
+            "url": url,
+            "header_environments": header_environments,
         }),
         DependencyTransportConfig::Stdio { .. } => json!({"transport":"stdio"}),
         DependencyTransportConfig::Mock { .. } => json!({"transport":"mock"}),
@@ -461,6 +589,9 @@ pub struct McpDependency {
     servers: Arc<BTreeMap<String, Arc<Server>>>,
     client: reqwest::Client,
     active: Arc<Mutex<BTreeMap<String, CancellationToken>>>,
+    oauth_locks: Arc<BTreeMap<String, Arc<Mutex<()>>>>,
+    oauth_callbacks: Arc<Mutex<BTreeMap<String, CancellationToken>>>,
+    oauth_mac_key: Arc<[u8; 32]>,
     authorization_key: Arc<AuthorizationKey>,
 }
 
@@ -470,6 +601,10 @@ impl McpDependency {
     /// # Errors
     ///
     /// Rejects invalid bounds, duplicate IDs, unsafe stdio configuration, and invalid URLs.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "composition validates all transports and constructs immutable server identities before publishing the dependency"
+    )]
     pub fn new(mut config: McpDependencyConfig) -> Result<Self, McpDependencyError> {
         if config.client_name.trim().is_empty()
             || config.client_version.trim().is_empty()
@@ -481,12 +616,38 @@ impl McpDependency {
             || config.authorization_session.trim().is_empty()
             || config.authorization_replay_root.as_os_str().is_empty()
             || config.http_state_root.as_os_str().is_empty()
+            || config.oauth_state_root.as_os_str().is_empty()
         {
             return Err(McpDependencyError::InvalidConfiguration);
         }
+        let has_oauth = config.servers.iter().any(|server| {
+            matches!(
+                server.transport,
+                DependencyTransportConfig::StreamableHttpOAuth { .. }
+            )
+        });
+        if has_oauth
+            && config
+                .oauth_encryption_key_hex
+                .as_deref()
+                .is_none_or(|value| AuthorizationKey::from_hex(value).is_err())
+        {
+            return Err(McpDependencyError::InvalidConfiguration);
+        }
+        let key_material = config
+            .oauth_encryption_key_hex
+            .as_deref()
+            .unwrap_or(&config.authorization_key_hex);
+        let oauth_mac_key = blake3::derive_key(
+            "agentmod/mcp/oauth-secret-store/v1",
+            key_material.as_bytes(),
+        );
         let authorization_key = AuthorizationKey::from_hex(&config.authorization_key_hex)
             .map_err(|_| McpDependencyError::InvalidConfiguration)?;
         config.authorization_key_hex.clear();
+        if let Some(value) = config.oauth_encryption_key_hex.as_mut() {
+            value.clear();
+        }
         let mut server_ids = BTreeSet::new();
         for server in &config.servers {
             validate_server(server)?;
@@ -497,7 +658,9 @@ impl McpDependency {
         std::fs::create_dir_all(&config.authorization_replay_root)
             .map_err(|_| McpDependencyError::ReplayState)?;
         fs::create_dir_all(&config.http_state_root).map_err(|_| McpDependencyError::HttpState)?;
+        fs::create_dir_all(&config.oauth_state_root).map_err(|_| McpDependencyError::OAuthState)?;
         let mut servers = BTreeMap::new();
+        let mut oauth_locks = BTreeMap::new();
         for server in &config.servers {
             let identity = server_identity(
                 server,
@@ -507,6 +670,8 @@ impl McpDependency {
             let http_state_path = matches!(
                 server.transport,
                 DependencyTransportConfig::StreamableHttp { .. }
+                    | DependencyTransportConfig::StreamableHttpOAuth { .. }
+                    | DependencyTransportConfig::LegacySse { .. }
             )
             .then(|| config.http_state_root.join(format!("{}.json", server.id)));
             let durable = http_state_path
@@ -542,19 +707,30 @@ impl McpDependency {
                     }),
                 }),
             );
+            if matches!(
+                server.transport,
+                DependencyTransportConfig::StreamableHttpOAuth { .. }
+            ) {
+                oauth_locks.insert(server.id.clone(), Arc::new(Mutex::new(())));
+            }
         }
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(config.request_timeout)
             .build()
             .map_err(|_| McpDependencyError::InvalidConfiguration)?;
-        Ok(Self {
+        let dependency = Self {
             config: Arc::new(config),
             servers: Arc::new(servers),
             client,
             active: Arc::new(Mutex::new(BTreeMap::new())),
+            oauth_locks: Arc::new(oauth_locks),
+            oauth_callbacks: Arc::new(Mutex::new(BTreeMap::new())),
+            oauth_mac_key: Arc::new(oauth_mac_key),
             authorization_key: Arc::new(authorization_key),
-        })
+        };
+        dependency.recover_oauth_callbacks();
+        Ok(dependency)
     }
 
     fn authorize(&self, authorization: &DependencyAuthorization) -> Result<(), McpDependencyError> {
@@ -650,8 +826,12 @@ impl McpDependency {
                 DependencyTransportConfig::Stdio { .. } => {
                     self.stdio_request(server, &request_id, request).await
                 }
-                DependencyTransportConfig::StreamableHttp { .. } => {
+                DependencyTransportConfig::StreamableHttp { .. }
+                | DependencyTransportConfig::StreamableHttpOAuth { .. } => {
                     self.http_request(server, request).await
+                }
+                DependencyTransportConfig::LegacySse { .. } => {
+                    self.legacy_sse_request(server, request).await
                 }
             }
         };
@@ -838,12 +1018,18 @@ impl McpDependency {
         request: Value,
     ) -> Result<(Value, Vec<DependencyProgress>), McpDependencyError> {
         let _request_guard = server.http_request_lock.lock().await;
-        let DependencyTransportConfig::StreamableHttp {
-            url,
-            bearer_token_environment,
-        } = &server.config.transport
-        else {
-            return Err(McpDependencyError::Protocol);
+        let (url, bearer_token_environment, header_environments) = match &server.config.transport {
+            DependencyTransportConfig::StreamableHttp {
+                url,
+                bearer_token_environment,
+                header_environments,
+            } => (
+                url,
+                bearer_token_environment.as_deref(),
+                Some(header_environments),
+            ),
+            DependencyTransportConfig::StreamableHttpOAuth { url, .. } => (url, None, None),
+            _ => return Err(McpDependencyError::Protocol),
         };
         let request_id = request
             .get("id")
@@ -868,7 +1054,8 @@ impl McpDependency {
                 .resume_http_request(
                     server,
                     url,
-                    bearer_token_environment.as_deref(),
+                    bearer_token_environment,
+                    header_environments,
                     &pending.request_id,
                     &operation_hash,
                     session_id,
@@ -882,6 +1069,7 @@ impl McpDependency {
             .post(url)
             .header("accept", "application/json, text/event-stream")
             .json(&request);
+        builder = apply_configured_headers(builder, header_environments)?;
         let (session_id, protocol_version) = {
             let state = server.state.lock().await;
             (state.session_id.clone(), state.protocol_version.clone())
@@ -896,6 +1084,11 @@ impl McpDependency {
             let token =
                 std::env::var(variable).map_err(|_| McpDependencyError::SecretUnavailable)?;
             builder = builder.bearer_auth(token);
+        } else if matches!(
+            server.config.transport,
+            DependencyTransportConfig::StreamableHttpOAuth { .. }
+        ) {
+            builder = builder.bearer_auth(self.oauth_access_token(server).await?);
         }
         let response = builder
             .send()
@@ -941,7 +1134,8 @@ impl McpDependency {
         self.resume_http_request(
             server,
             url,
-            bearer_token_environment.as_deref(),
+            bearer_token_environment,
+            header_environments,
             request_id,
             &operation_hash,
             session_id,
@@ -960,6 +1154,7 @@ impl McpDependency {
         server: &Server,
         url: &str,
         bearer_token_environment: Option<&str>,
+        header_environments: Option<&BTreeMap<String, String>>,
         request_id: &str,
         operation_hash: &str,
         session_id: String,
@@ -973,6 +1168,7 @@ impl McpDependency {
                 .header("accept", "text/event-stream")
                 .header("last-event-id", &last_event_id)
                 .header("mcp-session-id", &session_id);
+            resume = apply_configured_headers(resume, header_environments)?;
             if let Some(protocol_version) = server.state.lock().await.protocol_version.clone() {
                 resume = resume.header("mcp-protocol-version", protocol_version);
             }
@@ -980,6 +1176,11 @@ impl McpDependency {
                 let token =
                     std::env::var(variable).map_err(|_| McpDependencyError::SecretUnavailable)?;
                 resume = resume.bearer_auth(token);
+            } else if matches!(
+                server.config.transport,
+                DependencyTransportConfig::StreamableHttpOAuth { .. }
+            ) {
+                resume = resume.bearer_auth(self.oauth_access_token(server).await?);
             }
             let response = resume
                 .send()
@@ -1020,6 +1221,277 @@ impl McpDependency {
         }
         Err(McpDependencyError::ResumeExhausted)
     }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the serialized legacy SSE request keeps endpoint, header, progress, and terminal validation adjacent"
+    )]
+    async fn legacy_sse_request(
+        &self,
+        server: &Server,
+        request: Value,
+    ) -> Result<(Value, Vec<DependencyProgress>), McpDependencyError> {
+        let _request_guard = server.http_request_lock.lock().await;
+        let DependencyTransportConfig::LegacySse {
+            url,
+            header_environments,
+        } = &server.config.transport
+        else {
+            return Err(McpDependencyError::Protocol);
+        };
+        let request_id = request
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or(McpDependencyError::Protocol)?
+            .to_owned();
+        let existing_connection = {
+            let mut state = server.state.lock().await;
+            state.legacy_sse.take()
+        };
+        let mut connection = match existing_connection {
+            Some(connection) => connection,
+            None => {
+                self.connect_legacy_sse(server, url, header_environments)
+                    .await?
+            }
+        };
+        let mut post = self
+            .client
+            .post(&connection.endpoint)
+            .header("accept", "application/json, text/event-stream")
+            .json(&request);
+        post = apply_configured_headers(post, Some(header_environments))?;
+        let (session_id, protocol_version) = {
+            let state = server.state.lock().await;
+            (state.session_id.clone(), state.protocol_version.clone())
+        };
+        if let Some(session_id) = session_id {
+            post = post.header("mcp-session-id", session_id);
+        }
+        if let Some(protocol_version) = protocol_version {
+            post = post.header("mcp-protocol-version", protocol_version);
+        }
+        let response = post
+            .send()
+            .await
+            .map_err(|_| McpDependencyError::Transport)?;
+        self.update_http_session(server, &response).await?;
+        if !response.status().is_success() {
+            return Err(McpDependencyError::RemoteError);
+        }
+        let mut progress = Vec::new();
+        if response.status() != reqwest::StatusCode::ACCEPTED
+            && response.content_length().is_some_and(|length| length != 0)
+        {
+            let parsed = read_http_response(
+                response,
+                &request_id,
+                self.config.maximum_message_bytes,
+                None,
+            )
+            .await?;
+            progress.extend(parsed.progress);
+            if let Some(result) = parsed.result {
+                server.state.lock().await.legacy_sse = Some(connection);
+                return Ok((result, progress));
+            }
+        }
+        loop {
+            let event = read_legacy_sse_event(
+                &mut connection.response,
+                &mut connection.buffered,
+                self.config.maximum_message_bytes,
+            )
+            .await?;
+            if let Some(event_id) = event.id {
+                self.update_http_cursor(server, Some(event_id), None)
+                    .await?;
+            }
+            if event.event.as_deref() == Some("endpoint") {
+                return Err(McpDependencyError::Protocol);
+            }
+            let value: Value =
+                serde_json::from_str(&event.data).map_err(|_| McpDependencyError::Protocol)?;
+            if value.get("method").and_then(Value::as_str) == Some("notifications/progress") {
+                let params = value.get("params").cloned().unwrap_or(Value::Null);
+                progress.push(DependencyProgress {
+                    token: params.get("progressToken").cloned(),
+                    value: params,
+                });
+                continue;
+            }
+            if value.get("id").and_then(Value::as_str) != Some(request_id.as_str()) {
+                continue;
+            }
+            if value.get("error").is_some() {
+                return Err(McpDependencyError::RemoteError);
+            }
+            let result = value
+                .get("result")
+                .cloned()
+                .ok_or(McpDependencyError::Protocol)?;
+            server.state.lock().await.legacy_sse = Some(connection);
+            return Ok((result, progress));
+        }
+    }
+
+    async fn connect_legacy_sse(
+        &self,
+        server: &Server,
+        url: &str,
+        header_environments: &BTreeMap<String, String>,
+    ) -> Result<LegacySseConnection, McpDependencyError> {
+        let mut get = self.client.get(url).header("accept", "text/event-stream");
+        get = apply_configured_headers(get, Some(header_environments))?;
+        let (session_id, protocol_version, last_event_id) = {
+            let state = server.state.lock().await;
+            (
+                state.session_id.clone(),
+                state.protocol_version.clone(),
+                state.last_event_id.clone(),
+            )
+        };
+        if let Some(session_id) = session_id {
+            get = get.header("mcp-session-id", session_id);
+        }
+        if let Some(protocol_version) = protocol_version {
+            get = get.header("mcp-protocol-version", protocol_version);
+        }
+        if let Some(last_event_id) = last_event_id {
+            get = get.header("last-event-id", last_event_id);
+        }
+        let response = get
+            .send()
+            .await
+            .map_err(|_| McpDependencyError::Transport)?;
+        self.update_http_session(server, &response).await?;
+        if !response.status().is_success()
+            || !response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("text/event-stream"))
+        {
+            return Err(McpDependencyError::Protocol);
+        }
+        let mut connection = LegacySseConnection {
+            endpoint: String::new(),
+            response,
+            buffered: Vec::new(),
+        };
+        loop {
+            let event = read_legacy_sse_event(
+                &mut connection.response,
+                &mut connection.buffered,
+                self.config.maximum_message_bytes,
+            )
+            .await?;
+            if let Some(event_id) = event.id {
+                self.update_http_cursor(server, Some(event_id), None)
+                    .await?;
+            }
+            if event.event.as_deref() != Some("endpoint") {
+                continue;
+            }
+            connection.endpoint = validate_legacy_sse_endpoint(url, &event.data)?;
+            return Ok(connection);
+        }
+    }
+}
+
+struct LegacySseEvent {
+    event: Option<String>,
+    id: Option<String>,
+    data: String,
+}
+
+async fn read_legacy_sse_event(
+    response: &mut reqwest::Response,
+    buffered: &mut Vec<u8>,
+    maximum_message_bytes: usize,
+) -> Result<LegacySseEvent, McpDependencyError> {
+    loop {
+        if let Some((frame_end, separator_length)) = sse_frame_end(buffered) {
+            let frame = buffered.drain(..frame_end).collect::<Vec<_>>();
+            buffered.drain(..separator_length);
+            let text = std::str::from_utf8(&frame).map_err(|_| McpDependencyError::Protocol)?;
+            let mut event = None;
+            let mut id = None;
+            let mut data = Vec::new();
+            for line in text.lines() {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                if line.starts_with(':') {
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("event:") {
+                    event = Some(value.trim_start().to_owned());
+                } else if let Some(value) = line.strip_prefix("id:") {
+                    let value = value.trim_start();
+                    if !value.is_empty() {
+                        id = Some(value.to_owned());
+                    }
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    data.push(value.trim_start().to_owned());
+                }
+            }
+            if data.is_empty() {
+                continue;
+            }
+            if id
+                .as_deref()
+                .is_some_and(|value| !valid_http_identifier(value))
+            {
+                return Err(McpDependencyError::Protocol);
+            }
+            return Ok(LegacySseEvent {
+                event,
+                id,
+                data: data.join("\n"),
+            });
+        }
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|_| McpDependencyError::Transport)?
+            .ok_or(McpDependencyError::Transport)?;
+        if buffered.len().saturating_add(chunk.len()) > maximum_message_bytes {
+            return Err(McpDependencyError::MessageTooLarge);
+        }
+        buffered.extend_from_slice(&chunk);
+    }
+}
+
+fn sse_frame_end(bytes: &[u8]) -> Option<(usize, usize)> {
+    bytes
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| (index, 2))
+        .or_else(|| {
+            bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| (index, 4))
+        })
+}
+
+fn validate_legacy_sse_endpoint(base: &str, endpoint: &str) -> Result<String, McpDependencyError> {
+    if endpoint.is_empty() || endpoint.len() > 4_096 || endpoint.chars().any(char::is_control) {
+        return Err(McpDependencyError::Protocol);
+    }
+    let base = url::Url::parse(base).map_err(|_| McpDependencyError::Protocol)?;
+    let endpoint = base
+        .join(endpoint)
+        .map_err(|_| McpDependencyError::Protocol)?;
+    if endpoint.scheme() != base.scheme()
+        || endpoint.host_str() != base.host_str()
+        || endpoint.port_or_known_default() != base.port_or_known_default()
+        || endpoint.username() != ""
+        || endpoint.password().is_some()
+        || endpoint.fragment().is_some()
+    {
+        return Err(McpDependencyError::Protocol);
+    }
+    Ok(endpoint.to_string())
 }
 
 struct ParsedHttpResponse {
@@ -1144,6 +1616,10 @@ impl McpDependencyPort for McpDependency {
                 transport: match server.config.transport {
                     DependencyTransportConfig::Stdio { .. } => "stdio",
                     DependencyTransportConfig::StreamableHttp { .. } => "streamable_http",
+                    DependencyTransportConfig::StreamableHttpOAuth { .. } => {
+                        "streamable_http_oauth"
+                    }
+                    DependencyTransportConfig::LegacySse { .. } => "legacy_sse",
                     DependencyTransportConfig::Mock { .. } => "mock",
                 }
                 .to_owned(),
@@ -1259,6 +1735,35 @@ impl McpDependencyPort for McpDependency {
         Ok(DependencyInvokeResponse { result, progress })
     }
 
+    async fn begin_oauth(
+        &self,
+        server_id: &str,
+        cancellation_id: &str,
+        authorization: DependencyAuthorization,
+    ) -> Result<DependencyOAuthStart, McpDependencyError> {
+        self.authorize(&authorization)?;
+        self.oauth_begin(server_id, cancellation_id).await
+    }
+
+    async fn oauth_status(
+        &self,
+        server_id: &str,
+        authorization: DependencyAuthorization,
+    ) -> Result<DependencyOAuthStatus, McpDependencyError> {
+        self.authorize(&authorization)?;
+        self.oauth_redacted_status(server_id)
+    }
+
+    async fn cancel_oauth(
+        &self,
+        server_id: &str,
+        transaction_id: &str,
+        authorization: DependencyAuthorization,
+    ) -> Result<DependencyOAuthStatus, McpDependencyError> {
+        self.authorize(&authorization)?;
+        self.oauth_cancel(server_id, transaction_id).await
+    }
+
     async fn cancel(&self, cancellation_id: &str) -> Result<(), McpDependencyError> {
         self.active
             .lock()
@@ -1271,6 +1776,10 @@ impl McpDependencyPort for McpDependency {
     }
 
     async fn shutdown(&self) {
+        let callbacks = std::mem::take(&mut *self.oauth_callbacks.lock().await);
+        for callback in callbacks.into_values() {
+            callback.cancel();
+        }
         for server in self.servers.values() {
             let mut state = server.state.lock().await;
             if let Some(mut connection) = state.stdio.take() {
@@ -1320,6 +1829,10 @@ fn normalize_json(value: &Value) -> Value {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "all transport-specific security validation remains exhaustive and adjacent"
+)]
 fn validate_server(server: &DependencyServerConfig) -> Result<(), McpDependencyError> {
     if server.id.is_empty()
         || server.id.len() > 64
@@ -1340,10 +1853,7 @@ fn validate_server(server: &DependencyServerConfig) -> Result<(), McpDependencyE
                 || program.contains('\0')
                 || arguments.iter().any(|value| value.contains('\0'))
                 || environment.iter().any(|(key, value)| {
-                    key.is_empty()
-                        || key.contains(['=', '\0'])
-                        || value.contains('\0')
-                        || sensitive_name(key)
+                    key.is_empty() || key.contains(['=', '\0']) || value.contains('\0')
                 })
             {
                 return Err(McpDependencyError::InvalidConfiguration);
@@ -1352,6 +1862,7 @@ fn validate_server(server: &DependencyServerConfig) -> Result<(), McpDependencyE
         DependencyTransportConfig::StreamableHttp {
             url,
             bearer_token_environment,
+            header_environments,
         } => {
             let parsed =
                 url::Url::parse(url).map_err(|_| McpDependencyError::InvalidConfiguration)?;
@@ -1371,17 +1882,107 @@ fn validate_server(server: &DependencyServerConfig) -> Result<(), McpDependencyE
             }) {
                 return Err(McpDependencyError::InvalidConfiguration);
             }
+            validate_header_environments(header_environments)?;
+        }
+        DependencyTransportConfig::StreamableHttpOAuth {
+            url,
+            authorization_server,
+            client_id,
+            client_secret_environment,
+            redirect_uri,
+            scopes,
+        } => {
+            validate_secure_url(url, false)?;
+            validate_secure_url(authorization_server, false)?;
+            let redirect = url::Url::parse(redirect_uri)
+                .map_err(|_| McpDependencyError::InvalidConfiguration)?;
+            let redirect_host = redirect
+                .host_str()
+                .ok_or(McpDependencyError::InvalidConfiguration)?;
+            if !matches!(redirect_host, "localhost" | "127.0.0.1" | "::1")
+                || redirect.scheme() != "http"
+                || redirect.port().is_none()
+                || redirect.fragment().is_some()
+                || client_id.is_empty()
+                || client_id.len() > 1_024
+                || scopes.len() > 64
+                || scopes.iter().any(|scope| {
+                    scope.is_empty() || scope.len() > 256 || scope.chars().any(char::is_whitespace)
+                })
+                || client_secret_environment.as_ref().is_some_and(|name| {
+                    name.is_empty()
+                        || !name.bytes().all(|byte| {
+                            byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                        })
+                })
+            {
+                return Err(McpDependencyError::InvalidConfiguration);
+            }
+        }
+        DependencyTransportConfig::LegacySse {
+            url,
+            header_environments,
+        } => {
+            validate_secure_url(url, false)?;
+            validate_header_environments(header_environments)?;
         }
         DependencyTransportConfig::Mock { .. } => {}
     }
     Ok(())
 }
 
-fn sensitive_name(name: &str) -> bool {
-    let upper = name.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL"]
-        .iter()
-        .any(|marker| upper.contains(marker))
+fn apply_configured_headers(
+    mut builder: reqwest::RequestBuilder,
+    header_environments: Option<&BTreeMap<String, String>>,
+) -> Result<reqwest::RequestBuilder, McpDependencyError> {
+    if let Some(header_environments) = header_environments {
+        for (header, environment) in header_environments {
+            let value =
+                std::env::var(environment).map_err(|_| McpDependencyError::SecretUnavailable)?;
+            let name = reqwest::header::HeaderName::from_bytes(header.as_bytes())
+                .map_err(|_| McpDependencyError::InvalidConfiguration)?;
+            let value = reqwest::header::HeaderValue::from_str(&value)
+                .map_err(|_| McpDependencyError::InvalidConfiguration)?;
+            builder = builder.header(name, value);
+        }
+    }
+    Ok(builder)
+}
+
+fn validate_header_environments(
+    header_environments: &BTreeMap<String, String>,
+) -> Result<(), McpDependencyError> {
+    if header_environments.len() > 64
+        || header_environments.iter().any(|(header, environment)| {
+            reqwest::header::HeaderName::from_bytes(header.as_bytes()).is_err()
+                || environment.is_empty()
+                || !environment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+    {
+        Err(McpDependencyError::InvalidConfiguration)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_secure_url(value: &str, allow_query: bool) -> Result<(), McpDependencyError> {
+    let parsed = url::Url::parse(value).map_err(|_| McpDependencyError::InvalidConfiguration)?;
+    let host = parsed
+        .host_str()
+        .ok_or(McpDependencyError::InvalidConfiguration)?;
+    let secure = parsed.scheme() == "https"
+        || (parsed.scheme() == "http" && matches!(host, "localhost" | "127.0.0.1" | "::1"));
+    if !secure
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+        || (!allow_query && parsed.query().is_some())
+    {
+        return Err(McpDependencyError::InvalidConfiguration);
+    }
+    Ok(())
 }
 
 fn spawn_stdio(config: &DependencyServerConfig) -> Result<StdioConnection, McpDependencyError> {
@@ -1500,6 +2101,21 @@ pub enum McpDependencyError {
     /// Durable HTTP session or cursor state is corrupt or unavailable.
     #[error("MCP HTTP recovery state unavailable")]
     HttpState,
+    /// Durable OAuth state or secret storage is corrupt, unavailable, or substituted.
+    #[error("MCP OAuth recovery state unavailable")]
+    OAuthState,
+    /// Authorization discovery metadata failed validation.
+    #[error("MCP OAuth metadata is invalid")]
+    OAuthMetadata,
+    /// Authorization transaction is missing, expired, cancelled, or mismatched.
+    #[error("MCP OAuth transaction is invalid")]
+    OAuthTransaction,
+    /// OAuth authorization is required before accessing the server.
+    #[error("MCP OAuth authorization is required")]
+    OAuthRequired,
+    /// OAuth token exchange or refresh failed.
+    #[error("MCP OAuth token operation failed")]
+    OAuthToken,
     /// Transport failed.
     #[error("MCP transport failed")]
     Transport,
@@ -1573,6 +2189,8 @@ mod tests {
             authorization_key_hex: encode_hex(&KEY),
             authorization_replay_root: root.join("replay"),
             http_state_root: root.join("http-state"),
+            oauth_state_root: root.join("oauth-state"),
+            oauth_encryption_key_hex: None,
         })
         .expect("dependency")
     }
@@ -1755,6 +2373,7 @@ mod tests {
                 transport: DependencyTransportConfig::StreamableHttp {
                     url: "http://example.com/mcp".to_owned(),
                     bearer_token_environment: None,
+                    header_environments: BTreeMap::new(),
                 },
             }],
             client_name: "agentmod".to_owned(),
@@ -1767,6 +2386,8 @@ mod tests {
             authorization_key_hex: encode_hex(&KEY),
             authorization_replay_root: root.path().join("replay"),
             http_state_root: root.path().join("http-state"),
+            oauth_state_root: root.path().join("oauth-state"),
+            oauth_encryption_key_hex: None,
         });
         assert!(matches!(bad, Err(McpDependencyError::InvalidConfiguration)));
     }
@@ -1782,6 +2403,7 @@ mod tests {
                 transport: DependencyTransportConfig::StreamableHttp {
                     url: url.to_owned(),
                     bearer_token_environment: None,
+                    header_environments: BTreeMap::new(),
                 },
             }],
             client_name: "agentmod".into(),
@@ -1794,6 +2416,8 @@ mod tests {
             authorization_key_hex: encode_hex(&KEY),
             authorization_replay_root: root.path().join("replay"),
             http_state_root: root.path().join("http-state"),
+            oauth_state_root: root.path().join("oauth-state"),
+            oauth_encryption_key_hex: None,
         };
         let dependency = McpDependency::new(config("http://127.0.0.1:1/mcp", "owner", "session"))
             .expect("dependency");
@@ -1907,6 +2531,7 @@ mod tests {
                 transport: DependencyTransportConfig::StreamableHttp {
                     url: format!("http://{address}/mcp"),
                     bearer_token_environment: None,
+                    header_environments: BTreeMap::new(),
                 },
             }],
             client_name: "agentmod".into(),
@@ -1919,6 +2544,8 @@ mod tests {
             authorization_key_hex: encode_hex(&KEY),
             authorization_replay_root: root.path().join("replay"),
             http_state_root: root.path().join("http-state"),
+            oauth_state_root: root.path().join("oauth-state"),
+            oauth_encryption_key_hex: None,
         })
         .expect("dependency");
         let server = dependency.server("http-fixture").expect("server");
@@ -1932,6 +2559,66 @@ mod tests {
         assert_eq!(
             server.state.lock().await.last_event_id.as_deref(),
             Some("event-2")
+        );
+        server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    async fn streamable_http_request_cancellation_aborts_the_in_flight_transport() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let (mut connection, _) = listener.accept().await.expect("POST");
+            let request = read_test_http_request(&mut connection).await;
+            assert!(request.starts_with("POST /mcp "));
+            accepted.send(()).expect("signal accepted request");
+            let mut byte = [0_u8; 1];
+            let _ = tokio::time::timeout(Duration::from_secs(2), connection.read(&mut byte)).await;
+        });
+        let root = tempfile::tempdir().expect("root");
+        let dependency = McpDependency::new(McpDependencyConfig {
+            servers: vec![DependencyServerConfig {
+                id: "cancel-fixture".into(),
+                display_name: "Cancellation fixture".into(),
+                active: true,
+                transport: DependencyTransportConfig::StreamableHttp {
+                    url: format!("http://{address}/mcp"),
+                    bearer_token_environment: None,
+                    header_environments: BTreeMap::new(),
+                },
+            }],
+            client_name: "agentmod".into(),
+            client_version: "0.1.0".into(),
+            request_timeout: Duration::from_secs(5),
+            maximum_message_bytes: 64 * 1024,
+            maximum_servers: 1,
+            authorization_owner: "owner".into(),
+            authorization_session: "session".into(),
+            authorization_key_hex: encode_hex(&KEY),
+            authorization_replay_root: root.path().join("replay"),
+            http_state_root: root.path().join("http-state"),
+            oauth_state_root: root.path().join("oauth-state"),
+            oauth_encryption_key_hex: None,
+        })
+        .expect("dependency");
+        let server = dependency.server("cancel-fixture").expect("server");
+        let pending_dependency = dependency.clone();
+        let pending = tokio::spawn(async move {
+            pending_dependency
+                .request(&server, "fixture/cancel", json!({}), Some("http-cancel"))
+                .await
+        });
+        accepted_rx.await.expect("request reached server");
+        dependency
+            .cancel("http-cancel")
+            .await
+            .expect("cancel active request");
+        assert_eq!(
+            pending.await.expect("request task"),
+            Err(McpDependencyError::Cancelled)
         );
         server_task.await.expect("server task");
     }
@@ -2009,6 +2696,7 @@ mod tests {
                     transport: DependencyTransportConfig::StreamableHttp {
                         url: format!("http://{address}/mcp"),
                         bearer_token_environment: None,
+                        header_environments: BTreeMap::new(),
                     },
                 }],
                 client_name: "agentmod".into(),
@@ -2021,6 +2709,8 @@ mod tests {
                 authorization_key_hex: encode_hex(&KEY),
                 authorization_replay_root: root.path().join("replay"),
                 http_state_root: root.path().join("http-state"),
+                oauth_state_root: root.path().join("oauth-state"),
+                oauth_encryption_key_hex: None,
             })
             .expect("dependency")
         };
@@ -2055,6 +2745,127 @@ mod tests {
         assert!(state.pending_request.is_none());
         drop(state);
         server_task.await.expect("server task");
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the raw transport fixture asserts the complete GET/endpoint/POST/SSE exchange"
+    )]
+    async fn legacy_sse_uses_advertised_same_origin_endpoint_and_exact_runtime_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server_task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("legacy SSE GET");
+            let get = read_test_http_request(&mut stream).await;
+            let lower = get.to_ascii_lowercase();
+            assert!(get.starts_with("GET /events "));
+            assert!(lower.contains("\r\nmcp-session-id: legacy-session\r\n"));
+            assert!(lower.contains("\r\nmcp-protocol-version: 2025-06-18\r\n"));
+            assert!(lower.contains("\r\nlast-event-id: legacy-0\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: keep-alive\r\n\r\n",
+                )
+                .await
+                .expect("SSE headers");
+            let endpoint =
+                b"id: legacy-1\nevent: endpoint\ndata: /messages?session=legacy-session\n\n";
+            stream
+                .write_all(format!("{:X}\r\n", endpoint.len()).as_bytes())
+                .await
+                .expect("endpoint chunk size");
+            stream.write_all(endpoint).await.expect("endpoint event");
+            stream.write_all(b"\r\n").await.expect("endpoint chunk end");
+            stream.flush().await.expect("flush endpoint");
+
+            let (mut post, _) = listener.accept().await.expect("legacy POST");
+            let posted = read_test_http_request(&mut post).await;
+            let lower = posted.to_ascii_lowercase();
+            assert!(posted.starts_with("POST /messages?session=legacy-session "));
+            assert!(lower.contains("\r\nmcp-session-id: legacy-session\r\n"));
+            assert!(lower.contains("\r\nmcp-protocol-version: 2025-06-18\r\n"));
+            let request: Value =
+                serde_json::from_str(posted.split_once("\r\n\r\n").expect("POST body").1)
+                    .expect("request JSON");
+            let request_id = request["id"].as_str().expect("request ID");
+            post.write_all(
+                b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .expect("POST accepted");
+            post.shutdown().await.expect("close POST");
+
+            let events = format!(
+                "id: legacy-2\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{\"progress\":1}}}}\n\nid: legacy-3\ndata: {{\"jsonrpc\":\"2.0\",\"id\":\"{request_id}\",\"result\":{{\"value\":\"legacy\"}}}}\n\n"
+            );
+            stream
+                .write_all(format!("{:X}\r\n", events.len()).as_bytes())
+                .await
+                .expect("result chunk size");
+            stream
+                .write_all(events.as_bytes())
+                .await
+                .expect("legacy result");
+            stream.write_all(b"\r\n").await.expect("result chunk end");
+            stream.flush().await.expect("flush result");
+        });
+        let root = tempfile::tempdir().expect("root");
+        let dependency = McpDependency::new(McpDependencyConfig {
+            servers: vec![DependencyServerConfig {
+                id: "legacy-fixture".into(),
+                display_name: "Legacy fixture".into(),
+                active: true,
+                transport: DependencyTransportConfig::LegacySse {
+                    url: format!("http://{address}/events"),
+                    header_environments: BTreeMap::new(),
+                },
+            }],
+            client_name: "agentmod".into(),
+            client_version: "0.1.0".into(),
+            request_timeout: Duration::from_secs(2),
+            maximum_message_bytes: 64 * 1024,
+            maximum_servers: 1,
+            authorization_owner: "owner".into(),
+            authorization_session: "session".into(),
+            authorization_key_hex: encode_hex(&KEY),
+            authorization_replay_root: root.path().join("replay"),
+            http_state_root: root.path().join("http-state"),
+            oauth_state_root: root.path().join("oauth-state"),
+            oauth_encryption_key_hex: None,
+        })
+        .expect("dependency");
+        let server = dependency.server("legacy-fixture").expect("server");
+        {
+            let mut state = server.state.lock().await;
+            state.protocol_version = Some(MCP_VERSION.into());
+            state.session_id = Some("legacy-session".into());
+            state.last_event_id = Some("legacy-0".into());
+        }
+        let (result, progress) = dependency
+            .request(&server, "fixture/legacy", json!({}), None)
+            .await
+            .expect("legacy response");
+        assert_eq!(result["value"], "legacy");
+        assert_eq!(progress.len(), 1);
+        assert_eq!(
+            server.state.lock().await.last_event_id.as_deref(),
+            Some("legacy-3")
+        );
+        server_task.await.expect("server task");
+    }
+
+    #[test]
+    fn legacy_sse_rejects_cross_origin_advertised_endpoint() {
+        assert_eq!(
+            validate_legacy_sse_endpoint(
+                "https://example.test/events",
+                "https://attacker.test/messages"
+            ),
+            Err(McpDependencyError::Protocol)
+        );
     }
 
     #[test]

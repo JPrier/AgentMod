@@ -9,19 +9,21 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-agentmod-primitives = { path = "../../core/primitives" }
-agentmod-protocol-support = { path = "../../core/protocol-support" }
-agentmod-event-pipeline = { path = "../../core/event-pipeline" }
-agentmod-filesystem-host-data = { path = "../../apps/tools/filesystem/data" }
-agentmod-filesystem-host-dependency = { path = "../../apps/tools/filesystem/dependency" }
-agentmod-filesystem-host-logic = { path = "../../apps/tools/filesystem/logic" }
-agentmod-filesystem-host-service = { path = "../../apps/tools/filesystem/service" }
-agentmod-runtime-data = { path = "../../apps/runtime/data" }
-agentmod-runtime-dependency = { path = "../../apps/runtime/dependency" }
-agentmod-runtime-logic = { path = "../../apps/runtime/logic" }
-agentmod-runtime-protocol = { path = "../../protocols/runtime-protocol" }
-agentmod-runtime-service = { path = "../../apps/runtime/service" }
-agentmod-tool-protocol = { path = "../../protocols/tool-protocol" }
+agentmod-primitives = { version = "0.1.0", path = "../../core/primitives" }
+agentmod-event-model = { version = "0.1.0", path = "../../core/event-model" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../core/protocol-support" }
+agentmod-event-pipeline = { version = "0.1.0", path = "../../core/event-pipeline" }
+agentmod-filesystem-host-data = { version = "0.1.0", path = "../../apps/tools/filesystem/data" }
+agentmod-filesystem-host-dependency = { version = "0.1.0", path = "../../apps/tools/filesystem/dependency" }
+agentmod-filesystem-host-logic = { version = "0.1.0", path = "../../apps/tools/filesystem/logic" }
+agentmod-filesystem-host-service = { version = "0.1.0", path = "../../apps/tools/filesystem/service" }
+agentmod-runtime-data = { version = "0.1.0", path = "../../apps/runtime/data" }
+agentmod-runtime-dependency = { version = "0.1.0", path = "../../apps/runtime/dependency" }
+agentmod-runtime-logic = { version = "0.1.0", path = "../../apps/runtime/logic" }
+agentmod-runtime-protocol = { version = "0.1.0", path = "../../protocols/runtime-protocol" }
+agentmod-runtime-service = { version = "0.1.0", path = "../../apps/runtime/service" }
+agentmod-session-style-sdk = { version = "0.1.0", path = "../../sdk/session-style-sdk" }
+agentmod-tool-protocol = { version = "0.1.0", path = "../../protocols/tool-protocol" }
 async-trait.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

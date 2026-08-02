@@ -54,6 +54,11 @@ use crate::{
         DependencyCancelToolRequest, DependencyToolCommand, DependencyToolEvent,
         ProcessToolHostDependency, ToolHostDependencyError, ToolHostDependencyPort,
     },
+    workspace::{
+        DependencyBindWorkspaceSessionRequest, DependencyEnsureWorkspaceLeaseRequest,
+        DependencyWorkspaceLeaseRecord, DependencyWorkspaceSessionBinding,
+        WorkspaceLeaseDependencyError, WorkspaceLeaseDependencyPort,
+    },
 };
 
 /// First-party local storage plus an injected harness registry.
@@ -203,20 +208,23 @@ impl RuntimeSchedulerDependencyPort for SupervisedRuntimeDependencies {
 
     fn fire_runtime_event(
         &self,
+        source_session_id: &str,
         event_id: &str,
         event_type: &str,
     ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
-        self.scheduler.fire_runtime_event(event_id, event_type)
+        self.scheduler
+            .fire_runtime_event(source_session_id, event_id, event_type)
     }
 
     fn fire_process_output(
         &self,
+        source_session_id: &str,
         output_id: &str,
         process_id: &str,
         output: &str,
     ) -> Result<Vec<DependencyScheduledExecution>, RuntimeSchedulerDependencyError> {
         self.scheduler
-            .fire_process_output(output_id, process_id, output)
+            .fire_process_output(source_session_id, output_id, process_id, output)
     }
 
     fn complete_execution(
@@ -250,6 +258,13 @@ impl ContinuationDependencyPort for SupervisedRuntimeDependencies {
     ) -> Result<DependencyTransitionContinuationResponse, ContinuationDependencyError> {
         self.continuations.transition_continuation(request)
     }
+
+    fn list_continuations(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<DependencyContinuationRecord>, ContinuationDependencyError> {
+        self.continuations.list_continuations(limit)
+    }
 }
 
 impl RuntimeDependencyPort for SupervisedRuntimeDependencies {
@@ -258,6 +273,22 @@ impl RuntimeDependencyPort for SupervisedRuntimeDependencies {
         request: DependencyStorageHealthRequest,
     ) -> Result<DependencyStorageHealthResponse, DependencyError> {
         LocalRuntimeDependencies.check_storage(request)
+    }
+}
+
+impl WorkspaceLeaseDependencyPort for SupervisedRuntimeDependencies {
+    fn ensure_workspace_lease(
+        &self,
+        request: DependencyEnsureWorkspaceLeaseRequest,
+    ) -> Result<DependencyWorkspaceLeaseRecord, WorkspaceLeaseDependencyError> {
+        LocalRuntimeDependencies.ensure_workspace_lease(request)
+    }
+
+    fn bind_workspace_session(
+        &self,
+        request: DependencyBindWorkspaceSessionRequest,
+    ) -> Result<DependencyWorkspaceSessionBinding, WorkspaceLeaseDependencyError> {
+        LocalRuntimeDependencies.bind_workspace_session(request)
     }
 }
 
@@ -311,6 +342,16 @@ impl SessionCatalogDependencyPort for SupervisedRuntimeDependencies {
         request: DependencyCreateChildSessionRequest,
     ) -> Result<DependencyCreatedSession, SessionCatalogDependencyError> {
         FileSessionCatalogDependency.create_child_session(request)
+    }
+
+    fn append_child_message(
+        &self,
+        request: crate::registry::DependencyAppendChildMessageRequest,
+    ) -> Result<
+        crate::registry::DependencyChildMessageReceipt,
+        crate::registry::ChildMessageDependencyError,
+    > {
+        FileSessionCatalogDependency.append_child_message(request)
     }
 
     fn list_sessions(
@@ -388,6 +429,11 @@ impl ToolHostDependencyPort for SupervisedRuntimeDependencies {
         &self,
         command: DependencyToolCommand,
     ) -> Result<Vec<DependencyToolEvent>, ToolHostDependencyError> {
+        crate::tool::validate_bound_workspace_authorization(
+            &command,
+            &self.receipts.sessions_root().join(".workspace-leases"),
+        )?;
+        crate::tool::validate(&command)?;
         if let Some(events) = self.receipts.load(&command)? {
             return Ok(events);
         }
@@ -484,6 +530,19 @@ impl ToolHostDependencyPort for SupervisedRuntimeDependencies {
                     &active.workspace,
                     &request.cancellation_id,
                 )
+                .await;
+            active
+                .cancellation
+                .finish(result.as_ref().copied().unwrap_or(false))
+                .await;
+            return result;
+        }
+        if active.tool.starts_with("mcp.") {
+            let result = self
+                .mcp
+                .cancel(DependencyCancelToolRequest {
+                    cancellation_id: request.cancellation_id,
+                })
                 .await;
             active
                 .cancellation

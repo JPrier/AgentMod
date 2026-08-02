@@ -1,0 +1,1048 @@
+{
+  "style_id": "planner-worker",
+  "style_version": "1.2.0",
+  "kind": "built_in",
+  "built_in_semantic": "planner_worker",
+  "graph": {
+    "format_version": 1,
+    "entry_index": 5,
+    "budget": {
+      "max_steps": 750,
+      "max_tokens": 900000,
+      "max_cost_micros": 90000000,
+      "max_duration_ms": 3300000
+    },
+    "declarations": {
+      "capabilities": [
+        "agents",
+        "artifacts",
+        "model"
+      ],
+      "tools": [],
+      "providers": [
+        "deterministic-mock"
+      ],
+      "events": [],
+      "plugins": []
+    },
+    "variables": [
+      {
+        "name": "evidence_child",
+        "type": {
+          "kind": "child_id"
+        },
+        "scope": "run",
+        "producer": "spawn-evidence",
+        "merge_contributors": [],
+        "consumers": [
+          "join-workers",
+          "wait-evidence"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 128,
+        "security_classification": "internal"
+      },
+      {
+        "name": "evidence_task",
+        "type": {
+          "kind": "string"
+        },
+        "scope": "run",
+        "producer": "plan",
+        "merge_contributors": [],
+        "consumers": [
+          "spawn-evidence"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 8192,
+        "security_classification": "internal"
+      },
+      {
+        "name": "integration_artifact",
+        "type": {
+          "kind": "artifact_reference"
+        },
+        "scope": "run",
+        "producer": "persist-integration",
+        "merge_contributors": [],
+        "consumers": [
+          "done",
+          "review"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 512,
+        "security_classification": "confidential"
+      },
+      {
+        "name": "integration_disposition",
+        "type": {
+          "kind": "enum",
+          "values": [
+            "response_complete",
+            "tool_requests"
+          ]
+        },
+        "scope": "run",
+        "producer": "integrate",
+        "merge_contributors": [],
+        "consumers": [
+          "integration-route"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 64,
+        "security_classification": "internal"
+      },
+      {
+        "name": "integration_result",
+        "type": {
+          "kind": "node_result_reference"
+        },
+        "scope": "run",
+        "producer": "integrate",
+        "merge_contributors": [],
+        "consumers": [
+          "done",
+          "persist-integration",
+          "review"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 512,
+        "security_classification": "internal"
+      },
+      {
+        "name": "iteration",
+        "type": {
+          "kind": "map",
+          "value_type": {
+            "kind": "boolean"
+          },
+          "max_entries": 1
+        },
+        "scope": "run",
+        "producer": "revision",
+        "merge_contributors": [],
+        "consumers": [
+          "revision"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 128,
+        "security_classification": "internal"
+      },
+      {
+        "name": "joined_results",
+        "type": {
+          "kind": "node_result_reference"
+        },
+        "scope": "run",
+        "producer": "join-workers",
+        "merge_contributors": [],
+        "consumers": [
+          "integrate"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 512,
+        "security_classification": "internal"
+      },
+      {
+        "name": "plan_disposition",
+        "type": {
+          "kind": "enum",
+          "values": [
+            "response_complete",
+            "tool_requests"
+          ]
+        },
+        "scope": "run",
+        "producer": "plan",
+        "merge_contributors": [],
+        "consumers": [
+          "plan-route"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 64,
+        "security_classification": "internal"
+      },
+      {
+        "name": "plan_result",
+        "type": {
+          "kind": "node_result_reference"
+        },
+        "scope": "run",
+        "producer": "plan",
+        "merge_contributors": [],
+        "consumers": [
+          "plan-route"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 512,
+        "security_classification": "internal"
+      },
+      {
+        "name": "planner_child",
+        "type": {
+          "kind": "child_id"
+        },
+        "scope": "run",
+        "producer": "spawn-planner",
+        "merge_contributors": [],
+        "consumers": [
+          "join-workers",
+          "wait-planner"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 128,
+        "security_classification": "internal"
+      },
+      {
+        "name": "planner_task",
+        "type": {
+          "kind": "string"
+        },
+        "scope": "run",
+        "producer": "plan",
+        "merge_contributors": [],
+        "consumers": [
+          "spawn-planner"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 8192,
+        "security_classification": "internal"
+      }
+    ],
+    "nodes": [
+      {
+        "index": 0,
+        "id": "done",
+        "kind": "complete_session",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "integration_artifact",
+          "integration_result"
+        ],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 1,
+        "id": "integrate",
+        "kind": "model_call",
+        "configuration": {
+          "type": "model_request",
+          "disposition_output": "integration_disposition",
+          "result_output": "integration_result",
+          "provider_options": {
+            "mock_planner_phase": "integrate"
+          },
+          "json_outputs": {}
+        },
+        "condition": null,
+        "tool": null,
+        "provider": "deterministic-mock",
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "joined_results"
+        ],
+        "write_variables": [
+          "integration_disposition",
+          "integration_result"
+        ],
+        "retry_limit": 2,
+        "max_iterations": null
+      },
+      {
+        "index": 2,
+        "id": "integration-route",
+        "kind": "conditional_branch",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "integration_disposition"
+        ],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 3,
+        "id": "join-workers",
+        "kind": "join_results",
+        "configuration": {
+          "type": "join_results",
+          "required": [
+            "evidence",
+            "planner"
+          ],
+          "optional": [],
+          "minimum_successes": 2,
+          "failure_policy": "wait_required",
+          "ordering_policy": "member_id",
+          "timeout_ms": 600000,
+          "cancellation_propagates": true,
+          "result_projection": "node_references",
+          "artifact_collection": "all"
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "evidence_child",
+          "planner_child"
+        ],
+        "write_variables": [
+          "joined_results"
+        ],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 4,
+        "id": "persist-integration",
+        "kind": "persist_artifact",
+        "configuration": {
+          "type": "persist_artifact",
+          "content": {
+            "kind": "provider_result_text",
+            "reference_variable": "integration_result"
+          },
+          "mime_type": "text/markdown",
+          "security": "private",
+          "retention": "session"
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "integration_result"
+        ],
+        "write_variables": [
+          "integration_artifact"
+        ],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 5,
+        "id": "plan",
+        "kind": "model_call",
+        "configuration": {
+          "type": "model_request",
+          "disposition_output": "plan_disposition",
+          "result_output": "plan_result",
+          "provider_options": {
+            "mock_planner_phase": "plan"
+          },
+          "json_outputs": {
+            "evidence_task": "/tasks/1/description",
+            "planner_task": "/tasks/0/description"
+          }
+        },
+        "condition": null,
+        "tool": null,
+        "provider": "deterministic-mock",
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [
+          "evidence_task",
+          "plan_disposition",
+          "plan_result",
+          "planner_task"
+        ],
+        "retry_limit": 2,
+        "max_iterations": null
+      },
+      {
+        "index": 6,
+        "id": "plan-route",
+        "kind": "conditional_branch",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "plan_disposition",
+          "plan_result"
+        ],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 7,
+        "id": "review",
+        "kind": "review",
+        "configuration": {
+          "type": "review",
+          "input": {
+            "kind": "variable",
+            "variable": "integration_result"
+          },
+          "artifact_references": [],
+          "result_schema": {
+            "maximum_findings": 16,
+            "maximum_finding_bytes": 1024,
+            "maximum_rejections": 2,
+            "require_artifact_evidence": false
+          },
+          "routes": {
+            "approved": "done",
+            "revision": "revision",
+            "failure": "structured-failure"
+          },
+          "maximum_revisions": 2
+        },
+        "condition": null,
+        "tool": null,
+        "provider": "deterministic-mock",
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "integration_artifact",
+          "integration_result"
+        ],
+        "write_variables": [],
+        "retry_limit": 2,
+        "max_iterations": null
+      },
+      {
+        "index": 8,
+        "id": "revision",
+        "kind": "loop",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "iteration"
+        ],
+        "write_variables": [
+          "iteration"
+        ],
+        "retry_limit": 0,
+        "max_iterations": 2
+      },
+      {
+        "index": 9,
+        "id": "spawn-evidence",
+        "kind": "spawn_child_agent",
+        "configuration": {
+          "type": "spawn_child_agent",
+          "task_input": {
+            "kind": "variable",
+            "variable": "evidence_task"
+          },
+          "task_id_prefix": "evidence-task",
+          "child_style": "ephemeral-turn@1.2.0",
+          "tool_groups": [],
+          "maximum_children": 1,
+          "maximum_depth": 2,
+          "token_budget": 100000,
+          "context_budget_tokens": 64000,
+          "cost_budget_micros": 10000000,
+          "workspace": {
+            "mode": "shared_read_only"
+          },
+          "artifact_references": [],
+          "security_classification": "internal",
+          "approval_required": true
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "evidence_task"
+        ],
+        "write_variables": [
+          "evidence_child"
+        ],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 10,
+        "id": "spawn-planner",
+        "kind": "spawn_child_agent",
+        "configuration": {
+          "type": "spawn_child_agent",
+          "task_input": {
+            "kind": "variable",
+            "variable": "planner_task"
+          },
+          "task_id_prefix": "planner-task",
+          "child_style": "ephemeral-turn@1.2.0",
+          "tool_groups": [],
+          "maximum_children": 1,
+          "maximum_depth": 2,
+          "token_budget": 100000,
+          "context_budget_tokens": 64000,
+          "cost_budget_micros": 10000000,
+          "workspace": {
+            "mode": "shared_read_only"
+          },
+          "artifact_references": [],
+          "security_classification": "internal",
+          "approval_required": true
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "planner_task"
+        ],
+        "write_variables": [
+          "planner_child"
+        ],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 11,
+        "id": "structured-failure",
+        "kind": "fail",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 12,
+        "id": "wait-evidence",
+        "kind": "wait_for_agents",
+        "configuration": {
+          "type": "wait_for_agents",
+          "children": {
+            "kind": "variable",
+            "variable": "evidence_child"
+          },
+          "maximum_children": 1,
+          "minimum_successes": 1,
+          "timeout_ms": 600000,
+          "cancellation": "cascade"
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "evidence_child"
+        ],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 13,
+        "id": "wait-fanout",
+        "kind": "parallel_branch",
+        "configuration": {
+          "type": "parallel_branch",
+          "max_parallelism": 2,
+          "max_queue_depth": 2,
+          "join_target": "join-workers",
+          "join_policy": "all",
+          "variable_merge_policies": {},
+          "serialization_policy": null
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 14,
+        "id": "wait-planner",
+        "kind": "wait_for_agents",
+        "configuration": {
+          "type": "wait_for_agents",
+          "children": {
+            "kind": "variable",
+            "variable": "planner_child"
+          },
+          "maximum_children": 1,
+          "minimum_successes": 1,
+          "timeout_ms": 600000,
+          "cancellation": "cascade"
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "planner_child"
+        ],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      }
+    ],
+    "edges": [
+      {
+        "from": 1,
+        "to": 2,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 2,
+        "to": 4,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "integration_disposition"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "string",
+                "value": "response_complete"
+              }
+            }
+          }
+        },
+        "label": "integrated"
+      },
+      {
+        "from": 2,
+        "to": 11,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "integration_disposition"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "string",
+                "value": "tool_requests"
+              }
+            }
+          }
+        },
+        "label": "unsupported-tool-request"
+      },
+      {
+        "from": 3,
+        "to": 1,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 4,
+        "to": 7,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 5,
+        "to": 6,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 6,
+        "to": 10,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "plan_disposition"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "string",
+                "value": "response_complete"
+              }
+            }
+          }
+        },
+        "label": "planned"
+      },
+      {
+        "from": 6,
+        "to": 11,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "plan_disposition"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "string",
+                "value": "tool_requests"
+              }
+            }
+          }
+        },
+        "label": "unsupported-plan-tool-request"
+      },
+      {
+        "from": 7,
+        "to": 0,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 7,
+        "to": 8,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 7,
+        "to": 11,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 8,
+        "to": 10,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "iteration"
+                  },
+                  {
+                    "segment": "key",
+                    "value": "remaining"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "boolean",
+                "value": true
+              }
+            }
+          }
+        },
+        "label": "revise"
+      },
+      {
+        "from": 8,
+        "to": 11,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "iteration"
+                  },
+                  {
+                    "segment": "key",
+                    "value": "remaining"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "boolean",
+                "value": false
+              }
+            }
+          }
+        },
+        "label": "revision-limit"
+      },
+      {
+        "from": 9,
+        "to": 13,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 10,
+        "to": 9,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 12,
+        "to": 3,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 13,
+        "to": 12,
+        "condition": null,
+        "label": "evidence"
+      },
+      {
+        "from": 13,
+        "to": 14,
+        "condition": null,
+        "label": "planner"
+      },
+      {
+        "from": 14,
+        "to": 3,
+        "condition": null,
+        "label": null
+      }
+    ],
+    "cache_key": {
+      "graph_content_hash": "af1e2eafbcda40fad7797195ad59c581d238e1678c5b57e14f86472c4b48e3b2",
+      "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+      "capability_set_hash": "740ec0810d6069d7cb3b1338c71fca1a20bea948cc6e94730dc81f165e16435d",
+      "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+      "combined_hash": "c3b137f008711f64f4fc0477b6b4a9288782170051df0292a855eb2717dae006"
+    }
+  },
+  "interceptor_order": [
+    "runtime-style-policy"
+  ],
+  "interceptors": [
+    {
+      "id": "runtime-style-policy",
+      "owner": "runtime.security",
+      "event": "action.proposed",
+      "stage": 10,
+      "priority": 100,
+      "before": [],
+      "after": [],
+      "supported_decisions": [
+        "continue",
+        "replace",
+        "reject",
+        "require_approval",
+        "cancel"
+      ],
+      "required_capabilities": [
+        "approval"
+      ]
+    }
+  ],
+  "required_capabilities": [
+    "agents",
+    "approval",
+    "artifacts",
+    "model"
+  ],
+  "allowed_tool_groups": [],
+  "allowed_providers": [
+    "deterministic-mock"
+  ],
+  "allowed_plugins": [
+    "runtime.security"
+  ],
+  "harness": {
+    "id": "native",
+    "required_capabilities": [
+      "cancellation",
+      "streaming",
+      "structured_context_replacement",
+      "token_usage"
+    ]
+  },
+  "memory": {
+    "provider": "file",
+    "scopes": [
+      "session",
+      "project"
+    ],
+    "retrieval_timing": "before_model_request",
+    "query": {
+      "source": "current_input_and_goal",
+      "include_active_artifacts": true,
+      "include_style_context": true,
+      "max_query_bytes": 32768
+    },
+    "max_items": 64,
+    "max_injected_bytes": 524288,
+    "write_policy": "session_completion",
+    "injection_location": "before_current_input"
+  },
+  "compaction": {
+    "strategy": "summary",
+    "trigger_tokens": 750000,
+    "reserved_context_tokens": 32000,
+    "max_provider_projection_tokens": 250000,
+    "preserve_unresolved_tasks": true,
+    "preserve_active_processes": true,
+    "preservation_requirements": [
+      "system_instructions",
+      "current_input",
+      "pending_control_state",
+      "artifact_references",
+      "memory_provenance",
+      "active_graph_state",
+      "tool_call_correlation"
+    ]
+  },
+  "approvals": {
+    "default": "ask",
+    "groups": {
+      "filesystem.read": "allow"
+    }
+  },
+  "budgets": {
+    "max_iterations": 4,
+    "max_steps": 1000,
+    "max_tokens": 1000000,
+    "max_cost_micros": 100000000,
+    "max_duration_ms": 3600000
+  },
+  "child_agents": {
+    "max_children": 8,
+    "max_concurrent": 2,
+    "max_depth": 2,
+    "per_child_token_budget": 100000,
+    "child_style": "ephemeral-turn@1.2.0",
+    "workspace_mode": "shared_read_only",
+    "inherit_provider": true,
+    "inherit_model": true,
+    "context_budget_tokens": 64000,
+    "per_child_cost_budget_micros": 10000000,
+    "memory_access": "none",
+    "join_behavior": "all",
+    "cancellation_behavior": "cascade",
+    "reviewer_max_attempts": 2
+  },
+  "retry": {
+    "max_attempts": 4,
+    "initial_backoff_ms": 100,
+    "max_backoff_ms": 5000,
+    "retryable_failures": [
+      "provider.rate_limit",
+      "provider.unavailable"
+    ]
+  },
+  "termination": {
+    "allowed_outcomes": [
+      "complete_session",
+      "fail"
+    ],
+    "on_hard_limit": "fail",
+    "require_explicit_terminal_node": true
+  },
+  "selection": {
+    "requires_explicit_selection": true,
+    "model_may_select": false
+  },
+  "cache_key": {
+    "style_content_hash": "00716ec1dbdbeea930ff43b3515c01fd22dd0d5591525bc81b21691b944423d0",
+    "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+    "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+    "capability_set_hash": "ed32eaa3749667657942a541cc1cd92d768c994f382cc55088354c23cfa41df4",
+    "combined_hash": "d0602852ac995fafa91f845b6ac88fd71b7642656636dd9ce60d36efd8c3aa70"
+  }
+}

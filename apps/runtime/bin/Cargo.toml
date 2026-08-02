@@ -12,13 +12,13 @@ name = "agentmod-runtime"
 path = "src/main.rs"
 
 [dependencies]
-agentmod-event-pipeline = { path = "../../../core/event-pipeline" }
-agentmod-protocol-support = { path = "../../../core/protocol-support" }
-agentmod-runtime-data = { path = "../data" }
-agentmod-runtime-dependency = { path = "../dependency" }
-agentmod-runtime-logic = { path = "../logic" }
-agentmod-runtime-protocol = { path = "../../../protocols/runtime-protocol" }
-agentmod-runtime-service = { path = "../service" }
+agentmod-event-pipeline = { version = "0.1.0", path = "../../../core/event-pipeline" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../../core/protocol-support" }
+agentmod-runtime-data = { version = "0.1.0", path = "../data" }
+agentmod-runtime-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-runtime-logic = { version = "0.1.0", path = "../logic" }
+agentmod-runtime-protocol = { version = "0.1.0", path = "../../../protocols/runtime-protocol" }
+agentmod-runtime-service = { version = "0.1.0", path = "../service" }
 serde_json.workspace = true
 tokio.workspace = true
 uuid.workspace = true

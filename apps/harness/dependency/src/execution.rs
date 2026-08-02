@@ -2,8 +2,12 @@
 
 use std::{
     collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::Path,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crate::StaticProviderCatalogDependency;
@@ -238,6 +242,7 @@ impl ProviderExecutionDependency for StaticProviderCatalogDependency {
             .into_iter()
             .map(|option| (option.key, option.value))
             .collect();
+        wait_for_test_gate(&options, &request.cancellation_reference)?;
         if options
             .get("mock_scenario")
             .is_some_and(|value| matches!(value.as_str(), "approval_write" | "approval_multi"))
@@ -297,6 +302,10 @@ impl ProviderExecutionDependency for StaticProviderCatalogDependency {
             process_action_events(&options)?
         } else if scenario == "planner_worker" {
             planner_worker_events(&options, &request.entries)?
+        } else if scenario == "planner_worker_child" {
+            planner_worker_child_events(&request.entries)?
+        } else if scenario == "graph_b_review_sequence" {
+            graph_b_review_sequence_events(&request.entries)?
         } else {
             scenario_events(scenario, text)?
         };
@@ -306,6 +315,123 @@ impl ProviderExecutionDependency for StaticProviderCatalogDependency {
         }
         Ok(DependencyProviderExecutionResponse { events })
     }
+}
+
+fn planner_worker_child_events(
+    entries: &[DependencyConversationEntry],
+) -> Result<Vec<DependencyProviderEvent>, ProviderExecutionDependencyError> {
+    let work = entries.iter().find_map(|entry| match entry {
+        DependencyConversationEntry::Metadata { key, value_json }
+            if key == "agentmod.canonical_node_work" =>
+        {
+            Some(value_json.as_str())
+        }
+        _ => None,
+    });
+    let work: serde_json::Value = serde_json::from_str(work.ok_or_else(|| {
+        ProviderExecutionDependencyError::InvalidRequest(String::from(
+            "planner worker child canonical node work is missing",
+        ))
+    })?)
+    .map_err(|_| {
+        ProviderExecutionDependencyError::InvalidRequest(String::from(
+            "planner worker child canonical node work is invalid",
+        ))
+    })?;
+    let iteration = work
+        .get("loop_iteration")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            ProviderExecutionDependencyError::InvalidRequest(String::from(
+                "planner worker child loop iteration is invalid",
+            ))
+        })?;
+    let mut events = vec![DependencyProviderEvent::Started];
+    let (call_id, tool, arguments) = match iteration {
+        0 => (
+            "planner-worker-edit",
+            "filesystem.edit",
+            r#"{"path":"worker.txt","replacements":[{"old":"parent-owned","new":"child-owned\n","expected_occurrences":1}]}"#,
+        ),
+        1 => (
+            "planner-worker-test",
+            "process.run",
+            r#"{"executable":"cargo","arguments":["test","--quiet"],"working_directory":".","output_limit_bytes":262144,"timeout_ms":30000,"cleanup":"remove_logs_on_success"}"#,
+        ),
+        2 => ("planner-worker-diff", "git.diff", r#"{"path":"."}"#),
+        _ => {
+            events.push(DependencyProviderEvent::TextDelta(String::from(
+                "worker edit, test, and diff evidence completed",
+            )));
+            events.push(completed(
+                "stop",
+                DependencyUsage {
+                    input_tokens: 24,
+                    output_tokens: 8,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            ));
+            return Ok(events);
+        }
+    };
+    append_tool_call(&mut events, CONTINUATION_ONE, call_id, tool, arguments);
+    Ok(events)
+}
+
+fn wait_for_test_gate(
+    options: &BTreeMap<String, String>,
+    cancellation_reference: &str,
+) -> Result<(), ProviderExecutionDependencyError> {
+    let Some(gate_id) = options.get("mock_gate_id") else {
+        return Ok(());
+    };
+    if gate_id.is_empty()
+        || gate_id.len() > 64
+        || !gate_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(invalid_gate("mock_gate_id is invalid"));
+    }
+    let root = std::env::var_os("AGENTMOD_HARNESS_TEST_GATE_ROOT")
+        .ok_or_else(|| invalid_gate("mock gate root is unavailable"))?;
+    let gate = Path::new(&root).join(gate_id);
+    fs::create_dir_all(&gate).map_err(|_| invalid_gate("mock gate cannot be initialized"))?;
+    let request_hash = blake3::hash(cancellation_reference.as_bytes()).to_hex();
+    let started = gate.join(format!("started-{request_hash}"));
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&started)
+    {
+        Ok(mut marker) => marker
+            .write_all(cancellation_reference.as_bytes())
+            .map_err(|_| invalid_gate("mock gate start cannot be recorded"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(_) => return Err(invalid_gate("mock gate start cannot be recorded")),
+    }
+    let timeout_ms = options
+        .get("mock_gate_timeout_ms")
+        .map_or(Ok(30_000_u64), |value| value.parse::<u64>())
+        .map_err(|_| invalid_gate("mock gate timeout is invalid"))?;
+    if !(10..=120_000).contains(&timeout_ms) {
+        return Err(invalid_gate("mock gate timeout is invalid"));
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    while !gate.join("release").is_file() {
+        if Instant::now() >= deadline {
+            return Err(invalid_gate("mock gate timed out"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(gate.join(format!("released-{request_hash}")), b"released")
+        .map_err(|_| invalid_gate("mock gate release cannot be recorded"))?;
+    Ok(())
+}
+
+fn invalid_gate(message: &str) -> ProviderExecutionDependencyError {
+    ProviderExecutionDependencyError::InvalidRequest(message.to_owned())
 }
 
 pub(crate) fn validate_runtime_grant(
@@ -375,7 +501,7 @@ fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
 fn validate_request(
     request: &DependencyProviderExecutionRequest,
 ) -> Result<(), ProviderExecutionDependencyError> {
-    if request.provider_key != "deterministic-mock" {
+    if !matches!(request.provider_key.as_str(), "deterministic-mock" | "mock") {
         return Err(ProviderExecutionDependencyError::ProviderNotConfigured);
     }
     if request.model_key.trim().is_empty()
@@ -390,6 +516,10 @@ fn validate_request(
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the deterministic planner fixture keeps every phase and exact structured review response visible together"
+)]
 fn planner_worker_events(
     options: &BTreeMap<String, String>,
     entries: &[DependencyConversationEntry],
@@ -409,8 +539,166 @@ fn planner_worker_events(
         }
         _ => None,
     });
+    let generic_review = entries.iter().find_map(|entry| match entry {
+        DependencyConversationEntry::Metadata { key, value_json }
+            if key == "agentmod.generic_review_request" =>
+        {
+            Some(value_json.as_str())
+        }
+        _ => None,
+    });
+    let canonical_model_inputs = entries.iter().find_map(|entry| match entry {
+        DependencyConversationEntry::Metadata { key, value_json }
+            if key == "agentmod.canonical_model_inputs" =>
+        {
+            Some(value_json.as_str())
+        }
+        _ => None,
+    });
+    if phase.is_none()
+        && pending_task.is_none()
+        && let Some(review) = generic_review
+    {
+        let request: serde_json::Value = serde_json::from_str(review).map_err(|_| {
+            ProviderExecutionDependencyError::InvalidRequest(String::from(
+                "planner_worker generic review metadata is invalid",
+            ))
+        })?;
+        let schema_version = request
+            .get("schema_version")
+            .and_then(serde_json::Value::as_u64);
+        let artifact_reference = request
+            .get("artifact_evidence")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|evidence| evidence.first())
+            .and_then(|evidence| evidence.get("artifact_reference"))
+            .and_then(serde_json::Value::as_str);
+        if schema_version == Some(2) && artifact_reference.is_none() {
+            return Err(ProviderExecutionDependencyError::InvalidRequest(
+                String::from("planner_worker generic review artifact evidence is missing"),
+            ));
+        }
+        let revision = request
+            .get("current_revision")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| {
+                ProviderExecutionDependencyError::InvalidRequest(String::from(
+                    "planner_worker generic review revision is invalid",
+                ))
+            })?;
+        let known_task_ids = request
+            .get("known_task_ids")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                ProviderExecutionDependencyError::InvalidRequest(String::from(
+                    "planner_worker generic review task set is invalid",
+                ))
+            })?;
+        let rejected = known_task_ids
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .find(|task| task.starts_with("evidence-task"))
+            .or_else(|| known_task_ids.iter().find_map(serde_json::Value::as_str))
+            .ok_or_else(|| {
+                ProviderExecutionDependencyError::InvalidRequest(String::from(
+                    "planner_worker generic review task set is empty",
+                ))
+            })?;
+        let response = if revision == 0 {
+            serde_json::json!({
+                "approved": false,
+                "rejected_task_ids": [rejected],
+                "findings": [{
+                    "code": "planner.evidence_revision",
+                    "message": "evidence task requires one artifact-bound revision",
+                    "artifact_references": [artifact_reference.unwrap_or("integration_artifact")],
+                }],
+            })
+        } else {
+            serde_json::json!({
+                "approved": true,
+                "rejected_task_ids": [],
+                "findings": [],
+            })
+        };
+        let text = serde_json::to_string(&response).map_err(|_| {
+            ProviderExecutionDependencyError::InvalidRequest(String::from(
+                "planner_worker generic review response is invalid",
+            ))
+        })?;
+        return Ok(vec![
+            DependencyProviderEvent::Started,
+            DependencyProviderEvent::TextDelta(text),
+            completed(
+                "stop",
+                DependencyUsage {
+                    input_tokens: 24,
+                    output_tokens: 16,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+            ),
+        ]);
+    }
+    let mut integration_member_order = None;
+    if phase == Some("integrate_v1_4") {
+        let inputs = canonical_model_inputs.ok_or_else(|| {
+            ProviderExecutionDependencyError::InvalidRequest(String::from(
+                "planner_worker v1.4 integration inputs are missing",
+            ))
+        })?;
+        let inputs: serde_json::Value = serde_json::from_str(inputs).map_err(|_| {
+            ProviderExecutionDependencyError::InvalidRequest(String::from(
+                "planner_worker v1.4 integration inputs are invalid",
+            ))
+        })?;
+        let evidence = inputs
+            .pointer("/joined/artifact_evidence")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                ProviderExecutionDependencyError::InvalidRequest(String::from(
+                    "planner_worker v1.4 integration artifact evidence is missing",
+                ))
+            })?;
+        if evidence.len() < 2
+            || evidence.iter().any(|item| {
+                item.get("member_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_none()
+                    || item
+                        .get("child_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_none()
+                    || item.get("content").is_none()
+            })
+        {
+            return Err(ProviderExecutionDependencyError::InvalidRequest(
+                String::from("planner_worker v1.4 integration evidence is incomplete"),
+            ));
+        }
+        let member_order = evidence
+            .iter()
+            .map(|item| {
+                item.get("member_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| {
+                        ProviderExecutionDependencyError::InvalidRequest(String::from(
+                            "planner_worker v1.4 integration member identity is invalid",
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if member_order.windows(2).any(|pair| pair[0] > pair[1]) {
+            return Err(ProviderExecutionDependencyError::InvalidRequest(
+                String::from("planner_worker v1.4 integration evidence order is not canonical"),
+            ));
+        }
+        integration_member_order = Some(member_order);
+    }
     let text = match (phase, pending_task) {
-        (Some("plan"), _) => String::from(
+        (Some("plan" | "plan_v1_4"), _) => String::from(
             r#"{"tasks":[{"task_id":"task-1","description":"inspect runtime child recovery"},{"task_id":"task-2","description":"inspect planner join evidence"}]}"#,
         ),
         (None, Some(task)) => format!(
@@ -419,6 +707,17 @@ fn planner_worker_events(
         (Some("integrate"), _) => format!(
             r#"{{"integration":"combined runtime-owned child handoffs","iteration":{iteration},"tests":"deterministic fixture passed"}}"#
         ),
+        (Some("integrate_v1_4"), _) => serde_json::json!({
+            "integration": "combined runtime-owned child handoffs",
+            "iteration": iteration,
+            "tests": "deterministic fixture passed",
+            "member_order": integration_member_order.ok_or_else(|| {
+                ProviderExecutionDependencyError::InvalidRequest(String::from(
+                    "planner_worker v1.4 integration order is missing",
+                ))
+            })?,
+        })
+        .to_string(),
         (Some("review"), _) if iteration == 0 => String::from(
             r#"{"approved":false,"rejected_task_ids":["task-2"],"findings":["task-2 requires one evidence-bound revision"]}"#,
         ),
@@ -431,6 +730,100 @@ fn planner_worker_events(
             ));
         }
     };
+    Ok(vec![
+        DependencyProviderEvent::Started,
+        DependencyProviderEvent::TextDelta(text),
+        completed(
+            "stop",
+            DependencyUsage {
+                input_tokens: 24,
+                output_tokens: 16,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        ),
+    ])
+}
+
+fn graph_b_review_sequence_events(
+    entries: &[DependencyConversationEntry],
+) -> Result<Vec<DependencyProviderEvent>, ProviderExecutionDependencyError> {
+    let request = entries
+        .iter()
+        .find_map(|entry| match entry {
+            DependencyConversationEntry::Metadata { key, value_json }
+                if key == "agentmod.generic_review_request" =>
+            {
+                Some(value_json)
+            }
+            _ => None,
+        })
+        .ok_or_else(|| {
+            ProviderExecutionDependencyError::InvalidRequest(String::from(
+                "graph_b_review_sequence requires generic review metadata",
+            ))
+        })?;
+    let request: serde_json::Value = serde_json::from_str(request).map_err(|_| {
+        ProviderExecutionDependencyError::InvalidRequest(String::from(
+            "graph_b_review_sequence metadata is invalid",
+        ))
+    })?;
+    let revision = request
+        .get("current_revision")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            ProviderExecutionDependencyError::InvalidRequest(String::from(
+                "graph_b_review_sequence requires current_revision",
+            ))
+        })?;
+    let known_task_ids = request
+        .get("known_task_ids")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            ProviderExecutionDependencyError::InvalidRequest(String::from(
+                "graph_b_review_sequence requires known_task_ids",
+            ))
+        })?;
+    let mut known_task_ids = known_task_ids
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                ProviderExecutionDependencyError::InvalidRequest(String::from(
+                    "graph_b_review_sequence known_task_ids must contain only strings",
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    known_task_ids.sort_unstable();
+    known_task_ids.dedup();
+    let rejected_task = known_task_ids.first().copied().ok_or_else(|| {
+        ProviderExecutionDependencyError::InvalidRequest(String::from(
+            "graph_b_review_sequence requires a known task",
+        ))
+    })?;
+    let (approved, findings, rejected_task_ids) = if revision == 0 {
+        (
+            false,
+            serde_json::json!([{
+                "code": "graph_b.revision_required",
+                "message": "deterministic reviewer requires one evidence-bound revision",
+                "artifact_references": [],
+            }]),
+            serde_json::json!([rejected_task]),
+        )
+    } else {
+        (true, serde_json::json!([]), serde_json::json!([]))
+    };
+    let text = serde_json::to_string(&BTreeMap::from([
+        ("approved", serde_json::Value::Bool(approved)),
+        ("findings", findings),
+        ("rejected_task_ids", rejected_task_ids),
+    ]))
+    .map_err(|_| {
+        ProviderExecutionDependencyError::InvalidRequest(String::from(
+            "graph_b_review_sequence response serialization failed",
+        ))
+    })?;
     Ok(vec![
         DependencyProviderEvent::Started,
         DependencyProviderEvent::TextDelta(text),
@@ -916,6 +1309,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deterministic_gate_rejects_path_like_identifiers_before_environment_access() {
+        let options = BTreeMap::from([(String::from("mock_gate_id"), String::from("../escape"))]);
+        assert!(matches!(
+            wait_for_test_gate(&options, "request"),
+            Err(ProviderExecutionDependencyError::InvalidRequest(message))
+                if message == "mock_gate_id is invalid"
+        ));
+    }
+
+    #[test]
     fn deterministic_scenarios_cover_required_provider_behaviors() {
         let dependency = StaticProviderCatalogDependency::built_in();
         for scenario in [
@@ -950,6 +1353,24 @@ mod tests {
             ));
             assert!(response.events.len() <= MAX_EVENTS);
         }
+    }
+
+    #[test]
+    fn frozen_mock_provider_selector_uses_the_same_deterministic_fixture() {
+        let dependency = StaticProviderCatalogDependency::built_in();
+        let mut legacy = request("text");
+        legacy.provider_key = String::from("mock");
+        assert!(
+            dependency.execute_provider(legacy).is_ok(),
+            "frozen 1.1 built-in styles retain their exact mock provider selector"
+        );
+
+        let mut unsupported = request("text");
+        unsupported.provider_key = String::from("unconfigured-provider");
+        assert!(matches!(
+            dependency.execute_provider(unsupported),
+            Err(ProviderExecutionDependencyError::ProviderNotConfigured)
+        ));
     }
 
     #[test]
@@ -997,6 +1418,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the deterministic planner fixture test keeps all canonical phases visible together"
+    )]
     fn planner_worker_fixture_is_stateless_and_phase_driven() {
         let dependency = StaticProviderCatalogDependency::built_in();
         let mut plan = request("planner_worker");
@@ -1054,6 +1479,170 @@ mod tests {
             DependencyProviderEvent::TextDelta(text)
                 if text.contains("\"approved\":false")
                     && text.contains("\"task-2\"")
+        )));
+
+        let generic_review = |revision| {
+            let mut request = request("planner_worker");
+            request.entries = vec![DependencyConversationEntry::Metadata {
+                key: String::from("agentmod.generic_review_request"),
+                value_json: serde_json::json!({
+                    "current_revision": revision,
+                    "known_task_ids": ["planner-task-0", "evidence-task-0"],
+                })
+                .to_string(),
+            }];
+            dependency
+                .execute_provider(request)
+                .expect("generic planner review")
+        };
+        assert!(generic_review(0).events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::TextDelta(text)
+                if text.contains("\"approved\":false")
+                    && text.contains("\"evidence-task-0\"")
+                    && text.contains("\"planner.evidence_revision\"")
+        )));
+        assert!(generic_review(1).events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::TextDelta(text)
+                if text.contains("\"approved\":true")
+        )));
+
+        let mut evidence_bound = request("planner_worker");
+        evidence_bound.entries = vec![DependencyConversationEntry::Metadata {
+            key: String::from("agentmod.generic_review_request"),
+            value_json: serde_json::json!({
+                "schema_version": 2,
+                "current_revision": 0,
+                "known_task_ids": ["planner-task-0", "evidence-task-0"],
+                "artifact_evidence": [{
+                    "artifact_reference": "artifact:blake3:review-evidence",
+                }],
+            })
+            .to_string(),
+        }];
+        let evidence_bound = dependency
+            .execute_provider(evidence_bound)
+            .expect("evidence-bound generic planner review");
+        assert!(evidence_bound.events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::TextDelta(text)
+                if text.contains("\"artifact:blake3:review-evidence\"")
+                    && !text.contains("\"integration_artifact\"")
+        )));
+    }
+
+    #[test]
+    fn planner_worker_child_routes_real_tools_from_canonical_loop_iteration() {
+        let events_for = |loop_iteration| {
+            planner_worker_child_events(&[DependencyConversationEntry::Metadata {
+                key: String::from("agentmod.canonical_node_work"),
+                value_json: serde_json::json!({
+                    "run_id": "run-1",
+                    "node_id": "research",
+                    "attempt": 1,
+                    "loop_iteration": loop_iteration,
+                    "step": loop_iteration + 1,
+                })
+                .to_string(),
+            }])
+            .expect("canonical worker request")
+        };
+        for (iteration, call_id, tool) in [
+            (0, "planner-worker-edit", "filesystem.edit"),
+            (1, "planner-worker-test", "process.run"),
+            (2, "planner-worker-diff", "git.diff"),
+        ] {
+            assert!(events_for(iteration).iter().any(|event| matches!(
+                event,
+                DependencyProviderEvent::ToolCallProposed {
+                    call_id: actual_call_id,
+                    tool: actual_tool,
+                    ..
+                } if actual_call_id == call_id && actual_tool == tool
+            )));
+        }
+        assert!(matches!(
+            events_for(3).last(),
+            Some(DependencyProviderEvent::Completed { .. })
+        ));
+    }
+
+    #[test]
+    fn planner_worker_v1_4_integration_requires_canonical_member_order() {
+        let integration = |members: &[&str]| {
+            let evidence = members
+                .iter()
+                .map(|member| {
+                    serde_json::json!({
+                        "member_id": member,
+                        "child_session_id": format!("child-{member}"),
+                        "content": {"receipt": member},
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut request = request("planner_worker");
+            request.options.push(DependencyProviderOption {
+                key: String::from("mock_planner_phase"),
+                value: String::from("integrate_v1_4"),
+            });
+            request.entries = vec![DependencyConversationEntry::Metadata {
+                key: String::from("agentmod.canonical_model_inputs"),
+                value_json: serde_json::json!({
+                    "joined": {"artifact_evidence": evidence},
+                })
+                .to_string(),
+            }];
+            StaticProviderCatalogDependency::built_in().execute_provider(request)
+        };
+        let accepted = integration(&["evidence", "planner"]).expect("canonical order");
+        assert!(accepted.events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::TextDelta(text)
+                if text.contains("\"member_order\":[\"evidence\",\"planner\"]")
+        )));
+        assert!(matches!(
+            integration(&["planner", "evidence"]),
+            Err(ProviderExecutionDependencyError::InvalidRequest(message))
+                if message.contains("order is not canonical")
+        ));
+    }
+
+    #[test]
+    fn graph_b_review_fixture_routes_from_canonical_revision_metadata() {
+        let dependency = StaticProviderCatalogDependency::built_in();
+        let review_request = |revision, known_task_ids: &[&str]| {
+            let mut request = request("graph_b_review_sequence");
+            request.entries = vec![DependencyConversationEntry::Metadata {
+                key: String::from("agentmod.generic_review_request"),
+                value_json: serde_json::json!({
+                    "current_revision": revision,
+                    "known_task_ids": known_task_ids,
+                })
+                .to_string(),
+            }];
+            request
+        };
+
+        let rejected = dependency
+            .execute_provider(review_request(0, &["worker-b-0", "worker-a-0"]))
+            .expect("revision zero is rejected");
+        assert!(rejected.events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::TextDelta(text)
+                if text.contains("\"approved\":false")
+                    && text.contains("\"worker-a-0\"")
+                    && !text.contains("\"worker-b-0\"")
+                    && text.contains("\"graph_b.revision_required\"")
+        )));
+
+        let approved = dependency
+            .execute_provider(review_request(1, &["worker-b-1", "worker-a-1"]))
+            .expect("later revision is approved");
+        assert!(approved.events.iter().any(|event| matches!(
+            event,
+            DependencyProviderEvent::TextDelta(text)
+                if text == "{\"approved\":true,\"findings\":[],\"rejected_task_ids\":[]}"
         )));
     }
 

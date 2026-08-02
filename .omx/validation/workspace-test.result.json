@@ -1,0 +1,6 @@
+{
+  "command": "cargo test --workspace --all-targets --all-features --locked",
+  "exit_code": 0,
+  "elapsed_seconds": 18.5987223,
+  "completed_at": "2026-07-30T10:17:39.7222644-04:00"
+}

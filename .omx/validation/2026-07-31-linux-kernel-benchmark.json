@@ -1,0 +1,57 @@
+{
+  "profile": "release",
+  "results": [
+    {
+      "elapsed_ns": 225331399,
+      "iterations": 100000,
+      "name": "event_seal",
+      "ns_per_operation": 2253.31399,
+      "operations_per_second": 443790.79189048125
+    },
+    {
+      "elapsed_ns": 526169724,
+      "iterations": 250000,
+      "name": "event_verify",
+      "ns_per_operation": 2104.678896,
+      "operations_per_second": 475131.8606845574
+    },
+    {
+      "elapsed_ns": 107863528,
+      "iterations": 50000,
+      "name": "protocol_cbor_round_trip",
+      "ns_per_operation": 2157.27056,
+      "operations_per_second": 463548.71685635945
+    },
+    {
+      "elapsed_ns": 78346188,
+      "iterations": 100000,
+      "name": "expression_parse",
+      "ns_per_operation": 783.46188,
+      "operations_per_second": 1276386.286975443
+    },
+    {
+      "elapsed_ns": 38592660,
+      "iterations": 500000,
+      "name": "expression_evaluate",
+      "ns_per_operation": 77.18532,
+      "operations_per_second": 12955831.49749201
+    },
+    {
+      "elapsed_ns": 148057324,
+      "iterations": 10000,
+      "name": "graph_compile",
+      "ns_per_operation": 14805.7324,
+      "operations_per_second": 67541.40713768404
+    },
+    {
+      "elapsed_ns": 154796666,
+      "iterations": 100000,
+      "name": "protocol_decode_only",
+      "ns_per_operation": 1547.96666,
+      "operations_per_second": 646008.7454338325
+    }
+  ],
+  "schema_version": 1,
+  "target_arch": "x86_64",
+  "target_os": "linux"
+}

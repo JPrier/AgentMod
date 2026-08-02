@@ -1,0 +1,471 @@
+{
+  "style_id": "declarative-graph",
+  "style_version": "1.2.0",
+  "kind": "built_in",
+  "built_in_semantic": "declarative_graph",
+  "graph": {
+    "format_version": 1,
+    "entry_index": 1,
+    "budget": {
+      "max_steps": 64,
+      "max_tokens": 1000,
+      "max_cost_micros": 1000,
+      "max_duration_ms": 10000
+    },
+    "declarations": {
+      "capabilities": [
+        "approval",
+        "tools"
+      ],
+      "tools": [
+        "filesystem.read"
+      ],
+      "providers": [],
+      "events": [],
+      "plugins": []
+    },
+    "variables": [
+      {
+        "name": "iteration",
+        "type": {
+          "kind": "map",
+          "value_type": {
+            "kind": "boolean"
+          },
+          "max_entries": 1
+        },
+        "scope": "run",
+        "producer": "repeat",
+        "merge_contributors": [],
+        "consumers": [
+          "repeat"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 128,
+        "security_classification": "internal"
+      },
+      {
+        "name": "request",
+        "type": {
+          "kind": "map",
+          "value_type": {
+            "kind": "boolean"
+          },
+          "max_entries": 1
+        },
+        "scope": "run",
+        "producer": "runtime",
+        "merge_contributors": [],
+        "consumers": [
+          "branch"
+        ],
+        "mutability": "immutable",
+        "merge_policy": null,
+        "max_size_bytes": 128,
+        "security_classification": "internal"
+      },
+      {
+        "name": "tool_arguments",
+        "type": {
+          "kind": "map",
+          "value_type": {
+            "kind": "string"
+          },
+          "max_entries": 8
+        },
+        "scope": "run",
+        "producer": "runtime",
+        "merge_contributors": [],
+        "consumers": [
+          "tool"
+        ],
+        "mutability": "immutable",
+        "merge_policy": null,
+        "max_size_bytes": 4096,
+        "security_classification": "internal"
+      }
+    ],
+    "nodes": [
+      {
+        "index": 0,
+        "id": "approval",
+        "kind": "user_approval",
+        "configuration": {
+          "type": "user_approval",
+          "action_summary": {
+            "kind": "static",
+            "value": "declarative graph requested user approval"
+          }
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 1,
+        "id": "branch",
+        "kind": "conditional_branch",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "request"
+        ],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 2,
+        "id": "done",
+        "kind": "complete_session",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 3,
+        "id": "repeat",
+        "kind": "loop",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "iteration"
+        ],
+        "write_variables": [
+          "iteration"
+        ],
+        "retry_limit": 0,
+        "max_iterations": 3
+      },
+      {
+        "index": 4,
+        "id": "tool",
+        "kind": "tool_execution_gate",
+        "configuration": {
+          "type": "tool_execution",
+          "arguments": {
+            "kind": "variable",
+            "variable": "tool_arguments"
+          }
+        },
+        "condition": null,
+        "tool": "filesystem.read",
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [
+          "workspace"
+        ],
+        "write_scopes": [],
+        "read_variables": [
+          "tool_arguments"
+        ],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      }
+    ],
+    "edges": [
+      {
+        "from": 0,
+        "to": 4,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 1,
+        "to": 0,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "request"
+                  },
+                  {
+                    "segment": "key",
+                    "value": "requires_approval"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "boolean",
+                "value": true
+              }
+            }
+          }
+        },
+        "label": "require-approval"
+      },
+      {
+        "from": 1,
+        "to": 4,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "request"
+                  },
+                  {
+                    "segment": "key",
+                    "value": "requires_approval"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "boolean",
+                "value": false
+              }
+            }
+          }
+        },
+        "label": "skip-approval"
+      },
+      {
+        "from": 3,
+        "to": 2,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "iteration"
+                  },
+                  {
+                    "segment": "key",
+                    "value": "remaining"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "boolean",
+                "value": false
+              }
+            }
+          }
+        },
+        "label": "complete"
+      },
+      {
+        "from": 3,
+        "to": 4,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "iteration"
+                  },
+                  {
+                    "segment": "key",
+                    "value": "remaining"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "boolean",
+                "value": true
+              }
+            }
+          }
+        },
+        "label": "continue"
+      },
+      {
+        "from": 4,
+        "to": 3,
+        "condition": null,
+        "label": null
+      }
+    ],
+    "cache_key": {
+      "graph_content_hash": "f8b4b22dd59568fcc08fd784b231c01c63c18658405246366d86b49e2e18d5b4",
+      "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+      "capability_set_hash": "740ec0810d6069d7cb3b1338c71fca1a20bea948cc6e94730dc81f165e16435d",
+      "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+      "combined_hash": "2cdcbe8e21c2331904a25268bafb2fdf67b7dac0a41ddf65a1ecb4e6a3a85406"
+    }
+  },
+  "interceptor_order": [
+    "runtime-style-policy"
+  ],
+  "interceptors": [
+    {
+      "id": "runtime-style-policy",
+      "owner": "runtime.security",
+      "event": "action.proposed",
+      "stage": 10,
+      "priority": 100,
+      "before": [],
+      "after": [],
+      "supported_decisions": [
+        "continue",
+        "replace",
+        "reject",
+        "require_approval",
+        "cancel"
+      ],
+      "required_capabilities": [
+        "approval"
+      ]
+    }
+  ],
+  "required_capabilities": [
+    "approval",
+    "tools"
+  ],
+  "allowed_tool_groups": [
+    "filesystem"
+  ],
+  "allowed_providers": [],
+  "allowed_plugins": [
+    "runtime.security"
+  ],
+  "harness": {
+    "id": "native",
+    "required_capabilities": [
+      "cancellation",
+      "streaming",
+      "structured_context_replacement",
+      "token_usage",
+      "tool_calls"
+    ]
+  },
+  "memory": {
+    "provider": "none",
+    "scopes": [],
+    "retrieval_timing": "never",
+    "query": {
+      "source": "current_input",
+      "include_active_artifacts": false,
+      "include_style_context": false,
+      "max_query_bytes": 16384
+    },
+    "max_items": 0,
+    "max_injected_bytes": 0,
+    "write_policy": "never",
+    "injection_location": "none"
+  },
+  "compaction": {
+    "strategy": "none",
+    "trigger_tokens": null,
+    "reserved_context_tokens": 0,
+    "max_provider_projection_tokens": 0,
+    "preserve_unresolved_tasks": true,
+    "preserve_active_processes": true,
+    "preservation_requirements": [
+      "system_instructions",
+      "current_input",
+      "pending_control_state",
+      "artifact_references",
+      "memory_provenance",
+      "active_graph_state",
+      "tool_call_correlation"
+    ]
+  },
+  "approvals": {
+    "default": "ask",
+    "groups": {
+      "filesystem.read": "allow"
+    }
+  },
+  "budgets": {
+    "max_iterations": 3,
+    "max_steps": 1000,
+    "max_tokens": 1000000,
+    "max_cost_micros": 100000000,
+    "max_duration_ms": 3600000
+  },
+  "child_agents": {
+    "max_children": 0,
+    "max_concurrent": 0,
+    "max_depth": 0,
+    "per_child_token_budget": 0
+  },
+  "retry": {
+    "max_attempts": 2,
+    "initial_backoff_ms": 100,
+    "max_backoff_ms": 5000,
+    "retryable_failures": [
+      "provider.rate_limit",
+      "provider.unavailable"
+    ]
+  },
+  "termination": {
+    "allowed_outcomes": [
+      "complete_session",
+      "fail"
+    ],
+    "on_hard_limit": "fail",
+    "require_explicit_terminal_node": true
+  },
+  "selection": {
+    "requires_explicit_selection": true,
+    "model_may_select": false
+  },
+  "cache_key": {
+    "style_content_hash": "56ef6bb3df9e70f3b6239ae31b331fb19c3f55fdf58ebefb462f1d9ba7745d54",
+    "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+    "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+    "capability_set_hash": "ed32eaa3749667657942a541cc1cd92d768c994f382cc55088354c23cfa41df4",
+    "combined_hash": "35d8c3887d5ad4ee8fd86ed8c556a5bbeb367b22387ab6dd9695927d29a1909e"
+  }
+}

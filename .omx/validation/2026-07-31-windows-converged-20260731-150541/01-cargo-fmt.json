@@ -1,0 +1,8 @@
+{
+  "name": "01-cargo-fmt",
+  "command": "cargo fmt --all -- --check",
+  "exit_code": 0,
+  "elapsed_ms": 3100,
+  "started_at": "2026-07-31T19:06:23.9896680Z",
+  "ended_at": "2026-07-31T19:06:27.0945627Z"
+}

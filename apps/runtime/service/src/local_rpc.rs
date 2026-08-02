@@ -104,7 +104,7 @@ where
 }
 
 /// Runtime protocol version accepted by this service.
-pub const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 4);
+pub const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 5);
 
 /// Local endpoint configuration supplied by the composition root.
 #[derive(Clone, Debug)]
@@ -362,7 +362,15 @@ where
         let service = service.clone();
         let config = config.clone();
         tokio::spawn(async move {
-            let _ = serve_connection(&mut server, &service, &config).await;
+            if let Err(error) = serve_connection(&mut server, &service, &config).await {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "runtime.local_rpc.connection_failed",
+                        "diagnostic": error.to_string(),
+                    })
+                );
+            }
         });
     }
 }

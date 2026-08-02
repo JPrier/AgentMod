@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "step_id": "06-architecture-test",
+  "command": "cargo test --locked -p xtask --test architecture",
+  "arguments": [
+    "test",
+    "--locked",
+    "-p",
+    "xtask",
+    "--test",
+    "architecture"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 0.7688986,
+  "started_at_utc": "2026-07-31T12:41:11.2438139+00:00",
+  "completed_at_utc": "2026-07-31T12:41:12.0923913+00:00",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree_dirty": true,
+  "working_tree_porcelain_entries": 338,
+  "stdout_path": ".omx\\validation\\2026-07-31-windows-final-06-architecture-test.stdout.log",
+  "stderr_path": ".omx\\validation\\2026-07-31-windows-final-06-architecture-test.stderr.log",
+  "launch_failure": null
+}

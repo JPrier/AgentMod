@@ -12,11 +12,11 @@ name = "agentmod-scheduler"
 path = "src/main.rs"
 
 [dependencies]
-agentmod-scheduler-data = { path = "../data" }
-agentmod-scheduler-dependency = { path = "../dependency" }
-agentmod-scheduler-logic = { path = "../logic" }
-agentmod-scheduler-protocol = { path = "../../../protocols/scheduler-protocol" }
-agentmod-scheduler-service = { path = "../service" }
+agentmod-scheduler-data = { version = "0.1.0", path = "../data" }
+agentmod-scheduler-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-scheduler-logic = { version = "0.1.0", path = "../logic" }
+agentmod-scheduler-protocol = { version = "0.1.0", path = "../../../protocols/scheduler-protocol" }
+agentmod-scheduler-service = { version = "0.1.0", path = "../service" }
 serde_json.workspace = true
 
 [lints]

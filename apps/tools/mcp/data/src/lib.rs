@@ -1,8 +1,8 @@
 //! Business-facing MCP datasets and dependency normalization.
 
 use agentmod_mcp_host_dependency::{
-    DependencyAuthorization, DependencyInvocationKind, DependencyInvokeRequest, McpDependencyError,
-    McpDependencyPort,
+    DependencyAuthorization, DependencyInvocationKind, DependencyInvokeRequest,
+    DependencyOAuthStatusKind, McpDependencyError, McpDependencyPort,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -101,6 +101,62 @@ pub struct InvokeDataRecord {
     pub progress: Vec<Value>,
 }
 
+/// Data-owned OAuth status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OAuthDataStatusKind {
+    /// No authorization.
+    Unauthorized,
+    /// Authorization awaits callback completion.
+    Pending,
+    /// Bearer credential is available by reference.
+    Authorized,
+    /// Prior authorization failed closed.
+    Failed,
+}
+
+/// Data-owned OAuth start request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BeginOAuthDataRequest {
+    /// Exact signed runtime authorization.
+    pub authorization: McpDataAuthorization,
+    /// Exact server.
+    pub server_id: String,
+    /// Cancellation identity.
+    pub cancellation_id: String,
+}
+
+/// Data-owned OAuth start record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OAuthStartDataRecord {
+    /// Exact server.
+    pub server_id: String,
+    /// Opaque transaction.
+    pub transaction_id: String,
+    /// User authorization URL.
+    pub authorization_url: String,
+    /// Transaction expiry.
+    pub expires_at_ms: i64,
+    /// Stable hash of the exact configured OAuth server binding.
+    pub configuration_hash: String,
+}
+
+/// Redacted data-owned OAuth status.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OAuthStatusDataRecord {
+    /// Exact server.
+    pub server_id: String,
+    /// Stable status.
+    pub status: OAuthDataStatusKind,
+    /// Opaque pending transaction.
+    pub transaction_id: Option<String>,
+    /// Pending transaction or access-token expiry.
+    pub expires_at_ms: Option<i64>,
+    /// Granted non-secret scopes.
+    pub scopes: Vec<String>,
+    /// Stable hash of the exact configured OAuth server binding.
+    pub configuration_hash: String,
+}
+
 /// Data port.
 #[async_trait]
 pub trait McpDataPort: Send + Sync {
@@ -117,6 +173,24 @@ pub trait McpDataPort: Send + Sync {
     ) -> Result<CapabilityDataSet, McpDataError>;
     /// Invokes.
     async fn invoke(&self, request: InvokeDataRequest) -> Result<InvokeDataRecord, McpDataError>;
+    /// Begins an OAuth authorization transaction.
+    async fn begin_oauth(
+        &self,
+        request: BeginOAuthDataRequest,
+    ) -> Result<OAuthStartDataRecord, McpDataError>;
+    /// Reads redacted OAuth state.
+    async fn oauth_status(
+        &self,
+        server_id: &str,
+        authorization: McpDataAuthorization,
+    ) -> Result<OAuthStatusDataRecord, McpDataError>;
+    /// Cancels an exact pending OAuth transaction.
+    async fn cancel_oauth(
+        &self,
+        server_id: &str,
+        transaction_id: &str,
+        authorization: McpDataAuthorization,
+    ) -> Result<OAuthStatusDataRecord, McpDataError>;
     /// Cancels.
     async fn cancel(&self, cancellation_id: &str) -> Result<(), McpDataError>;
 }
@@ -225,6 +299,71 @@ impl<D: McpDependencyPort> McpDataPort for McpData<D> {
             .await
             .map_err(map_error)
     }
+
+    async fn begin_oauth(
+        &self,
+        request: BeginOAuthDataRequest,
+    ) -> Result<OAuthStartDataRecord, McpDataError> {
+        let value = self
+            .dependency
+            .begin_oauth(
+                &request.server_id,
+                &request.cancellation_id,
+                map_authorization(request.authorization),
+            )
+            .await
+            .map_err(map_error)?;
+        Ok(OAuthStartDataRecord {
+            server_id: value.server_id,
+            transaction_id: value.transaction_id,
+            authorization_url: value.authorization_url,
+            expires_at_ms: value.expires_at_ms,
+            configuration_hash: value.configuration_hash,
+        })
+    }
+
+    async fn oauth_status(
+        &self,
+        server_id: &str,
+        authorization: McpDataAuthorization,
+    ) -> Result<OAuthStatusDataRecord, McpDataError> {
+        self.dependency
+            .oauth_status(server_id, map_authorization(authorization))
+            .await
+            .map(map_oauth_status)
+            .map_err(map_error)
+    }
+
+    async fn cancel_oauth(
+        &self,
+        server_id: &str,
+        transaction_id: &str,
+        authorization: McpDataAuthorization,
+    ) -> Result<OAuthStatusDataRecord, McpDataError> {
+        self.dependency
+            .cancel_oauth(server_id, transaction_id, map_authorization(authorization))
+            .await
+            .map(map_oauth_status)
+            .map_err(map_error)
+    }
+}
+
+fn map_oauth_status(
+    value: agentmod_mcp_host_dependency::DependencyOAuthStatus,
+) -> OAuthStatusDataRecord {
+    OAuthStatusDataRecord {
+        server_id: value.server_id,
+        status: match value.status {
+            DependencyOAuthStatusKind::Unauthorized => OAuthDataStatusKind::Unauthorized,
+            DependencyOAuthStatusKind::Pending => OAuthDataStatusKind::Pending,
+            DependencyOAuthStatusKind::Authorized => OAuthDataStatusKind::Authorized,
+            DependencyOAuthStatusKind::Failed => OAuthDataStatusKind::Failed,
+        },
+        transaction_id: value.transaction_id,
+        expires_at_ms: value.expires_at_ms,
+        scopes: value.scopes,
+        configuration_hash: value.configuration_hash,
+    }
 }
 
 fn map_authorization(value: McpDataAuthorization) -> DependencyAuthorization {
@@ -244,7 +383,9 @@ fn map_authorization(value: McpDataAuthorization) -> DependencyAuthorization {
 )]
 fn map_error(error: McpDependencyError) -> McpDataError {
     match error {
-        McpDependencyError::InvalidRequest => McpDataError::Invalid,
+        McpDependencyError::InvalidRequest | McpDependencyError::OAuthTransaction => {
+            McpDataError::Invalid
+        }
         McpDependencyError::Cancelled => McpDataError::Cancelled,
         McpDependencyError::ServerUnavailable | McpDependencyError::UnknownCancellation => {
             McpDataError::Unavailable

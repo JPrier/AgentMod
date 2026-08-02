@@ -29,7 +29,8 @@ errors.
 
 Served endpoints include health, style/harness/component discovery, durable
 session create/list/inspect/replay/branch, provider turns, cancellation,
-approval resolution, and bounded session event catch-up. Runtime protocol 2.4
+approval resolution, session-scoped plugin disable/quarantine, and bounded
+session event catch-up. Runtime protocol 2.5
 adds optional memory, compaction, and hard execution-budget selections to
 session creation plus the
 component catalog used by frontends. Receiving service types translate runtime

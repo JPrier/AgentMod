@@ -1,13 +1,14 @@
 //! Business-facing session catalog datasets.
 
-use std::{path::PathBuf, str::FromStr};
+use std::{fmt, path::PathBuf, str::FromStr};
 
 use agentmod_primitives::{CausationId, CorrelationId, EventId, SessionId, TimestampMillis};
 use agentmod_runtime_dependency::registry::{
-    DependencyBranchArtifact, DependencyBranchEvent, DependencyCreateBranchRequest,
-    DependencyCreateChildSessionRequest, DependencyCreateSessionRequest,
-    DependencyListSessionsRequest, DependencyPrepareSessionRequest, DependencyPreparedSession,
-    FileSessionCatalogDependency, SessionCatalogDependencyError, SessionCatalogDependencyPort,
+    DependencyBranchArtifact, DependencyBranchEvent, DependencyBranchMcpBootstrap,
+    DependencyCreateBranchRequest, DependencyCreateChildSessionRequest,
+    DependencyCreateSessionRequest, DependencyListSessionsRequest, DependencyPrepareSessionRequest,
+    DependencyPreparedSession, FileSessionCatalogDependency, SessionCatalogDependencyError,
+    SessionCatalogDependencyPort,
 };
 use thiserror::Error;
 
@@ -52,6 +53,24 @@ pub struct CreateSessionDataRequest {
     pub compiled_style_json: String,
     /// Canonical initial event bytes.
     pub initial_event_json: Vec<u8>,
+    /// Exact transient MCP configuration; diagnostics are always redacted.
+    pub mcp_configuration: Option<SensitiveMcpConfigurationData>,
+}
+
+/// Data-owned sensitive MCP configuration wrapper.
+#[derive(Clone, Eq, PartialEq)]
+pub struct SensitiveMcpConfigurationData(pub String);
+
+impl From<String> for SensitiveMcpConfigurationData {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Debug for SensitiveMcpConfigurationData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SensitiveMcpConfigurationData(<redacted>)")
+    }
 }
 
 /// Created data record.
@@ -106,10 +125,24 @@ pub struct CreateBranchDataRequest {
     pub parent_session_id: SessionId,
     /// Inclusive source fork point.
     pub fork_sequence: u64,
+    /// Exact dependency-owned MCP bootstrap handling for this branch.
+    pub mcp_bootstrap: BranchMcpBootstrapData,
     /// Complete child journal.
     pub events: Vec<BranchEventDataRecord>,
     /// Immutable artifacts atomically staged with the child.
     pub artifacts: Vec<BranchArtifactDataRecord>,
+}
+
+/// Data-owned MCP bootstrap disposition for an atomic branch.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BranchMcpBootstrapData {
+    /// The immutable branch binding declares no MCP activation.
+    None,
+    /// Authenticate and copy the exact parent bootstrap under fresh child AAD.
+    InheritExact {
+        /// Parent session that owns the authenticated source bootstrap.
+        source_session_id: SessionId,
+    },
 }
 
 /// Data request for atomic runtime-managed worker creation.
@@ -135,6 +168,8 @@ pub struct CreateChildSessionDataRequest {
     pub parent_graph_node_id: String,
     /// Runtime-owned task identity.
     pub task_id: String,
+    /// Exact dependency-owned MCP bootstrap handling for this child.
+    pub mcp_bootstrap: BranchMcpBootstrapData,
     /// Complete sealed child journal.
     pub events: Vec<BranchEventDataRecord>,
 }
@@ -275,6 +310,7 @@ where
                 style_manifest_json: request.style_manifest_json,
                 compiled_style_json: request.compiled_style_json,
                 initial_event_json: request.initial_event_json,
+                mcp_configuration: request.mcp_configuration.map(|value| value.0.into()),
             })
             .map(|created| CreatedSessionDataRecord {
                 session_directory: created.session_directory,
@@ -380,6 +416,7 @@ where
                 style_manifest_json: request.style_manifest_json,
                 compiled_style_json: request.compiled_style_json,
                 initial_event_json: request.initial_event_json,
+                mcp_configuration: request.mcp_configuration.map(|value| value.0.into()),
             })
             .map(|created| CreatedSessionDataRecord {
                 session_directory: created.session_directory,
@@ -477,6 +514,16 @@ fn to_dependency_branch(request: CreateBranchDataRequest) -> DependencyCreateBra
         compiled_style_json: request.compiled_style_json,
         parent_session_id: request.parent_session_id.to_string(),
         fork_sequence: request.fork_sequence,
+        mcp_bootstrap: match request.mcp_bootstrap {
+            BranchMcpBootstrapData::None => {
+                agentmod_runtime_dependency::registry::DependencyBranchMcpBootstrap::None
+            }
+            BranchMcpBootstrapData::InheritExact { source_session_id } => {
+                agentmod_runtime_dependency::registry::DependencyBranchMcpBootstrap::InheritExact {
+                    source_session_id: source_session_id.to_string(),
+                }
+            }
+        },
         events: request
             .events
             .into_iter()
@@ -514,6 +561,14 @@ fn to_dependency_child(
         parent_action_sequence: request.parent_action_sequence,
         parent_graph_node_id: request.parent_graph_node_id,
         task_id: request.task_id,
+        mcp_bootstrap: match request.mcp_bootstrap {
+            BranchMcpBootstrapData::None => DependencyBranchMcpBootstrap::None,
+            BranchMcpBootstrapData::InheritExact { source_session_id } => {
+                DependencyBranchMcpBootstrap::InheritExact {
+                    source_session_id: source_session_id.to_string(),
+                }
+            }
+        },
         events: request
             .events
             .into_iter()

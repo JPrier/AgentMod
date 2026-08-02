@@ -1,0 +1,181 @@
+schema_version = 1
+category = "graph_node"
+scope = "session"
+classification = "blocking"
+trust = "approved_third_party"
+isolation = "process"
+required_capabilities = []
+provided_capabilities = [
+  "model",
+  "plugin.graph",
+  "plugin.graph_invalid",
+  "plugin.invalid",
+  "plugin.cancel",
+  "plugin.timeout",
+  "plugin.unavailable",
+]
+subscribed_events = []
+timeout_ms = 5000
+state_migration_version = 1
+
+[identity]
+id = "fixture.node"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[entrypoint]
+kind = "process"
+program = "__PLUGIN_WORKER__"
+args = []
+
+[authorities]
+read = ["invocation_state"]
+proposed_write = []
+
+[permissions]
+tools = ["filesystem.read"]
+network = ["api.example"]
+
+[ordering]
+stage = 0
+priority = 0
+before = []
+after = []
+
+[configuration]
+schema_id = "fixture.node.config"
+schema_version = 1
+required = false
+
+[configuration.source]
+kind = "inline_json"
+document = '{"type":"object","additionalProperties":false}'
+
+[failure_policy]
+kind = "reject"
+
+[[node_executors]]
+executor_id = "fixture.graph"
+version = "1.0.0"
+runtime_api = "^1.0"
+node_kind = "model_call"
+handler = "graph_action_artifact"
+capabilities = ["model", "plugin.graph"]
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object"}'
+timeout_ms = 500
+idempotency = "non_idempotent"
+state_scope = "session"
+external_effects = true
+
+[node_executors.failure_policy]
+kind = "reject"
+
+[node_executors.required_permissions]
+tools = ["filesystem.read"]
+network = ["api.example"]
+
+[[node_executors]]
+executor_id = "fixture.graph.invalid_transition"
+version = "1.0.0"
+runtime_api = "^1.0"
+node_kind = "model_call"
+handler = "graph_success"
+capabilities = ["model", "plugin.graph_invalid"]
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object"}'
+timeout_ms = 500
+idempotency = "non_idempotent"
+state_scope = "session"
+external_effects = false
+
+[node_executors.failure_policy]
+kind = "reject"
+
+[node_executors.required_permissions]
+tools = ["filesystem.read"]
+network = ["api.example"]
+
+[[node_executors]]
+executor_id = "fixture.invalid"
+version = "1.0.0"
+runtime_api = "^1.0"
+node_kind = "model_call"
+handler = "invalid_output"
+capabilities = ["model", "plugin.invalid"]
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object"}'
+timeout_ms = 500
+idempotency = "non_idempotent"
+state_scope = "session"
+external_effects = false
+
+[node_executors.failure_policy]
+kind = "reject"
+
+[node_executors.required_permissions]
+tools = ["filesystem.read"]
+network = ["api.example"]
+
+[[node_executors]]
+executor_id = "fixture.cancel"
+version = "1.0.0"
+runtime_api = "^1.0"
+node_kind = "model_call"
+handler = "timeout_effect"
+capabilities = ["model", "plugin.cancel"]
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object"}'
+timeout_ms = 5000
+idempotency = "non_idempotent"
+state_scope = "session"
+external_effects = true
+
+[node_executors.failure_policy]
+kind = "reject"
+
+[node_executors.required_permissions]
+tools = ["filesystem.read"]
+network = ["api.example"]
+
+[[node_executors]]
+executor_id = "fixture.timeout"
+version = "1.0.0"
+runtime_api = "^1.0"
+node_kind = "model_call"
+handler = "timeout_effect"
+capabilities = ["model", "plugin.timeout"]
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object"}'
+timeout_ms = 50
+idempotency = "non_idempotent"
+state_scope = "session"
+external_effects = true
+
+[node_executors.failure_policy]
+kind = "reject"
+
+[node_executors.required_permissions]
+tools = ["filesystem.read"]
+network = ["api.example"]
+
+[[node_executors]]
+executor_id = "fixture.unavailable"
+version = "1.0.0"
+runtime_api = "^1.0"
+node_kind = "model_call"
+handler = "execute_echo"
+capabilities = ["model", "plugin.unavailable"]
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object"}'
+timeout_ms = 500
+idempotency = "non_idempotent"
+state_scope = "session"
+external_effects = true
+
+[node_executors.failure_policy]
+kind = "reject"
+
+[node_executors.required_permissions]
+tools = ["filesystem.read"]
+network = ["api.example"]

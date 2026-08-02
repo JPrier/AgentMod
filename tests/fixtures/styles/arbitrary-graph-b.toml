@@ -1,0 +1,280 @@
+schema_version = 1
+kind = "custom"
+required_capabilities = ["agents", "approval", "model"]
+allowed_tool_groups = []
+allowed_providers = ["deterministic-mock"]
+allowed_plugins = ["runtime.security"]
+
+[identity]
+id = "user-graph-b"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[harness]
+id = "native"
+required_capabilities = [
+  "cancellation",
+  "streaming",
+  "structured_context_replacement",
+  "token_usage",
+  "tool_calls",
+]
+
+[graph]
+kind = "inline"
+source = '''
+format_version = 1
+entry = "spawn-a"
+
+[budget]
+max_steps = 96
+max_tokens = 40000
+max_cost_micros = 4000000
+max_duration_ms = 120000
+
+[declarations]
+capabilities = ["agents", "approval", "model"]
+providers = ["deterministic-mock"]
+
+[[variables]]
+name = "mock_scenario"
+type = { kind = "string" }
+scope = "run"
+producer = "runtime"
+consumers = ["review"]
+mutability = "immutable"
+max_size_bytes = 128
+security_classification = "internal"
+
+[[variables]]
+name = "worker_a"
+type = { kind = "child_id" }
+scope = "run"
+producer = "spawn-a"
+consumers = ["message-a", "wait-a", "join-workers"]
+mutability = "mutable"
+max_size_bytes = 128
+security_classification = "internal"
+
+[[variables]]
+name = "worker_b"
+type = { kind = "child_id" }
+scope = "run"
+producer = "spawn-b"
+consumers = ["message-b", "wait-b", "join-workers"]
+mutability = "mutable"
+max_size_bytes = 128
+security_classification = "internal"
+
+[[nodes]]
+id = "spawn-a"
+kind = "spawn_child_agent"
+write_variables = ["worker_a"]
+  configuration = { type = "spawn_child_agent", task_input = { kind = "static", value = "Graph B worker A: return bounded structured evidence" }, task_id_prefix = "worker-a", child_style = "graph-b-worker@1.0.0", tool_groups = [], maximum_children = 1, maximum_depth = 2, token_budget = 4000, context_budget_tokens = 2000, cost_budget_micros = 200000, workspace = { mode = "shared_read_only" }, artifact_references = [], security_classification = "internal", approval_required = true }
+
+[[nodes]]
+id = "spawn-b"
+kind = "spawn_child_agent"
+write_variables = ["worker_b"]
+  configuration = { type = "spawn_child_agent", task_input = { kind = "static", value = "Graph B worker B: return bounded structured evidence" }, task_id_prefix = "worker-b", child_style = "graph-b-worker@1.0.0", tool_groups = [], maximum_children = 1, maximum_depth = 2, token_budget = 4000, context_budget_tokens = 2000, cost_budget_micros = 200000, workspace = { mode = "shared_read_only" }, artifact_references = [], security_classification = "internal", approval_required = true }
+
+[[nodes]]
+id = "message-a"
+kind = "send_child_agent_message"
+read_variables = ["worker_a"]
+configuration = { type = "send_child_agent_message", child = { kind = "variable", variable = "worker_a" }, payload = { kind = "revision_context", worker = "a", instruction = "include exact restart evidence" }, artifact_references = [], security_classification = "internal", max_message_bytes = 1024, cancellation = "reject" }
+
+[[nodes]]
+id = "message-b"
+kind = "send_child_agent_message"
+read_variables = ["worker_b"]
+configuration = { type = "send_child_agent_message", child = { kind = "variable", variable = "worker_b" }, payload = { kind = "revision_context", worker = "b", instruction = "include exact ordering evidence" }, artifact_references = [], security_classification = "internal", max_message_bytes = 1024, cancellation = "reject" }
+
+[[nodes]]
+id = "wait-fanout"
+kind = "parallel_branch"
+configuration = { type = "parallel_branch", max_parallelism = 2, max_queue_depth = 2, join_target = "join-workers", join_policy = "all" }
+
+[[nodes]]
+id = "wait-a"
+kind = "wait_for_agents"
+read_variables = ["worker_a"]
+configuration = { type = "wait_for_agents", children = { kind = "variable", variable = "worker_a" }, maximum_children = 1, minimum_successes = 1, timeout_ms = 60000, cancellation = "cascade" }
+
+[[nodes]]
+id = "wait-b"
+kind = "wait_for_agents"
+read_variables = ["worker_b"]
+configuration = { type = "wait_for_agents", children = { kind = "variable", variable = "worker_b" }, maximum_children = 1, minimum_successes = 1, timeout_ms = 60000, cancellation = "cascade" }
+
+[[nodes]]
+id = "join-workers"
+kind = "join_results"
+read_variables = ["worker_a", "worker_b"]
+configuration = { type = "join_results", required = ["worker-a", "worker-b"], minimum_successes = 2, failure_policy = "wait_required", ordering_policy = "member_id", timeout_ms = 60000, cancellation_propagates = true, result_projection = "node_references", artifact_collection = "all" }
+
+[[nodes]]
+id = "review"
+kind = "review"
+provider = "deterministic-mock"
+read_variables = ["mock_scenario"]
+configuration = { type = "review", input = { kind = "static", value = { rubric = "approve only after one revision", graph = "B" } }, artifact_references = [], result_schema = { maximum_findings = 8, maximum_finding_bytes = 512, maximum_rejections = 2, require_artifact_evidence = false }, routes = { approved = "success", revision = "revision", failure = "structured-failure" }, maximum_revisions = 2 }
+
+[[nodes]]
+id = "revision"
+kind = "loop"
+max_iterations = 2
+
+[[nodes]]
+id = "success"
+kind = "complete_session"
+
+[[nodes]]
+id = "structured-failure"
+kind = "fail"
+
+[[edges]]
+from = "spawn-a"
+to = "spawn-b"
+
+[[edges]]
+from = "spawn-b"
+to = "message-a"
+
+[[edges]]
+from = "message-a"
+to = "message-b"
+
+[[edges]]
+from = "message-b"
+to = "wait-fanout"
+
+[[edges]]
+from = "wait-fanout"
+to = "wait-a"
+label = "worker-a"
+
+[[edges]]
+from = "wait-fanout"
+to = "wait-b"
+label = "worker-b"
+
+[[edges]]
+from = "wait-a"
+to = "join-workers"
+
+[[edges]]
+from = "wait-b"
+to = "join-workers"
+
+[[edges]]
+from = "join-workers"
+to = "review"
+
+[[edges]]
+from = "review"
+to = "success"
+
+[[edges]]
+from = "review"
+to = "revision"
+
+[[edges]]
+from = "review"
+to = "structured-failure"
+
+[[edges]]
+from = "revision"
+to = "spawn-a"
+'''
+
+[[interceptors]]
+id = "runtime-style-policy"
+owner = "runtime.security"
+event = "action.proposed"
+stage = 10
+priority = 100
+before = []
+after = []
+supported_decisions = [
+  "continue",
+  "replace",
+  "reject",
+  "require_approval",
+  "cancel",
+]
+required_capabilities = ["approval"]
+
+[memory]
+provider = "none"
+scopes = []
+retrieval_timing = "never"
+max_items = 0
+max_injected_bytes = 0
+write_policy = "never"
+injection_location = "none"
+
+[memory.query]
+source = "current_input"
+include_active_artifacts = false
+include_style_context = false
+max_query_bytes = 16384
+
+[compaction]
+strategy = "none"
+reserved_context_tokens = 0
+max_provider_projection_tokens = 0
+preserve_unresolved_tasks = true
+preserve_active_processes = true
+preservation_requirements = [
+  "system_instructions",
+  "current_input",
+  "pending_control_state",
+  "artifact_references",
+  "memory_provenance",
+  "active_graph_state",
+  "tool_call_correlation",
+]
+
+[approvals]
+default = "allow"
+groups = { child_agent_creation = "ask", child_agent_cancellation = "ask" }
+
+[budgets]
+max_iterations = 4
+max_steps = 96
+max_tokens = 40000
+max_cost_micros = 4000000
+max_duration_ms = 120000
+
+[child_agents]
+max_children = 8
+max_concurrent = 2
+max_depth = 2
+per_child_token_budget = 4000
+child_style = "graph-b-worker@1.0.0"
+workspace_mode = "shared_read_only"
+inherit_provider = true
+inherit_model = true
+context_budget_tokens = 2000
+per_child_cost_budget_micros = 200000
+tool_groups = []
+memory_access = "none"
+join_behavior = "all"
+cancellation_behavior = "cascade"
+reviewer_max_attempts = 2
+
+[retry]
+max_attempts = 3
+initial_backoff_ms = 10
+max_backoff_ms = 100
+retryable_failures = ["provider.unavailable", "review.revision"]
+
+[termination]
+allowed_outcomes = ["complete_session", "fail"]
+on_hard_limit = "fail"
+require_explicit_terminal_node = true
+
+[selection]
+requires_explicit_selection = true
+model_may_select = false

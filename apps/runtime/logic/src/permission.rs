@@ -157,6 +157,22 @@ impl PermissionMatcher {
                     && optional_eq(self.model.as_deref(), model)
                     && action_unrelated_fields_empty(self, ActionFieldGroup::Provider)
             }
+            ConsequentialAction::PluginNodeInvocation(invocation) => {
+                optional_eq(self.source.as_deref(), &invocation.plugin_id)
+                    && action_unrelated_fields_empty(self, ActionFieldGroup::Plugin)
+            }
+            ConsequentialAction::PluginMemoryRetrieve(action) => {
+                optional_eq(self.source.as_deref(), &action.identity.plugin_id)
+                    && action_unrelated_fields_empty(self, ActionFieldGroup::Plugin)
+            }
+            ConsequentialAction::PluginMemoryWrite(action) => {
+                optional_eq(self.source.as_deref(), &action.identity.plugin_id)
+                    && action_unrelated_fields_empty(self, ActionFieldGroup::Plugin)
+            }
+            ConsequentialAction::PluginCompaction(action) => {
+                optional_eq(self.source.as_deref(), &action.identity.plugin_id)
+                    && action_unrelated_fields_empty(self, ActionFieldGroup::Plugin)
+            }
             _ => action_unrelated_fields_empty(self, ActionFieldGroup::None),
         }
     }
@@ -170,11 +186,14 @@ enum ActionFieldGroup {
     Process,
     Http,
     Provider,
+    Plugin,
 }
 
 fn action_unrelated_fields_empty(matcher: &PermissionMatcher, group: ActionFieldGroup) -> bool {
     (matches!(group, ActionFieldGroup::Tool)
-        || (matcher.tool.is_none() && matcher.tool_group.is_none() && matcher.source.is_none()))
+        || (matcher.tool.is_none() && matcher.tool_group.is_none()))
+        && (matches!(group, ActionFieldGroup::Tool | ActionFieldGroup::Plugin)
+            || matcher.source.is_none())
         && (matches!(group, ActionFieldGroup::Path) || matcher.path_prefix.is_none())
         && (matches!(group, ActionFieldGroup::Process) || matcher.executable.is_none())
         && (matches!(group, ActionFieldGroup::Http)
@@ -260,21 +279,58 @@ pub fn evaluate_permissions(
     user: &PermissionPolicy,
     mandatory: &PermissionPolicy,
 ) -> PermissionDecision {
-    let user_match = user.evaluate(proposal);
+    evaluate_layered_permissions(proposal, &[user], mandatory)
+}
+
+/// Applies ordered, non-relaxing user-policy layers and then mandatory native
+/// security policy.
+///
+/// Each user layer is authoritative: an `ask` or `deny` from any layer cannot
+/// be relaxed by another user layer. Mandatory policy remains the final gate.
+#[must_use]
+pub fn evaluate_layered_permissions(
+    proposal: &ActionProposal,
+    users: &[&PermissionPolicy],
+    mandatory: &PermissionPolicy,
+) -> PermissionDecision {
+    let user_matches = users
+        .iter()
+        .map(|policy| policy.evaluate(proposal))
+        .collect::<Vec<_>>();
+    let (user_effect, user_reason) = user_matches.iter().fold(
+        (PermissionEffect::Allow, String::new()),
+        |(effect, reason), matched| {
+            if permission_rank(matched.effect) > permission_rank(effect) {
+                (matched.effect, matched.reason.clone())
+            } else {
+                (effect, reason)
+            }
+        },
+    );
     let mandatory_match = mandatory.evaluate(proposal);
-    let (effect, reason) = match (user_match.effect, mandatory_match.effect) {
+    let (effect, reason) = match (user_effect, mandatory_match.effect) {
         (_, PermissionEffect::Deny) => (PermissionEffect::Deny, mandatory_match.reason.clone()),
-        (PermissionEffect::Deny, _) => (PermissionEffect::Deny, user_match.reason.clone()),
+        (PermissionEffect::Deny, _) => (PermissionEffect::Deny, user_reason),
         (_, PermissionEffect::Ask) => (PermissionEffect::Ask, mandatory_match.reason.clone()),
-        (PermissionEffect::Ask, _) => (PermissionEffect::Ask, user_match.reason.clone()),
+        (PermissionEffect::Ask, _) => (PermissionEffect::Ask, user_reason),
         (PermissionEffect::Allow, PermissionEffect::Allow) => {
             (PermissionEffect::Allow, mandatory_match.reason.clone())
         }
     };
+    let mut trace = user_matches;
+    trace.push(mandatory_match);
     PermissionDecision {
         effect,
-        trace: vec![user_match, mandatory_match],
+        trace,
         reason,
+    }
+}
+
+const fn permission_rank(effect: PermissionEffect) -> u8 {
+    match effect {
+        PermissionEffect::Allow => 0,
+        PermissionEffect::Ask => 1,
+        PermissionEffect::Deny => 2,
     }
 }
 
@@ -305,7 +361,9 @@ pub fn revalidate_mandatory_after_approval(
 mod tests {
     use agentmod_primitives::ContentHash;
 
-    use crate::action::{FilesystemWriteAction, HttpRequestAction, ProposalId};
+    use crate::action::{
+        FilesystemWriteAction, HttpRequestAction, PluginNodeInvocationAction, ProposalId,
+    };
 
     use super::*;
 
@@ -322,6 +380,54 @@ mod tests {
             workspace: "repo".into(),
             origin: "runtime".into(),
         }
+    }
+
+    #[test]
+    fn layered_user_policies_are_non_relaxing_and_mandatory_is_final() {
+        let proposal = file("/workspace/report.txt");
+        let policy = |id, effect, reason| PermissionPolicy::new(id, Vec::new(), effect, reason);
+        let mandatory = policy("mandatory", PermissionEffect::Allow, "mandatory allow");
+
+        let base_deny = policy("base", PermissionEffect::Deny, "base deny");
+        let style_allow = policy("style", PermissionEffect::Allow, "style allow");
+        let denied =
+            evaluate_layered_permissions(&proposal, &[&base_deny, &style_allow], &mandatory);
+        assert_eq!(denied.effect, PermissionEffect::Deny);
+        assert_eq!(denied.reason, "base deny");
+        assert_eq!(
+            denied
+                .trace
+                .iter()
+                .map(|matched| matched.policy_id.as_str())
+                .collect::<Vec<_>>(),
+            ["base", "style", "mandatory"]
+        );
+
+        let base_allow = policy("base", PermissionEffect::Allow, "base allow");
+        let style_ask = policy("style", PermissionEffect::Ask, "style ask");
+        assert_eq!(
+            evaluate_layered_permissions(&proposal, &[&base_allow, &style_ask], &mandatory,).effect,
+            PermissionEffect::Ask
+        );
+        let style_deny = policy("style", PermissionEffect::Deny, "style deny");
+        assert_eq!(
+            evaluate_layered_permissions(&proposal, &[&base_allow, &style_deny], &mandatory,)
+                .effect,
+            PermissionEffect::Deny
+        );
+
+        let mandatory_deny = policy("mandatory", PermissionEffect::Deny, "mandatory deny");
+        let final_denial =
+            evaluate_layered_permissions(&proposal, &[&base_allow, &style_ask], &mandatory_deny);
+        assert_eq!(final_denial.effect, PermissionEffect::Deny);
+        assert_eq!(final_denial.reason, "mandatory deny");
+        assert_eq!(
+            final_denial
+                .trace
+                .last()
+                .map(|matched| matched.policy_id.as_str()),
+            Some("mandatory")
+        );
     }
 
     fn policy(id: &str, effect: PermissionEffect, matcher: PermissionMatcher) -> PermissionPolicy {
@@ -415,5 +521,32 @@ mod tests {
         assert!(matcher.matches(&proposal("https://api.example.com/v1")));
         assert!(!matcher.matches(&proposal("https://example.com")));
         assert!(!matcher.matches(&proposal("https://example.com.evil.test")));
+    }
+
+    #[test]
+    fn plugin_node_rules_match_the_exact_plugin_source() {
+        let proposal = |plugin_id: &str| ActionProposal {
+            id: ProposalId("plugin-node:invoke-1".into()),
+            action: ConsequentialAction::PluginNodeInvocation(PluginNodeInvocationAction {
+                plugin_id: plugin_id.into(),
+                executor_id: "fixture.transform".into(),
+                executor_version: "1.0.0".into(),
+                invocation_id: "invoke-1".into(),
+                invocation_digest: ContentHash::digest(b"complete invocation"),
+                declaration_hash: ContentHash::digest(b"declaration"),
+                external_effects: false,
+                required_permissions: vec!["artifact.read".into()],
+            }),
+            style: "user-graph".into(),
+            workspace: "repo".into(),
+            origin: format!("plugin:{plugin_id}"),
+        };
+        let matcher = PermissionMatcher {
+            action: Some("plugin_node_invocation".into()),
+            source: Some("fixture.plugin".into()),
+            ..PermissionMatcher::default()
+        };
+        assert!(matcher.matches(&proposal("fixture.plugin")));
+        assert!(!matcher.matches(&proposal("substituted.plugin")));
     }
 }

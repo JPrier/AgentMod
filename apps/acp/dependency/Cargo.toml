@@ -8,9 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-primitives = { path = "../../../core/primitives" }
-agentmod-protocol-support = { path = "../../../core/protocol-support" }
-agentmod-runtime-protocol = { path = "../../../protocols/runtime-protocol" }
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../../core/protocol-support" }
+agentmod-runtime-protocol = { version = "0.1.0", path = "../../../protocols/runtime-protocol" }
 async-trait.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

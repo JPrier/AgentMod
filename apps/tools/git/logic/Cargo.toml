@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-git-host-data = { path = "../data" }
+agentmod-git-host-data = { version = "0.1.0", path = "../data" }
 async-trait.workspace = true
 thiserror.workspace = true
 

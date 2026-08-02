@@ -12,11 +12,11 @@ name = "agentmod-tui"
 path = "src/main.rs"
 
 [dependencies]
-agentmod-protocol-support = { path = "../../../core/protocol-support" }
-agentmod-tui-data = { path = "../data" }
-agentmod-tui-dependency = { path = "../dependency" }
-agentmod-tui-logic = { path = "../logic" }
-agentmod-tui-service = { path = "../service" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../../core/protocol-support" }
+agentmod-tui-data = { version = "0.1.0", path = "../data" }
+agentmod-tui-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-tui-logic = { version = "0.1.0", path = "../logic" }
+agentmod-tui-service = { version = "0.1.0", path = "../service" }
 
 [lints]
 workspace = true

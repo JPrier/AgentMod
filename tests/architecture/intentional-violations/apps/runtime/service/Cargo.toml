@@ -9,5 +9,5 @@ process = "runtime"
 layer = "service"
 
 [dependencies]
-fixture-runtime-data = { path = "../data" }
-fixture-harness-logic = { path = "../../harness/logic" }
+fixture-runtime-data = { version = "0.1.0", path = "../data" }
+fixture-harness-logic = { version = "0.1.0", path = "../../harness/logic" }

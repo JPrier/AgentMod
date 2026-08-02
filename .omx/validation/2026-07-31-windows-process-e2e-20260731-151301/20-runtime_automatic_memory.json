@@ -1,0 +1,12 @@
+{
+  "index": 20,
+  "name": "20-runtime_automatic_memory",
+  "script": "runtime_automatic_memory.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_automatic_memory.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 7756,
+  "started_at": "2026-07-31T19:28:15.2139988Z",
+  "ended_at": "2026-07-31T19:28:22.9776316Z",
+  "log": "20-runtime_automatic_memory.log"
+}

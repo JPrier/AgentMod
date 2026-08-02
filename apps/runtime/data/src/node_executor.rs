@@ -6,6 +6,7 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
+use agentmod_primitives::ContentHash;
 use thiserror::Error;
 
 const MAX_REGISTRATIONS: usize = 256;
@@ -51,6 +52,8 @@ pub struct RegisterNodeExecutorDataRecord {
     pub boundary: NodeExecutorBoundaryData,
     /// Whether the implementation may be selected for new work.
     pub available: bool,
+    /// Hash of the exact executor declaration/configuration.
+    pub declaration_hash: ContentHash,
 }
 
 /// Normalized immutable data record consumed by runtime logic.
@@ -72,6 +75,8 @@ pub struct NodeExecutorDataRecord {
     pub boundary: NodeExecutorBoundaryData,
     /// Whether the implementation may be selected for new work.
     pub available: bool,
+    /// Hash of the exact executor declaration/configuration.
+    pub declaration_hash: ContentHash,
 }
 
 /// Data-layer list request.
@@ -136,8 +141,8 @@ impl RuntimeNodeExecutorData {
     /// Returns the exact first-party registry assembled by the native runtime
     /// composition root.
     ///
-    /// Unsupported categories remain inspectable with `available = false`;
-    /// compilation alone therefore cannot make them executable.
+    /// Availability is only the first gate: runtime logic still validates each
+    /// graph's typed semantics and rejects unsupported executor combinations.
     ///
     /// # Errors
     ///
@@ -152,7 +157,6 @@ impl RuntimeNodeExecutorData {
                 true,
             ),
             ("model_call", "runtime.model-request", &["model"], true),
-            ("tool_execution_gate", "runtime.tool-gate", &["tools"], true),
             (
                 "user_approval",
                 "runtime.user-approval",
@@ -169,17 +173,17 @@ impl RuntimeNodeExecutorData {
                 "send_child_agent_message",
                 "runtime.child-message",
                 &["agents"],
-                false,
+                true,
             ),
             ("wait_for_agents", "runtime.child-wait", &["agents"], true),
-            ("join_results", "runtime.join", &["agents"], false),
+            ("join_results", "runtime.join", &["agents"], true),
             ("review", "runtime.review", &["model"], true),
             ("loop", "runtime.loop", &[], true),
             ("conditional_branch", "runtime.conditional", &[], true),
-            ("parallel_branch", "runtime.parallel", &[], false),
-            ("delay", "runtime.delay", &["scheduling"], false),
-            ("schedule", "runtime.schedule", &["scheduling"], false),
-            ("emit_event", "runtime.event-emission", &["events"], false),
+            ("parallel_branch", "runtime.parallel", &[], true),
+            ("delay", "runtime.delay", &["scheduling"], true),
+            ("schedule", "runtime.schedule", &["scheduling"], true),
+            ("emit_event", "runtime.event-emission", &["events"], true),
             (
                 "persist_artifact",
                 "runtime.artifact-persistence",
@@ -190,27 +194,146 @@ impl RuntimeNodeExecutorData {
             ("complete_session", "runtime.session-completion", &[], true),
             ("fail", "runtime.structured-failure", &[], true),
         ];
-        Self::new(
-            IMPLEMENTATIONS
-                .iter()
-                .map(
-                    |(node_kind, id, capabilities, available)| RegisterNodeExecutorDataRecord {
-                        id: (*id).to_owned(),
-                        version: String::from("1.0.0"),
-                        runtime_api: String::from("^1.0"),
-                        node_kind: (*node_kind).to_owned(),
-                        capabilities: capabilities
-                            .iter()
-                            .map(|capability| (*capability).to_owned())
-                            .collect(),
-                        source: NodeExecutorSourceData::Runtime,
-                        boundary: NodeExecutorBoundaryData::RuntimeLogic,
-                        available: *available,
-                    },
-                )
-                .collect(),
-        )
+        let mut registrations = IMPLEMENTATIONS
+            .iter()
+            .map(|(node_kind, id, capabilities, available)| {
+                native_registration(node_kind, id, capabilities, "1.0.0", *available, None)
+            })
+            .collect::<Vec<_>>();
+        registrations.extend(versioned_native_registrations());
+        Self::new(registrations)
     }
+
+    /// Assembles the single immutable registry from native registrations and
+    /// exact validated plugin declarations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeExecutorDataError`] when the combined native/plugin
+    /// declaration set is invalid, excessive, or contains an exact duplicate.
+    pub fn native_with_plugins(
+        manifests: &[crate::plugin::PluginManifestDataRecord],
+    ) -> Result<Self, NodeExecutorDataError> {
+        let native = Self::native()?;
+        let mut registrations = native
+            .records
+            .iter()
+            .map(|record| RegisterNodeExecutorDataRecord {
+                id: record.id.clone(),
+                version: record.version.clone(),
+                runtime_api: record.runtime_api.clone(),
+                node_kind: record.node_kind.clone(),
+                capabilities: record.capabilities.clone(),
+                source: record.source.clone(),
+                boundary: record.boundary,
+                available: record.available,
+                declaration_hash: record.declaration_hash,
+            })
+            .collect::<Vec<_>>();
+        for manifest in manifests {
+            registrations.extend(manifest.node_executors.iter().map(|executor| {
+                RegisterNodeExecutorDataRecord {
+                    id: executor.executor_id.clone(),
+                    version: executor.version.clone(),
+                    runtime_api: executor.runtime_api.clone(),
+                    node_kind: executor.node_kind.clone(),
+                    capabilities: executor.capabilities.clone(),
+                    source: NodeExecutorSourceData::Plugin {
+                        plugin_id: manifest.id.clone(),
+                    },
+                    boundary: NodeExecutorBoundaryData::PluginHost,
+                    available: true,
+                    declaration_hash: executor.declaration_hash,
+                }
+            }));
+        }
+        Self::new(registrations)
+    }
+}
+
+fn versioned_native_registrations() -> Vec<RegisterNodeExecutorDataRecord> {
+    vec![
+        native_registration(
+            "tool_execution_gate",
+            "runtime.tool-gate",
+            &["tools"],
+            "1.0.0",
+            true,
+            None,
+        ),
+        native_registration(
+            "tool_execution_gate",
+            "runtime.tool-gate",
+            &["tools"],
+            "1.1.0",
+            true,
+            Some(crate::tool::canonical_tool_catalog_hash()),
+        ),
+        native_registration(
+            "model_call",
+            "runtime.model-request",
+            &["model"],
+            "1.1.0",
+            true,
+            None,
+        ),
+        native_registration(
+            "spawn_child_agent",
+            "runtime.child-spawn",
+            &["agents"],
+            "1.1.0",
+            true,
+            None,
+        ),
+        native_registration("review", "runtime.review", &["model"], "1.1.0", true, None),
+        native_registration(
+            "persist_artifact",
+            "runtime.artifact-persistence",
+            &["artifacts"],
+            "1.1.0",
+            true,
+            None,
+        ),
+    ]
+}
+
+fn native_registration(
+    node_kind: &str,
+    id: &str,
+    capabilities: &[&str],
+    version: &str,
+    available: bool,
+    behavior_abi: Option<ContentHash>,
+) -> RegisterNodeExecutorDataRecord {
+    RegisterNodeExecutorDataRecord {
+        id: id.to_owned(),
+        version: version.to_owned(),
+        runtime_api: String::from("^1.0"),
+        node_kind: node_kind.to_owned(),
+        capabilities: capabilities
+            .iter()
+            .map(|capability| (*capability).to_owned())
+            .collect(),
+        source: NodeExecutorSourceData::Runtime,
+        boundary: NodeExecutorBoundaryData::RuntimeLogic,
+        available,
+        declaration_hash: native_declaration_hash(node_kind, id, version, behavior_abi),
+    }
+}
+
+fn native_declaration_hash(
+    node_kind: &str,
+    id: &str,
+    version: &str,
+    behavior_abi: Option<ContentHash>,
+) -> ContentHash {
+    let mut bytes = format!("{node_kind}\0{id}\0{version}\0^1.0").into_bytes();
+    if let Some(behavior_abi) = behavior_abi {
+        bytes.push(0);
+        bytes.extend_from_slice(b"behavior-abi:");
+        bytes.extend_from_slice(behavior_abi.as_bytes());
+    }
+    ContentHash::digest(&bytes)
 }
 
 impl NodeExecutorDataPort for RuntimeNodeExecutorData {
@@ -261,6 +384,7 @@ fn normalize(
         source: registration.source,
         boundary: registration.boundary,
         available: registration.available,
+        declaration_hash: registration.declaration_hash,
     })
 }
 
@@ -299,12 +423,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_registry_is_stable_and_marks_unsupported_categories() {
+    fn native_registry_is_stable_and_admits_implemented_categories() {
         let registry = RuntimeNodeExecutorData::native().expect("native registry");
         let records = registry
             .list_node_executors(ListNodeExecutorsDataRequest)
             .expect("records");
-        assert_eq!(records.len(), 19);
+        assert_eq!(records.len(), 24);
         assert!(records.windows(2).all(|pair| {
             (
                 pair[0].node_kind.as_str(),
@@ -319,8 +443,57 @@ mod tests {
         assert!(records.iter().any(|record| {
             record.node_kind == "parallel_branch"
                 && record.id == "runtime.parallel"
-                && !record.available
+                && record.available
         }));
+        assert!(records.iter().any(|record| {
+            record.node_kind == "emit_event"
+                && record.id == "runtime.event-emission"
+                && record.available
+        }));
+        for available in ["delay", "schedule"] {
+            assert!(
+                records
+                    .iter()
+                    .any(|record| { record.node_kind == available && record.available })
+            );
+        }
+        assert!(records.iter().any(|record| {
+            record.node_kind == "send_child_agent_message"
+                && record.id == "runtime.child-message"
+                && record.available
+        }));
+        for available in ["join_results", "parallel_branch"] {
+            assert!(
+                records
+                    .iter()
+                    .any(|record| { record.node_kind == available && record.available })
+            );
+        }
+        let tool_gate = records
+            .iter()
+            .filter(|record| record.id == "runtime.tool-gate")
+            .collect::<Vec<_>>();
+        assert_eq!(tool_gate.len(), 2);
+        assert_eq!(tool_gate[0].version, "1.0.0");
+        assert_eq!(
+            tool_gate[0].declaration_hash,
+            native_declaration_hash("tool_execution_gate", "runtime.tool-gate", "1.0.0", None),
+            "the historical declaration identity must remain exact"
+        );
+        assert_eq!(tool_gate[1].version, "1.1.0");
+        assert_eq!(
+            tool_gate[1].declaration_hash,
+            native_declaration_hash(
+                "tool_execution_gate",
+                "runtime.tool-gate",
+                "1.1.0",
+                Some(crate::tool::canonical_tool_catalog_hash())
+            )
+        );
+        assert_ne!(
+            tool_gate[0].declaration_hash, tool_gate[1].declaration_hash,
+            "alias-aware behavior must not masquerade as the historical executor"
+        );
     }
 
     #[test]
@@ -336,6 +509,7 @@ mod tests {
             },
             boundary: NodeExecutorBoundaryData::PluginHost,
             available: true,
+            declaration_hash: ContentHash::digest(b"fixture-plugin-node"),
         };
         assert_eq!(
             RuntimeNodeExecutorData::new(vec![registration.clone(), registration])
@@ -351,10 +525,69 @@ mod tests {
             source: NodeExecutorSourceData::Runtime,
             boundary: NodeExecutorBoundaryData::PluginHost,
             available: true,
+            declaration_hash: ContentHash::digest(b"runtime-invalid"),
         };
         assert_eq!(
             RuntimeNodeExecutorData::new(vec![invalid]).expect_err("boundary"),
             NodeExecutorDataError::InvalidBoundary
         );
+    }
+
+    #[test]
+    fn validated_plugin_declaration_joins_the_single_registry() {
+        let declaration_hash = ContentHash::digest(b"exact-plugin-declaration");
+        let manifest = crate::plugin::PluginManifestDataRecord {
+            id: String::from("fixture.node"),
+            version: String::from("3.0.0"),
+            category: String::from("graph_node"),
+            class: String::from("blocking"),
+            provided_capabilities: BTreeSet::new(),
+            subscribed_events: BTreeSet::new(),
+            timeout_ms: 1_000,
+            failure_policy: String::from("reject"),
+            canonical_manifest_json: String::from("{}"),
+            configuration: serde_json::json!({}),
+            configuration_reference: ContentHash::digest(b"{}"),
+            node_executors: vec![crate::plugin::PluginNodeExecutorDataRecord {
+                plugin_version: String::from("3.0.0"),
+                executor_id: String::from("fixture.echo"),
+                version: String::from("2.1.0"),
+                runtime_api: String::from("^1.0"),
+                node_kind: String::from("model_call"),
+                handler: String::from("execute_echo"),
+                capabilities: BTreeSet::from([String::from("model")]),
+                input_schema: String::from(r#"{"type":"object"}"#),
+                output_schema: String::from(r#"{"type":"object"}"#),
+                timeout_ms: 500,
+                failure_policy: String::from("reject"),
+                max_attempts: 1,
+                retry_backoff_ms: 0,
+                idempotent: false,
+                tool_permissions: BTreeSet::new(),
+                network_permissions: BTreeSet::new(),
+                state_scope: String::from("invocation"),
+                external_effects: false,
+                declaration_hash,
+            }],
+            context_transforms: Vec::new(),
+            memory_providers: Vec::new(),
+            compactors: Vec::new(),
+        };
+        let registry =
+            RuntimeNodeExecutorData::native_with_plugins(&[manifest]).expect("combined registry");
+        let records = registry
+            .list_node_executors(ListNodeExecutorsDataRequest)
+            .expect("records");
+        assert!(records.iter().any(|record| {
+            record.id == "fixture.echo"
+                && record.version == "2.1.0"
+                && record.source
+                    == (NodeExecutorSourceData::Plugin {
+                        plugin_id: String::from("fixture.node"),
+                    })
+                && record.boundary == NodeExecutorBoundaryData::PluginHost
+                && record.declaration_hash == declaration_hash
+                && record.available
+        }));
     }
 }

@@ -3,12 +3,18 @@
 //! Storage, runtime workflows, provider semantics, and tool behavior deliberately live
 //! outside this crate.
 
+use std::{fmt, str::FromStr};
+
 use agentmod_primitives::{
     ArtifactId, CausationId, ContentHash, CorrelationId, EventId, Sequence, SessionId,
     TimestampMillis, Version,
 };
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use thiserror::Error;
+
+const BLAKE3_ARTIFACT_PREFIX: &str = "blake3:";
+const BLAKE3_HEX_LENGTH: usize = 64;
+const MAX_ARTIFACT_IDENTIFIER_BYTES: usize = BLAKE3_ARTIFACT_PREFIX.len() + BLAKE3_HEX_LENGTH;
 
 /// Scope addressed by a canonical event.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -46,11 +52,99 @@ pub struct EventOrigin {
 /// Reference to immutable content stored outside the journal.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ArtifactReference {
-    /// Opaque artifact identifier.
-    pub id: ArtifactId,
+    /// Validated portable artifact identifier.
+    pub id: ArtifactIdentifier,
     /// Hash of exact stored bytes.
     pub content_hash: ContentHash,
 }
+
+/// Validated artifact identifier carried by canonical event envelopes.
+///
+/// UUID identifiers remain compatible with events written before artifacts
+/// became content-addressed. New artifact storage uses the exact
+/// `blake3:<64 lowercase hexadecimal characters>` identity.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct ArtifactIdentifier(String);
+
+impl ArtifactIdentifier {
+    /// Parses a portable event artifact identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactIdentifierError`] for empty, oversized, malformed, or
+    /// path-like identifiers.
+    pub fn parse(value: impl Into<String>) -> Result<Self, ArtifactIdentifierError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > MAX_ARTIFACT_IDENTIFIER_BYTES {
+            return Err(ArtifactIdentifierError);
+        }
+        if let Ok(uuid) = ArtifactId::from_str(&value) {
+            return Ok(Self(uuid.to_string()));
+        }
+        let Some(hash) = value.strip_prefix(BLAKE3_ARTIFACT_PREFIX) else {
+            return Err(ArtifactIdentifierError);
+        };
+        if hash.len() != BLAKE3_HEX_LENGTH
+            || !hash
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            return Err(ArtifactIdentifierError);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the exact portable identifier.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<ArtifactId> for ArtifactIdentifier {
+    fn from(value: ArtifactId) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl FromStr for ArtifactIdentifier {
+    type Err = ArtifactIdentifierError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+impl TryFrom<String> for ArtifactIdentifier {
+    type Error = ArtifactIdentifierError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl fmt::Display for ArtifactIdentifier {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl<'de> Deserialize<'de> for ArtifactIdentifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Invalid canonical event artifact identifier.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("artifact identifier must be a UUID or blake3:<64 lowercase hex characters>")]
+pub struct ArtifactIdentifierError;
 
 /// Metadata required for every canonical event.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -262,5 +356,64 @@ mod tests {
             EventEnvelope::<Proposal<String>>::from_verified_json(&json).expect("event verifies"),
             envelope
         );
+    }
+
+    #[test]
+    fn uuid_artifact_identifier_preserves_event_json_compatibility() {
+        let uuid = id(
+            "018f6f83-7b80-7000-8000-000000000005",
+            ArtifactId::from_uuid,
+        );
+        let identifier = ArtifactIdentifier::from(uuid);
+
+        assert_eq!(
+            serde_json::to_string(&identifier).expect("identifier serializes"),
+            "\"018f6f83-7b80-7000-8000-000000000005\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ArtifactIdentifier>("\"018F6F83-7B80-7000-8000-000000000005\"")
+                .expect("legacy UUID parses"),
+            identifier
+        );
+    }
+
+    #[test]
+    fn content_addressed_artifact_identifier_round_trips_exactly() {
+        let expected = format!("blake3:{}", "a5".repeat(32));
+        let identifier = ArtifactIdentifier::parse(expected.clone()).expect("valid BLAKE3 ID");
+        let json = serde_json::to_vec(&identifier).expect("identifier serializes");
+        let decoded =
+            serde_json::from_slice::<ArtifactIdentifier>(&json).expect("identifier deserializes");
+
+        assert_eq!(identifier.as_str(), expected);
+        assert_eq!(decoded, identifier);
+        assert_eq!(decoded.to_string(), expected);
+    }
+
+    #[test]
+    fn invalid_artifact_identifiers_fail_closed() {
+        let invalid = [
+            String::new(),
+            String::from("../artifact"),
+            String::from("folder/artifact"),
+            String::from(r"folder\artifact"),
+            String::from("blake3:"),
+            format!("blake3:{}", "a".repeat(63)),
+            format!("blake3:{}", "a".repeat(65)),
+            format!("blake3:{}", "A".repeat(64)),
+            format!("sha256:{}", "a".repeat(64)),
+        ];
+
+        for value in invalid {
+            assert!(
+                ArtifactIdentifier::parse(value.clone()).is_err(),
+                "{value:?} must be rejected"
+            );
+            let json = serde_json::to_string(&value).expect("test string serializes");
+            assert!(
+                serde_json::from_str::<ArtifactIdentifier>(&json).is_err(),
+                "{value:?} must fail during event decoding"
+            );
+        }
     }
 }

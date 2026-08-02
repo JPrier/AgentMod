@@ -1676,11 +1676,13 @@ fn contained_uri(uri: &str, workspace: &Path) -> Result<PathBuf, DependencyError
     let encoded = uri
         .strip_prefix("file://")
         .ok_or(DependencyError::UnsupportedUri)?;
-    let mut decoded = percent_decode(encoded)?;
+    let decoded = percent_decode(encoded)?;
     #[cfg(windows)]
-    if decoded.starts_with('/') && decoded.as_bytes().get(2) == Some(&b':') {
-        decoded.remove(0);
-    }
+    let decoded = if decoded.starts_with('/') && decoded.as_bytes().get(2) == Some(&b':') {
+        decoded[1..].to_owned()
+    } else {
+        decoded
+    };
     let canonical =
         fs::canonicalize(PathBuf::from(decoded)).map_err(|_| DependencyError::WorkspaceEscape)?;
     if canonical.starts_with(workspace) {

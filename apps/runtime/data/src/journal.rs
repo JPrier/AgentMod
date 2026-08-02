@@ -29,6 +29,9 @@ pub enum JournalDurability {
 pub struct AppendEventDataRequest {
     /// Durable session directory selected by runtime logic.
     pub session_directory: PathBuf,
+    /// Exact prior event identity required for an atomic compare-and-swap
+    /// append. `None` selects the ordinary sequence-checked append contract.
+    pub expected_head_event_id: Option<EventId>,
     /// Generic canonical event whose integrity must already be sealed.
     pub event: EventEnvelope<Value>,
     /// Required persistence guarantee.
@@ -291,6 +294,7 @@ where
         let dependency_request = DependencyAppendJournalRequest {
             session_directory: request.session_directory,
             sequence: sequence.get(),
+            expected_head_event_id: request.expected_head_event_id.map(|id| id.to_string()),
             event_id: event_id.to_string(),
             event_json,
             durability: map_durability(request.durability),
@@ -517,7 +521,8 @@ fn map_dependency_error(error: &JournalDependencyError) -> JournalDataError {
         JournalDependencyError::Io(_) => JournalDependencyFailureCode::Access,
         JournalDependencyError::Json(_) => JournalDependencyFailureCode::Encoding,
         JournalDependencyError::InvalidEventJson(_) => JournalDependencyFailureCode::InvalidEvent,
-        JournalDependencyError::SequenceMismatch { .. } => {
+        JournalDependencyError::SequenceMismatch { .. }
+        | JournalDependencyError::HeadEventIdMismatch { .. } => {
             JournalDependencyFailureCode::SequenceConflict
         }
         JournalDependencyError::DuplicateEventId(_) => {
@@ -661,6 +666,7 @@ mod tests {
         let appended = data
             .append_event(AppendEventDataRequest {
                 session_directory: PathBuf::from("session-a"),
+                expected_head_event_id: None,
                 event,
                 durability: JournalDurability::Full,
             })
@@ -693,6 +699,7 @@ mod tests {
         assert!(matches!(
             data.append_event(AppendEventDataRequest {
                 session_directory: PathBuf::from("session-a"),
+                expected_head_event_id: None,
                 event,
                 durability: JournalDurability::Buffered,
             }),

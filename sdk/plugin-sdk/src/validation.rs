@@ -5,8 +5,10 @@ use agentmod_event_pipeline::{CompileDiagnostic, OrderingSpec, compile_order};
 use semver::{Version, VersionReq};
 
 use crate::{
-    AuthorityTarget, ConfigurationSchemaSource, Entrypoint, FailurePolicy, IsolationMode,
-    PluginCategory, PluginClassification, PluginManifest, PluginScope, TrustLevel,
+    AuthorityTarget, ConfigurationSchemaSource, ContextTransformIdempotency, Entrypoint,
+    FailurePolicy, IsolationMode, MemoryRetrieveManifest, MemoryWriteManifest, PermissionManifest,
+    PluginCategory, PluginClassification, PluginManifest, PluginOperationIdempotency, PluginScope,
+    TrustLevel,
 };
 
 /// Current supported plugin manifest schema.
@@ -251,6 +253,10 @@ fn validate_intrinsic(
     validate_permissions(manifest, &plugin_path, &mut diagnostics);
     validate_ordering(manifest, &plugin_path, &mut diagnostics);
     validate_configuration(manifest, &plugin_path, &mut diagnostics);
+    validate_node_executors(manifest, context, &plugin_path, &mut diagnostics);
+    validate_context_transforms(manifest, context, &plugin_path, &mut diagnostics);
+    validate_memory_providers(manifest, context, &plugin_path, &mut diagnostics);
+    validate_compactors(manifest, context, &plugin_path, &mut diagnostics);
     if manifest.state_migration_version == 0 {
         diagnostics.push(error(
             "PLUG019",
@@ -260,6 +266,704 @@ fn validate_intrinsic(
         ));
     }
     diagnostics
+}
+
+struct OperationDeclaration<'a> {
+    handler: &'a str,
+    input_schema: &'a str,
+    output_schema: &'a str,
+    timeout_ms: u64,
+    failure_policy: &'a FailurePolicy,
+    idempotency: PluginOperationIdempotency,
+    required_permissions: &'a PermissionManifest,
+    state_scope: PluginScope,
+    external_effects: bool,
+}
+
+impl<'a> From<&'a MemoryRetrieveManifest> for OperationDeclaration<'a> {
+    fn from(operation: &'a MemoryRetrieveManifest) -> Self {
+        Self {
+            handler: &operation.handler,
+            input_schema: &operation.input_schema,
+            output_schema: &operation.output_schema,
+            timeout_ms: operation.timeout_ms,
+            failure_policy: &operation.failure_policy,
+            idempotency: operation.idempotency,
+            required_permissions: &operation.required_permissions,
+            state_scope: operation.state_scope,
+            external_effects: operation.external_effects,
+        }
+    }
+}
+
+impl<'a> From<&'a MemoryWriteManifest> for OperationDeclaration<'a> {
+    fn from(operation: &'a MemoryWriteManifest) -> Self {
+        Self {
+            handler: &operation.handler,
+            input_schema: &operation.input_schema,
+            output_schema: &operation.output_schema,
+            timeout_ms: operation.timeout_ms,
+            failure_policy: &operation.failure_policy,
+            idempotency: operation.idempotency,
+            required_permissions: &operation.required_permissions,
+            state_scope: operation.state_scope,
+            external_effects: operation.external_effects,
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the helper keeps one exact operation audit shared by memory and compaction declarations"
+)]
+fn validate_operation_declaration(
+    operation: &OperationDeclaration<'_>,
+    manifest: &PluginManifest,
+    context: &ValidationContext,
+    path: &str,
+    declaration_code: &'static str,
+    authority_code: &'static str,
+    label: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let retry_valid = match operation.failure_policy {
+        FailurePolicy::Retry {
+            max_attempts,
+            backoff_ms,
+        } => {
+            (1..=10).contains(max_attempts)
+                && *backoff_ms < operation.timeout_ms
+                && *backoff_ms <= context.maximum_timeout_ms.min(300_000)
+        }
+        _ => true,
+    };
+    let schemas_valid = [operation.input_schema, operation.output_schema]
+        .into_iter()
+        .all(valid_inline_schema);
+    if !is_symbol(operation.handler)
+        || operation.timeout_ms == 0
+        || operation.timeout_ms > manifest.timeout_ms
+        || operation.timeout_ms > context.maximum_timeout_ms.min(300_000)
+        || !retry_valid
+        || !schemas_valid
+    {
+        diagnostics.push(error(
+            declaration_code,
+            path,
+            format!("{label} handler, schema, timeout, or failure policy is invalid"),
+            "use a safe handler, bounded object schemas, and a timeout/retry policy within plugin and runtime ceilings",
+        ));
+    }
+
+    validate_unique_strings(
+        &operation.required_permissions.tools,
+        authority_code,
+        &format!("{path}.required_permissions.tools"),
+        &format!("{label} tool permission"),
+        diagnostics,
+    );
+    validate_unique_strings(
+        &operation.required_permissions.network,
+        authority_code,
+        &format!("{path}.required_permissions.network"),
+        &format!("{label} network permission"),
+        diagnostics,
+    );
+    let plugin_tools: BTreeSet<_> = manifest.permissions.tools.iter().collect();
+    let plugin_network: BTreeSet<_> = manifest.permissions.network.iter().collect();
+    if operation
+        .required_permissions
+        .tools
+        .iter()
+        .any(|permission| !plugin_tools.contains(permission))
+        || operation
+            .required_permissions
+            .network
+            .iter()
+            .any(|permission| !plugin_network.contains(permission))
+        || scope_rank(operation.state_scope) > scope_rank(manifest.scope)
+    {
+        diagnostics.push(error(
+            authority_code,
+            path,
+            format!("{label} permissions or state scope exceed the plugin declaration"),
+            "reduce operation authority to the containing plugin manifest",
+        ));
+    }
+}
+
+fn valid_inline_schema(schema: &str) -> bool {
+    schema.len() <= 65_536
+        && serde_json::from_str::<serde_json::Value>(schema).is_ok_and(|value| value.is_object())
+}
+
+fn validate_declaration_capabilities(
+    capabilities: &[String],
+    manifest: &PluginManifest,
+    path: &str,
+    code: &'static str,
+    label: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let provided: BTreeSet<_> = manifest.provided_capabilities.iter().collect();
+    if capabilities.len() > 128
+        || capabilities
+            .iter()
+            .any(|capability| !is_capability(capability) || !provided.contains(capability))
+    {
+        diagnostics.push(error(
+            code,
+            path,
+            format!("{label} capabilities are invalid or not exported by the plugin"),
+            "declare unique stable capabilities also present in provided_capabilities",
+        ));
+    }
+    validate_unique_strings(capabilities, code, path, label, diagnostics);
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one deterministic audit keeps every exact memory-provider declaration field at a stable diagnostic path"
+)]
+fn validate_memory_providers(
+    manifest: &PluginManifest,
+    context: &ValidationContext,
+    plugin_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if manifest.memory_providers.len() > 64 {
+        diagnostics.push(bounds(plugin_path, "memory_providers"));
+        return;
+    }
+    if manifest.category == PluginCategory::Memory && manifest.memory_providers.is_empty() {
+        diagnostics.push(error(
+            "PLUG042",
+            format!("{plugin_path}.memory_providers"),
+            "memory plugin declares no memory provider",
+            "declare at least one exact memory provider",
+        ));
+    } else if manifest.category != PluginCategory::Memory && !manifest.memory_providers.is_empty() {
+        diagnostics.push(error(
+            "PLUG042",
+            format!("{plugin_path}.memory_providers"),
+            "only memory plugins may declare memory providers",
+            "use category memory or remove the declarations",
+        ));
+    }
+
+    let runtime = Version::parse(&context.runtime_api_version).ok();
+    let mut identities = BTreeSet::new();
+    for (index, provider) in manifest.memory_providers.iter().enumerate() {
+        let path = format!("{plugin_path}.memory_providers[{index}]");
+        if !identities.insert((&provider.provider_id, &provider.version)) {
+            diagnostics.push(error(
+                "PLUG043",
+                path.clone(),
+                "duplicate memory-provider identity and version",
+                "memory-provider ID and version pairs must be unique within a plugin",
+            ));
+        }
+        if !is_capability(&provider.provider_id) || Version::parse(&provider.version).is_err() {
+            diagnostics.push(error(
+                "PLUG044",
+                path.clone(),
+                "memory-provider identity or version is invalid",
+                "use a bounded stable provider ID and complete semantic version",
+            ));
+        }
+        match (VersionReq::parse(&provider.runtime_api), runtime.as_ref()) {
+            (Ok(requirement), Some(runtime)) if requirement.matches(runtime) => {}
+            _ => diagnostics.push(error(
+                "PLUG045",
+                format!("{path}.runtime_api"),
+                "memory-provider runtime API requirement is invalid or incompatible",
+                "declare a semantic requirement matching the running runtime API",
+            )),
+        }
+        validate_declaration_capabilities(
+            &provider.capabilities,
+            manifest,
+            &format!("{path}.capabilities"),
+            "PLUG047",
+            "memory-provider capability",
+            diagnostics,
+        );
+
+        let retrieve = OperationDeclaration::from(&provider.retrieve);
+        validate_operation_declaration(
+            &retrieve,
+            manifest,
+            context,
+            &format!("{path}.retrieve"),
+            "PLUG046",
+            "PLUG047",
+            "memory retrieval",
+            diagnostics,
+        );
+        if retrieve.idempotency != PluginOperationIdempotency::Idempotent
+            || retrieve.external_effects
+        {
+            diagnostics.push(error(
+                "PLUG048",
+                format!("{path}.retrieve"),
+                "memory retrieval must be pure and idempotent",
+                "declare idempotent retrieval with external_effects = false",
+            ));
+        }
+
+        if let Some(write) = provider.write.as_ref() {
+            let write = OperationDeclaration::from(write);
+            validate_operation_declaration(
+                &write,
+                manifest,
+                context,
+                &format!("{path}.write"),
+                "PLUG046",
+                "PLUG047",
+                "memory write",
+                diagnostics,
+            );
+            if matches!(write.failure_policy, FailurePolicy::Retry { .. })
+                && write.idempotency != PluginOperationIdempotency::Idempotent
+            {
+                diagnostics.push(error(
+                    "PLUG048",
+                    format!("{path}.write"),
+                    "non-idempotent memory writes cannot declare automatic retries",
+                    "use a terminal failure policy or declare and implement idempotent writes",
+                ));
+            }
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one deterministic audit keeps every exact compactor declaration field at a stable diagnostic path"
+)]
+fn validate_compactors(
+    manifest: &PluginManifest,
+    context: &ValidationContext,
+    plugin_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if manifest.compactors.len() > 64 {
+        diagnostics.push(bounds(plugin_path, "compactors"));
+        return;
+    }
+    if manifest.category == PluginCategory::Compaction && manifest.compactors.is_empty() {
+        diagnostics.push(error(
+            "PLUG049",
+            format!("{plugin_path}.compactors"),
+            "compaction plugin declares no compactor",
+            "declare at least one exact compactor",
+        ));
+    } else if manifest.category != PluginCategory::Compaction && !manifest.compactors.is_empty() {
+        diagnostics.push(error(
+            "PLUG049",
+            format!("{plugin_path}.compactors"),
+            "only compaction plugins may declare compactors",
+            "use category compaction or remove the declarations",
+        ));
+    }
+
+    let runtime = Version::parse(&context.runtime_api_version).ok();
+    let mut identities = BTreeSet::new();
+    for (index, compactor) in manifest.compactors.iter().enumerate() {
+        let path = format!("{plugin_path}.compactors[{index}]");
+        if !identities.insert((&compactor.compactor_id, &compactor.version)) {
+            diagnostics.push(error(
+                "PLUG050",
+                path.clone(),
+                "duplicate compactor identity and version",
+                "compactor ID and version pairs must be unique within a plugin",
+            ));
+        }
+        if !is_capability(&compactor.compactor_id)
+            || !is_symbol(&compactor.handler)
+            || Version::parse(&compactor.version).is_err()
+        {
+            diagnostics.push(error(
+                "PLUG051",
+                path.clone(),
+                "compactor identity, version, or handler is invalid",
+                "use bounded stable identifiers and a complete semantic version",
+            ));
+        }
+        match (VersionReq::parse(&compactor.runtime_api), runtime.as_ref()) {
+            (Ok(requirement), Some(runtime)) if requirement.matches(runtime) => {}
+            _ => diagnostics.push(error(
+                "PLUG052",
+                format!("{path}.runtime_api"),
+                "compactor runtime API requirement is invalid or incompatible",
+                "declare a semantic requirement matching the running runtime API",
+            )),
+        }
+        validate_declaration_capabilities(
+            &compactor.capabilities,
+            manifest,
+            &format!("{path}.capabilities"),
+            "PLUG054",
+            "compactor capability",
+            diagnostics,
+        );
+        let operation = OperationDeclaration {
+            handler: &compactor.handler,
+            input_schema: &compactor.input_schema,
+            output_schema: &compactor.output_schema,
+            timeout_ms: compactor.timeout_ms,
+            failure_policy: &compactor.failure_policy,
+            idempotency: compactor.idempotency,
+            required_permissions: &compactor.required_permissions,
+            state_scope: compactor.state_scope,
+            external_effects: compactor.external_effects,
+        };
+        validate_operation_declaration(
+            &operation,
+            manifest,
+            context,
+            &path,
+            "PLUG053",
+            "PLUG054",
+            "compactor",
+            diagnostics,
+        );
+        if operation.idempotency != PluginOperationIdempotency::Idempotent
+            || operation.external_effects
+        {
+            diagnostics.push(error(
+                "PLUG055",
+                path,
+                "compaction must be pure and idempotent",
+                "declare idempotent compaction with external_effects = false",
+            ));
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one deterministic audit keeps every exact context-transform declaration field at a stable diagnostic path"
+)]
+fn validate_context_transforms(
+    manifest: &PluginManifest,
+    context: &ValidationContext,
+    plugin_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if manifest.context_transforms.len() > 64 {
+        diagnostics.push(bounds(plugin_path, "context_transforms"));
+        return;
+    }
+    if manifest.category == PluginCategory::ContextTransform
+        && manifest.context_transforms.is_empty()
+    {
+        diagnostics.push(error(
+            "PLUG033",
+            format!("{plugin_path}.context_transforms"),
+            "context-transform plugin declares no context transform",
+            "declare at least one exact context transform",
+        ));
+    } else if manifest.category != PluginCategory::ContextTransform
+        && !manifest.context_transforms.is_empty()
+    {
+        diagnostics.push(error(
+            "PLUG033",
+            format!("{plugin_path}.context_transforms"),
+            "only context-transform plugins may declare context transforms",
+            "use category context_transform or remove the declarations",
+        ));
+    }
+
+    let runtime = Version::parse(&context.runtime_api_version).ok();
+    let provided: BTreeSet<_> = manifest.provided_capabilities.iter().collect();
+    let plugin_tools: BTreeSet<_> = manifest.permissions.tools.iter().collect();
+    let plugin_network: BTreeSet<_> = manifest.permissions.network.iter().collect();
+    let mut identities = BTreeSet::new();
+    for (index, transform) in manifest.context_transforms.iter().enumerate() {
+        let path = format!("{plugin_path}.context_transforms[{index}]");
+        if !identities.insert((&transform.transform_id, &transform.version)) {
+            diagnostics.push(error(
+                "PLUG034",
+                path.clone(),
+                "duplicate context-transform identity and version",
+                "context-transform ID and version pairs must be unique within a plugin",
+            ));
+        }
+        if !is_capability(&transform.transform_id)
+            || !is_symbol(&transform.handler)
+            || Version::parse(&transform.version).is_err()
+        {
+            diagnostics.push(error(
+                "PLUG035",
+                path.clone(),
+                "context-transform identity, version, or handler is invalid",
+                "use bounded stable identifiers and a complete semantic version",
+            ));
+        }
+        match (VersionReq::parse(&transform.runtime_api), runtime.as_ref()) {
+            (Ok(requirement), Some(runtime)) if requirement.matches(runtime) => {}
+            _ => diagnostics.push(error(
+                "PLUG036",
+                format!("{path}.runtime_api"),
+                "context-transform runtime API requirement is invalid or incompatible",
+                "declare a semantic requirement matching the running runtime API",
+            )),
+        }
+        if transform.timeout_ms == 0
+            || transform.timeout_ms > manifest.timeout_ms
+            || transform.timeout_ms > context.maximum_timeout_ms.min(300_000)
+        {
+            diagnostics.push(error(
+                "PLUG037",
+                format!("{path}.timeout_ms"),
+                "context-transform timeout is zero or exceeds its plugin/runtime ceiling",
+                "choose a positive timeout no larger than the plugin timeout",
+            ));
+        }
+        if let FailurePolicy::Retry {
+            max_attempts,
+            backoff_ms,
+        } = &transform.failure_policy
+            && (!(1..=10).contains(max_attempts)
+                || *backoff_ms >= transform.timeout_ms
+                || *backoff_ms > context.maximum_timeout_ms.min(300_000))
+        {
+            diagnostics.push(error(
+                "PLUG037",
+                format!("{path}.failure_policy"),
+                "context-transform retry policy exceeds its bounded attempts or timeout",
+                "use 1-10 attempts and a backoff below the transform timeout",
+            ));
+        }
+        if transform.capabilities.len() > 128
+            || transform
+                .capabilities
+                .iter()
+                .any(|capability| !is_capability(capability) || !provided.contains(capability))
+        {
+            diagnostics.push(error(
+                "PLUG038",
+                format!("{path}.capabilities"),
+                "context-transform capabilities are invalid or not exported by the plugin",
+                "declare unique stable capabilities also present in provided_capabilities",
+            ));
+        }
+        validate_unique_strings(
+            &transform.capabilities,
+            "PLUG038",
+            &format!("{path}.capabilities"),
+            "context-transform capability",
+            diagnostics,
+        );
+        let schemas_valid = [&transform.input_schema, &transform.output_schema]
+            .into_iter()
+            .all(|schema| {
+                schema.len() <= 65_536
+                    && serde_json::from_str::<serde_json::Value>(schema)
+                        .is_ok_and(|value| value.is_object())
+            });
+        if !schemas_valid {
+            diagnostics.push(error(
+                "PLUG039",
+                path.clone(),
+                "context-transform input or output schema is invalid or oversized",
+                "supply bounded inline JSON Schema objects",
+            ));
+        }
+        validate_unique_strings(
+            &transform.required_permissions.tools,
+            "PLUG040",
+            &format!("{path}.required_permissions.tools"),
+            "context-transform tool permission",
+            diagnostics,
+        );
+        validate_unique_strings(
+            &transform.required_permissions.network,
+            "PLUG040",
+            &format!("{path}.required_permissions.network"),
+            "context-transform network permission",
+            diagnostics,
+        );
+        if transform
+            .required_permissions
+            .tools
+            .iter()
+            .any(|permission| !plugin_tools.contains(permission))
+            || transform
+                .required_permissions
+                .network
+                .iter()
+                .any(|permission| !plugin_network.contains(permission))
+            || scope_rank(transform.state_scope) > scope_rank(manifest.scope)
+        {
+            diagnostics.push(error(
+                "PLUG040",
+                path.clone(),
+                "context-transform permissions or state scope exceed the plugin declaration",
+                "reduce context-transform authority to the containing plugin manifest",
+            ));
+        }
+        if transform.idempotency != ContextTransformIdempotency::Idempotent
+            || transform.external_effects
+        {
+            diagnostics.push(error(
+                "PLUG041",
+                path,
+                "the current context-transform runtime requires pure idempotent execution",
+                "declare idempotent execution with external_effects = false",
+            ));
+        }
+    }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one deterministic audit keeps every exact executor declaration field at a stable diagnostic path"
+)]
+fn validate_node_executors(
+    manifest: &PluginManifest,
+    context: &ValidationContext,
+    plugin_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if manifest.node_executors.len() > 64 {
+        diagnostics.push(bounds(plugin_path, "node_executors"));
+        return;
+    }
+    if manifest.category == PluginCategory::GraphNode && manifest.node_executors.is_empty() {
+        diagnostics.push(error(
+            "PLUG025",
+            format!("{plugin_path}.node_executors"),
+            "graph-node plugin declares no node executor",
+            "declare at least one exact node executor",
+        ));
+    } else if manifest.category != PluginCategory::GraphNode && !manifest.node_executors.is_empty()
+    {
+        diagnostics.push(error(
+            "PLUG025",
+            format!("{plugin_path}.node_executors"),
+            "only graph-node plugins may declare node executors",
+            "use category graph_node or remove the declarations",
+        ));
+    }
+    let runtime = Version::parse(&context.runtime_api_version).ok();
+    let provided: BTreeSet<_> = manifest.provided_capabilities.iter().collect();
+    let plugin_tools: BTreeSet<_> = manifest.permissions.tools.iter().collect();
+    let plugin_network: BTreeSet<_> = manifest.permissions.network.iter().collect();
+    let mut identities = BTreeSet::new();
+    for (index, executor) in manifest.node_executors.iter().enumerate() {
+        let path = format!("{plugin_path}.node_executors[{index}]");
+        if !identities.insert((&executor.executor_id, &executor.version)) {
+            diagnostics.push(error(
+                "PLUG026",
+                path.clone(),
+                "duplicate executor identity and version",
+                "executor ID and version pairs must be unique within a plugin",
+            ));
+        }
+        if !is_capability(&executor.executor_id)
+            || !is_capability(&executor.node_kind)
+            || !is_symbol(&executor.handler)
+            || Version::parse(&executor.version).is_err()
+        {
+            diagnostics.push(error(
+                "PLUG027",
+                path.clone(),
+                "executor identity, version, node kind, or handler is invalid",
+                "use bounded stable identifiers and a complete semantic version",
+            ));
+        }
+        match (VersionReq::parse(&executor.runtime_api), runtime.as_ref()) {
+            (Ok(requirement), Some(runtime)) if requirement.matches(runtime) => {}
+            _ => diagnostics.push(error(
+                "PLUG028",
+                format!("{path}.runtime_api"),
+                "executor runtime API requirement is invalid or incompatible",
+                "declare a semantic requirement matching the running runtime API",
+            )),
+        }
+        if executor.timeout_ms == 0
+            || executor.timeout_ms > manifest.timeout_ms
+            || executor.timeout_ms > context.maximum_timeout_ms.min(300_000)
+        {
+            diagnostics.push(error(
+                "PLUG029",
+                format!("{path}.timeout_ms"),
+                "executor timeout is zero or exceeds its plugin/runtime ceiling",
+                "choose a positive timeout no larger than the plugin timeout",
+            ));
+        }
+        if let FailurePolicy::Retry {
+            max_attempts,
+            backoff_ms,
+        } = &executor.failure_policy
+            && (!(1..=10).contains(max_attempts)
+                || *backoff_ms >= executor.timeout_ms
+                || *backoff_ms > context.maximum_timeout_ms.min(300_000))
+        {
+            diagnostics.push(error(
+                "PLUG029",
+                format!("{path}.failure_policy"),
+                "executor retry policy exceeds its bounded attempts or timeout",
+                "use 1-10 attempts and a backoff below the executor timeout",
+            ));
+        }
+        if executor.capabilities.len() > 128
+            || executor
+                .capabilities
+                .iter()
+                .any(|capability| !is_capability(capability) || !provided.contains(capability))
+        {
+            diagnostics.push(error(
+                "PLUG030",
+                format!("{path}.capabilities"),
+                "executor capabilities are invalid or not exported by the plugin",
+                "declare unique stable capabilities also present in provided_capabilities",
+            ));
+        }
+        validate_unique_strings(
+            &executor.capabilities,
+            "PLUG030",
+            &format!("{path}.capabilities"),
+            "executor capability",
+            diagnostics,
+        );
+        let schemas_valid = [&executor.input_schema, &executor.output_schema]
+            .into_iter()
+            .all(|schema| {
+                schema.len() <= 65_536
+                    && serde_json::from_str::<serde_json::Value>(schema)
+                        .is_ok_and(|value| value.is_object())
+            });
+        if !schemas_valid {
+            diagnostics.push(error(
+                "PLUG031",
+                path.clone(),
+                "executor input or output schema is invalid or oversized",
+                "supply bounded inline JSON Schema objects",
+            ));
+        }
+        if executor
+            .required_permissions
+            .tools
+            .iter()
+            .any(|permission| !plugin_tools.contains(permission))
+            || executor
+                .required_permissions
+                .network
+                .iter()
+                .any(|permission| !plugin_network.contains(permission))
+            || scope_rank(executor.state_scope) > scope_rank(manifest.scope)
+        {
+            diagnostics.push(error(
+                "PLUG032",
+                path,
+                "executor permissions or state scope exceed the plugin declaration",
+                "reduce executor authority to the containing plugin manifest",
+            ));
+        }
+    }
 }
 
 fn validate_runtime_api(

@@ -1,0 +1,497 @@
+{
+  "style_id": "research-loop",
+  "style_version": "1.2.0",
+  "kind": "built_in",
+  "built_in_semantic": "research_loop",
+  "graph": {
+    "format_version": 1,
+    "entry_index": 1,
+    "budget": {
+      "max_steps": 500,
+      "max_tokens": 750000,
+      "max_cost_micros": 75000000,
+      "max_duration_ms": 2700000
+    },
+    "declarations": {
+      "capabilities": [
+        "artifacts",
+        "context",
+        "model",
+        "tools"
+      ],
+      "tools": [
+        "filesystem.read"
+      ],
+      "providers": [
+        "deterministic-mock"
+      ],
+      "events": [],
+      "plugins": []
+    },
+    "variables": [
+      {
+        "name": "iteration",
+        "type": {
+          "kind": "map",
+          "value_type": {
+            "kind": "boolean"
+          },
+          "max_entries": 1
+        },
+        "scope": "run",
+        "producer": "repeat",
+        "merge_contributors": [],
+        "consumers": [
+          "repeat"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 128,
+        "security_classification": "internal"
+      },
+      {
+        "name": "model_disposition",
+        "type": {
+          "kind": "enum",
+          "values": [
+            "response_complete",
+            "tool_requests"
+          ]
+        },
+        "scope": "run",
+        "producer": "research",
+        "merge_contributors": [],
+        "consumers": [
+          "tool-batch"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 64,
+        "security_classification": "internal"
+      },
+      {
+        "name": "model_result",
+        "type": {
+          "kind": "node_result_reference"
+        },
+        "scope": "run",
+        "producer": "research",
+        "merge_contributors": [],
+        "consumers": [
+          "tool-batch"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 512,
+        "security_classification": "internal"
+      },
+      {
+        "name": "receipt_artifact",
+        "type": {
+          "kind": "artifact_reference"
+        },
+        "scope": "run",
+        "producer": "persist",
+        "merge_contributors": [],
+        "consumers": [
+          "done"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 512,
+        "security_classification": "confidential"
+      },
+      {
+        "name": "research_receipt",
+        "type": {
+          "kind": "node_result_reference"
+        },
+        "scope": "run",
+        "producer": "tool-batch",
+        "merge_contributors": [],
+        "consumers": [
+          "persist"
+        ],
+        "mutability": "mutable",
+        "merge_policy": null,
+        "max_size_bytes": 512,
+        "security_classification": "internal"
+      }
+    ],
+    "nodes": [
+      {
+        "index": 0,
+        "id": "done",
+        "kind": "complete_session",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "receipt_artifact"
+        ],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 1,
+        "id": "fresh-context",
+        "kind": "context_transform",
+        "configuration": {
+          "type": "context_transform",
+          "strategy": "fresh"
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 2,
+        "id": "persist",
+        "kind": "persist_artifact",
+        "configuration": {
+          "type": "persist_artifact",
+          "content": {
+            "kind": "provider_result_text",
+            "reference_variable": "research_receipt"
+          },
+          "mime_type": "text/markdown",
+          "security": "private",
+          "retention": "session"
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "research_receipt"
+        ],
+        "write_variables": [
+          "receipt_artifact"
+        ],
+        "retry_limit": 0,
+        "max_iterations": null
+      },
+      {
+        "index": 3,
+        "id": "repeat",
+        "kind": "loop",
+        "configuration": null,
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [
+          "iteration"
+        ],
+        "write_variables": [
+          "iteration"
+        ],
+        "retry_limit": 0,
+        "max_iterations": 3
+      },
+      {
+        "index": 4,
+        "id": "research",
+        "kind": "model_call",
+        "configuration": {
+          "type": "model_request",
+          "disposition_output": "model_disposition",
+          "result_output": "model_result",
+          "provider_options": {},
+          "json_outputs": {}
+        },
+        "condition": null,
+        "tool": null,
+        "provider": "deterministic-mock",
+        "required_capabilities": [],
+        "read_scopes": [],
+        "write_scopes": [],
+        "read_variables": [],
+        "write_variables": [
+          "model_disposition",
+          "model_result"
+        ],
+        "retry_limit": 2,
+        "max_iterations": null
+      },
+      {
+        "index": 5,
+        "id": "tool-batch",
+        "kind": "tool_execution_gate",
+        "configuration": {
+          "type": "provider_tool_batch_execution",
+          "request_reference_variable": "model_result",
+          "disposition_variable": "model_disposition",
+          "maximum_calls": 32,
+          "allowed_tools": [
+            "filesystem.read"
+          ]
+        },
+        "condition": null,
+        "tool": null,
+        "provider": null,
+        "required_capabilities": [],
+        "read_scopes": [
+          "workspace"
+        ],
+        "write_scopes": [],
+        "read_variables": [
+          "model_disposition",
+          "model_result"
+        ],
+        "write_variables": [
+          "research_receipt"
+        ],
+        "retry_limit": 0,
+        "max_iterations": null
+      }
+    ],
+    "edges": [
+      {
+        "from": 1,
+        "to": 4,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 2,
+        "to": 3,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 3,
+        "to": 0,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "iteration"
+                  },
+                  {
+                    "segment": "key",
+                    "value": "remaining"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "boolean",
+                "value": false
+              }
+            }
+          }
+        },
+        "label": "complete"
+      },
+      {
+        "from": 3,
+        "to": 1,
+        "condition": {
+          "expression": "compare",
+          "value": {
+            "left": {
+              "operand": "path",
+              "value": {
+                "segments": [
+                  {
+                    "segment": "key",
+                    "value": "iteration"
+                  },
+                  {
+                    "segment": "key",
+                    "value": "remaining"
+                  }
+                ]
+              }
+            },
+            "operator": "equal",
+            "right": {
+              "operand": "literal",
+              "value": {
+                "type": "boolean",
+                "value": true
+              }
+            }
+          }
+        },
+        "label": "continue"
+      },
+      {
+        "from": 4,
+        "to": 5,
+        "condition": null,
+        "label": null
+      },
+      {
+        "from": 5,
+        "to": 2,
+        "condition": null,
+        "label": null
+      }
+    ],
+    "cache_key": {
+      "graph_content_hash": "1540fad0f7d4d01ccf89f9dc93ab04e23fd67c068e808b06207e50b2abbe4899",
+      "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+      "capability_set_hash": "740ec0810d6069d7cb3b1338c71fca1a20bea948cc6e94730dc81f165e16435d",
+      "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+      "combined_hash": "26aa79247b46125483ab1007f905b017c9ca128f7e4818248c9a29c74c889a14"
+    }
+  },
+  "interceptor_order": [
+    "runtime-style-policy"
+  ],
+  "interceptors": [
+    {
+      "id": "runtime-style-policy",
+      "owner": "runtime.security",
+      "event": "action.proposed",
+      "stage": 10,
+      "priority": 100,
+      "before": [],
+      "after": [],
+      "supported_decisions": [
+        "continue",
+        "replace",
+        "reject",
+        "require_approval",
+        "cancel"
+      ],
+      "required_capabilities": [
+        "approval"
+      ]
+    }
+  ],
+  "required_capabilities": [
+    "approval",
+    "artifacts",
+    "context",
+    "model",
+    "tools"
+  ],
+  "allowed_tool_groups": [
+    "filesystem"
+  ],
+  "allowed_providers": [
+    "deterministic-mock"
+  ],
+  "allowed_plugins": [
+    "runtime.security"
+  ],
+  "harness": {
+    "id": "native",
+    "required_capabilities": [
+      "cancellation",
+      "streaming",
+      "structured_context_replacement",
+      "token_usage",
+      "tool_calls"
+    ]
+  },
+  "memory": {
+    "provider": "file",
+    "scopes": [
+      "session",
+      "project"
+    ],
+    "retrieval_timing": "iteration_start",
+    "query": {
+      "source": "session_goal",
+      "include_active_artifacts": true,
+      "include_style_context": true,
+      "max_query_bytes": 32768
+    },
+    "max_items": 64,
+    "max_injected_bytes": 524288,
+    "write_policy": "iteration_completion",
+    "injection_location": "before_current_input"
+  },
+  "compaction": {
+    "strategy": "none",
+    "trigger_tokens": null,
+    "reserved_context_tokens": 0,
+    "max_provider_projection_tokens": 0,
+    "preserve_unresolved_tasks": true,
+    "preserve_active_processes": true,
+    "preservation_requirements": [
+      "system_instructions",
+      "current_input",
+      "pending_control_state",
+      "artifact_references",
+      "memory_provenance",
+      "active_graph_state",
+      "tool_call_correlation"
+    ]
+  },
+  "approvals": {
+    "default": "ask",
+    "groups": {
+      "filesystem.read": "allow"
+    }
+  },
+  "budgets": {
+    "max_iterations": 16,
+    "max_steps": 1000,
+    "max_tokens": 1000000,
+    "max_cost_micros": 100000000,
+    "max_duration_ms": 3600000
+  },
+  "child_agents": {
+    "max_children": 0,
+    "max_concurrent": 0,
+    "max_depth": 0,
+    "per_child_token_budget": 0
+  },
+  "retry": {
+    "max_attempts": 4,
+    "initial_backoff_ms": 100,
+    "max_backoff_ms": 5000,
+    "retryable_failures": [
+      "provider.rate_limit",
+      "provider.unavailable"
+    ]
+  },
+  "termination": {
+    "allowed_outcomes": [
+      "complete_session",
+      "fail"
+    ],
+    "on_hard_limit": "fail",
+    "require_explicit_terminal_node": true
+  },
+  "selection": {
+    "requires_explicit_selection": true,
+    "model_may_select": false
+  },
+  "cache_key": {
+    "style_content_hash": "e51acddf6ce377cae71114bffee1164e0000c97a2bc2d2d968263a0e17becc9a",
+    "plugin_set_hash": "ce80e75ffcec706970f56d13162517c8c92f51fd9821589641f42f97e2e363eb",
+    "runtime_api_hash": "23eaa9f2792c8711c5ded41da3ef1485379a28b4b5f2b3f21698fdfd38535a10",
+    "capability_set_hash": "ed32eaa3749667657942a541cc1cd92d768c994f382cc55088354c23cfa41df4",
+    "combined_hash": "c2b949c05645f88de25d9dd78108d8487dce3e122188e2a655a84e8fa402c0e0"
+  }
+}

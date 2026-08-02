@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-acp-dependency = { path = "../dependency" }
-agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-acp-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
 async-trait.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

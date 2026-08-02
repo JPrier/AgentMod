@@ -5,6 +5,7 @@ $runRoot = $null
 $daemon = $null
 $runtimeLog = $null
 $launchCounter = 0
+$succeeded = $false
 Push-Location $repository
 try {
     cargo build -p agentmod-runtime -p agentmod-harness `
@@ -113,7 +114,12 @@ try {
         Start-Sleep -Milliseconds 100
     }
     if (-not $canonicalCompletionObserved) {
-        throw "startup recovery did not execute the unstarted claim"
+        $detail = if (Test-Path -LiteralPath $runtimeLog) {
+            Get-Content $runtimeLog -Raw
+        } else {
+            "runtime produced no diagnostic log"
+        }
+        throw "startup recovery did not execute the unstarted claim: $detail"
     }
     $terminalMarker = Join-Path $env:AGENTMOD_SCHEDULER_ROOT (
         "executions\" + $executionId + ".succeeded"
@@ -155,6 +161,7 @@ try {
     if (@($pending.executions).Count -ne 0) {
         throw "terminal recovery left a due occurrence"
     }
+    $succeeded = $true
     Write-Output "runtime scheduler claim and terminal reconciliation E2E passed"
 }
 finally {
@@ -173,7 +180,7 @@ finally {
     )) {
         Remove-Item "Env:$name" -ErrorAction SilentlyContinue
     }
-    if ($null -ne $runRoot -and (Test-Path -LiteralPath $runRoot)) {
+    if ($succeeded -and $null -ne $runRoot -and (Test-Path -LiteralPath $runRoot)) {
         $resolvedTemp = (Resolve-Path ([System.IO.Path]::GetTempPath())).Path
         $resolvedRun = (Resolve-Path $runRoot).Path
         if ($resolvedRun.StartsWith($resolvedTemp) -and
@@ -183,6 +190,9 @@ finally {
             Remove-Item -LiteralPath $resolvedRun -Recurse -Force `
                 -ErrorAction SilentlyContinue
         }
+    } elseif ($null -ne $runRoot) {
+        Write-Error "scheduler recovery E2E retained failed state at $runRoot" `
+            -ErrorAction Continue
     }
     Pop-Location
 }

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "step_id": "20-lsp-focused-clippy",
+  "command": "cargo clippy -p agentmod-lsp-host-dependency --all-targets --all-features -- -D warnings",
+  "arguments": [
+    "clippy",
+    "-p",
+    "agentmod-lsp-host-dependency",
+    "--all-targets",
+    "--all-features",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 1.084046,
+  "started_at_utc": "2026-07-31T12:48:30.1961694+00:00",
+  "completed_at_utc": "2026-07-31T12:48:31.3623246+00:00",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree_dirty": true,
+  "working_tree_porcelain_entries": 339,
+  "stdout_path": ".omx\\validation\\2026-07-31-windows-final-20-lsp-focused-clippy.stdout.log",
+  "stderr_path": ".omx\\validation\\2026-07-31-windows-final-20-lsp-focused-clippy.stderr.log",
+  "launch_failure": null
+}

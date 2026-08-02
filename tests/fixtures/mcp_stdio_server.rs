@@ -1,4 +1,7 @@
-use std::io::{self, BufRead, Write};
+use std::{
+    fs::OpenOptions,
+    io::{self, BufRead, Write},
+};
 
 fn main() {
     let stdin = io::stdin();
@@ -19,6 +22,7 @@ fn main() {
             "resources/list" => String::from(r#"{"resources":[]}"#),
             "prompts/list" => String::from(r#"{"prompts":[]}"#),
             "tools/call" => {
+                record_tool_call();
                 write_message(
                     &mut stdout,
                     r#"{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":"runtime-e2e","progress":1,"total":1}}"#,
@@ -32,6 +36,19 @@ fn main() {
             &format!(r#"{{"jsonrpc":"2.0","id":"{id}","result":{result}}}"#),
         );
     }
+}
+
+fn record_tool_call() {
+    let Ok(path) = std::env::var("FIXTURE_AUDIT_PATH") else {
+        return;
+    };
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("audit file");
+    writeln!(file, "{}", r#"{"event":"tools/call"}"#).expect("audit record");
+    file.sync_data().expect("durable audit record");
 }
 
 fn read_message(reader: &mut impl BufRead) -> Option<String> {

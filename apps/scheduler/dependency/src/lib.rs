@@ -42,6 +42,8 @@ pub enum DependencyPayload {
     Prompt { prompt: String },
     /// Continuation wakeup.
     Continuation { continuation_id: String },
+    /// Runtime-owned graph trigger.
+    GraphTrigger { run_id: String, node_id: String },
 }
 
 /// Dependency-owned persisted schedule.
@@ -69,7 +71,14 @@ pub struct DependencyExecution {
     pub scheduled_for_ms: i64,
     /// Unix timestamp when the claim record was created.
     pub claimed_at_ms: i64,
+    pub observation: Option<DependencyObservation>,
     pub schedule: DependencySchedule,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum DependencyObservation {
+    RuntimeEvent { event_id: String },
+    ProcessOutput { output_id: String },
 }
 
 /// Store result.
@@ -97,11 +106,13 @@ pub trait SchedulerDependencyPort: Send + Sync {
     }
     fn fire_runtime_event(
         &self,
+        source_session_id: &str,
         event_id: &str,
         event_type: &str,
     ) -> Result<Vec<DependencyExecution>, SchedulerDependencyError>;
     fn fire_process_output(
         &self,
+        source_session_id: &str,
         output_id: &str,
         process_id: &str,
         output: &str,
@@ -159,7 +170,12 @@ impl FileSchedulerDependency {
 
     fn schedule_path(&self, id: &str) -> Result<PathBuf, SchedulerDependencyError> {
         validate_id(id)?;
-        Ok(self.root.join("schedules").join(format!("{id}.json")))
+        let schedules = self.root.join("schedules");
+        let legacy = schedules.join(format!("{id}.json"));
+        if legacy.exists() {
+            return Ok(legacy);
+        }
+        Ok(schedules.join(format!("{}.json", portable_schedule_file_stem(id))))
     }
 
     fn load_state(path: &Path) -> Result<ScheduleState, SchedulerDependencyError> {
@@ -189,6 +205,7 @@ impl FileSchedulerDependency {
         source: &str,
         scheduled_for_ms: i64,
         claimed_at_ms: i64,
+        observation: Option<DependencyObservation>,
     ) -> Result<Option<DependencyExecution>, SchedulerDependencyError> {
         let occurrence = if source == "time" {
             scheduled_for_ms.to_string()
@@ -203,6 +220,7 @@ impl FileSchedulerDependency {
             execution_id: digest.clone(),
             scheduled_for_ms,
             claimed_at_ms,
+            observation,
             schedule: schedule.clone(),
         };
         let stored = StoredExecution {
@@ -225,16 +243,24 @@ impl FileSchedulerDependency {
     fn event_matches(
         &self,
         source_id: &str,
+        source_session_id: &str,
         scheduled_for_ms: i64,
+        observation: &DependencyObservation,
         predicate: impl Fn(&DependencyTrigger) -> bool,
     ) -> Result<Vec<DependencyExecution>, SchedulerDependencyError> {
         self.locked(|| {
             let mut result = Vec::new();
             for schedule in self.list_unlocked(10_000)? {
                 if schedule.active
+                    && schedule.session_id == source_session_id
                     && predicate(&schedule.trigger)
-                    && let Some(execution) =
-                        self.claim(&schedule, source_id, scheduled_for_ms, scheduled_for_ms)?
+                    && let Some(execution) = self.claim(
+                        &schedule,
+                        source_id,
+                        scheduled_for_ms,
+                        scheduled_for_ms,
+                        Some(observation.clone()),
+                    )?
                 {
                     result.push(execution);
                 }
@@ -344,7 +370,7 @@ impl SchedulerDependencyPort for FileSchedulerDependency {
                     let Some(due) = state.next_due_ms.filter(|due| *due <= now) else {
                         break;
                     };
-                    if let Some(execution) = self.claim(&state.schedule, "time", due, now)? {
+                    if let Some(execution) = self.claim(&state.schedule, "time", due, now, None)? {
                         result.push(execution);
                     }
                     match state.schedule.trigger {
@@ -416,6 +442,7 @@ impl SchedulerDependencyPort for FileSchedulerDependency {
                     execution_id: stored.record.execution_id,
                     scheduled_for_ms: stored.record.scheduled_for_ms,
                     claimed_at_ms: stored.record.claimed_at_ms,
+                    observation: stored.record.observation,
                     schedule: stored.record.schedule,
                 });
                 if pending.len() == limit {
@@ -428,33 +455,53 @@ impl SchedulerDependencyPort for FileSchedulerDependency {
 
     fn fire_runtime_event(
         &self,
+        source_session_id: &str,
         event_id: &str,
         event_type: &str,
     ) -> Result<Vec<DependencyExecution>, SchedulerDependencyError> {
         validate_id(event_id)?;
+        validate_id(source_session_id)?;
         let now = now_millis()?;
-        self.event_matches(event_id, now, |trigger| {
-            matches!(trigger, DependencyTrigger::RuntimeEvent { event_type: expected } if expected == event_type)
-        })
+        self.event_matches(
+            event_id,
+            source_session_id,
+            now,
+            &DependencyObservation::RuntimeEvent {
+                event_id: event_id.to_owned(),
+            },
+            |trigger| {
+                matches!(trigger, DependencyTrigger::RuntimeEvent { event_type: expected } if expected == event_type)
+            },
+        )
     }
 
     fn fire_process_output(
         &self,
+        source_session_id: &str,
         output_id: &str,
         process_id: &str,
         output: &str,
     ) -> Result<Vec<DependencyExecution>, SchedulerDependencyError> {
         validate_id(output_id)?;
+        validate_id(source_session_id)?;
         let now = now_millis()?;
-        self.event_matches(output_id, now, |trigger| {
-            matches!(
-                trigger,
-                DependencyTrigger::ProcessOutput {
-                    process_id: expected,
-                    contains,
-                } if expected == process_id && output.contains(contains)
-            )
-        })
+        self.event_matches(
+            output_id,
+            source_session_id,
+            now,
+            &DependencyObservation::ProcessOutput {
+                output_id: output_id.to_owned(),
+            },
+            |trigger| {
+                matches!(
+                    trigger,
+                    DependencyTrigger::ProcessOutput {
+                        process_id: expected,
+                        contains,
+                    } if expected == process_id && output.contains(contains)
+                )
+            },
+        )
     }
 
     fn complete_execution(
@@ -548,6 +595,8 @@ struct ExecutionRecord {
     scheduled_for_ms: i64,
     #[serde(default)]
     claimed_at_ms: i64,
+    #[serde(default)]
+    observation: Option<DependencyObservation>,
     schedule: DependencySchedule,
     status: ExecutionStatus,
 }
@@ -563,6 +612,7 @@ fn execution_record(value: &DependencyExecution, status: ExecutionStatus) -> Exe
         execution_id: value.execution_id.clone(),
         scheduled_for_ms: value.scheduled_for_ms,
         claimed_at_ms: value.claimed_at_ms,
+        observation: value.observation.clone(),
         schedule: value.schedule.clone(),
         status,
     }
@@ -609,6 +659,10 @@ fn validate_id(value: &str) -> Result<(), SchedulerDependencyError> {
     } else {
         Ok(())
     }
+}
+
+fn portable_schedule_file_stem(value: &str) -> String {
+    value.replace(':', "%3A")
 }
 
 fn validate_hash(value: &str) -> Result<(), SchedulerDependencyError> {
@@ -728,8 +782,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        DependencyPayload, DependencySchedule, DependencyTrigger, FileSchedulerDependency,
-        SchedulerDependencyError, SchedulerDependencyPort,
+        DependencyObservation, DependencyPayload, DependencySchedule, DependencyTrigger,
+        FileSchedulerDependency, SchedulerDependencyError, SchedulerDependencyPort,
     };
 
     #[test]
@@ -817,7 +871,38 @@ mod tests {
     }
 
     #[test]
-    fn event_and_process_triggers_use_source_ids_for_deduplication() {
+    fn colon_schedule_id_uses_portable_filename_and_preserves_raw_identity() {
+        let root = TempDir::new().expect("root");
+        let dependency =
+            FileSchedulerDependency::new(root.path().to_path_buf()).expect("dependency");
+        let schedule = fixture(
+            "graph-schedule:0123456789abcdef",
+            DependencyTrigger::AtMillis(i64::MAX),
+        );
+        assert!(
+            !dependency
+                .upsert(schedule.clone())
+                .expect("portable store")
+                .replayed
+        );
+        let portable_path = root
+            .path()
+            .join("schedules")
+            .join("graph-schedule%3A0123456789abcdef.json");
+        assert!(portable_path.is_file());
+        assert_eq!(dependency.list(10).expect("list"), vec![schedule.clone()]);
+        assert!(
+            dependency
+                .upsert(schedule.clone())
+                .expect("idempotent replay")
+                .replayed
+        );
+        assert!(dependency.remove(&schedule.schedule_id).expect("remove"));
+        assert!(dependency.list(10).expect("empty").is_empty());
+    }
+
+    #[test]
+    fn event_and_process_triggers_are_session_scoped_durable_and_idempotent() {
         let root = TempDir::new().expect("root");
         let dependency =
             FileSchedulerDependency::new(root.path().to_path_buf()).expect("dependency");
@@ -839,32 +924,55 @@ mod tests {
             ))
             .expect("output");
 
+        assert!(
+            dependency
+                .fire_runtime_event("session:2", "event:foreign", "tool.execution_completed",)
+                .expect("foreign session")
+                .is_empty()
+        );
         assert_eq!(
             dependency
-                .fire_runtime_event("event:1", "tool.execution_completed")
+                .fire_runtime_event("session:1", "event:1", "tool.execution_completed")
                 .expect("fire")
                 .len(),
             1
         );
         assert!(
             dependency
-                .fire_runtime_event("event:1", "tool.execution_completed")
+                .fire_runtime_event("session:1", "event:1", "tool.execution_completed")
                 .expect("dedupe")
                 .is_empty()
         );
+        let process_claim = dependency
+            .fire_process_output("session:1", "output:1", "process:1", "server READY")
+            .expect("process");
+        assert_eq!(process_claim.len(), 1);
         assert_eq!(
-            dependency
-                .fire_process_output("output:1", "process:1", "server READY")
-                .expect("process")
-                .len(),
-            1
+            process_claim[0].observation,
+            Some(DependencyObservation::ProcessOutput {
+                output_id: "output:1".to_owned()
+            })
         );
         assert!(
             dependency
-                .fire_process_output("output:2", "process:1", "not yet")
+                .fire_process_output("session:1", "output:2", "process:1", "not yet")
                 .expect("no match")
                 .is_empty()
         );
+        let restarted = FileSchedulerDependency::new(root.path().to_path_buf()).expect("restart");
+        let pending = restarted.list_pending_executions(10).expect("pending");
+        assert!(pending.iter().any(|claim| {
+            claim.observation
+                == Some(DependencyObservation::RuntimeEvent {
+                    event_id: "event:1".to_owned(),
+                })
+        }));
+        assert!(pending.iter().any(|claim| {
+            claim.observation
+                == Some(DependencyObservation::ProcessOutput {
+                    output_id: "output:1".to_owned(),
+                })
+        }));
     }
 
     #[test]

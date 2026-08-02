@@ -1,0 +1,12 @@
+{
+  "index": 11,
+  "name": "11-runtime_arbitrary_graph_c",
+  "script": "runtime_arbitrary_graph_c.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_arbitrary_graph_c.ps1",
+  "exit_code": 0,
+  "status": "passed",
+  "elapsed_ms": 36325,
+  "started_at": "2026-07-31T19:20:53.6475578Z",
+  "ended_at": "2026-07-31T19:21:29.9730460Z",
+  "log": "11-runtime_arbitrary_graph_c.log"
+}

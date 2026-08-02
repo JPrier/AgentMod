@@ -1,0 +1,12 @@
+{
+  "index": 16,
+  "name": "16-plugin_node_executor",
+  "script": "plugin_node_executor.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\plugin_node_executor.ps1",
+  "exit_code": 0,
+  "status": "passed",
+  "elapsed_ms": 5422,
+  "started_at": "2026-07-31T19:22:36.7385735Z",
+  "ended_at": "2026-07-31T19:22:42.1611391Z",
+  "log": "16-plugin_node_executor.log"
+}

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "step_id": "30-final-architecture-command",
+  "command": "cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml",
+  "arguments": [
+    "run",
+    "--locked",
+    "-p",
+    "xtask",
+    "--",
+    "architecture",
+    "--manifest-path",
+    "Cargo.toml"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 7.4770991,
+  "started_at_utc": "2026-07-31T13:06:06.8782853+00:00",
+  "completed_at_utc": "2026-07-31T13:06:14.4392744+00:00",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree_dirty": true,
+  "working_tree_porcelain_entries": 339,
+  "stdout_path": ".omx\\validation\\2026-07-31-windows-final-30-final-architecture-command.stdout.log",
+  "stderr_path": ".omx\\validation\\2026-07-31-windows-final-30-final-architecture-command.stderr.log",
+  "launch_failure": null
+}

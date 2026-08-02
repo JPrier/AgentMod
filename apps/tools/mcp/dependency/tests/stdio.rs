@@ -46,6 +46,8 @@ async fn stdio_server_negotiates_discovers_and_invokes() {
         authorization_key_hex: encode_hex(&KEY),
         authorization_replay_root: root.path().join("authorization-replay"),
         http_state_root: root.path().join("http-state"),
+        oauth_state_root: root.path().join("oauth-state"),
+        oauth_encryption_key_hex: None,
     })
     .expect("dependency");
     let capabilities = dependency
@@ -184,14 +186,11 @@ fn compile_fixture(root: &std::path::Path) -> PathBuf {
 }
 
 fn find_rlib(name: &str) -> PathBuf {
-    let dependency_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("..")
-        .join("target")
-        .join("debug")
-        .join("deps");
+    let dependency_directory = std::env::current_exe()
+        .expect("current test executable")
+        .parent()
+        .expect("test dependency directory")
+        .to_path_buf();
     std::fs::read_dir(dependency_directory)
         .expect("deps")
         .filter_map(Result::ok)

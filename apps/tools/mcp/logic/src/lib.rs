@@ -1,7 +1,8 @@
 //! MCP activation, namespacing, capability, and invocation business logic.
 
 use agentmod_mcp_host_data::{
-    InvocationDataKind, InvokeDataRequest, McpDataAuthorization, McpDataError, McpDataPort,
+    BeginOAuthDataRequest, InvocationDataKind, InvokeDataRequest, McpDataAuthorization,
+    McpDataError, McpDataPort, OAuthDataStatusKind,
 };
 use async_trait::async_trait;
 use serde_json::Value;
@@ -100,6 +101,62 @@ pub struct InvokeResult {
     pub progress: Vec<Value>,
 }
 
+/// Logic-owned OAuth status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OAuthStatusKind {
+    /// No authorization.
+    Unauthorized,
+    /// Authorization awaits callback completion.
+    Pending,
+    /// Bearer credential is available by reference.
+    Authorized,
+    /// Prior authorization failed closed.
+    Failed,
+}
+
+/// Logic-owned authorization start command.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BeginOAuthCommand {
+    /// Exact signed management authorization.
+    pub authorization: McpAuthorization,
+    /// Exact server.
+    pub server_id: String,
+    /// Cancellation identity.
+    pub cancellation_id: String,
+}
+
+/// Logic-owned redacted authorization result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OAuthStatusResult {
+    /// Exact server.
+    pub server_id: String,
+    /// Stable status.
+    pub status: OAuthStatusKind,
+    /// Opaque pending transaction.
+    pub transaction_id: Option<String>,
+    /// Transaction or token expiry.
+    pub expires_at_ms: Option<i64>,
+    /// Non-secret granted scopes.
+    pub scopes: Vec<String>,
+    /// Stable hash of the exact configured OAuth server binding.
+    pub configuration_hash: String,
+}
+
+/// Logic-owned authorization start result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OAuthStartResult {
+    /// Exact server.
+    pub server_id: String,
+    /// Opaque transaction.
+    pub transaction_id: String,
+    /// URL the user opens.
+    pub authorization_url: String,
+    /// Transaction expiry.
+    pub expires_at_ms: i64,
+    /// Stable hash of the exact configured OAuth server binding.
+    pub configuration_hash: String,
+}
+
 /// Logic interface.
 #[async_trait]
 pub trait McpLogicPort: Send + Sync {
@@ -116,6 +173,24 @@ pub trait McpLogicPort: Send + Sync {
     ) -> Result<CapabilityResult, McpLogicError>;
     /// Invokes.
     async fn invoke(&self, command: InvokeCommand) -> Result<InvokeResult, McpLogicError>;
+    /// Starts a user-authorized OAuth transaction.
+    async fn begin_oauth(
+        &self,
+        command: BeginOAuthCommand,
+    ) -> Result<OAuthStartResult, McpLogicError>;
+    /// Reads redacted OAuth state.
+    async fn oauth_status(
+        &self,
+        server_id: &str,
+        authorization: McpAuthorization,
+    ) -> Result<OAuthStatusResult, McpLogicError>;
+    /// Cancels an exact pending transaction.
+    async fn cancel_oauth(
+        &self,
+        server_id: &str,
+        transaction_id: &str,
+        authorization: McpAuthorization,
+    ) -> Result<OAuthStatusResult, McpLogicError>;
     /// Cancels.
     async fn cancel(&self, cancellation_id: &str) -> Result<(), McpLogicError>;
 }
@@ -221,6 +296,98 @@ impl<D: McpDataPort> McpLogicPort for McpLogic<D> {
             return Err(McpLogicError::InvalidCommand);
         }
         self.data.cancel(cancellation_id).await.map_err(map_error)
+    }
+
+    async fn begin_oauth(
+        &self,
+        command: BeginOAuthCommand,
+    ) -> Result<OAuthStartResult, McpLogicError> {
+        validate_authorization(&command.authorization)?;
+        validate_component(&command.server_id)?;
+        validate_cancellation(&command.cancellation_id)?;
+        let value = self
+            .data
+            .begin_oauth(BeginOAuthDataRequest {
+                authorization: map_authorization(command.authorization),
+                server_id: command.server_id,
+                cancellation_id: command.cancellation_id,
+            })
+            .await
+            .map_err(map_error)?;
+        Ok(OAuthStartResult {
+            server_id: value.server_id,
+            transaction_id: value.transaction_id,
+            authorization_url: value.authorization_url,
+            expires_at_ms: value.expires_at_ms,
+            configuration_hash: value.configuration_hash,
+        })
+    }
+
+    async fn oauth_status(
+        &self,
+        server_id: &str,
+        authorization: McpAuthorization,
+    ) -> Result<OAuthStatusResult, McpLogicError> {
+        validate_authorization(&authorization)?;
+        validate_component(server_id)?;
+        self.data
+            .oauth_status(server_id, map_authorization(authorization))
+            .await
+            .map(map_oauth_status)
+            .map_err(map_error)
+    }
+
+    async fn cancel_oauth(
+        &self,
+        server_id: &str,
+        transaction_id: &str,
+        authorization: McpAuthorization,
+    ) -> Result<OAuthStatusResult, McpLogicError> {
+        validate_authorization(&authorization)?;
+        validate_component(server_id)?;
+        validate_transaction(transaction_id)?;
+        self.data
+            .cancel_oauth(server_id, transaction_id, map_authorization(authorization))
+            .await
+            .map(map_oauth_status)
+            .map_err(map_error)
+    }
+}
+
+fn map_oauth_status(value: agentmod_mcp_host_data::OAuthStatusDataRecord) -> OAuthStatusResult {
+    OAuthStatusResult {
+        server_id: value.server_id,
+        status: match value.status {
+            OAuthDataStatusKind::Unauthorized => OAuthStatusKind::Unauthorized,
+            OAuthDataStatusKind::Pending => OAuthStatusKind::Pending,
+            OAuthDataStatusKind::Authorized => OAuthStatusKind::Authorized,
+            OAuthDataStatusKind::Failed => OAuthStatusKind::Failed,
+        },
+        transaction_id: value.transaction_id,
+        expires_at_ms: value.expires_at_ms,
+        scopes: value.scopes,
+        configuration_hash: value.configuration_hash,
+    }
+}
+
+fn validate_cancellation(value: &str) -> Result<(), McpLogicError> {
+    if value.is_empty() || value.len() > 1_024 {
+        Err(McpLogicError::InvalidCommand)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_transaction(value: &str) -> Result<(), McpLogicError> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Err(McpLogicError::InvalidCommand)
+    } else {
+        Ok(())
     }
 }
 

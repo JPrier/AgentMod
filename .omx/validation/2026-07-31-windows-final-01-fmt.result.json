@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "step_id": "01-fmt",
+  "command": "cargo fmt --all -- --check",
+  "arguments": [
+    "fmt",
+    "--all",
+    "--",
+    "--check"
+  ],
+  "exit_code": 0,
+  "passed": true,
+  "elapsed_seconds": 3.0501161,
+  "started_at_utc": "2026-07-31T12:28:24.3300903+00:00",
+  "completed_at_utc": "2026-07-31T12:28:27.4624829+00:00",
+  "head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "working_tree_dirty": true,
+  "working_tree_porcelain_entries": 337,
+  "stdout_path": ".omx\\validation\\2026-07-31-windows-final-01-fmt.stdout.log",
+  "stderr_path": ".omx\\validation\\2026-07-31-windows-final-01-fmt.stderr.log",
+  "launch_failure": null
+}

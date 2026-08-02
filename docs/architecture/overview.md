@@ -20,13 +20,15 @@ The workspace currently contains:
 - isolated harness, plugin-host, and first-party tool-host processes connected by
   versioned protocols;
 - an N-tier session-style registry, immutable per-session style bindings, and a
-  generic compiled-graph executor used by the live built-in modes;
+  generic compiled-graph executor used by arbitrary admitted graphs and current
+  built-in modes;
 - an N-tier harness registry with per-session adapter identity and capability
   negotiation;
 - replay-derived style/graph introspection consumed by CLI JSON and the TUI
   Graph view without dispatching effects;
-- per-session memory retrieval and compaction with canonical projection
-  provenance;
+- per-session runtime- and plugin-provided memory retrieval and compaction plus
+  ordered plugin context transforms with canonical projection provenance,
+  durable receipts, and fail-closed recovery;
 - protocol-only CLI, TUI, and ACP frontends;
 - deterministic architecture enforcement and intentional violating fixtures.
 
@@ -54,13 +56,22 @@ crates may not import another process's internal layer crates.
 
 ## Partial product integrations
 
-The process topology and the five built-in execution adapters are live, but
-session-style execution is not complete. Arbitrary user graph shapes,
-artifact-backed/concurrent planner workers, plugin-provided context components,
-the full lifecycle-boundary pipeline matrix, rich introspection, and complete
-cross-platform execution evidence remain active development. Consult
-`STATUS.md` for the evidence level of each tool host, protocol, recovery path,
-and frontend surface.
+Exact persisted executor dispatch is live for arbitrary admitted user graphs,
+the migrated built-ins, planner-worker v1.4, and isolated plugin nodes,
+including an exact plugin-host executor inside a bounded parallel region. Runtime
+logic owns variable, transition, effect, receipt, budget, and recovery
+validation; plugin context transforms and plugin-provided memory retrieval and
+compaction use the same proposal/dispatch/receipt/application discipline.
+
+Product completion remains broader than this foundation. Independent planner
+worker turns, branch workspaces, and child-owned diff/test evidence are
+cross-platform process-tested. The complete workspace-mode/write-denial matrix,
+additional plugin action and nested-parallel classes, TUI LSP management,
+broader semantic DLP, and macOS process evidence remain open. Immediate-parent
+child-session MCP inheritance is process-tested on Windows and Ubuntu/WSL2 but
+does not establish transitive or grandchild inheritance. Consult `STATUS.md` for
+the evidence level of each tool host, protocol, recovery path, and frontend
+surface.
 
 See [Initial maps](initial-maps.md), [N-tier rules](n-tier.md), and
 [Process boundaries](process-boundaries.md).

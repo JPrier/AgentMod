@@ -1,0 +1,310 @@
+format_version = 1
+entry = "plan"
+
+[budget]
+max_steps = 750
+max_tokens = 900000
+max_cost_micros = 90000000
+max_duration_ms = 3300000
+
+[declarations]
+capabilities = ["agents", "artifacts", "model"]
+providers = ["deterministic-mock"]
+
+[[variables]]
+name = "plan_disposition"
+type = { kind = "enum", values = ["response_complete", "tool_requests"] }
+scope = "run"
+producer = "plan"
+consumers = ["plan-route"]
+mutability = "mutable"
+max_size_bytes = 64
+security_classification = "internal"
+
+[[variables]]
+name = "plan_result"
+type = { kind = "node_result_reference" }
+scope = "run"
+producer = "plan"
+consumers = ["plan-route"]
+mutability = "mutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[variables]]
+name = "planner_task"
+type = { kind = "string" }
+scope = "run"
+producer = "plan"
+consumers = ["spawn-planner"]
+mutability = "mutable"
+max_size_bytes = 8192
+security_classification = "internal"
+
+[[variables]]
+name = "evidence_task"
+type = { kind = "string" }
+scope = "run"
+producer = "plan"
+consumers = ["spawn-evidence"]
+mutability = "mutable"
+max_size_bytes = 8192
+security_classification = "internal"
+
+[[variables]]
+name = "planner_child"
+type = { kind = "child_id" }
+scope = "run"
+producer = "spawn-planner"
+consumers = ["wait-planner", "join-workers"]
+mutability = "mutable"
+merge_policy = "first_branch"
+max_size_bytes = 128
+security_classification = "internal"
+
+[[variables]]
+name = "evidence_child"
+type = { kind = "child_id" }
+scope = "run"
+producer = "spawn-evidence"
+consumers = ["wait-evidence", "join-workers"]
+mutability = "mutable"
+merge_policy = "first_branch"
+max_size_bytes = 128
+security_classification = "internal"
+
+[[variables]]
+name = "joined_results"
+type = { kind = "node_result_reference" }
+scope = "run"
+producer = "join-workers"
+consumers = ["integrate"]
+mutability = "mutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[variables]]
+name = "integration_disposition"
+type = { kind = "enum", values = ["response_complete", "tool_requests"] }
+scope = "run"
+producer = "integrate"
+consumers = ["integration-route"]
+mutability = "mutable"
+max_size_bytes = 64
+security_classification = "internal"
+
+[[variables]]
+name = "integration_result"
+type = { kind = "node_result_reference" }
+scope = "run"
+producer = "integrate"
+consumers = ["persist-integration", "review", "done"]
+mutability = "mutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[variables]]
+name = "integration_artifact"
+type = { kind = "artifact_reference" }
+scope = "run"
+producer = "persist-integration"
+consumers = ["review", "done"]
+mutability = "mutable"
+max_size_bytes = 512
+security_classification = "confidential"
+
+[[variables]]
+name = "iteration"
+type = { kind = "map", value_type = { kind = "boolean" }, max_entries = 1 }
+scope = "run"
+producer = "revision"
+consumers = ["revision"]
+mutability = "mutable"
+max_size_bytes = 128
+security_classification = "internal"
+
+[[nodes]]
+id = "plan"
+kind = "model_call"
+provider = "deterministic-mock"
+write_variables = ["plan_disposition", "plan_result", "planner_task", "evidence_task"]
+retry_limit = 2
+configuration = { type = "model_request", disposition_output = "plan_disposition", result_output = "plan_result", provider_options = { mock_planner_phase = "plan" }, json_outputs = { planner_task = "/tasks/0/description", evidence_task = "/tasks/1/description" } }
+
+[[nodes]]
+id = "plan-route"
+kind = "conditional_branch"
+read_variables = ["plan_disposition", "plan_result"]
+
+[[nodes]]
+id = "worker-fanout"
+kind = "parallel_branch"
+configuration = { type = "parallel_branch", max_parallelism = 2, max_queue_depth = 2, join_target = "join-workers", join_policy = "all", variable_merge_policies = { planner_child = "first_branch", evidence_child = "first_branch" } }
+
+[[nodes]]
+id = "spawn-planner"
+kind = "spawn_child_agent"
+read_variables = ["planner_task"]
+write_variables = ["planner_child"]
+configuration = { type = "spawn_child_agent", task_input = { kind = "variable", variable = "planner_task" }, task_id_prefix = "planner-task", child_style = "ephemeral-turn@1.2.0", tool_groups = [], maximum_children = 1, maximum_depth = 2, token_budget = 100000, context_budget_tokens = 64000, cost_budget_micros = 10000000, workspace = { mode = "shared_read_only" }, artifact_references = [], security_classification = "internal", approval_required = true }
+
+[[nodes]]
+id = "wait-planner"
+kind = "wait_for_agents"
+read_variables = ["planner_child"]
+configuration = { type = "wait_for_agents", children = { kind = "variable", variable = "planner_child" }, maximum_children = 1, minimum_successes = 1, timeout_ms = 600000, cancellation = "cascade" }
+
+[[nodes]]
+id = "spawn-evidence"
+kind = "spawn_child_agent"
+read_variables = ["evidence_task"]
+write_variables = ["evidence_child"]
+configuration = { type = "spawn_child_agent", task_input = { kind = "variable", variable = "evidence_task" }, task_id_prefix = "evidence-task", child_style = "ephemeral-turn@1.2.0", tool_groups = [], maximum_children = 1, maximum_depth = 2, token_budget = 100000, context_budget_tokens = 64000, cost_budget_micros = 10000000, workspace = { mode = "shared_read_only" }, artifact_references = [], security_classification = "internal", approval_required = true }
+
+[[nodes]]
+id = "wait-evidence"
+kind = "wait_for_agents"
+read_variables = ["evidence_child"]
+configuration = { type = "wait_for_agents", children = { kind = "variable", variable = "evidence_child" }, maximum_children = 1, minimum_successes = 1, timeout_ms = 600000, cancellation = "cascade" }
+
+[[nodes]]
+id = "join-workers"
+kind = "join_results"
+read_variables = ["planner_child", "evidence_child"]
+write_variables = ["joined_results"]
+configuration = { type = "join_results", required = ["planner", "evidence"], minimum_successes = 2, failure_policy = "wait_required", ordering_policy = "member_id", timeout_ms = 600000, cancellation_propagates = true, result_projection = "node_references", artifact_collection = "all" }
+
+[[nodes]]
+id = "integrate"
+kind = "model_call"
+provider = "deterministic-mock"
+read_variables = ["joined_results"]
+write_variables = ["integration_disposition", "integration_result"]
+retry_limit = 2
+configuration = { type = "model_request", disposition_output = "integration_disposition", result_output = "integration_result", provider_options = { mock_planner_phase = "integrate" } }
+
+[[nodes]]
+id = "integration-route"
+kind = "conditional_branch"
+read_variables = ["integration_disposition"]
+
+[[nodes]]
+id = "persist-integration"
+kind = "persist_artifact"
+read_variables = ["integration_result"]
+write_variables = ["integration_artifact"]
+configuration = { type = "persist_artifact", content = { kind = "provider_result_text", reference_variable = "integration_result" }, mime_type = "text/markdown", security = "private", retention = "session" }
+
+[[nodes]]
+id = "review"
+kind = "review"
+provider = "deterministic-mock"
+read_variables = ["integration_result", "integration_artifact"]
+retry_limit = 2
+configuration = { type = "review", input = { kind = "variable", variable = "integration_result" }, artifact_references = ["integration_artifact"], result_schema = { maximum_findings = 16, maximum_finding_bytes = 1024, maximum_rejections = 2, require_artifact_evidence = true }, routes = { approved = "done", revision = "revision", failure = "structured-failure" }, maximum_revisions = 2 }
+
+[[nodes]]
+id = "revision"
+kind = "loop"
+read_variables = ["iteration"]
+write_variables = ["iteration"]
+max_iterations = 2
+
+[[nodes]]
+id = "done"
+kind = "complete_session"
+read_variables = ["integration_result", "integration_artifact"]
+
+[[nodes]]
+id = "structured-failure"
+kind = "fail"
+
+[[edges]]
+from = "plan"
+to = "plan-route"
+
+[[edges]]
+from = "plan-route"
+to = "worker-fanout"
+condition = "plan_disposition == \"response_complete\""
+label = "planned"
+
+[[edges]]
+from = "plan-route"
+to = "structured-failure"
+condition = "plan_disposition == \"tool_requests\""
+label = "unsupported-plan-tool-request"
+
+[[edges]]
+from = "worker-fanout"
+to = "spawn-planner"
+label = "planner"
+
+[[edges]]
+from = "spawn-planner"
+to = "wait-planner"
+
+[[edges]]
+from = "wait-planner"
+to = "join-workers"
+
+[[edges]]
+from = "worker-fanout"
+to = "spawn-evidence"
+label = "evidence"
+
+[[edges]]
+from = "spawn-evidence"
+to = "wait-evidence"
+
+[[edges]]
+from = "wait-evidence"
+to = "join-workers"
+
+[[edges]]
+from = "join-workers"
+to = "integrate"
+
+[[edges]]
+from = "integrate"
+to = "integration-route"
+
+[[edges]]
+from = "integration-route"
+to = "persist-integration"
+condition = "integration_disposition == \"response_complete\""
+label = "integrated"
+
+[[edges]]
+from = "integration-route"
+to = "structured-failure"
+condition = "integration_disposition == \"tool_requests\""
+label = "unsupported-tool-request"
+
+[[edges]]
+from = "persist-integration"
+to = "review"
+
+[[edges]]
+from = "review"
+to = "done"
+
+[[edges]]
+from = "review"
+to = "revision"
+
+[[edges]]
+from = "review"
+to = "structured-failure"
+
+[[edges]]
+from = "revision"
+to = "worker-fanout"
+condition = "iteration.remaining == true"
+label = "revise"
+
+[[edges]]
+from = "revision"
+to = "structured-failure"
+condition = "iteration.remaining == false"
+label = "revision-limit"

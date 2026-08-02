@@ -114,6 +114,7 @@ pub(crate) fn project(entries: &[ConversationEntry]) -> Vec<ProviderEntry> {
                 key: "artifact".into(),
                 value: json!({
                     "id": value.artifact_id,
+                    "reference": value.artifact_reference,
                     "hash": value.content_hash,
                     "mime_type": value.mime_type,
                     "label": value.label

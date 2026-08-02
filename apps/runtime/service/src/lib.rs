@@ -1,12 +1,15 @@
 //! Runtime endpoint mapping and lifecycle.
 
+pub mod artifact;
 pub mod continuation;
 pub mod harness;
 pub mod local_rpc;
+pub mod mcp_oauth;
 pub mod turn;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt,
     path::PathBuf,
 };
 
@@ -19,28 +22,38 @@ use agentmod_runtime_logic::{
         BranchSessionCommand, InspectSessionCommand, SessionHistoryLogicPort,
         SubscribeSessionCommand,
     },
+    plugin_lifecycle::{
+        ChangePluginLifecycleCommand, PluginLifecycleAction, PluginLifecycleLogicPort,
+        RecoverPluginLifecyclesCommand,
+    },
     registry::{
-        CreateSessionCommand, ListSessionsCommand, SessionRegistryLogicError,
+        CreateSessionCommand, ListSessionsCommand, SessionMcpSensitiveEntry,
+        SessionMcpServerDeclaration, SessionMcpTransportDeclaration, SessionRegistryLogicError,
         SessionRegistryLogicPort,
     },
     scheduler::{
         FireProcessOutputCommand, FireRuntimeEventCommand, RuntimeSchedule,
-        RuntimeScheduleLogicError, RuntimeScheduleLogicPort, SchedulePayload, ScheduleTrigger,
-        ScheduledExecution, UpsertScheduleCommand,
+        RuntimeScheduleLogicError, RuntimeScheduleLogicPort, ScheduleObservation, SchedulePayload,
+        ScheduleTrigger, ScheduledExecution, UpsertScheduleCommand,
     },
     style::{
         InspectStyleCommand, ListStyleComponentsCommand, ListStylesCommand,
         SelectStyleBudgetsCommand, SelectStyleComponentsCommand, SelectStyleHarnessCommand,
-        SessionStyleLogicError, SessionStyleLogicPort, StyleAvailability, StyleDecisionCapability,
-        StyleEnvironment, StyleHarnessDescriptor, StyleInspection, StyleManifestFormat,
-        StyleSource, StyleSummary, ValidateStyleBindingCommand, ValidateStyleCommand,
+        SessionStyleLogicError, SessionStyleLogicPort, StyleAvailability,
+        StyleContextTransformDescriptor, StyleDecisionCapability, StyleEnvironment,
+        StyleHarnessDescriptor, StyleInspection, StyleManifestFormat,
+        StylePluginCompactorDescriptor, StylePluginMemoryProviderDescriptor, StyleSource,
+        StyleSummary, ValidateStyleBindingCommand, ValidateStyleCommand,
     },
+    tool::canonical_tool_groups,
 };
 use agentmod_runtime_protocol::{
-    RuntimeHarnessDescriptor, RuntimeRequest, RuntimeResponse, RuntimeSchedulePayload,
-    RuntimeScheduleSpec, RuntimeScheduleTrigger, RuntimeScheduledExecution,
-    RuntimeStyleAvailability, RuntimeStyleDiagnostic, RuntimeStyleInspection,
-    RuntimeStyleManifestFormat, RuntimeStyleSourceKind, RuntimeStyleSummary, SessionSummary,
+    RuntimeHarnessDescriptor, RuntimeMcpServerDeclaration as WireMcpServerDeclaration,
+    RuntimeMcpTransportDeclaration as WireMcpTransportDeclaration, RuntimeRequest, RuntimeResponse,
+    RuntimeScheduleObservation, RuntimeSchedulePayload, RuntimeScheduleSpec,
+    RuntimeScheduleTrigger, RuntimeScheduledExecution, RuntimeStyleAvailability,
+    RuntimeStyleDiagnostic, RuntimeStyleInspection, RuntimeStyleManifestFormat,
+    RuntimeStyleSourceKind, RuntimeStyleSummary, SessionSummary,
 };
 use thiserror::Error;
 
@@ -67,6 +80,60 @@ pub enum ServiceHealthStatus {
     Ok,
     /// Runtime can respond but a required capability is unavailable.
     Degraded,
+}
+
+/// Service-owned plugin lifecycle transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServicePluginLifecycleAction {
+    /// Disable while retaining state.
+    Disable,
+    /// Restore a disabled plugin.
+    Enable,
+    /// Quarantine after a policy or integrity finding.
+    Quarantine,
+    /// Release a quarantined plugin.
+    Unquarantine,
+}
+
+/// Service-owned plugin lifecycle request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceChangePluginLifecycleRequest {
+    /// Canonical session.
+    pub session_id: agentmod_primitives::SessionId,
+    /// Exact plugin ID.
+    pub plugin_id: String,
+    /// Requested lifecycle action.
+    pub action: ServicePluginLifecycleAction,
+    /// Redacted quarantine reason.
+    pub reason_code: Option<String>,
+    /// Management cancellation lineage.
+    pub cancellation_id: agentmod_primitives::CancellationId,
+}
+
+/// Service-owned plugin lifecycle result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceChangePluginLifecycleResponse {
+    /// Canonical session.
+    pub session_id: agentmod_primitives::SessionId,
+    /// Exact plugin ID.
+    pub plugin_id: String,
+    /// Exact plugin version.
+    pub plugin_version: String,
+    /// Terminal state.
+    pub state: String,
+    /// Terminal canonical sequence.
+    pub committed_sequence: agentmod_primitives::Sequence,
+    /// Whether replay already contained the terminal event.
+    pub replayed: bool,
+}
+
+/// Startup plugin-lifecycle reconciliation summary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceRecoverPluginLifecyclesResponse {
+    /// Sessions inspected.
+    pub inspected_sessions: usize,
+    /// Pending operations reconciled.
+    pub reconciled_operations: usize,
 }
 
 /// Runtime service configuration, not a logic business command.
@@ -103,6 +170,12 @@ pub struct RuntimeStyleServiceConfig {
     pub providers: BTreeSet<String>,
     /// Activated plugins.
     pub plugins: BTreeSet<String>,
+    /// Exact context-transform declarations from the activated plugin catalog.
+    pub context_transforms: Vec<ServiceContextTransformDescriptor>,
+    /// Exact memory-provider declarations from the activated plugin catalog.
+    pub plugin_memory_providers: Vec<ServicePluginMemoryProviderDescriptor>,
+    /// Exact compactor declarations from the activated plugin catalog.
+    pub plugin_compactors: Vec<ServicePluginCompactorDescriptor>,
     /// Available memory providers.
     pub memory_providers: BTreeSet<String>,
     /// Available compaction strategies.
@@ -113,6 +186,59 @@ pub struct RuntimeStyleServiceConfig {
     pub graph_references: BTreeMap<String, String>,
     /// Available harness descriptors used for style compatibility.
     pub harnesses: BTreeMap<String, ServiceHarnessDescriptor>,
+}
+
+/// Service bootstrap representation of one plugin context transform.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ServiceContextTransformDescriptor {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact transform identity.
+    pub transform_id: String,
+    /// Exact semantic version.
+    pub version: String,
+    /// Exact declaration hash.
+    pub declaration_hash: String,
+    /// Exact lifecycle boundary.
+    pub lifecycle: String,
+}
+
+/// Service bootstrap representation of one plugin memory provider.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ServicePluginMemoryProviderDescriptor {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact activated plugin version.
+    pub plugin_version: String,
+    /// Stable provider identity.
+    pub provider_id: String,
+    /// Exact provider version.
+    pub provider_version: String,
+    /// Exact declaration hash.
+    pub declaration_hash: String,
+    /// Exact canonical plugin configuration hash.
+    pub configuration_reference: String,
+    /// Whether retrieval is declared.
+    pub has_retrieve: bool,
+    /// Whether consequential write is declared.
+    pub has_write: bool,
+}
+
+/// Service bootstrap representation of one plugin compactor.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ServicePluginCompactorDescriptor {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact activated plugin version.
+    pub plugin_version: String,
+    /// Stable compactor identity.
+    pub compactor_id: String,
+    /// Exact compactor version.
+    pub compactor_version: String,
+    /// Exact declaration hash.
+    pub declaration_hash: String,
+    /// Exact canonical plugin configuration hash.
+    pub configuration_reference: String,
 }
 
 /// Service bootstrap representation of one harness adapter.
@@ -165,17 +291,18 @@ impl RuntimeStyleServiceConfig {
                 "context",
                 "events",
                 "model",
+                "scheduling",
                 "tools",
             ]
             .into_iter()
             .map(str::to_owned)
             .collect(),
-            tool_groups: BTreeMap::from([(
-                String::from("filesystem"),
-                BTreeSet::from([String::from("filesystem.read")]),
-            )]),
-            providers: BTreeSet::from([String::from("mock")]),
+            tool_groups: canonical_tool_groups(),
+            providers: BTreeSet::from([String::from("deterministic-mock"), String::from("mock")]),
             plugins: BTreeSet::from([String::from("runtime.security")]),
+            context_transforms: Vec::new(),
+            plugin_memory_providers: Vec::new(),
+            plugin_compactors: Vec::new(),
             memory_providers: ["none", "file", "sqlite-fts"]
                 .into_iter()
                 .map(str::to_owned)
@@ -264,6 +391,43 @@ impl RuntimeStyleServiceConfig {
             tool_groups: self.tool_groups.clone(),
             providers: self.providers.clone(),
             plugins: self.plugins.clone(),
+            context_transforms: self
+                .context_transforms
+                .iter()
+                .map(|transform| StyleContextTransformDescriptor {
+                    plugin_id: transform.plugin_id.clone(),
+                    transform_id: transform.transform_id.clone(),
+                    version: transform.version.clone(),
+                    declaration_hash: transform.declaration_hash.clone(),
+                    lifecycle: transform.lifecycle.clone(),
+                })
+                .collect(),
+            plugin_memory_providers: self
+                .plugin_memory_providers
+                .iter()
+                .map(|provider| StylePluginMemoryProviderDescriptor {
+                    plugin_id: provider.plugin_id.clone(),
+                    plugin_version: provider.plugin_version.clone(),
+                    provider_id: provider.provider_id.clone(),
+                    provider_version: provider.provider_version.clone(),
+                    declaration_hash: provider.declaration_hash.clone(),
+                    configuration_reference: provider.configuration_reference.clone(),
+                    has_retrieve: provider.has_retrieve,
+                    has_write: provider.has_write,
+                })
+                .collect(),
+            plugin_compactors: self
+                .plugin_compactors
+                .iter()
+                .map(|compactor| StylePluginCompactorDescriptor {
+                    plugin_id: compactor.plugin_id.clone(),
+                    plugin_version: compactor.plugin_version.clone(),
+                    compactor_id: compactor.compactor_id.clone(),
+                    compactor_version: compactor.compactor_version.clone(),
+                    declaration_hash: compactor.declaration_hash.clone(),
+                    configuration_reference: compactor.configuration_reference.clone(),
+                })
+                .collect(),
             memory_providers: self.memory_providers.clone(),
             compaction_strategies: self.compaction_strategies.clone(),
             supported_decisions: self
@@ -430,8 +594,41 @@ where
                         max_cost_micros: budgets.max_cost_micros,
                         max_duration_ms: budgets.max_duration_ms,
                     }),
+                    mcp_servers: Vec::new(),
                 };
                 let created = self.create_session(service_request)?;
+                Ok(RuntimeResponse::SessionCreated {
+                    session_id: created.session_id,
+                })
+            }
+            RuntimeRequest::CreateSessionWithMcp {
+                workspace,
+                style,
+                harness,
+                memory,
+                compaction,
+                budgets,
+                mcp_servers,
+            } => {
+                let created = self.create_session(ServiceCreateSessionRequest {
+                    workspace: workspace.clone(),
+                    style: style.clone(),
+                    harness: harness.clone(),
+                    memory: memory.clone(),
+                    compaction: compaction.clone(),
+                    budgets: budgets.map(|budgets| ServiceExecutionBudgetOverrides {
+                        max_iterations: budgets.max_iterations,
+                        max_steps: budgets.max_steps,
+                        max_tokens: budgets.max_tokens,
+                        max_cost_micros: budgets.max_cost_micros,
+                        max_duration_ms: budgets.max_duration_ms,
+                    }),
+                    mcp_servers: mcp_servers
+                        .iter()
+                        .cloned()
+                        .map(from_wire_mcp_server)
+                        .collect(),
+                })?;
                 Ok(RuntimeResponse::SessionCreated {
                     session_id: created.session_id,
                 })
@@ -816,6 +1013,11 @@ where
                 sessions_root: self.config.session_root.clone(),
                 workspace: PathBuf::from(request.workspace),
                 style_binding: resolved.binding,
+                mcp_servers: request
+                    .mcp_servers
+                    .into_iter()
+                    .map(to_logic_mcp_server)
+                    .collect(),
             })
             .map_err(ServiceError::SessionRegistry)?;
         Ok(ServiceCreateSessionResponse {
@@ -883,6 +1085,70 @@ where
     }
 }
 
+impl<L: PluginLifecycleLogicPort> RuntimeService<L> {
+    /// Reconciles canonical pending plugin lifecycle operations during startup.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::PluginLifecycle`] when canonical replay or exact
+    /// host-receipt reconciliation fails.
+    pub async fn recover_pending_plugin_lifecycles(
+        &self,
+        limit: usize,
+    ) -> Result<ServiceRecoverPluginLifecyclesResponse, ServiceError> {
+        self.logic
+            .recover_pending_plugin_lifecycles(RecoverPluginLifecyclesCommand {
+                sessions_root: self.config.session_root.clone(),
+                limit,
+            })
+            .await
+            .map(|result| ServiceRecoverPluginLifecyclesResponse {
+                inspected_sessions: result.inspected_sessions,
+                reconciled_operations: result.reconciled_operations,
+            })
+            .map_err(|error| ServiceError::PluginLifecycle(error.to_string()))
+    }
+
+    /// Changes one exact session plugin lifecycle state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError::PluginLifecycle`] for invalid, conflicting, or
+    /// unavailable lifecycle transitions.
+    pub async fn change_plugin_lifecycle(
+        &self,
+        request: ServiceChangePluginLifecycleRequest,
+    ) -> Result<ServiceChangePluginLifecycleResponse, ServiceError> {
+        let result = self
+            .logic
+            .change_plugin_lifecycle(ChangePluginLifecycleCommand {
+                sessions_root: self.config.session_root.clone(),
+                session_id: request.session_id,
+                plugin_id: request.plugin_id,
+                action: match request.action {
+                    ServicePluginLifecycleAction::Disable => PluginLifecycleAction::Disable,
+                    ServicePluginLifecycleAction::Enable => PluginLifecycleAction::Enable,
+                    ServicePluginLifecycleAction::Quarantine => PluginLifecycleAction::Quarantine,
+                    ServicePluginLifecycleAction::Unquarantine => {
+                        PluginLifecycleAction::Unquarantine
+                    }
+                },
+                reason_code: request.reason_code,
+                cancellation_id: request.cancellation_id.to_string(),
+            })
+            .await
+            .map_err(|error| ServiceError::PluginLifecycle(error.to_string()))?;
+        Ok(ServiceChangePluginLifecycleResponse {
+            session_id: request.session_id,
+            plugin_id: result.plugin_id,
+            plugin_version: result.plugin_version,
+            state: result.state,
+            committed_sequence: result.committed_sequence,
+            replayed: result.replayed,
+        })
+    }
+}
+
 impl<L: RuntimeScheduleLogicPort> RuntimeService<L> {
     /// Maps runtime schedule endpoints through service-owned and logic-owned types.
     ///
@@ -929,6 +1195,7 @@ impl<L: RuntimeScheduleLogicPort> RuntimeService<L> {
                         execution_id: execution.execution_id,
                         scheduled_for_ms: execution.scheduled_for_ms,
                         claimed_at_ms: execution.claimed_at_ms,
+                        observation: execution.observation.map(to_wire_observation),
                         schedule: to_wire_schedule(from_logic_schedule(execution.schedule)),
                     })
                     .collect();
@@ -944,6 +1211,7 @@ impl<L: RuntimeScheduleLogicPort> RuntimeService<L> {
                         execution_id: execution.execution_id,
                         scheduled_for_ms: execution.scheduled_for_ms,
                         claimed_at_ms: execution.claimed_at_ms,
+                        observation: execution.observation.map(to_wire_observation),
                         schedule: to_wire_schedule(from_logic_schedule(execution.schedule)),
                     })
                     .collect();
@@ -993,11 +1261,13 @@ impl<L: RuntimeScheduleLogicPort> RuntimeService<L> {
 
     fn fire_runtime_event(
         &self,
+        source_session_id: agentmod_primitives::SessionId,
         event_id: String,
         event_type: String,
     ) -> Result<Vec<ServiceScheduledExecution>, ServiceError> {
         self.logic
             .fire_runtime_event(FireRuntimeEventCommand {
+                source_session_id,
                 event_id,
                 event_type,
             })
@@ -1007,12 +1277,14 @@ impl<L: RuntimeScheduleLogicPort> RuntimeService<L> {
 
     fn fire_process_output(
         &self,
+        source_session_id: agentmod_primitives::SessionId,
         output_id: String,
         process_id: String,
         output: String,
     ) -> Result<Vec<ServiceScheduledExecution>, ServiceError> {
         self.logic
             .fire_process_output(FireProcessOutputCommand {
+                source_session_id,
                 output_id,
                 process_id,
                 output,
@@ -1173,6 +1445,59 @@ pub struct ServiceCreateSessionRequest {
     pub compaction: Option<String>,
     /// Optional per-session hard execution-budget overrides.
     pub budgets: Option<ServiceExecutionBudgetOverrides>,
+    /// Exact ordered per-session MCP declarations.
+    pub mcp_servers: Vec<ServiceMcpServerDeclaration>,
+}
+
+/// Service-owned MCP server declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceMcpServerDeclaration {
+    /// ACP display name.
+    pub name: String,
+    /// Exact requested transport.
+    pub transport: ServiceMcpTransportDeclaration,
+}
+
+/// Service-owned MCP transport declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceMcpTransportDeclaration {
+    /// Child process speaking MCP over stdio.
+    Stdio {
+        /// Absolute executable path.
+        program: String,
+        /// Exact argument vector.
+        arguments: Vec<String>,
+        /// Exact environment values.
+        environment: Vec<ServiceMcpSensitiveEntry>,
+    },
+    /// Streamable HTTP or legacy SSE endpoint.
+    StreamableHttp {
+        /// Secure or loopback endpoint.
+        url: String,
+        /// Whether ACP declared legacy SSE.
+        legacy_sse: bool,
+        /// Exact HTTP headers.
+        headers: Vec<ServiceMcpSensitiveEntry>,
+    },
+}
+
+/// Service-owned sensitive MCP entry with redacted diagnostics.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ServiceMcpSensitiveEntry {
+    /// Environment variable or HTTP header name.
+    pub name: String,
+    /// Exact transient value.
+    pub value: String,
+}
+
+impl fmt::Debug for ServiceMcpSensitiveEntry {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ServiceMcpSensitiveEntry")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Service-owned optional hard execution-budget overrides.
@@ -1348,6 +1673,7 @@ enum ServiceScheduleTrigger {
 enum ServiceSchedulePayload {
     Prompt { prompt: String },
     Continuation { continuation_id: String },
+    GraphTrigger { run_id: String, node_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1361,7 +1687,23 @@ struct ServiceScheduledExecution {
     execution_id: String,
     scheduled_for_ms: i64,
     claimed_at_ms: i64,
+    observation: Option<ServiceScheduleObservation>,
     schedule: ServiceSchedule,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Service-owned exact observation attached to a scheduler claim.
+pub enum ServiceScheduleObservation {
+    /// Canonical committed runtime event.
+    RuntimeEvent {
+        /// Exact committed event identity.
+        event_id: String,
+    },
+    /// Bounded process-output observation.
+    ProcessOutput {
+        /// Exact output observation identity.
+        output_id: String,
+    },
 }
 
 fn from_wire_schedule(value: RuntimeScheduleSpec) -> ServiceSchedule {
@@ -1401,6 +1743,9 @@ fn from_wire_schedule(value: RuntimeScheduleSpec) -> ServiceSchedule {
             RuntimeSchedulePayload::Continuation { continuation_id } => {
                 ServiceSchedulePayload::Continuation { continuation_id }
             }
+            RuntimeSchedulePayload::GraphTrigger { run_id, node_id } => {
+                ServiceSchedulePayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
     }
@@ -1434,6 +1779,9 @@ fn to_logic_payload(value: ServiceSchedulePayload) -> SchedulePayload {
         ServiceSchedulePayload::Prompt { prompt } => SchedulePayload::Prompt { prompt },
         ServiceSchedulePayload::Continuation { continuation_id } => {
             SchedulePayload::Continuation { continuation_id }
+        }
+        ServiceSchedulePayload::GraphTrigger { run_id, node_id } => {
+            SchedulePayload::GraphTrigger { run_id, node_id }
         }
     }
 }
@@ -1474,6 +1822,9 @@ fn from_logic_schedule(value: RuntimeSchedule) -> ServiceSchedule {
             SchedulePayload::Prompt { prompt } => ServiceSchedulePayload::Prompt { prompt },
             SchedulePayload::Continuation { continuation_id } => {
                 ServiceSchedulePayload::Continuation { continuation_id }
+            }
+            SchedulePayload::GraphTrigger { run_id, node_id } => {
+                ServiceSchedulePayload::GraphTrigger { run_id, node_id }
             }
         },
         active: value.active,
@@ -1609,7 +1960,37 @@ fn from_logic_execution(value: ScheduledExecution) -> ServiceScheduledExecution 
         execution_id: value.execution_id,
         scheduled_for_ms: value.scheduled_for_ms,
         claimed_at_ms: value.claimed_at_ms,
+        observation: value.observation.map(|observation| match observation {
+            ScheduleObservation::RuntimeEvent { event_id } => {
+                ServiceScheduleObservation::RuntimeEvent { event_id }
+            }
+            ScheduleObservation::ProcessOutput { output_id } => {
+                ServiceScheduleObservation::ProcessOutput { output_id }
+            }
+        }),
         schedule: from_logic_schedule(value.schedule),
+    }
+}
+
+fn to_wire_observation(value: ScheduleObservation) -> RuntimeScheduleObservation {
+    match value {
+        ScheduleObservation::RuntimeEvent { event_id } => {
+            RuntimeScheduleObservation::RuntimeEvent { event_id }
+        }
+        ScheduleObservation::ProcessOutput { output_id } => {
+            RuntimeScheduleObservation::ProcessOutput { output_id }
+        }
+    }
+}
+
+fn from_wire_observation(value: RuntimeScheduleObservation) -> ServiceScheduleObservation {
+    match value {
+        RuntimeScheduleObservation::RuntimeEvent { event_id } => {
+            ServiceScheduleObservation::RuntimeEvent { event_id }
+        }
+        RuntimeScheduleObservation::ProcessOutput { output_id } => {
+            ServiceScheduleObservation::ProcessOutput { output_id }
+        }
     }
 }
 
@@ -1650,8 +2031,87 @@ fn to_wire_schedule(value: ServiceSchedule) -> RuntimeScheduleSpec {
             ServiceSchedulePayload::Continuation { continuation_id } => {
                 RuntimeSchedulePayload::Continuation { continuation_id }
             }
+            ServiceSchedulePayload::GraphTrigger { run_id, node_id } => {
+                RuntimeSchedulePayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
+    }
+}
+
+fn from_wire_mcp_server(value: WireMcpServerDeclaration) -> ServiceMcpServerDeclaration {
+    ServiceMcpServerDeclaration {
+        name: value.name,
+        transport: match value.transport {
+            WireMcpTransportDeclaration::Stdio {
+                program,
+                arguments,
+                environment,
+            } => ServiceMcpTransportDeclaration::Stdio {
+                program,
+                arguments,
+                environment: environment
+                    .into_iter()
+                    .map(|entry| ServiceMcpSensitiveEntry {
+                        name: entry.name,
+                        value: entry.value,
+                    })
+                    .collect(),
+            },
+            WireMcpTransportDeclaration::StreamableHttp {
+                url,
+                legacy_sse,
+                headers,
+            } => ServiceMcpTransportDeclaration::StreamableHttp {
+                url,
+                legacy_sse,
+                headers: headers
+                    .into_iter()
+                    .map(|entry| ServiceMcpSensitiveEntry {
+                        name: entry.name,
+                        value: entry.value,
+                    })
+                    .collect(),
+            },
+        },
+    }
+}
+
+fn to_logic_mcp_server(value: ServiceMcpServerDeclaration) -> SessionMcpServerDeclaration {
+    SessionMcpServerDeclaration {
+        name: value.name,
+        transport: match value.transport {
+            ServiceMcpTransportDeclaration::Stdio {
+                program,
+                arguments,
+                environment,
+            } => SessionMcpTransportDeclaration::Stdio {
+                program,
+                arguments,
+                environment: environment
+                    .into_iter()
+                    .map(|entry| SessionMcpSensitiveEntry {
+                        name: entry.name,
+                        value: entry.value,
+                    })
+                    .collect(),
+            },
+            ServiceMcpTransportDeclaration::StreamableHttp {
+                url,
+                legacy_sse,
+                headers,
+            } => SessionMcpTransportDeclaration::StreamableHttp {
+                url,
+                legacy_sse,
+                headers: headers
+                    .into_iter()
+                    .map(|entry| SessionMcpSensitiveEntry {
+                        name: entry.name,
+                        value: entry.value,
+                    })
+                    .collect(),
+            },
+        },
     }
 }
 
@@ -1694,6 +2154,9 @@ pub enum ServiceError {
     /// Durable scheduler operation failed.
     #[error("scheduler operation failed: {0}")]
     Schedule(RuntimeScheduleLogicError),
+    /// Plugin lifecycle management failed.
+    #[error("plugin lifecycle operation failed: {0}")]
+    PluginLifecycle(String),
     /// Replay state could not be rendered at the endpoint boundary.
     #[error("session state could not be serialized")]
     StateSerialization,
@@ -1701,9 +2164,18 @@ pub enum ServiceError {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::{
+        cell::RefCell,
+        sync::{Arc, Mutex},
+    };
 
-    use agentmod_runtime_logic::RuntimeHealthResult;
+    use agentmod_runtime_logic::{
+        RuntimeHealthResult,
+        plugin_lifecycle::{
+            ChangePluginLifecycleResult, PluginLifecycleError, PluginLifecycleLogicPort,
+        },
+    };
+    use async_trait::async_trait;
 
     use super::*;
 
@@ -1842,6 +2314,101 @@ mod tests {
     }
 
     #[test]
+    fn native_style_configuration_uses_the_logic_tool_catalog() {
+        let config = RuntimeStyleServiceConfig::native(std::path::Path::new("sessions"));
+        assert_eq!(config.tool_groups, canonical_tool_groups());
+        assert_eq!(config.tool_groups.len(), 7);
+        assert_eq!(
+            config
+                .tool_groups
+                .values()
+                .map(BTreeSet::len)
+                .sum::<usize>(),
+            57
+        );
+    }
+
+    #[test]
+    fn style_context_transform_catalog_maps_exactly_into_logic_environment() {
+        let mut config = RuntimeStyleServiceConfig::native(std::path::Path::new("sessions"));
+        config.context_transforms = vec![ServiceContextTransformDescriptor {
+            plugin_id: String::from("fixture.context"),
+            transform_id: String::from("fixture.redact"),
+            version: String::from("1.2.3"),
+            declaration_hash: agentmod_primitives::ContentHash::digest(b"declaration").to_hex(),
+            lifecycle: String::from("before_model_request"),
+        }];
+        let environment = config.logic_environment(None);
+        assert_eq!(environment.context_transforms.len(), 1);
+        assert_eq!(
+            environment.context_transforms[0],
+            StyleContextTransformDescriptor {
+                plugin_id: String::from("fixture.context"),
+                transform_id: String::from("fixture.redact"),
+                version: String::from("1.2.3"),
+                declaration_hash: agentmod_primitives::ContentHash::digest(b"declaration").to_hex(),
+                lifecycle: String::from("before_model_request"),
+            }
+        );
+
+        config.plugin_memory_providers = vec![ServicePluginMemoryProviderDescriptor {
+            plugin_id: String::from("fixture.memory"),
+            plugin_version: String::from("3.0.0"),
+            provider_id: String::from("fixture.semantic"),
+            provider_version: String::from("1.4.0"),
+            declaration_hash: agentmod_primitives::ContentHash::digest(b"memory").to_hex(),
+            configuration_reference: agentmod_primitives::ContentHash::digest(
+                b"memory-configuration",
+            )
+            .to_hex(),
+            has_retrieve: true,
+            has_write: true,
+        }];
+        config.plugin_compactors = vec![ServicePluginCompactorDescriptor {
+            plugin_id: String::from("fixture.compaction"),
+            plugin_version: String::from("4.0.0"),
+            compactor_id: String::from("fixture.summary"),
+            compactor_version: String::from("2.0.0"),
+            declaration_hash: agentmod_primitives::ContentHash::digest(b"compactor").to_hex(),
+            configuration_reference: agentmod_primitives::ContentHash::digest(
+                b"compactor-configuration",
+            )
+            .to_hex(),
+        }];
+        let environment = config.logic_environment(None);
+        assert_eq!(
+            environment.plugin_memory_providers,
+            vec![StylePluginMemoryProviderDescriptor {
+                plugin_id: String::from("fixture.memory"),
+                plugin_version: String::from("3.0.0"),
+                provider_id: String::from("fixture.semantic"),
+                provider_version: String::from("1.4.0"),
+                declaration_hash: agentmod_primitives::ContentHash::digest(b"memory").to_hex(),
+                configuration_reference: agentmod_primitives::ContentHash::digest(
+                    b"memory-configuration",
+                )
+                .to_hex(),
+                has_retrieve: true,
+                has_write: true,
+            }]
+        );
+        assert_eq!(
+            environment.plugin_compactors,
+            vec![StylePluginCompactorDescriptor {
+                plugin_id: String::from("fixture.compaction"),
+                plugin_version: String::from("4.0.0"),
+                compactor_id: String::from("fixture.summary"),
+                compactor_version: String::from("2.0.0"),
+                declaration_hash: agentmod_primitives::ContentHash::digest(b"compactor").to_hex(),
+                configuration_reference: agentmod_primitives::ContentHash::digest(
+                    b"compactor-configuration",
+                )
+                .to_hex(),
+            }]
+        );
+    }
+
+    #[test]
     fn wire_health_is_mapped_through_service_and_logic_types() {
         let service = service(RuntimeHealthState::Ready);
         assert_eq!(
@@ -1871,6 +2438,69 @@ mod tests {
                 reason: String::from("fixture"),
             }),
             Err(ServiceError::UnsupportedEndpoint)
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct LifecycleMock {
+        observed: Arc<Mutex<Vec<ChangePluginLifecycleCommand>>>,
+    }
+
+    #[async_trait]
+    impl PluginLifecycleLogicPort for LifecycleMock {
+        async fn change_plugin_lifecycle(
+            &self,
+            command: ChangePluginLifecycleCommand,
+        ) -> Result<ChangePluginLifecycleResult, PluginLifecycleError> {
+            self.observed
+                .lock()
+                .expect("lifecycle commands")
+                .push(command.clone());
+            Ok(ChangePluginLifecycleResult {
+                plugin_id: command.plugin_id,
+                plugin_version: String::from("1.2.3"),
+                state: String::from("quarantined"),
+                committed_sequence: agentmod_primitives::Sequence::new(4).expect("sequence"),
+                replayed: false,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_lifecycle_service_maps_only_service_owned_types() {
+        let logic = LifecycleMock::default();
+        let service = RuntimeService::new(
+            logic.clone(),
+            RuntimeServiceConfig {
+                session_root: PathBuf::from("sessions"),
+                version: String::from("test"),
+                styles: RuntimeStyleServiceConfig::native(std::path::Path::new("sessions")),
+            },
+        );
+        let session_id = agentmod_primitives::SessionId::from_uuid(uuid::Uuid::from_u128(1));
+        let cancellation_id =
+            agentmod_primitives::CancellationId::from_uuid(uuid::Uuid::from_u128(2));
+        let result = service
+            .change_plugin_lifecycle(ServiceChangePluginLifecycleRequest {
+                session_id,
+                plugin_id: String::from("fixture.plugin"),
+                action: ServicePluginLifecycleAction::Quarantine,
+                reason_code: Some(String::from("integrity_failure")),
+                cancellation_id,
+            })
+            .await
+            .expect("quarantine");
+        assert_eq!(result.state, "quarantined");
+        assert_eq!(
+            logic.observed.lock().expect("commands").as_slice(),
+            &[ChangePluginLifecycleCommand {
+                sessions_root: PathBuf::from("sessions"),
+                session_id,
+                plugin_id: String::from("fixture.plugin"),
+                action: PluginLifecycleAction::Quarantine,
+                reason_code: Some(String::from("integrity_failure")),
+                cancellation_id: cancellation_id.to_string(),
+            }]
         );
     }
 }

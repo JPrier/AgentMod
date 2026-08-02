@@ -10,10 +10,14 @@
 
 use agentmod_primitives::{CancellationId, Sequence, SessionId};
 use agentmod_tui_dependency::{
-    DependencyBranchSessionRequest, DependencyCreateSessionRequest,
-    DependencySessionBudgetSelection, DependencyStyleAvailability, DependencyStyleInspection,
-    DependencyStyleSourceKind, DependencyTurnEvent, DependencyTurnStream, DependencyTurnStreamItem,
-    TuiDependencyError, TuiRuntimeDependencyPort,
+    DependencyArtifactResource, DependencyAttachment, DependencyAttachmentKind,
+    DependencyBranchSessionRequest, DependencyChildResource, DependencyCreateSessionRequest,
+    DependencyMcpOAuthAction, DependencyMcpOAuthRequest, DependencyMcpOAuthResponse,
+    DependencyPluginLifecycleAction, DependencyPluginLifecycleRequest, DependencyProcessResource,
+    DependencySchedule, DependencySchedulePayload, DependencyScheduleTrigger,
+    DependencySessionBudgetSelection, DependencySessionEventStream, DependencyStyleAvailability,
+    DependencyStyleInspection, DependencyStyleSourceKind, DependencyTurnEvent,
+    DependencyTurnStream, DependencyTurnStreamItem, TuiDependencyError, TuiRuntimeDependencyPort,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -22,6 +26,24 @@ use thiserror::Error;
 pub struct RuntimeHealthDataRecord {
     pub ready: bool,
     pub version: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentDataKind {
+    Image,
+    Audio,
+    Blob,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttachmentDataRecord {
+    pub identity: String,
+    pub name: String,
+    pub uri: String,
+    pub mime_type: String,
+    pub kind: AttachmentDataKind,
+    pub data_base64: String,
+    pub byte_size: u64,
 }
 
 /// Data-owned optional session budget selection.
@@ -139,6 +161,164 @@ pub struct BranchSessionDataRecord {
     pub child_head_sequence: Sequence,
 }
 
+/// Data-owned plugin lifecycle action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PluginLifecycleDataAction {
+    Disable,
+    Enable,
+    Quarantine,
+    Unquarantine,
+}
+
+/// Data-owned plugin lifecycle request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginLifecycleDataRequest {
+    pub session_id: SessionId,
+    pub plugin_id: String,
+    pub action: PluginLifecycleDataAction,
+    pub reason_code: Option<String>,
+    pub cancellation_id: CancellationId,
+}
+
+/// Data-owned canonical plugin lifecycle result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginLifecycleDataRecord {
+    pub session_id: SessionId,
+    pub plugin_id: String,
+    pub plugin_version: String,
+    pub state: String,
+    pub committed_sequence: Sequence,
+    pub replayed: bool,
+}
+
+/// Data-owned MCP OAuth management action.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpOAuthDataAction {
+    Begin,
+    Status,
+    Cancel { transaction_id: String },
+}
+
+/// Data-owned exact MCP OAuth management request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpOAuthDataRequest {
+    pub session_id: SessionId,
+    pub server_id: String,
+    pub action: McpOAuthDataAction,
+    pub cancellation_id: CancellationId,
+}
+
+/// Data-owned bounded MCP OAuth result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpOAuthDataRecord {
+    Started {
+        server_id: String,
+        transaction_id: String,
+        authorization_url: String,
+        authorization_url_hash: String,
+        expires_at_ms: i64,
+    },
+    Status {
+        server_id: String,
+        status: String,
+        transaction_id: Option<String>,
+        expires_at_ms: Option<i64>,
+        scopes: Vec<String>,
+        status_hash: String,
+    },
+}
+
+/// Data-owned replay-only artifact row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactResourceDataRecord {
+    pub execution_id: String,
+    pub node_id: String,
+    pub state: String,
+    pub mime_type: String,
+    pub byte_size: u64,
+    pub artifact_reference: Option<String>,
+}
+
+/// Data-owned replay-only child row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildResourceDataRecord {
+    pub execution_id: String,
+    pub task_id: String,
+    pub state: String,
+    pub child_style: String,
+    pub workspace_mode: String,
+    pub child_session_id: Option<String>,
+    pub summary: Option<String>,
+}
+
+/// Data-owned replay-only process reconciliation row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProcessResourceDataRecord {
+    pub call_id: String,
+    pub process_id: String,
+    pub status: Option<String>,
+    pub started_at: u64,
+    pub completed_at: Option<u64>,
+}
+
+/// Data-owned bounded canonical runtime-resource projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeResourcesDataRecord {
+    pub artifacts: Vec<ArtifactResourceDataRecord>,
+    pub children: Vec<ChildResourceDataRecord>,
+    pub processes: Vec<ProcessResourceDataRecord>,
+}
+
+/// Data-owned schedule trigger.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScheduleDataTrigger {
+    AtMillis(i64),
+    Interval {
+        starts_at_ms: i64,
+        every_ms: u64,
+    },
+    RuntimeEvent {
+        event_type: String,
+    },
+    ProcessOutput {
+        process_id: String,
+        contains: String,
+    },
+}
+
+/// Data-owned schedule payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ScheduleDataPayload {
+    Prompt { prompt: String },
+    Continuation { continuation_id: String },
+    GraphTrigger { run_id: String, node_id: String },
+}
+
+/// Data-owned durable schedule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleDataRecord {
+    pub schedule_id: String,
+    pub session_id: SessionId,
+    pub idempotency_id: String,
+    pub style: String,
+    pub workspace: String,
+    pub permission_policy: String,
+    pub provider: String,
+    pub model: String,
+    pub token_budget: u64,
+    pub cost_budget_micros: u64,
+    pub trigger: ScheduleDataTrigger,
+    pub payload: ScheduleDataPayload,
+    pub active: bool,
+}
+
+/// Data-owned schedule store result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleStoreDataRecord {
+    pub schedule_id: String,
+    pub replayed: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionEventDataRecord {
     pub sequence: Sequence,
@@ -152,6 +332,26 @@ pub struct SessionEventPageDataRecord {
     pub head_sequence: Sequence,
     pub cursor: Option<Sequence>,
     pub has_more: bool,
+}
+
+/// Data-owned bounded stream of newly committed canonical events.
+pub struct SessionEventDataStream {
+    dependency: DependencySessionEventStream,
+}
+
+impl SessionEventDataStream {
+    #[must_use]
+    pub fn try_next(&self) -> Option<Result<SessionEventDataRecord, TuiDataError>> {
+        self.dependency.try_next().map(|value| {
+            value
+                .map(|event| SessionEventDataRecord {
+                    sequence: event.sequence,
+                    event_type: event.event_type,
+                    payload: event.payload,
+                })
+                .map_err(map_error)
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -211,6 +411,15 @@ impl TurnDataStream {
 }
 
 pub trait TuiDataPort {
+    fn load_attachment(
+        &self,
+        _workspace: String,
+        _path: String,
+    ) -> Result<AttachmentDataRecord, TuiDataError> {
+        Err(TuiDataError::Dependency(String::from(
+            "attachment loading unavailable",
+        )))
+    }
     fn runtime_health(&self) -> Result<RuntimeHealthDataRecord, TuiDataError>;
     fn list_styles(&self) -> Result<Vec<StyleDataRecord>, TuiDataError>;
     fn inspect_style(&self, _selector: String) -> Result<StyleInspectionDataRecord, TuiDataError> {
@@ -230,6 +439,16 @@ pub trait TuiDataPort {
     fn list_sessions(&self, limit: u32) -> Result<Vec<SessionDataRecord>, TuiDataError>;
     fn inspect_session(&self, _session_id: SessionId) -> Result<Value, TuiDataError> {
         Ok(Value::Null)
+    }
+    fn inspect_runtime_resources(
+        &self,
+        _session_id: SessionId,
+    ) -> Result<RuntimeResourcesDataRecord, TuiDataError> {
+        Ok(RuntimeResourcesDataRecord {
+            artifacts: Vec::new(),
+            children: Vec::new(),
+            processes: Vec::new(),
+        })
     }
     fn create_session(&self, workspace: String, style: String) -> Result<SessionId, TuiDataError>;
     fn create_session_with_harness(
@@ -269,12 +488,55 @@ pub trait TuiDataPort {
         &self,
         request: BranchSessionDataRequest,
     ) -> Result<BranchSessionDataRecord, TuiDataError>;
+    fn change_plugin_lifecycle(
+        &self,
+        _request: PluginLifecycleDataRequest,
+    ) -> Result<PluginLifecycleDataRecord, TuiDataError> {
+        Err(TuiDataError::Dependency(String::from(
+            "plugin lifecycle management unavailable",
+        )))
+    }
+    fn manage_mcp_oauth(
+        &self,
+        _request: McpOAuthDataRequest,
+    ) -> Result<McpOAuthDataRecord, TuiDataError> {
+        Err(TuiDataError::Dependency(String::from(
+            "MCP OAuth management unavailable",
+        )))
+    }
+    fn upsert_schedule(
+        &self,
+        _schedule: ScheduleDataRecord,
+    ) -> Result<ScheduleStoreDataRecord, TuiDataError> {
+        Err(TuiDataError::Dependency(String::from(
+            "schedule management unavailable",
+        )))
+    }
+    fn list_schedules(&self, _limit: u32) -> Result<Vec<ScheduleDataRecord>, TuiDataError> {
+        Err(TuiDataError::Dependency(String::from(
+            "schedule management unavailable",
+        )))
+    }
+    fn remove_schedule(&self, _schedule_id: &str) -> Result<bool, TuiDataError> {
+        Err(TuiDataError::Dependency(String::from(
+            "schedule management unavailable",
+        )))
+    }
     fn session_events(
         &self,
         session_id: SessionId,
         after: Option<Sequence>,
         limit: u32,
     ) -> Result<SessionEventPageDataRecord, TuiDataError>;
+    fn start_session_subscription(
+        &self,
+        _session_id: SessionId,
+        _after: Option<Sequence>,
+    ) -> Result<SessionEventDataStream, TuiDataError> {
+        Err(TuiDataError::Dependency(String::from(
+            "live event subscription unavailable",
+        )))
+    }
     fn start_turn(
         &self,
         session_id: SessionId,
@@ -306,6 +568,16 @@ impl<D> TuiData<D> {
 }
 
 impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
+    fn load_attachment(
+        &self,
+        workspace: String,
+        path: String,
+    ) -> Result<AttachmentDataRecord, TuiDataError> {
+        self.dependency
+            .load_attachment(workspace, path)
+            .map(map_attachment)
+            .map_err(map_error)
+    }
     fn runtime_health(&self) -> Result<RuntimeHealthDataRecord, TuiDataError> {
         self.dependency
             .health()
@@ -415,6 +687,32 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
             .map_err(map_error)
     }
 
+    fn inspect_runtime_resources(
+        &self,
+        session_id: SessionId,
+    ) -> Result<RuntimeResourcesDataRecord, TuiDataError> {
+        self.dependency
+            .inspect_runtime_resources(session_id)
+            .map(|resources| RuntimeResourcesDataRecord {
+                artifacts: resources
+                    .artifacts
+                    .into_iter()
+                    .map(map_artifact_resource)
+                    .collect(),
+                children: resources
+                    .children
+                    .into_iter()
+                    .map(map_child_resource)
+                    .collect(),
+                processes: resources
+                    .processes
+                    .into_iter()
+                    .map(map_process_resource)
+                    .collect(),
+            })
+            .map_err(map_error)
+    }
+
     fn create_session(&self, workspace: String, style: String) -> Result<SessionId, TuiDataError> {
         self.dependency
             .create_session(workspace, style)
@@ -488,6 +786,119 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
             .map_err(map_error)
     }
 
+    fn change_plugin_lifecycle(
+        &self,
+        request: PluginLifecycleDataRequest,
+    ) -> Result<PluginLifecycleDataRecord, TuiDataError> {
+        self.dependency
+            .change_plugin_lifecycle(DependencyPluginLifecycleRequest {
+                session_id: request.session_id,
+                plugin_id: request.plugin_id,
+                action: match request.action {
+                    PluginLifecycleDataAction::Disable => DependencyPluginLifecycleAction::Disable,
+                    PluginLifecycleDataAction::Enable => DependencyPluginLifecycleAction::Enable,
+                    PluginLifecycleDataAction::Quarantine => {
+                        DependencyPluginLifecycleAction::Quarantine
+                    }
+                    PluginLifecycleDataAction::Unquarantine => {
+                        DependencyPluginLifecycleAction::Unquarantine
+                    }
+                },
+                reason_code: request.reason_code,
+                cancellation_id: request.cancellation_id,
+            })
+            .map(|response| PluginLifecycleDataRecord {
+                session_id: response.session_id,
+                plugin_id: response.plugin_id,
+                plugin_version: response.plugin_version,
+                state: response.state,
+                committed_sequence: response.committed_sequence,
+                replayed: response.replayed,
+            })
+            .map_err(map_error)
+    }
+
+    fn manage_mcp_oauth(
+        &self,
+        request: McpOAuthDataRequest,
+    ) -> Result<McpOAuthDataRecord, TuiDataError> {
+        self.dependency
+            .manage_mcp_oauth(DependencyMcpOAuthRequest {
+                session_id: request.session_id,
+                server_id: request.server_id,
+                action: match request.action {
+                    McpOAuthDataAction::Begin => DependencyMcpOAuthAction::Begin,
+                    McpOAuthDataAction::Status => DependencyMcpOAuthAction::Status,
+                    McpOAuthDataAction::Cancel { transaction_id } => {
+                        DependencyMcpOAuthAction::Cancel { transaction_id }
+                    }
+                },
+                cancellation_id: request.cancellation_id,
+            })
+            .map(|response| match response {
+                DependencyMcpOAuthResponse::Started {
+                    server_id,
+                    transaction_id,
+                    authorization_url,
+                    authorization_url_hash,
+                    expires_at_ms,
+                } => McpOAuthDataRecord::Started {
+                    server_id,
+                    transaction_id,
+                    authorization_url,
+                    authorization_url_hash,
+                    expires_at_ms,
+                },
+                DependencyMcpOAuthResponse::Status {
+                    server_id,
+                    status,
+                    transaction_id,
+                    expires_at_ms,
+                    scopes,
+                    status_hash,
+                } => McpOAuthDataRecord::Status {
+                    server_id,
+                    status,
+                    transaction_id,
+                    expires_at_ms,
+                    scopes,
+                    status_hash,
+                },
+            })
+            .map_err(map_error)
+    }
+
+    fn upsert_schedule(
+        &self,
+        schedule: ScheduleDataRecord,
+    ) -> Result<ScheduleStoreDataRecord, TuiDataError> {
+        self.dependency
+            .upsert_schedule(to_dependency_schedule(schedule))
+            .map(|response| ScheduleStoreDataRecord {
+                schedule_id: response.schedule_id,
+                replayed: response.replayed,
+            })
+            .map_err(map_error)
+    }
+
+    fn list_schedules(&self, limit: u32) -> Result<Vec<ScheduleDataRecord>, TuiDataError> {
+        self.dependency
+            .list_schedules(limit)
+            .map(|schedules| {
+                schedules
+                    .into_iter()
+                    .map(from_dependency_schedule)
+                    .collect()
+            })
+            .map_err(map_error)
+    }
+
+    fn remove_schedule(&self, schedule_id: &str) -> Result<bool, TuiDataError> {
+        self.dependency
+            .remove_schedule(schedule_id)
+            .map_err(map_error)
+    }
+
     fn session_events(
         &self,
         session_id: SessionId,
@@ -510,6 +921,17 @@ impl<D: TuiRuntimeDependencyPort> TuiDataPort for TuiData<D> {
                 cursor: value.last_delivered_sequence,
                 has_more: value.has_more,
             })
+            .map_err(map_error)
+    }
+
+    fn start_session_subscription(
+        &self,
+        session_id: SessionId,
+        after: Option<Sequence>,
+    ) -> Result<SessionEventDataStream, TuiDataError> {
+        self.dependency
+            .start_session_subscription(session_id, after)
+            .map(|dependency| SessionEventDataStream { dependency })
             .map_err(map_error)
     }
 
@@ -575,6 +997,129 @@ fn map_stream_item(value: DependencyTurnStreamItem) -> TurnDataStreamItem {
     }
 }
 
+fn map_artifact_resource(value: DependencyArtifactResource) -> ArtifactResourceDataRecord {
+    ArtifactResourceDataRecord {
+        execution_id: value.execution_id,
+        node_id: value.node_id,
+        state: value.state,
+        mime_type: value.mime_type,
+        byte_size: value.byte_size,
+        artifact_reference: value.artifact_reference,
+    }
+}
+
+fn map_child_resource(value: DependencyChildResource) -> ChildResourceDataRecord {
+    ChildResourceDataRecord {
+        execution_id: value.execution_id,
+        task_id: value.task_id,
+        state: value.state,
+        child_style: value.child_style,
+        workspace_mode: value.workspace_mode,
+        child_session_id: value.child_session_id,
+        summary: value.summary,
+    }
+}
+
+fn map_process_resource(value: DependencyProcessResource) -> ProcessResourceDataRecord {
+    ProcessResourceDataRecord {
+        call_id: value.call_id,
+        process_id: value.process_id,
+        status: value.status,
+        started_at: value.started_at,
+        completed_at: value.completed_at,
+    }
+}
+
+fn to_dependency_schedule(schedule: ScheduleDataRecord) -> DependencySchedule {
+    DependencySchedule {
+        schedule_id: schedule.schedule_id,
+        session_id: schedule.session_id,
+        idempotency_id: schedule.idempotency_id,
+        style: schedule.style,
+        workspace: schedule.workspace,
+        permission_policy: schedule.permission_policy,
+        provider: schedule.provider,
+        model: schedule.model,
+        token_budget: schedule.token_budget,
+        cost_budget_micros: schedule.cost_budget_micros,
+        trigger: match schedule.trigger {
+            ScheduleDataTrigger::AtMillis(value) => DependencyScheduleTrigger::AtMillis(value),
+            ScheduleDataTrigger::Interval {
+                starts_at_ms,
+                every_ms,
+            } => DependencyScheduleTrigger::Interval {
+                starts_at_ms,
+                every_ms,
+            },
+            ScheduleDataTrigger::RuntimeEvent { event_type } => {
+                DependencyScheduleTrigger::RuntimeEvent { event_type }
+            }
+            ScheduleDataTrigger::ProcessOutput {
+                process_id,
+                contains,
+            } => DependencyScheduleTrigger::ProcessOutput {
+                process_id,
+                contains,
+            },
+        },
+        payload: match schedule.payload {
+            ScheduleDataPayload::Prompt { prompt } => DependencySchedulePayload::Prompt { prompt },
+            ScheduleDataPayload::Continuation { continuation_id } => {
+                DependencySchedulePayload::Continuation { continuation_id }
+            }
+            ScheduleDataPayload::GraphTrigger { run_id, node_id } => {
+                DependencySchedulePayload::GraphTrigger { run_id, node_id }
+            }
+        },
+        active: schedule.active,
+    }
+}
+
+fn from_dependency_schedule(schedule: DependencySchedule) -> ScheduleDataRecord {
+    ScheduleDataRecord {
+        schedule_id: schedule.schedule_id,
+        session_id: schedule.session_id,
+        idempotency_id: schedule.idempotency_id,
+        style: schedule.style,
+        workspace: schedule.workspace,
+        permission_policy: schedule.permission_policy,
+        provider: schedule.provider,
+        model: schedule.model,
+        token_budget: schedule.token_budget,
+        cost_budget_micros: schedule.cost_budget_micros,
+        trigger: match schedule.trigger {
+            DependencyScheduleTrigger::AtMillis(value) => ScheduleDataTrigger::AtMillis(value),
+            DependencyScheduleTrigger::Interval {
+                starts_at_ms,
+                every_ms,
+            } => ScheduleDataTrigger::Interval {
+                starts_at_ms,
+                every_ms,
+            },
+            DependencyScheduleTrigger::RuntimeEvent { event_type } => {
+                ScheduleDataTrigger::RuntimeEvent { event_type }
+            }
+            DependencyScheduleTrigger::ProcessOutput {
+                process_id,
+                contains,
+            } => ScheduleDataTrigger::ProcessOutput {
+                process_id,
+                contains,
+            },
+        },
+        payload: match schedule.payload {
+            DependencySchedulePayload::Prompt { prompt } => ScheduleDataPayload::Prompt { prompt },
+            DependencySchedulePayload::Continuation { continuation_id } => {
+                ScheduleDataPayload::Continuation { continuation_id }
+            }
+            DependencySchedulePayload::GraphTrigger { run_id, node_id } => {
+                ScheduleDataPayload::GraphTrigger { run_id, node_id }
+            }
+        },
+        active: schedule.active,
+    }
+}
+
 fn map_style_inspection(value: DependencyStyleInspection) -> StyleInspectionDataRecord {
     StyleInspectionDataRecord {
         summary: StyleDataRecord {
@@ -611,6 +1156,22 @@ fn map_style_inspection(value: DependencyStyleInspection) -> StyleInspectionData
                 help: diagnostic.help,
             })
             .collect(),
+    }
+}
+
+fn map_attachment(value: DependencyAttachment) -> AttachmentDataRecord {
+    AttachmentDataRecord {
+        identity: value.identity,
+        name: value.name,
+        uri: value.uri,
+        mime_type: value.mime_type,
+        kind: match value.kind {
+            DependencyAttachmentKind::Image => AttachmentDataKind::Image,
+            DependencyAttachmentKind::Audio => AttachmentDataKind::Audio,
+            DependencyAttachmentKind::Blob => AttachmentDataKind::Blob,
+        },
+        data_base64: value.data_base64,
+        byte_size: value.byte_size,
     }
 }
 
@@ -672,4 +1233,28 @@ fn map_error(error: TuiDependencyError) -> TuiDataError {
 pub enum TuiDataError {
     #[error("TUI runtime dependency failed: {0}")]
     Dependency(String),
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use agentmod_tui_dependency::{DependencyAttachment, DependencyAttachmentKind};
+
+    use super::{AttachmentDataKind, map_attachment};
+
+    #[test]
+    fn dependency_attachment_is_explicitly_mapped_to_data_owned_types() {
+        let mapped = map_attachment(DependencyAttachment {
+            identity: String::from("/workspace/pixel.png"),
+            name: String::from("pixel.png"),
+            uri: String::from("file:///workspace/pixel.png"),
+            mime_type: String::from("image/png"),
+            kind: DependencyAttachmentKind::Image,
+            data_base64: String::from("iVBORw=="),
+            byte_size: 4,
+        });
+        assert_eq!(mapped.kind, AttachmentDataKind::Image);
+        assert_eq!(mapped.name, "pixel.png");
+        assert_eq!(mapped.data_base64, "iVBORw==");
+        assert_eq!(mapped.byte_size, 4);
+    }
 }

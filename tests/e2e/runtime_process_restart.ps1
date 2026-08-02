@@ -5,7 +5,7 @@ Push-Location $repository
 try {
     cargo build -p agentmod-runtime -p agentmod-harness `
         -p agentmod-filesystem-host -p agentmod-process-host `
-        -p agentmod-scheduler -p agentmod-cli
+        -p agentmod-scheduler -p agentmod-cli -p agentmod-tui
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
     $runtime = (Resolve-Path "target\debug\agentmod-runtime.exe").Path
@@ -14,6 +14,7 @@ try {
     $processHost = (Resolve-Path "target\debug\agentmod-process-host.exe").Path
     $scheduler = (Resolve-Path "target\debug\agentmod-scheduler.exe").Path
     $cli = (Resolve-Path "target\debug\agentmod.exe").Path
+    $tui = (Resolve-Path "target\debug\agentmod-tui.exe").Path
     $runRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
         "agentmod-process-restart-e2e-" + [guid]::NewGuid().ToString("N")
     )
@@ -27,7 +28,7 @@ try {
 use std::io::{self, BufRead, Write};
 fn main() {
     std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::thread::sleep(std::time::Duration::from_secs(180));
         std::process::exit(124);
     });
     println!("ready");
@@ -325,6 +326,14 @@ fn main() {
                 $completed.sequence -ge $terminal[0].sequence) {
                 throw "canonical process reconciliation ordering is incorrect"
             }
+        }
+        $resources = @(
+            & $tui --smoke-session-command $created.session_id "/resources" 2>&1
+        ) -join [Environment]::NewLine
+        if ($LASTEXITCODE -ne 0 -or
+            $resources -notmatch "selected=$($created.session_id)" -or
+            $resources -notmatch "resources=0/0/2") {
+            throw "TUI canonical process resource projection failed: $resources"
         }
         $succeeded = $true
         Write-Output (

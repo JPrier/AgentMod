@@ -6,21 +6,32 @@ use std::{
 };
 
 use agentmod_primitives::ContentHash;
+use agentmod_runtime_data::node_executor::NodeExecutorDataPort;
 use agentmod_runtime_data::style::{
-    SessionStyleBudgetSelectionDataRequest, SessionStyleCatalogDataRequest,
-    SessionStyleCatalogRecord, SessionStyleCatalogStatus,
-    SessionStyleComponentSelectionDataRequest, SessionStyleDataError, SessionStyleDataPort,
-    SessionStyleDecisionCapability, SessionStyleDiagnostic as DataDiagnostic,
-    SessionStyleEnvironment as DataEnvironment, SessionStyleManifestFormat as DataManifestFormat,
+    DUPLICATE_STYLE_IDENTITY_DIAGNOSTIC_CODE, SessionStyleBudgetSelectionDataRequest,
+    SessionStyleCatalogDataRequest, SessionStyleCatalogRecord, SessionStyleCatalogStatus,
+    SessionStyleChildMemoryAccess, SessionStyleChildSelectionDataRequest,
+    SessionStyleComponentSelectionDataRequest,
+    SessionStyleContextTransformDescriptor as DataContextTransformDescriptor,
+    SessionStyleDataError, SessionStyleDataPort, SessionStyleDecisionCapability,
+    SessionStyleDiagnostic as DataDiagnostic, SessionStyleEnvironment as DataEnvironment,
+    SessionStyleManifestFormat as DataManifestFormat,
+    SessionStylePluginCompactorDescriptor as DataPluginCompactorDescriptor,
+    SessionStylePluginMemoryProviderDescriptor as DataPluginMemoryProviderDescriptor,
     SessionStyleSourceKind as DataSourceKind, SessionStyleValidationDataRequest,
 };
+use agentmod_session_style_sdk::CompiledSessionStyle;
 use semver::Version;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::session::{
-    SessionCompactionConfiguration, SessionMemoryConfiguration, SessionPermissionDefaults,
-    SessionStyleBinding, SessionStyleBudgets, SessionStyleSource,
+use crate::{
+    node_executor::revalidate_runtime_execution_plan,
+    session::{
+        SessionCompactionConfiguration, SessionMemoryConfiguration, SessionPermissionDefaults,
+        SessionPluginCompactorConfiguration, SessionPluginMemoryConfiguration, SessionStyleBinding,
+        SessionStyleBudgets, SessionStyleSource,
+    },
 };
 
 /// Logic-owned style compilation and discovery environment.
@@ -46,6 +57,12 @@ pub struct StyleEnvironment {
     pub providers: BTreeSet<String>,
     /// Available plugin IDs.
     pub plugins: BTreeSet<String>,
+    /// Exact context-transform declarations from the authoritative plugin catalog.
+    pub context_transforms: Vec<StyleContextTransformDescriptor>,
+    /// Exact memory-provider declarations from the authoritative plugin catalog.
+    pub plugin_memory_providers: Vec<StylePluginMemoryProviderDescriptor>,
+    /// Exact compactor declarations from the authoritative plugin catalog.
+    pub plugin_compactors: Vec<StylePluginCompactorDescriptor>,
     /// Available memory provider IDs.
     pub memory_providers: BTreeSet<String>,
     /// Available compaction strategies.
@@ -56,6 +73,59 @@ pub struct StyleEnvironment {
     pub graph_references: BTreeMap<String, String>,
     /// Available harnesses and their exact capabilities.
     pub harnesses: BTreeMap<String, StyleHarnessDescriptor>,
+}
+
+/// Logic-owned exact plugin context-transform availability descriptor.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct StyleContextTransformDescriptor {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact transform identity.
+    pub transform_id: String,
+    /// Exact semantic version.
+    pub version: String,
+    /// Exact declaration hash.
+    pub declaration_hash: String,
+    /// Exact lifecycle boundary.
+    pub lifecycle: String,
+}
+
+/// Logic-owned exact plugin memory-provider availability descriptor.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct StylePluginMemoryProviderDescriptor {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact activated plugin version.
+    pub plugin_version: String,
+    /// Stable provider identity.
+    pub provider_id: String,
+    /// Exact provider version.
+    pub provider_version: String,
+    /// Exact declaration hash.
+    pub declaration_hash: String,
+    /// Exact canonical plugin configuration hash.
+    pub configuration_reference: String,
+    /// Whether retrieval is declared.
+    pub has_retrieve: bool,
+    /// Whether consequential write is declared.
+    pub has_write: bool,
+}
+
+/// Logic-owned exact plugin compactor availability descriptor.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct StylePluginCompactorDescriptor {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact activated plugin version.
+    pub plugin_version: String,
+    /// Stable compactor identity.
+    pub compactor_id: String,
+    /// Exact compactor version.
+    pub compactor_version: String,
+    /// Exact declaration hash.
+    pub declaration_hash: String,
+    /// Exact canonical plugin configuration hash.
+    pub configuration_reference: String,
 }
 
 /// Logic-owned harness compatibility input.
@@ -276,6 +346,36 @@ pub struct SelectStyleBudgetsCommand {
     pub environment: StyleEnvironment,
 }
 
+/// Explicit immutable restriction selection for one runtime-managed child.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildStyleMemoryAccess {
+    /// Child receives no memory access.
+    None,
+    /// Child may retrieve but cannot write memory.
+    ReadOnly,
+    /// Child retains the compiled style's read/write memory access.
+    ReadWrite,
+}
+
+/// Explicit immutable restriction selection for one runtime-managed child.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectChildStyleCommand {
+    /// Fully compiled base style binding.
+    pub binding: SessionStyleBinding,
+    /// Exact parent-granted tool groups.
+    pub tool_groups: BTreeSet<String>,
+    /// Exact parent-selected memory access.
+    pub memory_access: ChildStyleMemoryAccess,
+    /// Exact inherited provider selected by the parent, when enabled.
+    pub inherited_provider: Option<String>,
+    /// Optional maximum provider tokens.
+    pub max_tokens: Option<u64>,
+    /// Optional maximum cost in configured currency micros.
+    pub max_cost_micros: Option<u64>,
+    /// Current runtime compatibility environment.
+    pub environment: StyleEnvironment,
+}
+
 /// Narrow session-style logic boundary.
 pub trait SessionStyleLogicPort {
     /// Lists the live style catalog.
@@ -370,6 +470,20 @@ pub trait SessionStyleLogicPort {
         Err(SessionStyleLogicError::InvalidData)
     }
 
+    /// Recompiles a child style after applying every parent-owned immutable
+    /// restriction to the manifest itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns structured diagnostics when the restricted descriptor is not
+    /// valid in the current environment.
+    fn select_child_style(
+        &self,
+        _command: SelectChildStyleCommand,
+    ) -> Result<ResolvedStyle, SessionStyleLogicError> {
+        Err(SessionStyleLogicError::InvalidData)
+    }
+
     /// Confirms that a persisted binding still resolves to the exact same
     /// compatible compiled style. No replacement or version fallback occurs.
     ///
@@ -385,7 +499,7 @@ pub trait SessionStyleLogicPort {
 
 impl<D> SessionStyleLogicPort for super::RuntimeLogic<D>
 where
-    D: SessionStyleDataPort,
+    D: SessionStyleDataPort + NodeExecutorDataPort,
 {
     fn list_style_components(
         &self,
@@ -484,6 +598,10 @@ where
         })
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "restart validation compares every immutable style, component, capability, and executor-plan field without partial acceptance"
+    )]
     fn validate_style_binding(
         &self,
         command: ValidateStyleBindingCommand,
@@ -508,28 +626,92 @@ where
         }
         let base_budgets = resolved.binding.budgets;
         let retained_budgets = command.binding.budgets;
-        if base_budgets != retained_budgets {
-            resolved = self.select_style_budgets(SelectStyleBudgetsCommand {
+        let live_compiled: CompiledSessionStyle =
+            serde_json::from_str(&resolved.binding.compiled_style_json)
+                .map_err(|_| SessionStyleLogicError::InvalidData)?;
+        let retained_compiled: CompiledSessionStyle =
+            serde_json::from_str(&command.binding.compiled_style_json)
+                .map_err(|_| SessionStyleLogicError::InvalidData)?;
+        let live_provider_binding = compiled_provider_binding(&live_compiled);
+        let retained_provider_binding = compiled_provider_binding(&retained_compiled);
+        let inherited_provider = (live_provider_binding != retained_provider_binding)
+            .then(|| retained_provider_binding.clone())
+            .flatten();
+        let child_restrictions_present = resolved.binding.tool_groups
+            != command.binding.tool_groups
+            || resolved.binding.memory != command.binding.memory
+            || live_provider_binding != retained_provider_binding;
+        if child_restrictions_present || base_budgets != retained_budgets {
+            let memory_access = if command.binding.memory.provider == "none" {
+                ChildStyleMemoryAccess::None
+            } else if command.binding.memory.write_policy == "never" {
+                ChildStyleMemoryAccess::ReadOnly
+            } else {
+                ChildStyleMemoryAccess::ReadWrite
+            };
+            // Empty child tool grants are persisted as a deny-all binding
+            // projection while retaining the immutable compiled graph. Rebuild
+            // that graph from its complete descriptor, then restore the exact
+            // persisted projection before the equality check below.
+            let selected_tool_groups = if command.binding.tool_groups.is_empty() {
+                resolved.binding.tool_groups.iter().cloned().collect()
+            } else {
+                command.binding.tool_groups.iter().cloned().collect()
+            };
+            resolved = self.select_child_style(SelectChildStyleCommand {
                 binding: resolved.binding,
-                max_iterations: (base_budgets.max_iterations != retained_budgets.max_iterations)
-                    .then_some(retained_budgets.max_iterations),
-                max_steps: (base_budgets.max_steps != retained_budgets.max_steps)
-                    .then_some(retained_budgets.max_steps),
+                tool_groups: selected_tool_groups,
+                memory_access,
+                inherited_provider,
                 max_tokens: (base_budgets.max_tokens != retained_budgets.max_tokens)
                     .then_some(retained_budgets.max_tokens),
                 max_cost_micros: (base_budgets.max_cost_micros != retained_budgets.max_cost_micros)
                     .then_some(retained_budgets.max_cost_micros),
-                max_duration_ms: (base_budgets.max_duration_ms != retained_budgets.max_duration_ms)
-                    .then_some(retained_budgets.max_duration_ms),
                 environment: command.environment.clone(),
             })?;
+            if resolved.binding.budgets.max_iterations != retained_budgets.max_iterations
+                || resolved.binding.budgets.max_steps != retained_budgets.max_steps
+                || resolved.binding.budgets.max_duration_ms != retained_budgets.max_duration_ms
+            {
+                resolved = self.select_style_budgets(SelectStyleBudgetsCommand {
+                    binding: resolved.binding,
+                    max_iterations: Some(retained_budgets.max_iterations),
+                    max_steps: Some(retained_budgets.max_steps),
+                    max_tokens: None,
+                    max_cost_micros: None,
+                    max_duration_ms: Some(retained_budgets.max_duration_ms),
+                    environment: command.environment.clone(),
+                })?;
+            }
         }
         let resolved = self.select_style_harness(SelectStyleHarnessCommand {
             binding: resolved.binding,
             harness: command.binding.harness.clone(),
             environment: command.environment,
         })?;
-        if resolved.binding != command.binding {
+        let mut live_binding = resolved.binding;
+        if !command
+            .binding
+            .tool_groups
+            .iter()
+            .all(|group| live_binding.tool_groups.contains(group))
+        {
+            return Err(SessionStyleLogicError::BindingIncompatible {
+                selector,
+                reason: String::from(
+                    "the persisted child tool projection exceeds the live compiled style",
+                ),
+            });
+        }
+        live_binding
+            .tool_groups
+            .clone_from(&command.binding.tool_groups);
+        live_binding
+            .execution_plan
+            .clone_from(&command.binding.execution_plan);
+        live_binding.execution_plan_hash = command.binding.execution_plan_hash;
+        live_binding.mcp.clone_from(&command.binding.mcp);
+        if live_binding != command.binding {
             return Err(SessionStyleLogicError::BindingIncompatible {
                 selector,
                 reason: String::from(
@@ -537,6 +719,12 @@ where
                 ),
             });
         }
+        revalidate_runtime_execution_plan(&self.data, &command.binding).map_err(|error| {
+            SessionStyleLogicError::BindingIncompatible {
+                selector,
+                reason: error.to_string(),
+            }
+        })?;
         Ok(())
     }
 
@@ -622,6 +810,81 @@ where
         selected.source_locator = command.binding.source_locator;
         Ok(ResolvedStyle { binding: selected })
     }
+
+    fn select_child_style(
+        &self,
+        command: SelectChildStyleCommand,
+    ) -> Result<ResolvedStyle, SessionStyleLogicError> {
+        let inherited_provider = command.inherited_provider.clone();
+        let record = self
+            .data
+            .select_session_child_style(SessionStyleChildSelectionDataRequest {
+                environment: data_environment(&command.environment),
+                manifest: command.binding.configuration_json.clone(),
+                tool_groups: command.tool_groups,
+                memory_access: data_child_memory_access(command.memory_access),
+                inherited_provider: command.inherited_provider,
+                max_iterations: None,
+                max_steps: None,
+                max_tokens: command.max_tokens,
+                max_cost_micros: command.max_cost_micros,
+                max_duration_ms: None,
+            })
+            .map_err(SessionStyleLogicError::Data)?;
+        if availability(&record) != StyleAvailability::Available {
+            return Err(SessionStyleLogicError::ComponentSelectionIncompatible {
+                diagnostics: record.diagnostics.iter().map(diagnostic).collect(),
+            });
+        }
+        let mut selected = binding(&record, &command.environment)?;
+        if inherited_provider.as_deref().is_some_and(|provider| {
+            child_binding_inherited_provider(&selected).as_deref() != Some(provider)
+        }) {
+            return Err(SessionStyleLogicError::InvalidData);
+        }
+        selected.source = command.binding.source;
+        selected.source_locator = command.binding.source_locator;
+        Ok(ResolvedStyle { binding: selected })
+    }
+}
+
+fn compiled_provider_binding(compiled: &CompiledSessionStyle) -> Option<String> {
+    let providers = compiled
+        .graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.kind,
+                agentmod_graph_engine::NodeKind::ModelCall
+                    | agentmod_graph_engine::NodeKind::Review
+            )
+        })
+        .filter_map(|node| node.provider.clone())
+        .collect::<BTreeSet<_>>();
+    let provider = (providers.len() == 1)
+        .then(|| providers.into_iter().next())
+        .flatten()?;
+    (compiled.allowed_providers.len() == 1
+        && compiled
+            .allowed_providers
+            .iter()
+            .any(|allowed| allowed == &provider))
+    .then_some(provider)
+}
+
+const fn data_child_memory_access(value: ChildStyleMemoryAccess) -> SessionStyleChildMemoryAccess {
+    match value {
+        ChildStyleMemoryAccess::None => SessionStyleChildMemoryAccess::None,
+        ChildStyleMemoryAccess::ReadOnly => SessionStyleChildMemoryAccess::ReadOnly,
+        ChildStyleMemoryAccess::ReadWrite => SessionStyleChildMemoryAccess::ReadWrite,
+    }
+}
+
+pub(crate) fn child_binding_inherited_provider(binding: &SessionStyleBinding) -> Option<String> {
+    serde_json::from_str::<CompiledSessionStyle>(&binding.compiled_style_json)
+        .ok()
+        .and_then(|compiled| compiled_provider_binding(&compiled))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -731,6 +994,43 @@ fn data_environment(environment: &StyleEnvironment) -> DataEnvironment {
         tool_groups: environment.tool_groups.clone(),
         providers: environment.providers.clone(),
         plugins: environment.plugins.clone(),
+        context_transforms: environment
+            .context_transforms
+            .iter()
+            .map(|transform| DataContextTransformDescriptor {
+                plugin_id: transform.plugin_id.clone(),
+                transform_id: transform.transform_id.clone(),
+                version: transform.version.clone(),
+                declaration_hash: transform.declaration_hash.clone(),
+                lifecycle: transform.lifecycle.clone(),
+            })
+            .collect(),
+        plugin_memory_providers: environment
+            .plugin_memory_providers
+            .iter()
+            .map(|provider| DataPluginMemoryProviderDescriptor {
+                plugin_id: provider.plugin_id.clone(),
+                plugin_version: provider.plugin_version.clone(),
+                provider_id: provider.provider_id.clone(),
+                provider_version: provider.provider_version.clone(),
+                declaration_hash: provider.declaration_hash.clone(),
+                configuration_reference: provider.configuration_reference.clone(),
+                has_retrieve: provider.has_retrieve,
+                has_write: provider.has_write,
+            })
+            .collect(),
+        plugin_compactors: environment
+            .plugin_compactors
+            .iter()
+            .map(|compactor| DataPluginCompactorDescriptor {
+                plugin_id: compactor.plugin_id.clone(),
+                plugin_version: compactor.plugin_version.clone(),
+                compactor_id: compactor.compactor_id.clone(),
+                compactor_version: compactor.compactor_version.clone(),
+                declaration_hash: compactor.declaration_hash.clone(),
+                configuration_reference: compactor.configuration_reference.clone(),
+            })
+            .collect(),
         memory_providers: environment.memory_providers.clone(),
         compaction_strategies: environment.compaction_strategies.clone(),
         supported_decisions: environment
@@ -799,6 +1099,10 @@ fn inspection(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the immutable binding maps every compiled selection into session-owned types explicitly"
+)]
 fn binding(
     record: &SessionStyleCatalogRecord,
     environment: &StyleEnvironment,
@@ -839,8 +1143,12 @@ fn binding(
         runtime_api_version: record.runtime_api.clone(),
         configuration_json: manifest_json,
         compiled_style_json: compiled_json,
+        execution_plan: None,
+        execution_plan_hash: None,
+        mcp: crate::session::SessionMcpBinding::default(),
         memory: SessionMemoryConfiguration {
             provider: required_value_string(memory, "provider")?,
+            plugin: optional_plugin_memory_configuration(memory)?,
             scopes: string_array(Some(memory), "scopes"),
             retrieval_timing: required_value_string(memory, "retrieval_timing")?,
             query_json: serde_json::to_string(required_child(memory, "query")?)
@@ -854,6 +1162,7 @@ fn binding(
         },
         compaction: SessionCompactionConfiguration {
             strategy: required_value_string(compaction, "strategy")?,
+            plugin: optional_plugin_compactor_configuration(compaction)?,
             trigger_tokens: compaction.get("trigger_tokens").and_then(Value::as_u64),
             reserved_context_tokens: value_u64(compaction, "reserved_context_tokens")?,
             max_provider_projection_tokens: value_u64(
@@ -942,16 +1251,69 @@ fn required_child<'a>(value: &'a Value, key: &str) -> Result<&'a Value, SessionS
     value.get(key).ok_or(SessionStyleLogicError::InvalidData)
 }
 
+fn optional_plugin_memory_configuration(
+    memory: &Value,
+) -> Result<Option<SessionPluginMemoryConfiguration>, SessionStyleLogicError> {
+    memory
+        .get("plugin")
+        .filter(|value| !value.is_null())
+        .map(|plugin| {
+            Ok(SessionPluginMemoryConfiguration {
+                plugin_id: required_value_string(plugin, "plugin_id")?,
+                plugin_version: required_value_string(plugin, "plugin_version")?,
+                provider_id: required_value_string(plugin, "provider_id")?,
+                provider_version: required_value_string(plugin, "provider_version")?,
+                declaration_hash: parse_hash(
+                    plugin.get("declaration_hash").and_then(Value::as_str),
+                )?,
+                configuration_reference: parse_hash(
+                    plugin
+                        .get("configuration_reference")
+                        .and_then(Value::as_str),
+                )?,
+            })
+        })
+        .transpose()
+}
+
+fn optional_plugin_compactor_configuration(
+    compaction: &Value,
+) -> Result<Option<SessionPluginCompactorConfiguration>, SessionStyleLogicError> {
+    compaction
+        .get("plugin")
+        .filter(|value| !value.is_null())
+        .map(|plugin| {
+            Ok(SessionPluginCompactorConfiguration {
+                plugin_id: required_value_string(plugin, "plugin_id")?,
+                plugin_version: required_value_string(plugin, "plugin_version")?,
+                compactor_id: required_value_string(plugin, "compactor_id")?,
+                compactor_version: required_value_string(plugin, "compactor_version")?,
+                declaration_hash: parse_hash(
+                    plugin.get("declaration_hash").and_then(Value::as_str),
+                )?,
+                configuration_reference: parse_hash(
+                    plugin
+                        .get("configuration_reference")
+                        .and_then(Value::as_str),
+                )?,
+            })
+        })
+        .transpose()
+}
+
 fn canonical_child_json(value: &Value, key: &str) -> Result<String, SessionStyleLogicError> {
     serde_json::to_string(required_child(value, key)?)
         .map_err(|_| SessionStyleLogicError::InvalidData)
 }
 
 fn availability(record: &SessionStyleCatalogRecord) -> StyleAvailability {
+    if record.status == SessionStyleCatalogStatus::Disabled {
+        return StyleAvailability::Disabled;
+    }
     if record
         .diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == "style_duplicate_identity")
+        .any(|diagnostic| diagnostic.code == DUPLICATE_STYLE_IDENTITY_DIAGNOSTIC_CODE)
     {
         return StyleAvailability::Conflict;
     }
@@ -1037,6 +1399,118 @@ fn string_array(value: Option<&Value>, key: &str) -> Vec<String> {
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect()
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    #[test]
+    fn child_memory_access_maps_explicitly_to_data_contract() {
+        assert_eq!(
+            data_child_memory_access(ChildStyleMemoryAccess::None),
+            SessionStyleChildMemoryAccess::None
+        );
+        assert_eq!(
+            data_child_memory_access(ChildStyleMemoryAccess::ReadOnly),
+            SessionStyleChildMemoryAccess::ReadOnly
+        );
+        assert_eq!(
+            data_child_memory_access(ChildStyleMemoryAccess::ReadWrite),
+            SessionStyleChildMemoryAccess::ReadWrite
+        );
+    }
+
+    #[test]
+    fn duplicate_data_diagnostic_maps_to_conflict_availability() {
+        let record = SessionStyleCatalogRecord {
+            id: Some(String::from("example")),
+            version: Some(String::from("1.0.0")),
+            status: SessionStyleCatalogStatus::Invalid,
+            source: agentmod_runtime_data::style::SessionStyleSource {
+                locator: String::from("test"),
+                kind: DataSourceKind::Inline,
+                format: None,
+                bytes: 0,
+            },
+            diagnostics: vec![DataDiagnostic {
+                code: DUPLICATE_STYLE_IDENTITY_DIAGNOSTIC_CODE.into(),
+                path: String::from("identity"),
+                message: String::from("duplicate"),
+                help: String::from("retain one source"),
+            }],
+            canonical_manifest_json: None,
+            compiled_json: None,
+            manifest_hash: None,
+            cache_key: None,
+            compiled_hash: None,
+            selections: None,
+            runtime_api: String::from("1.0.0"),
+            cache_hit: false,
+        };
+
+        assert_eq!(availability(&record), StyleAvailability::Conflict);
+    }
+
+    #[test]
+    fn compiled_plugin_memory_and_compactor_fields_map_exactly_into_session_configuration() {
+        let memory_hash = ContentHash::digest(b"memory declaration");
+        let memory_configuration = ContentHash::digest(b"memory configuration");
+        let compactor_hash = ContentHash::digest(b"compactor declaration");
+        let compactor_configuration = ContentHash::digest(b"compactor configuration");
+        let memory = serde_json::json!({
+            "plugin": {
+                "plugin_id": "fixture.context",
+                "plugin_version": "2.3.4",
+                "provider_id": "fixture.memory",
+                "provider_version": "1.4.0",
+                "declaration_hash": memory_hash,
+                "configuration_reference": memory_configuration,
+            }
+        });
+        let compaction = serde_json::json!({
+            "plugin": {
+                "plugin_id": "fixture.context",
+                "plugin_version": "2.3.4",
+                "compactor_id": "fixture.compactor",
+                "compactor_version": "3.1.0",
+                "declaration_hash": compactor_hash,
+                "configuration_reference": compactor_configuration,
+            }
+        });
+
+        assert_eq!(
+            optional_plugin_memory_configuration(&memory).expect("plugin memory"),
+            Some(SessionPluginMemoryConfiguration {
+                plugin_id: String::from("fixture.context"),
+                plugin_version: String::from("2.3.4"),
+                provider_id: String::from("fixture.memory"),
+                provider_version: String::from("1.4.0"),
+                declaration_hash: memory_hash,
+                configuration_reference: memory_configuration,
+            })
+        );
+        assert_eq!(
+            optional_plugin_compactor_configuration(&compaction).expect("plugin compactor"),
+            Some(SessionPluginCompactorConfiguration {
+                plugin_id: String::from("fixture.context"),
+                plugin_version: String::from("2.3.4"),
+                compactor_id: String::from("fixture.compactor"),
+                compactor_version: String::from("3.1.0"),
+                declaration_hash: compactor_hash,
+                configuration_reference: compactor_configuration,
+            })
+        );
+        assert_eq!(
+            optional_plugin_memory_configuration(&serde_json::json!({})).expect("legacy memory"),
+            None
+        );
+        assert_eq!(
+            optional_plugin_compactor_configuration(&serde_json::json!({}))
+                .expect("legacy compaction"),
+            None
+        );
+    }
 }
 
 /// Session-style business failure.

@@ -11,9 +11,10 @@ use agent_client_protocol::{
     schema::{
         ProtocolVersion,
         v1::{
-            AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Implementation,
-            InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-            NewSessionRequest, NewSessionResponse, PermissionOption, PermissionOptionKind,
+            AgentCapabilities, CancelNotification, ContentBlock, ContentChunk,
+            EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
+            LoadSessionRequest, LoadSessionResponse, McpServer, NewSessionRequest,
+            NewSessionResponse, PermissionOption, PermissionOptionKind, PromptCapabilities,
             PromptRequest, PromptResponse, RequestPermissionOutcome, RequestPermissionRequest,
             SessionNotification, SessionUpdate, StopReason, ToolCall, ToolCallStatus,
             ToolCallUpdate, ToolCallUpdateFields,
@@ -22,7 +23,8 @@ use agent_client_protocol::{
 };
 use agentmod_acp_logic::{
     AcpLogicError, AcpLogicPort, ApprovalRequired, CreateSessionCommand, LoadSessionCommand,
-    PromptCommand, PromptPart, PromptStream, PromptStreamItem, PromptUpdate,
+    PromptCommand, PromptPart, PromptStream, PromptStreamItem, PromptUpdate, SessionMcpKeyValue,
+    SessionMcpServer, SessionMcpTransport,
 };
 
 /// ACP service endpoint assembled around injected logic.
@@ -61,34 +63,41 @@ impl<L: AcpLogicPort + 'static> AcpService<L> {
                     let _ = &initialize_logic;
                     responder.respond(
                         InitializeResponse::new(request.protocol_version)
-                            .agent_capabilities(AgentCapabilities::new().load_session(true))
-                            .agent_info(Implementation::new(
-                                "agentmod",
-                                env!("CARGO_PKG_VERSION"),
-                            )),
+                            .agent_capabilities(
+                                AgentCapabilities::new()
+                                    .load_session(true)
+                                    .prompt_capabilities(
+                                        PromptCapabilities::new()
+                                            .image(true)
+                                            .audio(true)
+                                            .embedded_context(true),
+                                    ),
+                            )
+                            .agent_info(Implementation::new("agentmod", env!("CARGO_PKG_VERSION"))),
                     )
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 async move |request: NewSessionRequest, responder, _connection| {
-                    if !valid_workspace(&request.cwd)
-                        || !request.additional_directories.is_empty()
-                        || !request.mcp_servers.is_empty()
+                    if !valid_workspace(&request.cwd) || !request.additional_directories.is_empty()
                     {
                         return responder.respond_with_error(invalid_params(
-                            "cwd must be absolute; additional directories and per-session MCP servers are not yet supported",
+                            "cwd must be absolute and additional directories must be empty",
                         ));
                     }
+                    let mcp_servers = match map_mcp_servers(request.mcp_servers) {
+                        Ok(servers) => servers,
+                        Err(error) => return responder.respond_with_error(error),
+                    };
                     match new_logic
                         .create_session(CreateSessionCommand {
                             workspace: request.cwd.to_string_lossy().into_owned(),
+                            mcp_servers,
                         })
                         .await
                     {
-                        Ok(session_id) => {
-                            responder.respond(NewSessionResponse::new(session_id))
-                        }
+                        Ok(session_id) => responder.respond(NewSessionResponse::new(session_id)),
                         Err(error) => responder.respond_with_error(map_logic(error)),
                     }
                 },
@@ -96,18 +105,21 @@ impl<L: AcpLogicPort + 'static> AcpService<L> {
             )
             .on_receive_request(
                 async move |request: LoadSessionRequest, responder, _connection| {
-                    if !valid_workspace(&request.cwd)
-                        || !request.additional_directories.is_empty()
-                        || !request.mcp_servers.is_empty()
+                    if !valid_workspace(&request.cwd) || !request.additional_directories.is_empty()
                     {
                         return responder.respond_with_error(invalid_params(
-                            "loaded cwd must be absolute and optional roots/servers must be empty",
+                            "loaded cwd must be absolute and additional directories must be empty",
                         ));
                     }
+                    let mcp_servers = match map_mcp_servers(request.mcp_servers) {
+                        Ok(servers) => servers,
+                        Err(error) => return responder.respond_with_error(error),
+                    };
                     match load_logic
                         .load_session(LoadSessionCommand {
                             session_id: request.session_id.to_string(),
                             workspace: request.cwd.to_string_lossy().into_owned(),
+                            mcp_servers,
                         })
                         .await
                     {
@@ -125,10 +137,7 @@ impl<L: AcpLogicPort + 'static> AcpService<L> {
                         Err(error) => return responder.respond_with_error(error),
                     };
                     let mut stream = match prompt_logic
-                        .prompt_stream(PromptCommand {
-                            session_id,
-                            parts,
-                        })
+                        .prompt_stream(PromptCommand { session_id, parts })
                         .await
                     {
                         Ok(stream) => stream,
@@ -266,9 +275,89 @@ fn map_prompt(content: Vec<ContentBlock>) -> Result<Vec<PromptPart>, agent_clien
                 name: link.name,
                 uri: link.uri,
             }),
-            _ => Err(invalid_params(
-                "this AgentMod ACP adapter currently accepts text and resource links",
-            )),
+            ContentBlock::Image(image) => Ok(PromptPart::Image {
+                data: image.data,
+                mime_type: image.mime_type,
+                uri: image.uri,
+            }),
+            ContentBlock::Audio(audio) => Ok(PromptPart::Audio {
+                data: audio.data,
+                mime_type: audio.mime_type,
+            }),
+            ContentBlock::Resource(resource) => match resource.resource {
+                EmbeddedResourceResource::TextResourceContents(resource) => {
+                    Ok(PromptPart::EmbeddedText {
+                        text: resource.text,
+                        uri: resource.uri,
+                        mime_type: resource.mime_type,
+                    })
+                }
+                EmbeddedResourceResource::BlobResourceContents(resource) => {
+                    Ok(PromptPart::EmbeddedBlob {
+                        data: resource.blob,
+                        uri: resource.uri,
+                        mime_type: resource.mime_type,
+                    })
+                }
+                _ => Err(invalid_params(
+                    "unsupported embedded resource representation",
+                )),
+            },
+            _ => Err(invalid_params("unsupported ACP prompt content block")),
+        })
+        .collect()
+}
+
+fn map_mcp_servers(
+    servers: Vec<McpServer>,
+) -> Result<Vec<SessionMcpServer>, agent_client_protocol::Error> {
+    servers
+        .into_iter()
+        .map(|server| match server {
+            McpServer::Stdio(server) => Ok(SessionMcpServer {
+                name: server.name,
+                transport: SessionMcpTransport::Stdio {
+                    command: server.command.to_string_lossy().into_owned(),
+                    arguments: server.args,
+                    environment: server
+                        .env
+                        .into_iter()
+                        .map(|value| SessionMcpKeyValue {
+                            name: value.name,
+                            value: value.value,
+                        })
+                        .collect(),
+                },
+            }),
+            McpServer::Http(server) => Ok(SessionMcpServer {
+                name: server.name,
+                transport: SessionMcpTransport::Http {
+                    url: server.url,
+                    headers: server
+                        .headers
+                        .into_iter()
+                        .map(|value| SessionMcpKeyValue {
+                            name: value.name,
+                            value: value.value,
+                        })
+                        .collect(),
+                },
+            }),
+            McpServer::Sse(server) => Ok(SessionMcpServer {
+                name: server.name,
+                transport: SessionMcpTransport::Sse {
+                    url: server.url,
+                    headers: server
+                        .headers
+                        .into_iter()
+                        .map(|value| SessionMcpKeyValue {
+                            name: value.name,
+                            value: value.value,
+                        })
+                        .collect(),
+                },
+            }),
+            _ => Err(invalid_params("unsupported ACP MCP transport")),
         })
         .collect()
 }
@@ -286,11 +375,107 @@ fn invalid_params(message: &str) -> agent_client_protocol::Error {
     reason = "service boundary consumes and translates the logic error"
 )]
 fn map_logic(error: AcpLogicError) -> agent_client_protocol::Error {
-    agent_client_protocol::Error::internal_error().data(error.to_string())
+    match error {
+        AcpLogicError::InvalidWorkspace
+        | AcpLogicError::InvalidSessionId
+        | AcpLogicError::WorkspaceMismatch
+        | AcpLogicError::EmptyPrompt
+        | AcpLogicError::InvalidPromptContent
+        | AcpLogicError::PromptTooLarge
+        | AcpLogicError::InvalidMcpDeclaration
+        | AcpLogicError::McpBindingMismatch => {
+            agent_client_protocol::Error::invalid_params().data(error.to_string())
+        }
+        _ => agent_client_protocol::Error::internal_error().data(error.to_string()),
+    }
 }
 
 /// The stable ACP version implemented by this adapter.
 #[must_use]
 pub const fn supported_protocol_version() -> ProtocolVersion {
     ProtocolVersion::V1
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use agent_client_protocol::schema::v1::{
+        AudioContent, BlobResourceContents, EmbeddedResource, ImageContent, McpServerHttp,
+        McpServerSse, McpServerStdio, TextResourceContents,
+    };
+
+    use super::*;
+
+    #[test]
+    fn official_rich_blocks_map_without_sdk_types_crossing_service() {
+        let blocks = vec![
+            ContentBlock::Image(
+                ImageContent::new("aW1hZ2U=", "image/png").uri(String::from("file:///image.png")),
+            ),
+            ContentBlock::Audio(AudioContent::new("YXVkaW8=", "audio/wav")),
+            ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::TextResourceContents(
+                    TextResourceContents::new("context", "file:///context.txt")
+                        .mime_type(String::from("text/plain")),
+                ),
+            )),
+            ContentBlock::Resource(EmbeddedResource::new(
+                EmbeddedResourceResource::BlobResourceContents(
+                    BlobResourceContents::new("YmxvYg==", "file:///data.bin")
+                        .mime_type(String::from("application/octet-stream")),
+                ),
+            )),
+        ];
+        assert_eq!(
+            map_prompt(blocks).expect("rich mappings"),
+            vec![
+                PromptPart::Image {
+                    data: String::from("aW1hZ2U="),
+                    mime_type: String::from("image/png"),
+                    uri: Some(String::from("file:///image.png")),
+                },
+                PromptPart::Audio {
+                    data: String::from("YXVkaW8="),
+                    mime_type: String::from("audio/wav"),
+                },
+                PromptPart::EmbeddedText {
+                    text: String::from("context"),
+                    uri: String::from("file:///context.txt"),
+                    mime_type: Some(String::from("text/plain")),
+                },
+                PromptPart::EmbeddedBlob {
+                    data: String::from("YmxvYg=="),
+                    uri: String::from("file:///data.bin"),
+                    mime_type: Some(String::from("application/octet-stream")),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn official_mcp_declarations_map_to_layer_owned_transport_records() {
+        let servers = vec![
+            McpServer::Stdio(
+                McpServerStdio::new("stdio", PathBuf::from("/absolute/server"))
+                    .args(vec![String::from("--stdio")]),
+            ),
+            McpServer::Http(McpServerHttp::new("http", "https://example.test/mcp")),
+            McpServer::Sse(McpServerSse::new("sse", "https://example.test/events")),
+        ];
+        let mapped = map_mcp_servers(servers).expect("MCP mappings");
+        assert_eq!(mapped.len(), 3);
+        assert!(matches!(
+            &mapped[0].transport,
+            SessionMcpTransport::Stdio { arguments, .. } if arguments == &["--stdio"]
+        ));
+        assert!(matches!(
+            &mapped[1].transport,
+            SessionMcpTransport::Http { url, .. } if url == "https://example.test/mcp"
+        ));
+        assert!(matches!(
+            &mapped[2].transport,
+            SessionMcpTransport::Sse { url, .. } if url == "https://example.test/events"
+        ));
+    }
 }

@@ -8,8 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-cli-dependency = { path = "../dependency" }
-agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-cli-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
 serde_json.workspace = true
 thiserror.workspace = true
 

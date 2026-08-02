@@ -12,9 +12,14 @@ scheduler="$repository/target/debug/agentmod-scheduler"
 cli="$repository/target/debug/agentmod"
 daemon_pid=""
 launch_count=0
+succeeded=false
 cleanup() {
   if [[ -n "$daemon_pid" ]]; then kill "$daemon_pid" 2>/dev/null || true; fi
-  rm -rf -- "$run_root"
+  if [[ "$succeeded" == true ]]; then
+    rm -rf -- "$run_root"
+  else
+    echo "scheduler recovery E2E retained failed state at $run_root" >&2
+  fi
 }
 trap cleanup EXIT
 
@@ -28,7 +33,7 @@ export AGENTMOD_SCHEDULER_POLL_MS=0
 
 start_runtime() {
   launch_count=$((launch_count + 1))
-  (cd "$run_root" && "$runtime" serve \
+  (cd "$run_root" && exec "$runtime" serve \
     >/dev/null 2>"$run_root/runtime-$launch_count.stderr.log") &
   daemon_pid=$!
 }
@@ -79,7 +84,11 @@ for _ in $(seq 1 100); do
   fi
   sleep 0.1
 done
-test "$(grep -c '"event_type":"model.response_completed"' "$journal")" -eq 1
+if [[ "$(grep -c '"event_type":"model.response_completed"' "$journal" || true)" -ne 1 ]]; then
+  cat "$run_root/runtime-$launch_count.stderr.log" >&2 || true
+  echo "startup recovery did not execute the unstarted claim" >&2
+  exit 1
+fi
 test ! -f "$run_root/scheduler/executions/$execution_id.succeeded"
 stop_runtime
 
@@ -94,4 +103,5 @@ grep '"event_type":"scheduler.delivery_reconciled"' "$journal" |
   grep -q "\"execution_id\":\"$execution_id\".*\"outcome\":\"succeeded\""
 after="$("$cli" schedule claim --limit 4 --json)"
 printf '%s' "$after" | grep -q '"executions":\[\]'
+succeeded=true
 echo "runtime scheduler claim and terminal reconciliation E2E passed"

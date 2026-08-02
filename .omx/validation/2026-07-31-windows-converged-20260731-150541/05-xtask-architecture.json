@@ -1,0 +1,8 @@
+{
+  "name": "05-xtask-architecture",
+  "command": "cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml",
+  "exit_code": 0,
+  "elapsed_ms": 8021,
+  "started_at": "2026-07-31T19:09:41.5042628Z",
+  "ended_at": "2026-07-31T19:09:49.5303525Z"
+}

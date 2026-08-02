@@ -19,7 +19,10 @@ export AGENTMOD_RUNTIME_ENDPOINT="$run_root/runtime.sock"
 export AGENTMOD_RUNTIME_AUTH_TOKEN="0123456789abcdef0123456789abcdef0123456789abcdef"
 export AGENTMOD_HARNESS_PROGRAM="$repository/target/debug/agentmod-harness"
 export AGENTMOD_SCHEDULER_POLL_MS=0
-"$repository/target/debug/agentmod-runtime" serve >"$run_root/runtime.log" 2>&1 &
+(
+  cd "$run_root"
+  exec "$repository/target/debug/agentmod-runtime" serve
+) >"$run_root/runtime.log" 2>&1 &
 runtime_pid="$!"
 
 for _ in $(seq 1 50); do

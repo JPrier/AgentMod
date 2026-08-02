@@ -3,14 +3,15 @@
 use std::ffi::OsString;
 
 use agentmod_cli_logic::{
-    BranchSessionCommand, BranchSessionResult, CancelTurnCommand, CliLogicPort,
-    CreateSessionBudgetCommand, CreateSessionCommand, DeferredScheduleCommand, DoctorResult,
-    DoctorState, HarnessDescriptorResult, InspectSessionCommand, InspectSessionResult,
-    ListSessionsCommand, ResolveApprovalCommand, ResolveApprovalResult, RunDoctorCommand,
-    RunTurnCommand, RunTurnResult, RunTurnStream, RunTurnStreamItem,
-    ScheduleCommand as LogicScheduleCommand, SchedulePayload, ScheduleResult, ScheduleTrigger,
-    SessionEventPageResult, SessionSummaryResult, StyleAvailability, StyleDiagnostic,
-    StyleFileCommand, StyleInspectionResult, StyleSourceKind, StyleSummaryResult,
+    BranchSessionCommand, BranchSessionResult, CancelTurnCommand, ChangePluginLifecycleCommand,
+    ChangePluginLifecycleResult, CliLogicPort, CreateSessionBudgetCommand, CreateSessionCommand,
+    DeferredScheduleCommand, DoctorResult, DoctorState, HarnessDescriptorResult,
+    InspectSessionCommand, InspectSessionResult, ListSessionsCommand, ManageMcpOAuthCommand,
+    McpOAuthAction, McpOAuthResult, PluginLifecycleAction, ResolveApprovalCommand,
+    ResolveApprovalResult, RunDoctorCommand, RunTurnCommand, RunTurnResult, RunTurnStream,
+    RunTurnStreamItem, ScheduleCommand as LogicScheduleCommand, SchedulePayload, ScheduleResult,
+    ScheduleTrigger, SessionEventPageResult, SessionSummaryResult, StyleAvailability,
+    StyleDiagnostic, StyleFileCommand, StyleInspectionResult, StyleSourceKind, StyleSummaryResult,
     StyleValidationResult, SubscribeSessionCommand, TurnEvent,
 };
 use clap::{Parser, Subcommand, ValueEnum};
@@ -97,6 +98,18 @@ pub enum CliCommand {
         #[command(subcommand)]
         command: HarnessCommand,
     },
+    /// Manage session-scoped plugin lifecycle state.
+    Plugin {
+        /// Plugin lifecycle operation.
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
+    /// Manage MCP integrations.
+    Mcp {
+        /// MCP operation.
+        #[command(subcommand)]
+        command: McpCommand,
+    },
     /// Cancel one active provider request.
     Cancel {
         /// Cancellation ID supplied to `run`.
@@ -105,6 +118,131 @@ pub enum CliCommand {
         #[arg(long, default_value = "cancelled by user")]
         reason: String,
         /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// MCP management operations.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum McpCommand {
+    /// Manage OAuth authorization for an HTTP MCP server.
+    #[command(name = "oauth")]
+    OAuth {
+        /// OAuth operation.
+        #[command(subcommand)]
+        command: McpOAuthCommand,
+    },
+}
+
+/// User-driven MCP OAuth operations.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum McpOAuthCommand {
+    /// Begin discovery and open an authorization-code + PKCE transaction.
+    Begin {
+        /// Exact configured MCP server ID.
+        server_id: String,
+        /// Session owning the MCP host.
+        #[arg(long)]
+        session: String,
+        /// Stable management cancellation lineage.
+        #[arg(long)]
+        cancellation_id: Option<String>,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Read redacted authorization state.
+    Status {
+        /// Exact configured MCP server ID.
+        server_id: String,
+        /// Session owning the MCP host.
+        #[arg(long)]
+        session: String,
+        /// Stable management cancellation lineage.
+        #[arg(long)]
+        cancellation_id: Option<String>,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel one exact pending authorization transaction.
+    Cancel {
+        /// Exact configured MCP server ID.
+        server_id: String,
+        /// Opaque transaction returned by `begin`.
+        transaction_id: String,
+        /// Session owning the MCP host.
+        #[arg(long)]
+        session: String,
+        /// Stable management cancellation lineage.
+        #[arg(long)]
+        cancellation_id: Option<String>,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Session-scoped plugin lifecycle operations.
+#[derive(Clone, Debug, Eq, PartialEq, Subcommand)]
+pub enum PluginCommand {
+    /// Disable a plugin while retaining its state.
+    Disable {
+        /// Exact plugin ID.
+        plugin_id: String,
+        /// Session whose immutable style selected the plugin.
+        #[arg(long)]
+        session: String,
+        /// Stable cancellation lineage for exact retry/reconciliation.
+        #[arg(long)]
+        cancellation_id: Option<String>,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore a disabled plugin.
+    Enable {
+        /// Exact plugin ID.
+        plugin_id: String,
+        /// Session whose immutable style selected the plugin.
+        #[arg(long)]
+        session: String,
+        /// Stable cancellation lineage for exact retry/reconciliation.
+        #[arg(long)]
+        cancellation_id: Option<String>,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Quarantine a plugin after a policy or integrity finding.
+    Quarantine {
+        /// Exact plugin ID.
+        plugin_id: String,
+        /// Session whose immutable style selected the plugin.
+        #[arg(long)]
+        session: String,
+        /// Stable redacted reason code.
+        #[arg(long)]
+        reason: String,
+        /// Stable cancellation lineage for exact retry/reconciliation.
+        #[arg(long)]
+        cancellation_id: Option<String>,
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Release a quarantined plugin.
+    Unquarantine {
+        /// Exact plugin ID.
+        plugin_id: String,
+        /// Session whose immutable style selected the plugin.
+        #[arg(long)]
+        session: String,
+        /// Stable cancellation lineage for exact retry/reconciliation.
+        #[arg(long)]
+        cancellation_id: Option<String>,
+        /// Emit JSON.
         #[arg(long)]
         json: bool,
     },
@@ -849,6 +987,102 @@ where
                 HarnessCommand::List { json } => self.list_harnesses(json),
                 HarnessCommand::Inspect { id, json } => self.inspect_harness(&id, json),
             },
+            CliCommand::Plugin { command } => match command {
+                PluginCommand::Disable {
+                    plugin_id,
+                    session,
+                    cancellation_id,
+                    json,
+                } => self.change_plugin_lifecycle(
+                    &session,
+                    plugin_id,
+                    PluginLifecycleAction::Disable,
+                    None,
+                    cancellation_id.as_deref(),
+                    json,
+                ),
+                PluginCommand::Enable {
+                    plugin_id,
+                    session,
+                    cancellation_id,
+                    json,
+                } => self.change_plugin_lifecycle(
+                    &session,
+                    plugin_id,
+                    PluginLifecycleAction::Enable,
+                    None,
+                    cancellation_id.as_deref(),
+                    json,
+                ),
+                PluginCommand::Quarantine {
+                    plugin_id,
+                    session,
+                    reason,
+                    cancellation_id,
+                    json,
+                } => self.change_plugin_lifecycle(
+                    &session,
+                    plugin_id,
+                    PluginLifecycleAction::Quarantine,
+                    Some(reason),
+                    cancellation_id.as_deref(),
+                    json,
+                ),
+                PluginCommand::Unquarantine {
+                    plugin_id,
+                    session,
+                    cancellation_id,
+                    json,
+                } => self.change_plugin_lifecycle(
+                    &session,
+                    plugin_id,
+                    PluginLifecycleAction::Unquarantine,
+                    None,
+                    cancellation_id.as_deref(),
+                    json,
+                ),
+            },
+            CliCommand::Mcp { command } => match command {
+                McpCommand::OAuth { command } => match command {
+                    McpOAuthCommand::Begin {
+                        server_id,
+                        session,
+                        cancellation_id,
+                        json,
+                    } => self.manage_mcp_oauth(
+                        &session,
+                        server_id,
+                        McpOAuthAction::Begin,
+                        cancellation_id.as_deref(),
+                        json,
+                    ),
+                    McpOAuthCommand::Status {
+                        server_id,
+                        session,
+                        cancellation_id,
+                        json,
+                    } => self.manage_mcp_oauth(
+                        &session,
+                        server_id,
+                        McpOAuthAction::Status,
+                        cancellation_id.as_deref(),
+                        json,
+                    ),
+                    McpOAuthCommand::Cancel {
+                        server_id,
+                        transaction_id,
+                        session,
+                        cancellation_id,
+                        json,
+                    } => self.manage_mcp_oauth(
+                        &session,
+                        server_id,
+                        McpOAuthAction::Cancel { transaction_id },
+                        cancellation_id.as_deref(),
+                        json,
+                    ),
+                },
+            },
             CliCommand::Cancel {
                 cancellation_id,
                 reason,
@@ -1175,6 +1409,78 @@ where
     fn list_harnesses(&self, json: bool) -> Result<ServiceCommandResponse, ServiceError> {
         let harnesses = self.logic.list_harnesses().map_err(logic_error)?;
         Ok(render_harnesses(&harnesses, "harness_list", json))
+    }
+
+    fn change_plugin_lifecycle(
+        &self,
+        session: &str,
+        plugin_id: String,
+        action: PluginLifecycleAction,
+        reason_code: Option<String>,
+        cancellation_id: Option<&str>,
+        json: bool,
+    ) -> Result<ServiceCommandResponse, ServiceError> {
+        let session_id = session.parse().map_err(|_| ServiceError::Arguments {
+            detail: String::from("session must be a valid UUID"),
+        })?;
+        let cancellation_id = cancellation_id.map_or_else(
+            || {
+                Ok(agentmod_primitives::CancellationId::from_uuid(
+                    uuid::Uuid::now_v7(),
+                ))
+            },
+            |value| {
+                value.parse().map_err(|_| ServiceError::Arguments {
+                    detail: String::from("cancellation-id must be a valid UUID"),
+                })
+            },
+        )?;
+        let result = self
+            .logic
+            .change_plugin_lifecycle(ChangePluginLifecycleCommand {
+                session_id,
+                plugin_id,
+                action,
+                reason_code,
+                cancellation_id,
+            })
+            .map_err(logic_error)?;
+        Ok(render_plugin_lifecycle(&result, json))
+    }
+
+    fn manage_mcp_oauth(
+        &self,
+        session: &str,
+        server_id: String,
+        action: McpOAuthAction,
+        cancellation_id: Option<&str>,
+        json: bool,
+    ) -> Result<ServiceCommandResponse, ServiceError> {
+        let session_id = session.parse().map_err(|_| ServiceError::Arguments {
+            detail: String::from("session must be a valid UUID"),
+        })?;
+        let cancellation_id = cancellation_id.map_or_else(
+            || {
+                Ok(agentmod_primitives::CancellationId::from_uuid(
+                    uuid::Uuid::now_v7(),
+                ))
+            },
+            |value| {
+                value.parse().map_err(|_| ServiceError::Arguments {
+                    detail: String::from("cancellation-id must be a valid UUID"),
+                })
+            },
+        )?;
+        let result = self
+            .logic
+            .manage_mcp_oauth(ManageMcpOAuthCommand {
+                session_id,
+                server_id,
+                action,
+                cancellation_id,
+            })
+            .map_err(logic_error)?;
+        Ok(render_mcp_oauth(&result, json))
     }
 
     fn inspect_harness(
@@ -1693,6 +1999,80 @@ fn render_harnesses(
     )
 }
 
+fn render_plugin_lifecycle(
+    result: &ChangePluginLifecycleResult,
+    json: bool,
+) -> ServiceCommandResponse {
+    render_value(
+        serde_json::json!({
+            "command": "plugin_lifecycle",
+            "session_id": result.session_id.to_string(),
+            "plugin_id": result.plugin_id,
+            "plugin_version": result.plugin_version,
+            "state": result.state,
+            "committed_sequence": result.committed_sequence.get(),
+            "replayed": result.replayed,
+        }),
+        json,
+        format!(
+            "plugin {}@{} {} at sequence {}{}",
+            result.plugin_id,
+            result.plugin_version,
+            result.state,
+            result.committed_sequence.get(),
+            if result.replayed { " (replayed)" } else { "" }
+        ),
+    )
+}
+
+fn render_mcp_oauth(result: &McpOAuthResult, json: bool) -> ServiceCommandResponse {
+    match result {
+        McpOAuthResult::Begin(value) => render_value(
+            serde_json::json!({
+                "command": "mcp_oauth_begin",
+                "server_id": value.server_id,
+                "transaction_id": value.transaction_id,
+                "authorization_url": value.authorization_url,
+                "authorization_url_hash": value.authorization_url_hash,
+                "expires_at_ms": value.expires_at_ms,
+            }),
+            json,
+            format!(
+                "Open this URL to authorize MCP server {}:\n{}\ntransaction: {}\nexpires_at_ms: {}",
+                value.server_id, value.authorization_url, value.transaction_id, value.expires_at_ms,
+            ),
+        ),
+        McpOAuthResult::Status(value) => render_value(
+            serde_json::json!({
+                "command": "mcp_oauth_status",
+                "server_id": value.server_id,
+                "status": value.status,
+                "transaction_id": value.transaction_id,
+                "expires_at_ms": value.expires_at_ms,
+                "scopes": value.scopes,
+                "status_hash": value.status_hash,
+            }),
+            json,
+            format!(
+                "MCP server {}: {}{}{}",
+                value.server_id,
+                value.status,
+                value
+                    .transaction_id
+                    .as_ref()
+                    .map_or_else(String::new, |transaction| format!(
+                        "\ntransaction: {transaction}"
+                    )),
+                if value.scopes.is_empty() {
+                    String::new()
+                } else {
+                    format!("\nscopes: {}", value.scopes.join(" "))
+                },
+            ),
+        ),
+    }
+}
+
 fn render_style_inspection(
     inspection: &ServiceStyleInspection,
     command: &str,
@@ -1909,6 +2289,10 @@ fn render_schedule_value(value: &ScheduleResult) -> serde_json::Value {
         SchedulePayload::Continuation { continuation_id } => serde_json::json!({
             "kind": "continuation",
             "value": {"continuation_id": continuation_id}
+        }),
+        SchedulePayload::GraphTrigger { run_id, node_id } => serde_json::json!({
+            "kind": "graph_trigger",
+            "value": {"run_id": run_id, "node_id": node_id}
         }),
     };
     serde_json::json!({
@@ -2263,6 +2647,7 @@ mod tests {
         observed_create: RefCell<Vec<CreateSessionCommand>>,
         observed_schedules: RefCell<Vec<LogicScheduleCommand>>,
         observed_deferred: RefCell<Vec<DeferredScheduleCommand>>,
+        observed_plugin_lifecycle: RefCell<Vec<ChangePluginLifecycleCommand>>,
     }
 
     impl CliLogicPort for MockLogic {
@@ -2376,6 +2761,29 @@ mod tests {
             })
         }
 
+        fn change_plugin_lifecycle(
+            &self,
+            command: ChangePluginLifecycleCommand,
+        ) -> Result<ChangePluginLifecycleResult, LogicError> {
+            self.observed_plugin_lifecycle
+                .borrow_mut()
+                .push(command.clone());
+            Ok(ChangePluginLifecycleResult {
+                session_id: command.session_id,
+                plugin_id: command.plugin_id,
+                plugin_version: String::from("1.2.3"),
+                state: match command.action {
+                    PluginLifecycleAction::Disable => String::from("disabled"),
+                    PluginLifecycleAction::Enable | PluginLifecycleAction::Unquarantine => {
+                        String::from("active")
+                    }
+                    PluginLifecycleAction::Quarantine => String::from("quarantined"),
+                },
+                committed_sequence: Sequence::new(5).expect("sequence"),
+                replayed: false,
+            })
+        }
+
         fn upsert_schedule(
             &self,
             schedule: LogicScheduleCommand,
@@ -2410,6 +2818,7 @@ mod tests {
                 observed_create: RefCell::new(Vec::new()),
                 observed_schedules: RefCell::new(Vec::new()),
                 observed_deferred: RefCell::new(Vec::new()),
+                observed_plugin_lifecycle: RefCell::new(Vec::new()),
             },
             CliServiceConfig {
                 runtime_endpoint_label: "local-runtime".into(),
@@ -2443,6 +2852,59 @@ mod tests {
         assert_eq!(json["command"], "doctor");
         assert_eq!(json["state"], "degraded");
         assert_eq!(response.exit_code, 0);
+    }
+
+    #[test]
+    fn plugin_disable_and_quarantine_map_exact_session_reason_and_rendering() {
+        let service = service(DoctorState::Ready, true);
+        let session = Uuid::from_u128(1).to_string();
+        let cancellation_id = Uuid::from_u128(2).to_string();
+        let disabled = service
+            .run_from([
+                "agentmod",
+                "plugin",
+                "disable",
+                "fixture.plugin",
+                "--session",
+                &session,
+                "--cancellation-id",
+                &cancellation_id,
+                "--json",
+            ])
+            .expect("disable");
+        let disabled_json: serde_json::Value =
+            serde_json::from_str(&disabled.output).expect("disable JSON");
+        assert_eq!(disabled_json["state"], "disabled");
+        let quarantined = service
+            .run_from([
+                "agentmod",
+                "plugin",
+                "quarantine",
+                "fixture.plugin",
+                "--session",
+                &session,
+                "--reason",
+                "integrity_failure",
+            ])
+            .expect("quarantine");
+        assert!(quarantined.output.contains("quarantined"));
+        let observed = service.logic.observed_plugin_lifecycle.borrow();
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].action, PluginLifecycleAction::Disable);
+        assert_eq!(observed[0].reason_code, None);
+        assert_eq!(
+            observed[0].cancellation_id,
+            agentmod_primitives::CancellationId::from_uuid(Uuid::from_u128(2))
+        );
+        assert_eq!(observed[1].action, PluginLifecycleAction::Quarantine);
+        assert_eq!(
+            observed[1].reason_code.as_deref(),
+            Some("integrity_failure")
+        );
+        assert_ne!(
+            observed[0].cancellation_id, observed[1].cancellation_id,
+            "each management command receives an independent cancellation lineage"
+        );
     }
 
     #[test]

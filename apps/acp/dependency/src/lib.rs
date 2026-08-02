@@ -17,7 +17,10 @@ use agentmod_protocol_support::{
     DEFAULT_MAX_FRAME_BYTES, FrameHeader, FrameKind, Handshake, Negotiated, WireFrame, read_frame,
     write_frame,
 };
-use agentmod_runtime_protocol::{RuntimeProviderEvent, RuntimeRequest, RuntimeResponse};
+use agentmod_runtime_protocol::{
+    RuntimeMcpSensitiveEntry, RuntimeMcpServerDeclaration, RuntimeMcpTransportDeclaration,
+    RuntimeProviderEvent, RuntimeRequest, RuntimeResponse,
+};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -25,12 +28,56 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 4);
+const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencySession {
     pub id: SessionId,
     pub workspace: String,
+    pub mcp_declaration_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyCreateSessionRequest {
+    pub workspace: String,
+    pub style: String,
+    pub mcp_servers: Vec<DependencyMcpServer>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyMcpServer {
+    pub name: String,
+    pub transport: DependencyMcpTransport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DependencyMcpTransport {
+    Stdio {
+        program: String,
+        arguments: Vec<String>,
+        environment: Vec<DependencyMcpSensitiveEntry>,
+    },
+    StreamableHttp {
+        url: String,
+        legacy_sse: bool,
+        headers: Vec<DependencyMcpSensitiveEntry>,
+    },
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct DependencyMcpSensitiveEntry {
+    pub name: String,
+    pub value: String,
+}
+
+impl std::fmt::Debug for DependencyMcpSensitiveEntry {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DependencyMcpSensitiveEntry")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,8 +151,7 @@ impl DependencyTurnStreamSender {
 pub trait AcpRuntimeDependencyPort: Send + Sync {
     async fn create_session(
         &self,
-        workspace: String,
-        style: String,
+        request: DependencyCreateSessionRequest,
     ) -> Result<SessionId, AcpDependencyError>;
     async fn find_session(
         &self,
@@ -189,10 +235,24 @@ impl LocalRuntimeDependency {
 
     #[cfg(windows)]
     async fn send(&self, request: RuntimeRequest) -> Result<RuntimeResponse, AcpDependencyError> {
-        let mut stream = tokio::net::windows::named_pipe::ClientOptions::new()
-            .open(&self.endpoint)
-            .map_err(|_| AcpDependencyError::Transport)?;
+        let mut stream = self.open_windows_pipe().await?;
         self.exchange(&mut stream, request).await
+    }
+
+    #[cfg(windows)]
+    async fn open_windows_pipe(
+        &self,
+    ) -> Result<tokio::net::windows::named_pipe::NamedPipeClient, AcpDependencyError> {
+        for attempt in 0..200_u16 {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(&self.endpoint) {
+                Ok(stream) => return Ok(stream),
+                Err(_) if attempt < 199 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                Err(_) => return Err(AcpDependencyError::Transport),
+            }
+        }
+        Err(AcpDependencyError::Transport)
     }
 
     async fn exchange<S>(
@@ -292,9 +352,7 @@ impl LocalRuntimeDependency {
         request: RuntimeRequest,
         sender: &mpsc::Sender<Result<DependencyTurnStreamItem, AcpDependencyError>>,
     ) -> Result<(), AcpDependencyError> {
-        let mut stream = tokio::net::windows::named_pipe::ClientOptions::new()
-            .open(&self.endpoint)
-            .map_err(|_| AcpDependencyError::Transport)?;
+        let mut stream = self.open_windows_pipe().await?;
         self.exchange_turn(&mut stream, request, sender).await
     }
 
@@ -358,17 +416,55 @@ impl LocalRuntimeDependency {
 impl AcpRuntimeDependencyPort for LocalRuntimeDependency {
     async fn create_session(
         &self,
-        workspace: String,
-        style: String,
+        request: DependencyCreateSessionRequest,
     ) -> Result<SessionId, AcpDependencyError> {
         let RuntimeResponse::SessionCreated { session_id } = self
-            .send(RuntimeRequest::CreateSession {
-                workspace,
-                style,
+            .send(RuntimeRequest::CreateSessionWithMcp {
+                workspace: request.workspace,
+                style: request.style,
                 harness: None,
                 memory: None,
                 compaction: None,
                 budgets: None,
+                mcp_servers: request
+                    .mcp_servers
+                    .into_iter()
+                    .map(|server| RuntimeMcpServerDeclaration {
+                        name: server.name,
+                        transport: match server.transport {
+                            DependencyMcpTransport::Stdio {
+                                program,
+                                arguments,
+                                environment,
+                            } => RuntimeMcpTransportDeclaration::Stdio {
+                                program,
+                                arguments,
+                                environment: environment
+                                    .into_iter()
+                                    .map(|entry| RuntimeMcpSensitiveEntry {
+                                        name: entry.name,
+                                        value: entry.value,
+                                    })
+                                    .collect(),
+                            },
+                            DependencyMcpTransport::StreamableHttp {
+                                url,
+                                legacy_sse,
+                                headers,
+                            } => RuntimeMcpTransportDeclaration::StreamableHttp {
+                                url,
+                                legacy_sse,
+                                headers: headers
+                                    .into_iter()
+                                    .map(|entry| RuntimeMcpSensitiveEntry {
+                                        name: entry.name,
+                                        value: entry.value,
+                                    })
+                                    .collect(),
+                            },
+                        },
+                    })
+                    .collect(),
             })
             .await?
         else {
@@ -387,13 +483,33 @@ impl AcpRuntimeDependencyPort for LocalRuntimeDependency {
         else {
             return Err(AcpDependencyError::UnexpectedResponse);
         };
-        Ok(sessions
-            .into_iter()
-            .find(|value| value.id == session_id)
-            .map(|value| DependencySession {
-                id: value.id,
-                workspace: value.workspace_label,
-            }))
+        let Some(summary) = sessions.into_iter().find(|value| value.id == session_id) else {
+            return Ok(None);
+        };
+        let RuntimeResponse::SessionInspected { state, .. } = self
+            .send(RuntimeRequest::InspectSession {
+                session_id,
+                at: None,
+            })
+            .await?
+        else {
+            return Err(AcpDependencyError::UnexpectedResponse);
+        };
+        let mcp_declaration_hash = state
+            .get("style_binding")
+            .and_then(|binding| binding.get("mcp"))
+            .and_then(|mcp| mcp.get("declaration_hash"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let workspace = state
+            .get("workspace")
+            .and_then(Value::as_str)
+            .map_or(summary.workspace_label, str::to_owned);
+        Ok(Some(DependencySession {
+            id: summary.id,
+            workspace,
+            mcp_declaration_hash,
+        }))
     }
 
     async fn run_turn_stream(
@@ -600,5 +716,51 @@ mod tests {
             LocalRuntimeDependency::new(String::new(), String::from("short"), 0),
             Err(AcpDependencyError::InvalidConfiguration)
         ));
+    }
+
+    #[tokio::test]
+    async fn negotiation_uses_current_runtime_protocol_and_preserves_request() {
+        let dependency = LocalRuntimeDependency::new(
+            String::from("fixture"),
+            "x".repeat(32),
+            DEFAULT_MAX_FRAME_BYTES,
+        )
+        .expect("dependency");
+        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
+        let peer = tokio::spawn(async move {
+            let handshake: WireFrame<Handshake> = read_frame(&mut server, DEFAULT_MAX_FRAME_BYTES)
+                .await
+                .expect("handshake");
+            assert_eq!(
+                handshake.payload.supported_versions,
+                vec![Version::new(2, 5)]
+            );
+            let mut response = handshake.header;
+            response.kind = FrameKind::Response;
+            write_frame(
+                &mut server,
+                &WireFrame {
+                    header: response,
+                    payload: Negotiated {
+                        version: Version::new(2, 5),
+                        capabilities: BTreeSet::from([String::from("credit_windows")]),
+                    },
+                },
+                DEFAULT_MAX_FRAME_BYTES,
+            )
+            .await
+            .expect("negotiated");
+            let request: WireFrame<RuntimeRequest> =
+                read_frame(&mut server, DEFAULT_MAX_FRAME_BYTES)
+                    .await
+                    .expect("request");
+            assert_eq!(request.payload, RuntimeRequest::Health);
+        });
+        let (_, credits) = dependency
+            .negotiate(&mut client, RuntimeRequest::Health)
+            .await
+            .expect("negotiation");
+        assert!(credits);
+        peer.await.expect("peer");
     }
 }

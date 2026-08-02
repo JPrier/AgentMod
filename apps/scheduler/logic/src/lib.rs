@@ -9,8 +9,8 @@
 )]
 
 use agentmod_scheduler_data::{
-    DataPayload, DataTrigger, ExecutionDataRecord, ScheduleDataRecord, SchedulerDataError,
-    SchedulerDataPort,
+    DataObservation, DataPayload, DataTrigger, ExecutionDataRecord, ScheduleDataRecord,
+    SchedulerDataError, SchedulerDataPort,
 };
 use thiserror::Error;
 
@@ -34,6 +34,7 @@ pub enum ScheduleTrigger {
 pub enum SchedulePayload {
     Prompt { prompt: String },
     Continuation { continuation_id: String },
+    GraphTrigger { run_id: String, node_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -75,7 +76,14 @@ pub struct ExecutionResult {
     pub execution_id: String,
     pub scheduled_for_ms: i64,
     pub claimed_at_ms: i64,
+    pub observation: Option<ExecutionObservation>,
     pub schedule: ScheduleResult,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionObservation {
+    RuntimeEvent { event_id: String },
+    ProcessOutput { output_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,11 +105,13 @@ pub trait SchedulerLogicPort: Send + Sync {
     }
     fn fire_runtime_event(
         &self,
+        source_session_id: &str,
         event_id: &str,
         event_type: &str,
     ) -> Result<Vec<ExecutionResult>, SchedulerLogicError>;
     fn fire_process_output(
         &self,
+        source_session_id: &str,
         output_id: &str,
         process_id: &str,
         output: &str,
@@ -172,30 +182,34 @@ impl<D: SchedulerDataPort> SchedulerLogicPort for SchedulerLogic<D> {
 
     fn fire_runtime_event(
         &self,
+        source_session_id: &str,
         event_id: &str,
         event_type: &str,
     ) -> Result<Vec<ExecutionResult>, SchedulerLogicError> {
+        validate_id(source_session_id)?;
         validate_id(event_id)?;
         validate_text(event_type, 256)?;
         self.data
-            .fire_runtime_event(event_id, event_type)
+            .fire_runtime_event(source_session_id, event_id, event_type)
             .map(|values| values.into_iter().map(from_execution).collect())
             .map_err(map_error)
     }
 
     fn fire_process_output(
         &self,
+        source_session_id: &str,
         output_id: &str,
         process_id: &str,
         output: &str,
     ) -> Result<Vec<ExecutionResult>, SchedulerLogicError> {
+        validate_id(source_session_id)?;
         validate_id(output_id)?;
         validate_id(process_id)?;
         if output.len() > 64 * 1024 {
             return Err(SchedulerLogicError::Invalid);
         }
         self.data
-            .fire_process_output(output_id, process_id, output)
+            .fire_process_output(source_session_id, output_id, process_id, output)
             .map(|values| values.into_iter().map(from_execution).collect())
             .map_err(map_error)
     }
@@ -247,6 +261,10 @@ fn validate_schedule(value: &ScheduleCommand) -> Result<(), SchedulerLogicError>
     match &value.payload {
         SchedulePayload::Prompt { prompt } => validate_text(prompt, 256 * 1024),
         SchedulePayload::Continuation { continuation_id } => validate_id(continuation_id),
+        SchedulePayload::GraphTrigger { run_id, node_id } => {
+            validate_id(run_id)?;
+            validate_id(node_id)
+        }
     }
 }
 
@@ -316,6 +334,9 @@ fn to_data(value: ScheduleCommand) -> ScheduleDataRecord {
             SchedulePayload::Continuation { continuation_id } => {
                 DataPayload::Continuation { continuation_id }
             }
+            SchedulePayload::GraphTrigger { run_id, node_id } => {
+                DataPayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
     }
@@ -358,6 +379,9 @@ fn from_schedule(value: ScheduleDataRecord) -> ScheduleResult {
             DataPayload::Continuation { continuation_id } => {
                 SchedulePayload::Continuation { continuation_id }
             }
+            DataPayload::GraphTrigger { run_id, node_id } => {
+                SchedulePayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
     }
@@ -368,6 +392,14 @@ fn from_execution(value: ExecutionDataRecord) -> ExecutionResult {
         execution_id: value.execution_id,
         scheduled_for_ms: value.scheduled_for_ms,
         claimed_at_ms: value.claimed_at_ms,
+        observation: value.observation.map(|observation| match observation {
+            DataObservation::RuntimeEvent { event_id } => {
+                ExecutionObservation::RuntimeEvent { event_id }
+            }
+            DataObservation::ProcessOutput { output_id } => {
+                ExecutionObservation::ProcessOutput { output_id }
+            }
+        }),
         schedule: from_schedule(value.schedule),
     }
 }
@@ -437,11 +469,13 @@ mod tests {
             &self,
             _: &str,
             _: &str,
+            _: &str,
         ) -> Result<Vec<ExecutionDataRecord>, SchedulerDataError> {
             Ok(Vec::new())
         }
         fn fire_process_output(
             &self,
+            _: &str,
             _: &str,
             _: &str,
             _: &str,

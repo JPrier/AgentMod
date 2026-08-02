@@ -8,9 +8,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-primitives = { path = "../../../../core/primitives" }
-agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
-agentmod-mcp-host-logic = { path = "../logic" }
+agentmod-primitives = { version = "0.1.0", path = "../../../../core/primitives" }
+agentmod-tool-protocol = { version = "0.1.0", path = "../../../../protocols/tool-protocol" }
+agentmod-mcp-host-logic = { version = "0.1.0", path = "../logic" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

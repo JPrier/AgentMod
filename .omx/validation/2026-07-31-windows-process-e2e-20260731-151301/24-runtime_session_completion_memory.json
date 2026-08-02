@@ -1,0 +1,12 @@
+{
+  "index": 24,
+  "name": "24-runtime_session_completion_memory",
+  "script": "runtime_session_completion_memory.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_session_completion_memory.ps1",
+  "exit_code": 0,
+  "status": "passed",
+  "elapsed_ms": 3951,
+  "started_at": "2026-07-31T19:29:00.7604556Z",
+  "ended_at": "2026-07-31T19:29:04.7166469Z",
+  "log": "24-runtime_session_completion_memory.log"
+}

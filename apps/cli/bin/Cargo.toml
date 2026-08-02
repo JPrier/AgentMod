@@ -12,11 +12,11 @@ name = "agentmod"
 path = "src/main.rs"
 
 [dependencies]
-agentmod-cli-data = { path = "../data" }
-agentmod-cli-dependency = { path = "../dependency" }
-agentmod-cli-logic = { path = "../logic" }
-agentmod-cli-service = { path = "../service" }
-agentmod-protocol-support = { path = "../../../core/protocol-support" }
+agentmod-cli-data = { version = "0.1.0", path = "../data" }
+agentmod-cli-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-cli-logic = { version = "0.1.0", path = "../logic" }
+agentmod-cli-service = { version = "0.1.0", path = "../service" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../../core/protocol-support" }
 
 [lints]
 workspace = true

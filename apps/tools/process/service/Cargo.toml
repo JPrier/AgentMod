@@ -8,10 +8,10 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-primitives = { path = "../../../../core/primitives" }
-agentmod-process-host-logic = { path = "../logic" }
-agentmod-protocol-support = { path = "../../../../core/protocol-support" }
-agentmod-tool-protocol = { path = "../../../../protocols/tool-protocol" }
+agentmod-primitives = { version = "0.1.0", path = "../../../../core/primitives" }
+agentmod-process-host-logic = { version = "0.1.0", path = "../logic" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../../../core/protocol-support" }
+agentmod-tool-protocol = { version = "0.1.0", path = "../../../../protocols/tool-protocol" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

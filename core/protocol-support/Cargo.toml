@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-primitives = { path = "../primitives" }
+agentmod-primitives = { version = "0.1.0", path = "../primitives" }
 blake3.workspace = true
 ciborium.workspace = true
 serde.workspace = true

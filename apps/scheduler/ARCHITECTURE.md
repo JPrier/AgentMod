@@ -18,9 +18,12 @@ model, token-budget, and cost-budget fields. Triggers cover one-time timestamps,
 bounded recurring intervals, canonical runtime events, and process-output
 literals. Payloads cover background prompts and deferred continuations.
 
-Every occurrence receives a deterministic execution ID. A claim is written with
-`create_new` and synced before it is returned, so a restart or repeated event
-cannot return the same execution again. Completion is a separate immutable
+Every occurrence receives a deterministic execution ID. Runtime-event and
+process-output commands carry the committing runtime session through every
+layer, and owner filtering occurs before a durable claim. Claims retain the
+exact event or output observation ID, are written with `create_new`, and are
+synced before return, so a restart or repeated observation cannot return the
+same execution again. Completion is a separate immutable
 success/failure marker and is idempotent for the same outcome. Opposite terminal
 outcomes conflict. Schedule records have checksums; corrupt records fail closed.
 

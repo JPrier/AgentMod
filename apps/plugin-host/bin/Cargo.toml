@@ -8,13 +8,32 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-plugin-host-data = { path = "../data" }
-agentmod-plugin-host-dependency = { path = "../dependency" }
-agentmod-plugin-host-logic = { path = "../logic" }
-agentmod-plugin-host-service = { path = "../service" }
-agentmod-plugin-protocol = { path = "../../../protocols/plugin-protocol" }
+agentmod-plugin-host-data = { version = "0.1.0", path = "../data" }
+agentmod-plugin-host-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-plugin-host-logic = { version = "0.1.0", path = "../logic" }
+agentmod-plugin-host-service = { version = "0.1.0", path = "../service" }
+agentmod-plugin-protocol = { version = "0.1.0", path = "../../../protocols/plugin-protocol" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
+
+[dev-dependencies]
+agentmod-plugin-sdk = { version = "0.1.0", path = "../../../sdk/plugin-sdk" }
+agentmod-runtime-dependency = { version = "0.1.0", path = "../../runtime/dependency" }
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
+agentmod-protocol-support = { version = "0.1.0", path = "../../../core/protocol-support" }
+tempfile.workspace = true
+
+[[bin]]
+name = "agentmod-plugin-multiplex-fixture"
+path = "tests/support/multiplex_fixture.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "agentmod-plugin-corrupt-host-fixture"
+path = "tests/support/corrupt_host_fixture.rs"
+test = false
+bench = false
 
 [lints]
 workspace = true

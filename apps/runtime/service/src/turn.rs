@@ -12,10 +12,13 @@ use agentmod_runtime_logic::{
     turn::{
         ApprovalTurnLogicPort, CancelTurnCommand, CancelTurnLogicPort,
         CommittedEventObserverLogicPort, CreateDeferredTurnCommand, DeferredTurnLogicPort,
-        ObserveCommittedEventsCommand, RecordScheduledRecoveryCommand, RecoverStartupToolsCommand,
-        ResolveTurnApprovalCommand, RunScheduledTurnCommand, RunTurnCommand, RunTurnError,
-        RunTurnStream, RunTurnStreamItem, ScheduledRecoveryLogicPort, StartupToolRecoveryLogicPort,
-        TurnLogicPort, WakeScheduledTurnCommand,
+        DeliverGraphScheduleTriggerCommand, GraphScheduleTriggerLogicPort,
+        ObserveCommittedEventsCommand, RecordScheduledRecoveryCommand,
+        RecoverPendingObserverDeliveriesCommand, RecoverPendingObserverDeliveriesResult,
+        RecoverStartupToolsCommand, ResolveTurnApprovalCommand, RunScheduledTurnCommand,
+        RunTurnCommand, RunTurnError, RunTurnStream, RunTurnStreamItem, ScheduledRecoveryLogicPort,
+        ScheduledTriggerObservation, StartupToolRecoveryLogicPort, TurnLogicPort,
+        WakeScheduledTurnCommand,
     },
 };
 use agentmod_runtime_protocol::{
@@ -27,7 +30,9 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::{RuntimeService, ServiceSchedulePayload, ServiceScheduledExecution};
+use crate::{
+    RuntimeService, ServiceScheduleObservation, ServiceSchedulePayload, ServiceScheduledExecution,
+};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ServiceRunTurnRequest {
@@ -52,7 +57,26 @@ pub struct ServiceRunScheduledTurnRequest {
     pub execution_id: String,
     pub schedule_id: String,
     pub scheduled_for_ms: i64,
+    pub observation: Option<ServiceScheduleObservation>,
     pub turn: ServiceRunTurnRequest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServiceDeliverGraphScheduleTriggerRequest {
+    pub session_id: String,
+    pub run_id: String,
+    pub node_id: String,
+    pub schedule_id: String,
+    pub execution_id: String,
+    pub scheduled_for_ms: i64,
+    pub claimed_at_ms: i64,
+    pub observation: Option<ServiceScheduleObservation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceDeliverGraphScheduleTriggerResponse {
+    pub transitioned: bool,
+    pub sequence: agentmod_primitives::Sequence,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -87,10 +111,12 @@ pub enum ServiceContinuationWakeCondition {
 pub enum ServiceContinuationWakeProof {
     AtMillis(i64),
     RuntimeEvent {
+        event_id: String,
         event_type: String,
         observed_at_ms: i64,
     },
     ProcessOutput {
+        output_id: String,
         process_id: String,
         contains: String,
         observed_at_ms: i64,
@@ -233,19 +259,17 @@ impl<L: TurnLogicPort> TurnService<L> {
         if request.prompt.trim().is_empty() {
             return Err(TurnServiceError::Invalid);
         }
-        let result = self
-            .logic
-            .run_turn(RunTurnCommand {
-                sessions_root: self.sessions_root.clone(),
-                session_id: request.session_id,
-                prompt: request.prompt,
-                provider: request.provider,
-                model: request.model,
-                options: request.options,
-                cancellation_id: request.cancellation_id,
-            })
-            .await
-            .map_err(TurnServiceError::Logic)?;
+        let result = Box::pin(self.logic.run_turn(RunTurnCommand {
+            sessions_root: self.sessions_root.clone(),
+            session_id: request.session_id,
+            prompt: request.prompt,
+            provider: request.provider,
+            model: request.model,
+            options: request.options,
+            cancellation_id: request.cancellation_id,
+        }))
+        .await
+        .map_err(TurnServiceError::Logic)?;
         Ok(ServiceRunTurnResponse {
             events: result.events.into_iter().map(map_event).collect(),
             first_committed_sequence: result.first_committed_sequence,
@@ -266,24 +290,30 @@ impl<L: TurnLogicPort> TurnService<L> {
         if request.turn.prompt.trim().is_empty() {
             return Err(TurnServiceError::Invalid);
         }
-        let result = self
-            .logic
-            .run_scheduled_turn(RunScheduledTurnCommand {
-                execution_id: request.execution_id,
-                schedule_id: request.schedule_id,
-                scheduled_for_ms: request.scheduled_for_ms,
-                turn: RunTurnCommand {
-                    sessions_root: self.sessions_root.clone(),
-                    session_id: request.turn.session_id,
-                    prompt: request.turn.prompt,
-                    provider: request.turn.provider,
-                    model: request.turn.model,
-                    options: request.turn.options,
-                    cancellation_id: request.turn.cancellation_id,
-                },
-            })
-            .await
-            .map_err(TurnServiceError::Logic)?;
+        let result = Box::pin(self.logic.run_scheduled_turn(RunScheduledTurnCommand {
+            execution_id: request.execution_id,
+            schedule_id: request.schedule_id,
+            scheduled_for_ms: request.scheduled_for_ms,
+            observation: request.observation.map(|observation| match observation {
+                ServiceScheduleObservation::RuntimeEvent { event_id } => {
+                    ScheduledTriggerObservation::RuntimeEvent { event_id }
+                }
+                ServiceScheduleObservation::ProcessOutput { output_id } => {
+                    ScheduledTriggerObservation::ProcessOutput { output_id }
+                }
+            }),
+            turn: RunTurnCommand {
+                sessions_root: self.sessions_root.clone(),
+                session_id: request.turn.session_id,
+                prompt: request.turn.prompt,
+                provider: request.turn.provider,
+                model: request.turn.model,
+                options: request.turn.options,
+                cancellation_id: request.turn.cancellation_id,
+            },
+        }))
+        .await
+        .map_err(TurnServiceError::Logic)?;
         Ok(ServiceRunTurnResponse {
             events: result.events.into_iter().map(map_event).collect(),
             first_committed_sequence: result.first_committed_sequence,
@@ -321,7 +351,36 @@ impl<L: TurnLogicPort> TurnService<L> {
 }
 
 impl<L: CommittedEventObserverLogicPort> TurnService<L> {
-    async fn observe_committed_events(
+    /// Reconciles bounded observer deliveries whose canonical history is pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnServiceError::Logic`] when replay, validation, or exact
+    /// receipt reconciliation fails.
+    pub async fn recover_pending_observer_deliveries(
+        &self,
+        session_id: agentmod_primitives::SessionId,
+        maximum_deliveries: usize,
+        maximum_journal_bytes: u64,
+    ) -> Result<RecoverPendingObserverDeliveriesResult, TurnServiceError> {
+        self.logic
+            .recover_pending_observer_deliveries(RecoverPendingObserverDeliveriesCommand {
+                sessions_root: self.sessions_root.clone(),
+                session_id: session_id.to_string(),
+                maximum_deliveries,
+                maximum_journal_bytes,
+            })
+            .await
+            .map_err(TurnServiceError::Logic)
+    }
+
+    /// Delivers a bounded committed event batch to configured plugin observers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TurnServiceError::Logic`] when observer planning, dispatch, or
+    /// canonical terminal-state commitment fails.
+    pub async fn observe_committed_events(
         &self,
         session_id: agentmod_primitives::SessionId,
         events: Vec<crate::ServiceSessionEvent>,
@@ -368,17 +427,23 @@ impl<L: ApprovalTurnLogicPort> TurnService<L> {
         ),
         TurnServiceError,
     > {
-        let result = self
-            .logic
-            .resolve_turn_approval(ResolveTurnApprovalCommand {
-                sessions_root: self.sessions_root.clone(),
-                session_id,
-                continuation_id,
-                approved,
-                resume_after_resolution,
-            })
-            .await
-            .map_err(TurnServiceError::Logic)?;
+        // The approval coordinator deliberately retains every continuation
+        // variant in one typed future so recovery cannot skip a variant-
+        // specific validation gate. Keep that large state machine on the heap:
+        // a default Tokio worker stack must be sufficient for graph approval
+        // recovery regardless of how many executor variants are compiled in.
+        let result = Box::pin(
+            self.logic
+                .resolve_turn_approval(ResolveTurnApprovalCommand {
+                    sessions_root: self.sessions_root.clone(),
+                    session_id,
+                    continuation_id,
+                    approved,
+                    resume_after_resolution,
+                }),
+        )
+        .await
+        .map_err(TurnServiceError::Logic)?;
         Ok((
             result.transitioned,
             result.events.into_iter().map(map_event).collect(),
@@ -475,6 +540,7 @@ impl<L: CancelTurnLogicPort> TurnService<L> {
     ) -> Result<(), TurnServiceError> {
         self.logic
             .cancel_turn(CancelTurnCommand {
+                sessions_root: self.sessions_root.clone(),
                 cancellation_id,
                 reason,
             })
@@ -504,6 +570,45 @@ impl<L: ScheduledRecoveryLogicPort> TurnService<L> {
                 continuation_id: request.continuation_id,
             })
             .map_err(TurnServiceError::Logic)
+    }
+}
+
+impl<L: GraphScheduleTriggerLogicPort> TurnService<L> {
+    /// Canonically delivers one authenticated nonwaiting graph occurrence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a translated business failure for substituted claim, plan, or
+    /// graph registration identity.
+    pub fn deliver_graph_schedule_trigger(
+        &self,
+        request: ServiceDeliverGraphScheduleTriggerRequest,
+    ) -> Result<ServiceDeliverGraphScheduleTriggerResponse, TurnServiceError> {
+        let result = self
+            .logic
+            .deliver_graph_schedule_trigger(DeliverGraphScheduleTriggerCommand {
+                sessions_root: self.sessions_root.clone(),
+                session_id: request.session_id,
+                run_id: request.run_id,
+                node_id: request.node_id,
+                schedule_id: request.schedule_id,
+                execution_id: request.execution_id,
+                scheduled_for_ms: request.scheduled_for_ms,
+                claimed_at_ms: request.claimed_at_ms,
+                observation: request.observation.map(|observation| match observation {
+                    ServiceScheduleObservation::RuntimeEvent { event_id } => {
+                        ScheduledTriggerObservation::RuntimeEvent { event_id }
+                    }
+                    ServiceScheduleObservation::ProcessOutput { output_id } => {
+                        ScheduledTriggerObservation::ProcessOutput { output_id }
+                    }
+                }),
+            })
+            .map_err(TurnServiceError::Logic)?;
+        Ok(ServiceDeliverGraphScheduleTriggerResponse {
+            transitioned: result.transitioned,
+            sequence: result.sequence,
+        })
     }
 }
 
@@ -580,10 +685,12 @@ where
         + agentmod_runtime_logic::history::SessionHistoryLogicPort
         + agentmod_runtime_logic::style::SessionStyleLogicPort
         + agentmod_runtime_logic::harness_registry::HarnessRegistryLogicPort
+        + agentmod_runtime_logic::plugin_lifecycle::PluginLifecycleLogicPort
         + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort,
     T: TurnLogicPort
         + CommittedEventObserverLogicPort
         + DeferredTurnLogicPort
+        + GraphScheduleTriggerLogicPort
         + ScheduledRecoveryLogicPort,
 {
     /// Reconciles durable scheduler claims before the runtime accepts clients.
@@ -617,6 +724,7 @@ where
                 execution_id: execution.execution_id,
                 scheduled_for_ms: execution.scheduled_for_ms,
                 claimed_at_ms: execution.claimed_at_ms,
+                observation: execution.observation.map(crate::from_wire_observation),
                 schedule: crate::from_wire_schedule(execution.schedule),
             };
             let classification = self.classify_scheduled_recovery(&service_execution)?;
@@ -716,14 +824,43 @@ where
                 .map_err(|error| error.to_string())?;
             for event in page.events {
                 after = Some(event.sequence);
-                if event.event_type == "scheduler.fired" {
-                    let matches_execution = event
-                        .payload
-                        .get("payload")
+                if event.event_type == "graph.schedule_triggered" {
+                    let canonical_payload = event.payload.get("payload");
+                    let matches_execution = canonical_payload
                         .and_then(|payload| payload.get("execution_id"))
                         .and_then(Value::as_str)
                         .is_some_and(|value| value == execution.execution_id);
                     if matches_execution {
+                        let canonical_payload = canonical_payload.ok_or_else(|| {
+                            String::from("graph trigger event has no canonical payload")
+                        })?;
+                        if !graph_triggered_matches_claim(canonical_payload, execution) {
+                            return Err(String::from(
+                                "graph trigger event does not match the durable claim",
+                            ));
+                        }
+                        return Ok(ScheduledRecoveryClassification {
+                            state: ScheduledRecoveryState::Succeeded,
+                            reconciliation_sequence: None,
+                        });
+                    }
+                    continue;
+                }
+                if event.event_type == "scheduler.fired" {
+                    let canonical_payload = event.payload.get("payload");
+                    let matches_execution = canonical_payload
+                        .and_then(|payload| payload.get("execution_id"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == execution.execution_id);
+                    if matches_execution {
+                        let canonical_payload = canonical_payload.ok_or_else(|| {
+                            String::from("scheduler fired event has no canonical payload")
+                        })?;
+                        if !scheduler_fired_matches_claim(canonical_payload, execution) {
+                            return Err(String::from(
+                                "scheduler fired event does not match the durable claim",
+                            ));
+                        }
                         fired = true;
                     } else if fired {
                         return Ok(ScheduledRecoveryClassification {
@@ -849,6 +986,7 @@ where
         let mut runs = Vec::with_capacity(executions.len());
         for execution in executions {
             let execution_id = execution.execution_id;
+            let observation = execution.observation;
             let schedule = execution.schedule;
             let turn = match schedule.payload {
                 ServiceSchedulePayload::Prompt { prompt } => self
@@ -857,6 +995,7 @@ where
                         execution_id: execution_id.clone(),
                         schedule_id: schedule.schedule_id.clone(),
                         scheduled_for_ms: execution.scheduled_for_ms,
+                        observation,
                         turn: ServiceRunTurnRequest {
                             session_id: schedule.session_id.to_string(),
                             prompt,
@@ -876,6 +1015,24 @@ where
                     .await
                     .map(Some),
                 ServiceSchedulePayload::Continuation { continuation_id } => {
+                    let Some(proof) = wake_proof_from_schedule(
+                        &schedule.trigger,
+                        observation.as_ref(),
+                        execution.claimed_at_ms,
+                    ) else {
+                        runs.push(RuntimeScheduledRun {
+                            execution_id,
+                            schedule_id: schedule.schedule_id,
+                            terminal: false,
+                            succeeded: false,
+                            last_committed_sequence: None,
+                            awaiting_continuation: None,
+                            error: Some(String::from(
+                                "scheduler claim observation does not match its trigger",
+                            )),
+                        });
+                        continue;
+                    };
                     let wake = self
                         .turns
                         .wake_scheduled_turn(ServiceWakeScheduledTurnRequest {
@@ -884,10 +1041,7 @@ where
                             execution_id: execution_id.clone(),
                             schedule_id: schedule.schedule_id.clone(),
                             scheduled_for_ms: execution.scheduled_for_ms,
-                            proof: wake_proof_from_schedule(
-                                &schedule.trigger,
-                                execution.claimed_at_ms,
-                            ),
+                            proof,
                             allow_resumed_recovery,
                         })
                         .await;
@@ -897,6 +1051,26 @@ where
                         Err(error) => Err(error),
                     }
                 }
+                ServiceSchedulePayload::GraphTrigger { run_id, node_id } => self
+                    .turns
+                    .deliver_graph_schedule_trigger(ServiceDeliverGraphScheduleTriggerRequest {
+                        session_id: schedule.session_id.to_string(),
+                        run_id,
+                        node_id,
+                        schedule_id: schedule.schedule_id.clone(),
+                        execution_id: execution_id.clone(),
+                        scheduled_for_ms: execution.scheduled_for_ms,
+                        claimed_at_ms: execution.claimed_at_ms,
+                        observation,
+                    })
+                    .map(|result| {
+                        Some(ServiceRunTurnResponse {
+                            events: Vec::new(),
+                            first_committed_sequence: result.sequence,
+                            last_committed_sequence: result.sequence,
+                            awaiting_continuation: None,
+                        })
+                    }),
             };
             match turn {
                 Ok(Some(result)) if result.awaiting_continuation.is_some() => {
@@ -975,13 +1149,15 @@ where
 
     fn collect_scheduled_matches(
         &self,
+        session_id: agentmod_primitives::SessionId,
         event: &crate::ServiceSessionEvent,
         executions: &mut std::collections::BTreeMap<String, ServiceScheduledExecution>,
     ) {
-        match self
-            .core
-            .fire_runtime_event(event.event_id.to_string(), event.event_type.clone())
-        {
+        match self.core.fire_runtime_event(
+            session_id,
+            event.event_id.to_string(),
+            event.event_type.clone(),
+        ) {
             Ok(values) => {
                 for execution in values {
                     executions.insert(execution.execution_id.clone(), execution);
@@ -1021,10 +1197,12 @@ where
             }
             _ => event.event_id.to_string(),
         };
-        match self
-            .core
-            .fire_process_output(output_id, process_id.to_owned(), output.to_owned())
-        {
+        match self.core.fire_process_output(
+            session_id,
+            output_id,
+            process_id.to_owned(),
+            output.to_owned(),
+        ) {
             Ok(values) => {
                 for execution in values {
                     executions.insert(execution.execution_id.clone(), execution);
@@ -1083,7 +1261,7 @@ where
                 .take_while(|event| event.sequence <= last)
             {
                 after = Some(event.sequence);
-                self.collect_scheduled_matches(&event, &mut executions);
+                self.collect_scheduled_matches(session_id, &event, &mut executions);
                 committed_events.push(event);
             }
             if after.is_some_and(|sequence| sequence >= last) {
@@ -1123,6 +1301,84 @@ where
     }
 }
 
+fn scheduler_fired_matches_claim(payload: &Value, execution: &ServiceScheduledExecution) -> bool {
+    let schedule_matches = payload
+        .get("schedule_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == execution.schedule.schedule_id);
+    let time_matches = payload
+        .get("scheduled_for_ms")
+        .and_then(Value::as_i64)
+        .is_some_and(|value| value == execution.scheduled_for_ms);
+    let observation = payload.get("observation").filter(|value| !value.is_null());
+    let observation_matches = match (&execution.observation, observation) {
+        (None, None) => true,
+        (Some(crate::ServiceScheduleObservation::RuntimeEvent { event_id }), Some(value)) => {
+            value.get("kind").and_then(Value::as_str) == Some("runtime_event")
+                && value.get("event_id").and_then(Value::as_str) == Some(event_id)
+        }
+        (Some(crate::ServiceScheduleObservation::ProcessOutput { output_id }), Some(value)) => {
+            value.get("kind").and_then(Value::as_str) == Some("process_output")
+                && value.get("output_id").and_then(Value::as_str) == Some(output_id)
+        }
+        _ => false,
+    };
+    schedule_matches && time_matches && observation_matches
+}
+
+fn graph_triggered_matches_claim(payload: &Value, execution: &ServiceScheduledExecution) -> bool {
+    let ServiceSchedulePayload::GraphTrigger { run_id, node_id } = &execution.schedule.payload
+    else {
+        return false;
+    };
+    let identity = payload.get("identity");
+    let work = identity.and_then(|value| value.get("work"));
+    payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == execution.schedule.session_id.to_string())
+        && identity
+            .and_then(|value| value.get("schedule_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == execution.schedule.schedule_id)
+        && work
+            .and_then(|value| value.get("run_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == run_id)
+        && work
+            .and_then(|value| value.get("node_id"))
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == node_id)
+        && payload
+            .get("scheduled_for_ms")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value == execution.scheduled_for_ms)
+        && payload
+            .get("claimed_at_ms")
+            .and_then(Value::as_i64)
+            .is_some_and(|value| value == execution.claimed_at_ms)
+        && observation_payload_matches(payload, execution.observation.as_ref())
+}
+
+fn observation_payload_matches(
+    payload: &Value,
+    observation: Option<&ServiceScheduleObservation>,
+) -> bool {
+    let canonical = payload.get("observation").filter(|value| !value.is_null());
+    match (observation, canonical) {
+        (None, None) => true,
+        (Some(ServiceScheduleObservation::RuntimeEvent { event_id }), Some(value)) => {
+            value.get("kind").and_then(Value::as_str) == Some("runtime_event")
+                && value.get("event_id").and_then(Value::as_str) == Some(event_id)
+        }
+        (Some(ServiceScheduleObservation::ProcessOutput { output_id }), Some(value)) => {
+            value.get("kind").and_then(Value::as_str) == Some("process_output")
+                && value.get("output_id").and_then(Value::as_str) == Some(output_id)
+        }
+        _ => false,
+    }
+}
+
 #[async_trait]
 impl<C, T> crate::local_rpc::RuntimeWireEndpoint for RuntimeDaemonService<C, T>
 where
@@ -1131,6 +1387,7 @@ where
         + agentmod_runtime_logic::history::SessionHistoryLogicPort
         + agentmod_runtime_logic::style::SessionStyleLogicPort
         + agentmod_runtime_logic::harness_registry::HarnessRegistryLogicPort
+        + agentmod_runtime_logic::plugin_lifecycle::PluginLifecycleLogicPort
         + agentmod_runtime_logic::scheduler::RuntimeScheduleLogicPort
         + Clone
         + Send
@@ -1141,6 +1398,7 @@ where
         + CancelTurnLogicPort
         + CommittedEventObserverLogicPort
         + DeferredTurnLogicPort
+        + GraphScheduleTriggerLogicPort
         + ScheduledRecoveryLogicPort
         + Clone
         + 'static,
@@ -1153,6 +1411,111 @@ where
         &self,
         request: &RuntimeRequest,
     ) -> Result<RuntimeResponse, String> {
+        if let RuntimeRequest::DisablePlugin {
+            session_id,
+            plugin_id,
+            cancellation_id,
+        } = request
+        {
+            let changed = self
+                .core
+                .change_plugin_lifecycle(crate::ServiceChangePluginLifecycleRequest {
+                    session_id: *session_id,
+                    plugin_id: plugin_id.clone(),
+                    action: crate::ServicePluginLifecycleAction::Disable,
+                    reason_code: None,
+                    cancellation_id: *cancellation_id,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(RuntimeResponse::PluginLifecycleChanged {
+                session_id: changed.session_id,
+                plugin_id: changed.plugin_id,
+                plugin_version: changed.plugin_version,
+                state: changed.state,
+                committed_sequence: changed.committed_sequence,
+                replayed: changed.replayed,
+            });
+        }
+        if let RuntimeRequest::QuarantinePlugin {
+            session_id,
+            plugin_id,
+            reason_code,
+            cancellation_id,
+        } = request
+        {
+            let changed = self
+                .core
+                .change_plugin_lifecycle(crate::ServiceChangePluginLifecycleRequest {
+                    session_id: *session_id,
+                    plugin_id: plugin_id.clone(),
+                    action: crate::ServicePluginLifecycleAction::Quarantine,
+                    reason_code: Some(reason_code.clone()),
+                    cancellation_id: *cancellation_id,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(RuntimeResponse::PluginLifecycleChanged {
+                session_id: changed.session_id,
+                plugin_id: changed.plugin_id,
+                plugin_version: changed.plugin_version,
+                state: changed.state,
+                committed_sequence: changed.committed_sequence,
+                replayed: changed.replayed,
+            });
+        }
+        if let RuntimeRequest::EnablePlugin {
+            session_id,
+            plugin_id,
+            cancellation_id,
+        } = request
+        {
+            let changed = self
+                .core
+                .change_plugin_lifecycle(crate::ServiceChangePluginLifecycleRequest {
+                    session_id: *session_id,
+                    plugin_id: plugin_id.clone(),
+                    action: crate::ServicePluginLifecycleAction::Enable,
+                    reason_code: None,
+                    cancellation_id: *cancellation_id,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(RuntimeResponse::PluginLifecycleChanged {
+                session_id: changed.session_id,
+                plugin_id: changed.plugin_id,
+                plugin_version: changed.plugin_version,
+                state: changed.state,
+                committed_sequence: changed.committed_sequence,
+                replayed: changed.replayed,
+            });
+        }
+        if let RuntimeRequest::UnquarantinePlugin {
+            session_id,
+            plugin_id,
+            cancellation_id,
+        } = request
+        {
+            let changed = self
+                .core
+                .change_plugin_lifecycle(crate::ServiceChangePluginLifecycleRequest {
+                    session_id: *session_id,
+                    plugin_id: plugin_id.clone(),
+                    action: crate::ServicePluginLifecycleAction::Unquarantine,
+                    reason_code: None,
+                    cancellation_id: *cancellation_id,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            return Ok(RuntimeResponse::PluginLifecycleChanged {
+                session_id: changed.session_id,
+                plugin_id: changed.plugin_id,
+                plugin_version: changed.plugin_version,
+                state: changed.state,
+                committed_sequence: changed.committed_sequence,
+                replayed: changed.replayed,
+            });
+        }
         if let RuntimeRequest::ResolveApproval {
             session_id,
             continuation_id,
@@ -1247,6 +1610,7 @@ where
                     execution_id: execution.execution_id,
                     scheduled_for_ms: execution.scheduled_for_ms,
                     claimed_at_ms: execution.claimed_at_ms,
+                    observation: execution.observation.map(crate::from_wire_observation),
                     schedule: crate::from_wire_schedule(execution.schedule),
                 })
                 .collect();
@@ -1295,7 +1659,16 @@ where
                 cancellation_id: cancellation_id.to_string(),
             })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "runtime.turn_failed",
+                        "error": error.to_string(),
+                    })
+                );
+                error.to_string()
+            })?;
         self.observe_committed_range(
             *session_id,
             response.first_committed_sequence,
@@ -1413,6 +1786,13 @@ where
                 let item = match item {
                     Ok(item) => item,
                     Err(error) => {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "runtime.turn_failed",
+                                "error": error.to_string(),
+                            })
+                        );
                         let _ = sender.send(Err(error.to_string())).await;
                         break;
                     }
@@ -1508,26 +1888,37 @@ fn wake_condition_from_wire(
 
 fn wake_proof_from_schedule(
     trigger: &crate::ServiceScheduleTrigger,
+    observation: Option<&crate::ServiceScheduleObservation>,
     scheduled_for_ms: i64,
-) -> ServiceContinuationWakeProof {
+) -> Option<ServiceContinuationWakeProof> {
     match trigger {
         crate::ServiceScheduleTrigger::AtMillis(_)
-        | crate::ServiceScheduleTrigger::Interval { .. } => {
-            ServiceContinuationWakeProof::AtMillis(scheduled_for_ms)
-        }
-        crate::ServiceScheduleTrigger::RuntimeEvent { event_type } => {
-            ServiceContinuationWakeProof::RuntimeEvent {
-                event_type: event_type.clone(),
-                observed_at_ms: scheduled_for_ms,
+        | crate::ServiceScheduleTrigger::Interval { .. } => observation
+            .is_none()
+            .then_some(ServiceContinuationWakeProof::AtMillis(scheduled_for_ms)),
+        crate::ServiceScheduleTrigger::RuntimeEvent { event_type } => match observation {
+            Some(crate::ServiceScheduleObservation::RuntimeEvent { event_id }) => {
+                Some(ServiceContinuationWakeProof::RuntimeEvent {
+                    event_id: event_id.clone(),
+                    event_type: event_type.clone(),
+                    observed_at_ms: scheduled_for_ms,
+                })
             }
-        }
+            _ => None,
+        },
         crate::ServiceScheduleTrigger::ProcessOutput {
             process_id,
             contains,
-        } => ServiceContinuationWakeProof::ProcessOutput {
-            process_id: process_id.clone(),
-            contains: contains.clone(),
-            observed_at_ms: scheduled_for_ms,
+        } => match observation {
+            Some(crate::ServiceScheduleObservation::ProcessOutput { output_id }) => {
+                Some(ServiceContinuationWakeProof::ProcessOutput {
+                    output_id: output_id.clone(),
+                    process_id: process_id.clone(),
+                    contains: contains.clone(),
+                    observed_at_ms: scheduled_for_ms,
+                })
+            }
+            _ => None,
         },
     }
 }
@@ -1559,17 +1950,21 @@ fn to_logic_wake_proof(value: ServiceContinuationWakeProof) -> ContinuationWakeP
             ContinuationWakeProof::At(agentmod_primitives::TimestampMillis::new(value))
         }
         ServiceContinuationWakeProof::RuntimeEvent {
+            event_id,
             event_type,
             observed_at_ms,
         } => ContinuationWakeProof::RuntimeEvent {
+            event_id,
             event_type,
             observed_at: agentmod_primitives::TimestampMillis::new(observed_at_ms),
         },
         ServiceContinuationWakeProof::ProcessOutput {
+            output_id,
             process_id,
             contains,
             observed_at_ms,
         } => ContinuationWakeProof::ProcessOutput {
+            output_id,
             process_id,
             pattern: contains,
             observed_at: agentmod_primitives::TimestampMillis::new(observed_at_ms),
@@ -1686,4 +2081,171 @@ pub enum TurnServiceError {
     Invalid,
     #[error("turn failed: {0}")]
     Logic(RunTurnError),
+}
+
+#[cfg(test)]
+mod scheduler_provenance_tests {
+    use std::{
+        path::PathBuf,
+        sync::{Arc, Mutex},
+    };
+
+    use agentmod_primitives::{Sequence, SessionId};
+    use agentmod_runtime_logic::turn::{
+        DeliverGraphScheduleTriggerCommand, DeliverGraphScheduleTriggerResult,
+        GraphScheduleTriggerLogicPort, ScheduledTriggerObservation,
+    };
+    use uuid::Uuid;
+
+    use super::{
+        ServiceContinuationWakeProof, ServiceDeliverGraphScheduleTriggerRequest, TurnService,
+        graph_triggered_matches_claim, scheduler_fired_matches_claim, wake_proof_from_schedule,
+    };
+
+    #[derive(Clone, Default)]
+    struct GraphTriggerLogic {
+        command: Arc<Mutex<Option<DeliverGraphScheduleTriggerCommand>>>,
+    }
+
+    impl GraphScheduleTriggerLogicPort for GraphTriggerLogic {
+        fn deliver_graph_schedule_trigger(
+            &self,
+            command: DeliverGraphScheduleTriggerCommand,
+        ) -> Result<DeliverGraphScheduleTriggerResult, agentmod_runtime_logic::turn::RunTurnError>
+        {
+            *self.command.lock().expect("command") = Some(command);
+            Ok(DeliverGraphScheduleTriggerResult {
+                transitioned: true,
+                sequence: Sequence::FIRST,
+            })
+        }
+    }
+    use crate::{
+        ServiceSchedule, ServiceScheduleObservation, ServiceSchedulePayload,
+        ServiceScheduleTrigger, ServiceScheduledExecution,
+    };
+
+    fn execution(observation: ServiceScheduleObservation) -> ServiceScheduledExecution {
+        ServiceScheduledExecution {
+            execution_id: "a".repeat(64),
+            scheduled_for_ms: 12,
+            claimed_at_ms: 15,
+            observation: Some(observation),
+            schedule: ServiceSchedule {
+                schedule_id: String::from("schedule-1"),
+                session_id: SessionId::from_uuid(Uuid::from_u128(1)),
+                idempotency_id: String::from("idem-1"),
+                style: String::from("test"),
+                workspace: String::from("workspace"),
+                permission_policy: String::from("safe"),
+                provider: String::from("mock"),
+                model: String::from("mock"),
+                token_budget: 1,
+                cost_budget_micros: 0,
+                trigger: ServiceScheduleTrigger::RuntimeEvent {
+                    event_type: String::from("user.ready"),
+                },
+                payload: ServiceSchedulePayload::Continuation {
+                    continuation_id: String::from("continuation-1"),
+                },
+                active: true,
+            },
+        }
+    }
+
+    #[test]
+    fn exact_observation_becomes_wake_proof_and_must_match_recovery_event() {
+        let observation = ServiceScheduleObservation::RuntimeEvent {
+            event_id: String::from("event-7"),
+        };
+        assert_eq!(
+            wake_proof_from_schedule(
+                &ServiceScheduleTrigger::RuntimeEvent {
+                    event_type: String::from("user.ready"),
+                },
+                Some(&observation),
+                15,
+            ),
+            Some(ServiceContinuationWakeProof::RuntimeEvent {
+                event_id: String::from("event-7"),
+                event_type: String::from("user.ready"),
+                observed_at_ms: 15,
+            })
+        );
+        let execution = execution(observation);
+        let exact = serde_json::json!({
+            "execution_id": "a".repeat(64),
+            "schedule_id": "schedule-1",
+            "scheduled_for_ms": 12,
+            "observation": {
+                "kind": "runtime_event",
+                "event_id": "event-7"
+            }
+        });
+        assert!(scheduler_fired_matches_claim(&exact, &execution));
+        let mut changed = exact;
+        changed["observation"]["event_id"] = serde_json::json!("event-8");
+        assert!(!scheduler_fired_matches_claim(&changed, &execution));
+    }
+
+    #[test]
+    fn graph_trigger_service_maps_exact_claim_and_recovery_rejects_substitution() {
+        let logic = GraphTriggerLogic::default();
+        let service = TurnService::new(logic.clone(), PathBuf::from("sessions"));
+        let response = service
+            .deliver_graph_schedule_trigger(ServiceDeliverGraphScheduleTriggerRequest {
+                session_id: SessionId::from_uuid(Uuid::from_u128(1)).to_string(),
+                run_id: String::from("run-1"),
+                node_id: String::from("schedule-node"),
+                schedule_id: String::from("schedule-1"),
+                execution_id: "a".repeat(64),
+                scheduled_for_ms: 12,
+                claimed_at_ms: 15,
+                observation: Some(ServiceScheduleObservation::ProcessOutput {
+                    output_id: String::from("output-7"),
+                }),
+            })
+            .expect("delivery");
+        assert!(response.transitioned);
+        assert_eq!(
+            logic
+                .command
+                .lock()
+                .expect("command")
+                .as_ref()
+                .and_then(|command| command.observation.clone()),
+            Some(ScheduledTriggerObservation::ProcessOutput {
+                output_id: String::from("output-7")
+            })
+        );
+
+        let mut execution = execution(ServiceScheduleObservation::RuntimeEvent {
+            event_id: String::from("event-7"),
+        });
+        execution.schedule.payload = ServiceSchedulePayload::GraphTrigger {
+            run_id: String::from("run-1"),
+            node_id: String::from("schedule-node"),
+        };
+        let exact = serde_json::json!({
+            "session_id": execution.schedule.session_id,
+            "identity": {
+                "schedule_id": "schedule-1",
+                "work": {
+                    "run_id": "run-1",
+                    "node_id": "schedule-node"
+                }
+            },
+            "execution_id": "a".repeat(64),
+            "scheduled_for_ms": 12,
+            "claimed_at_ms": 15,
+            "observation": {
+                "kind": "runtime_event",
+                "event_id": "event-7"
+            }
+        });
+        assert!(graph_triggered_matches_claim(&exact, &execution));
+        let mut substituted = exact;
+        substituted["identity"]["work"]["node_id"] = serde_json::json!("other-node");
+        assert!(!graph_triggered_matches_claim(&substituted, &execution));
+    }
 }

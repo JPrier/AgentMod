@@ -1,0 +1,12 @@
+{
+  "index": 19,
+  "name": "19-runtime_plugin_lifecycle",
+  "script": "runtime_plugin_lifecycle.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_plugin_lifecycle.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 15222,
+  "started_at": "2026-07-31T19:27:50.1950590Z",
+  "ended_at": "2026-07-31T19:28:05.4215906Z",
+  "log": "19-runtime_plugin_lifecycle.log"
+}

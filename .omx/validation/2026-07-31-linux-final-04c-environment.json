@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "captured_at_utc": "2026-07-31T12:54:38+00:00",
+  "source_head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "source_working_tree_dirty": true,
+  "source_dirty_entries": 339,
+  "source_status_sha256": "42db261c816c33db90b234d23e2e42694f99f83832518bcc1aedf7c51c12a782",
+  "source_tracked_binary_diff_sha256": "f882ab65ddf53bc482d23aed75ae8c890dee4a756274275f48a258b53fca9634",
+  "source_status_path": ".omx/validation/2026-07-31-linux-final-04c-source-status.txt",
+  "isolated_copy_root": "/tmp/agentmod-linux-final-20260731-04c.qHmzg5",
+  "isolated_copy_bytes": 13023851,
+  "cargo_target_dir": "/tmp/agentmod-linux-final-20260731-04c.qHmzg5/.cargo-target",
+  "rustc": "rustc 1.91.1 (ed61e7d7e 2025-11-07)",
+  "rustc_host": "x86_64-unknown-linux-gnu",
+  "cargo": "cargo 1.91.1 (ea2d97820 2025-10-10)",
+  "os": "Ubuntu 24.04.3 LTS (Noble Numbat)",
+  "kernel": "Linux JOSH-PC 6.6.87.2-microsoft-standard-WSL2 #1 SMP PREEMPT_DYNAMIC Thu Jun  5 18:30:46 UTC 2025 x86_64 GNU/Linux",
+  "cpu": "AMD Ryzen 7 5800X3D 8-Core Processor",
+  "logical_cpus": 16,
+  "preserved_prior_copy_roots": [
+    "/tmp/agentmod-linux-final-20260731.le4Rdi",
+    "/tmp/agentmod-linux-final-20260731-02b.YmqECu"
+  ]
+}

@@ -51,8 +51,56 @@ cancellation through normal runtime endpoints. Browser isolation is implemented 
 managed WebDriver capability host. A durable scheduler worker owns schedule
 storage and occurrence claims; the runtime supervises it, polls with a bounded
 missed-tick policy, and executes claimed prompt work through the canonical
-intercepted turn path. Event/output trigger delivery remains open.
-ACP rich-content projection and per-session MCP activation remain open.
+intercepted turn path. Runtime-event and process-output delivery are live: the
+daemon observes newly committed canonical event ranges and supervised
+process/log-stream byte ranges, carries the exact source session and observation
+ID through the runtime/scheduler N-tier boundary, filters schedule ownership
+before claim, and commits canonical delivery provenance before terminal worker
+acknowledgement. Restart reuses that identity and deduplicates an existing
+receipt rather than redispatching the effect. Windows and Ubuntu/WSL2 scheduler
+process matrices cover time, runtime-event, process-output, deferred-turn, and
+restart-reconciliation paths. Broader crash-injection coverage across every
+host category and macOS process evidence remain open.
+ACP rich-content projection is live and process-tested on Windows and WSL/Linux:
+the official SDK types stop at the service boundary, bounded layer-owned blocks
+are validated in logic, and a versioned typed projection enters the normal
+canonical runtime turn. Per-session ACP MCP activation crosses the same explicit
+service → logic → data → dependency boundaries. The immutable session binding
+retains the exact declaration hash and sanitized server identities while an
+authenticated encrypted bootstrap, bound to that session and binding hash,
+holds the activation-only environment/header values. Exact declarations are
+required again on load; substitution fails closed. Windows and WSL/Linux process
+tests prove lazy stdio-host activation and a real tool invocation without the
+inline secret appearing in the style lock, journal, or encrypted payload.
+ACP-declared Streamable HTTP/legacy SSE and branch encrypted-bootstrap copying
+also have real Windows and WSL/Linux process evidence. The branch path retains
+the exact declaration under fresh child-session encryption, invokes before and
+after runtime restart, rejects missing/substituted/unauthenticated source data,
+and performs no replay effect.
+
+Runtime-managed child sessions cross the same boundary only when their parent
+style explicitly enables `child_agents.inherit_mcp` and both sides retain the
+`mcp` tool gate. The dependency authenticates the immediate parent's exact
+sanitized binding and bootstrap, rewrites the payload to the child session ID,
+and seals fresh nonce, AAD, and ciphertext for the child. Omitted/false policy
+binds an empty MCP configuration. Creation and recovery reject declaration,
+origin, workspace, or binding substitution; parent- and child-envelope tamper
+reaches `InvalidConfiguration` and closes the ACP path before host invocation.
+Runtime and dependency workspace-authorization digests recursively canonicalize
+nested JSON so the MCP call is bound identically at both layers.
+
+The Windows and Ubuntu/WSL2 child process matrix uses the exact immutable
+`temporary_copy` child workspace and canonical task `invoke the inherited MCP
+fixture`. It proves one MCP effect across execution, daemon restart, exact
+recovery, and replay, with no duplicate effect. This evidence covers only
+immediate children; transitive/grandchild inheritance and macOS execution remain
+open.
+
+TUI rich attachments traverse only the frontend dependency → data → logic →
+service boundary and the ordinary runtime turn stream. Windows and WSL/Linux
+process tests prove confined image/blob loading, the versioned rich envelope,
+transient-state clearing, restart, and pure replay. TUI LSP management remains
+unsupported until the runtime exposes a stable canonical management contract.
 
 Tool hosts return structured results only. The runtime alone decides which
 canonical events are committed. The harness owns provider execution but not

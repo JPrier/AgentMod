@@ -4,7 +4,11 @@
     reason = "logic-local tool records are intentionally boundary-specific"
 )]
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use agentmod_event_pipeline::{ActionCapabilities, BlockingPipeline};
 use agentmod_runtime_data::tool as data;
@@ -15,6 +19,7 @@ use crate::{
     action::{ActionProposal, ConsequentialAction, ProposalId, ToolCallAction},
     interception::{InterceptionOutcome, InterceptorAuditStep, intercept_action},
     permission::{PermissionEffect, PermissionPolicy, revalidate_mandatory_after_approval},
+    workspace::{WorkspaceLeaseContract, WorkspaceLeaseMode},
 };
 
 #[derive(Clone)]
@@ -43,6 +48,7 @@ pub struct PreparedToolRequest {
     workspace: PathBuf,
     call_id: String,
     cancellation_id: String,
+    workspace_lease: Option<WorkspaceLeaseContract>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -54,6 +60,7 @@ pub struct AuthorizedToolRequest {
     workspace: PathBuf,
     call_id: String,
     cancellation_id: String,
+    workspace_lease: Option<WorkspaceLeaseContract>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,12 +115,34 @@ pub enum ToolOutputStream {
 pub struct ToolExecutionLogic<D> {
     data: D,
     policy: ToolExecutionPolicy,
+    workspace_lease: Option<WorkspaceLeaseContract>,
 }
 
 impl<D> ToolExecutionLogic<D> {
     #[must_use]
     pub const fn new(data: D, policy: ToolExecutionPolicy) -> Self {
-        Self { data, policy }
+        Self {
+            data,
+            policy,
+            workspace_lease: None,
+        }
+    }
+
+    /// Binds an exact canonical child workspace lease to all later
+    /// authorization and dependency dispatch checks.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a substituted hash or a lease for another effective workspace.
+    pub fn with_workspace_lease(
+        mut self,
+        lease: WorkspaceLeaseContract,
+    ) -> Result<Self, ToolExecutionError> {
+        lease
+            .validate_hash()
+            .map_err(|_| ToolExecutionError::WorkspaceAuthorization)?;
+        self.workspace_lease = Some(lease);
+        Ok(self)
     }
 
     /// Builds the immutable normalized proposal without dispatching a host.
@@ -136,6 +165,13 @@ impl<D> ToolExecutionLogic<D> {
             return Err(ToolExecutionError::Invalid);
         }
         let (tool, group) = canonical_tool(&command.tool)?;
+        if let Some(lease) = &self.workspace_lease
+            && (lease.effective_root != command.workspace
+                || (lease.mode == WorkspaceLeaseMode::SharedReadOnly
+                    && workspace_mutating_tool(tool)))
+        {
+            return Err(ToolExecutionError::WorkspaceAuthorization);
+        }
         let original = ActionProposal {
             id: ProposalId(format!("tool-call:{}", command.call_id)),
             action: ConsequentialAction::ToolCall(ToolCallAction {
@@ -154,6 +190,7 @@ impl<D> ToolExecutionLogic<D> {
             workspace: command.workspace,
             call_id: command.call_id,
             cancellation_id: command.cancellation_id,
+            workspace_lease: self.workspace_lease.clone(),
         })
     }
 
@@ -219,6 +256,11 @@ impl<D> ToolExecutionLogic<D> {
         if !action.arguments.is_object() || !valid_descriptor {
             return Err(ToolExecutionError::InvalidReplacement);
         }
+        validate_workspace_action(
+            prepared.workspace_lease.as_ref(),
+            action,
+            &prepared.workspace,
+        )?;
         let authorized = AuthorizedToolRequest {
             original: prepared.original,
             executable,
@@ -227,6 +269,7 @@ impl<D> ToolExecutionLogic<D> {
             workspace: prepared.workspace,
             call_id: prepared.call_id,
             cancellation_id: prepared.cancellation_id,
+            workspace_lease: prepared.workspace_lease,
         };
         Ok(match approval_reason {
             Some(reason) => ToolAuthorizationOutcome::ApprovalRequired {
@@ -261,6 +304,7 @@ impl<D> ToolExecutionLogic<D> {
             workspace: prepared.workspace,
             call_id: prepared.call_id,
             cancellation_id: prepared.cancellation_id,
+            workspace_lease: prepared.workspace_lease,
         })
     }
 
@@ -350,6 +394,32 @@ impl<D: data::ToolDataPort> ToolExecutionLogic<D> {
         let ConsequentialAction::ToolCall(action) = request.executable.action else {
             return Err(ToolExecutionError::InvalidReplacement);
         };
+        validate_workspace_action(
+            request.workspace_lease.as_ref(),
+            &action,
+            &request.workspace,
+        )?;
+        let workspace_authorization = request
+            .workspace_lease
+            .as_ref()
+            .map(|lease| {
+                let read_only = lease.mode == WorkspaceLeaseMode::SharedReadOnly;
+                let dispatch_digest = workspace_dispatch_digest(
+                    &lease.lease_id,
+                    lease.lease_hash,
+                    read_only,
+                    &action.tool,
+                    &action.arguments,
+                    &request.cancellation_id,
+                )?;
+                Ok(data::WorkspaceAuthorizationDataRecord {
+                    lease_id: lease.lease_id.clone(),
+                    lease_hash: lease.lease_hash,
+                    read_only,
+                    dispatch_digest,
+                })
+            })
+            .transpose()?;
         let events = self
             .data
             .execute_tool(data::ExecuteToolDataRequest {
@@ -361,9 +431,13 @@ impl<D: data::ToolDataPort> ToolExecutionLogic<D> {
                 tool: action.tool,
                 arguments: action.arguments,
                 cancellation_id: request.cancellation_id,
+                workspace_authorization,
             })
             .await
             .map_err(|error| match error {
+                data::ToolDataError::InvalidConfiguration => {
+                    ToolExecutionError::InvalidConfiguration
+                }
                 data::ToolDataError::ReceiptUnavailable => ToolExecutionError::ReceiptUnavailable,
                 data::ToolDataError::Unavailable => ToolExecutionError::Unavailable,
             })?
@@ -374,67 +448,108 @@ impl<D: data::ToolDataPort> ToolExecutionLogic<D> {
     }
 }
 
-fn canonical_tool(tool: &str) -> Result<(&'static str, &'static str), ToolExecutionError> {
-    match tool {
-        "read_file" | "filesystem.read" => Ok(("filesystem.read", "filesystem")),
-        "list_files" | "filesystem.list" => Ok(("filesystem.list", "filesystem")),
-        "glob" | "filesystem.glob" => Ok(("filesystem.glob", "filesystem")),
-        "grep" | "filesystem.grep" => Ok(("filesystem.grep", "filesystem")),
-        "write_file" | "filesystem.write" => Ok(("filesystem.write", "filesystem")),
-        "edit_file" | "filesystem.edit" => Ok(("filesystem.edit", "filesystem")),
-        "apply_patch" | "filesystem.apply_patch" => Ok(("filesystem.apply_patch", "filesystem")),
-        "run_command" | "process.run" => Ok(("process.run", "process")),
-        "start_process" | "process.start" => Ok(("process.start", "process")),
-        "process.run_pty" => Ok(("process.run_pty", "process")),
-        "process.start_pty" => Ok(("process.start_pty", "process")),
-        "process.read" => Ok(("process.read", "process")),
-        "process.input" => Ok(("process.input", "process")),
-        "process.resize" => Ok(("process.resize", "process")),
-        "process.wait" => Ok(("process.wait", "process")),
-        "process.interrupt" => Ok(("process.interrupt", "process")),
-        "process.kill" => Ok(("process.kill", "process")),
-        "process.detach" => Ok(("process.detach", "process")),
-        "process.reattach" => Ok(("process.reattach", "process")),
-        "process.list" => Ok(("process.list", "process")),
-        "git.discover" => Ok(("git.discover", "git")),
-        "git.status" => Ok(("git.status", "git")),
-        "git.diff" => Ok(("git.diff", "git")),
-        "git.changed_files" => Ok(("git.changed_files", "git")),
-        "git.branch" => Ok(("git.branch", "git")),
-        "git.dirty" => Ok(("git.dirty", "git")),
-        "git.worktree_create" => Ok(("git.worktree_create", "git")),
-        "git.worktree_cleanup" => Ok(("git.worktree_cleanup", "git")),
-        "git.checkpoint_create" => Ok(("git.checkpoint_create", "git")),
-        "git.checkpoint_restore" => Ok(("git.checkpoint_restore", "git")),
-        "git.export_patch" => Ok(("git.export_patch", "git")),
-        "http.request" => Ok(("http.request", "web")),
-        "web.fetch" => Ok(("web.fetch", "web")),
-        "web.search" => Ok(("web.search", "web")),
-        "lsp.project_root" => Ok(("lsp.project_root", "lsp")),
-        "lsp.diagnostics" => Ok(("lsp.diagnostics", "lsp")),
-        "lsp.document_symbols" => Ok(("lsp.document_symbols", "lsp")),
-        "lsp.workspace_symbols" => Ok(("lsp.workspace_symbols", "lsp")),
-        "lsp.definition" => Ok(("lsp.definition", "lsp")),
-        "lsp.references" => Ok(("lsp.references", "lsp")),
-        "lsp.hover" => Ok(("lsp.hover", "lsp")),
-        "lsp.signature_help" => Ok(("lsp.signature_help", "lsp")),
-        "lsp.rename" => Ok(("lsp.rename", "lsp")),
-        "lsp.formatting" => Ok(("lsp.formatting", "lsp")),
-        "lsp.code_actions" => Ok(("lsp.code_actions", "lsp")),
-        "mcp.server.list" => Ok(("mcp.server.list", "mcp")),
-        "mcp.capabilities" => Ok(("mcp.capabilities", "mcp")),
-        "mcp.invoke" => Ok(("mcp.invoke", "mcp")),
-        "browser.start" => Ok(("browser.start", "browser")),
-        "browser.navigate" => Ok(("browser.navigate", "browser")),
-        "browser.inspect" => Ok(("browser.inspect", "browser")),
-        "browser.screenshot" => Ok(("browser.screenshot", "browser")),
-        "browser.click" => Ok(("browser.click", "browser")),
-        "browser.type" => Ok(("browser.type", "browser")),
-        "browser.submit" => Ok(("browser.submit", "browser")),
-        "browser.download" => Ok(("browser.download", "browser")),
-        "browser.close" => Ok(("browser.close", "browser")),
-        _ => Err(ToolExecutionError::UnsupportedTool),
+fn validate_workspace_action(
+    lease: Option<&WorkspaceLeaseContract>,
+    action: &ToolCallAction,
+    workspace: &std::path::Path,
+) -> Result<(), ToolExecutionError> {
+    let Some(lease) = lease else {
+        return Ok(());
+    };
+    lease
+        .validate_hash()
+        .map_err(|_| ToolExecutionError::WorkspaceAuthorization)?;
+    if lease.effective_root != workspace
+        || (lease.mode == WorkspaceLeaseMode::SharedReadOnly
+            && workspace_mutating_tool(&action.tool))
+    {
+        Err(ToolExecutionError::WorkspaceAuthorization)
+    } else {
+        Ok(())
     }
+}
+
+fn workspace_mutating_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "filesystem.write"
+            | "filesystem.edit"
+            | "filesystem.apply_patch"
+            | "process.run"
+            | "process.start"
+            | "process.run_pty"
+            | "process.start_pty"
+            | "process.input"
+            | "git.branch"
+            | "git.worktree_create"
+            | "git.worktree_cleanup"
+            | "git.checkpoint_create"
+            | "git.checkpoint_restore"
+            | "browser.download"
+            | "mcp.invoke"
+    )
+}
+
+fn workspace_dispatch_digest(
+    lease_id: &str,
+    lease_hash: agentmod_primitives::ContentHash,
+    read_only: bool,
+    tool: &str,
+    arguments: &Value,
+    cancellation_id: &str,
+) -> Result<agentmod_primitives::ContentHash, ToolExecutionError> {
+    serde_json::to_vec(&(
+        "agentmod.workspace-tool-dispatch@1",
+        lease_id,
+        lease_hash,
+        read_only,
+        tool,
+        canonical_json(arguments),
+        cancellation_id,
+    ))
+    .map(|bytes| agentmod_primitives::ContentHash::digest(&bytes))
+    .map_err(|_| ToolExecutionError::WorkspaceAuthorization)
+}
+
+fn canonical_json(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(values.iter().map(canonical_json).collect()),
+        Value::Object(values) => {
+            let sorted: BTreeMap<_, _> = values
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_json(value)))
+                .collect();
+            serde_json::to_value(sorted).unwrap_or(Value::Null)
+        }
+        value => value.clone(),
+    }
+}
+
+/// Returns the bounded first-party tool-group catalog advertised by the runtime.
+///
+/// Aliases are intentionally excluded because style manifests bind canonical
+/// tool IDs. The returned map contains at most one entry per immutable
+/// descriptor above and is safe to pass across the runtime service boundary.
+#[must_use]
+pub fn canonical_tool_groups() -> BTreeMap<String, BTreeSet<String>> {
+    let mut groups = BTreeMap::<String, BTreeSet<String>>::new();
+    for descriptor in data::canonical_tool_catalog() {
+        groups
+            .entry(descriptor.group.to_owned())
+            .or_default()
+            .insert(descriptor.id.to_owned());
+    }
+    groups
+}
+
+pub(crate) fn canonical_tool(
+    tool: &str,
+) -> Result<(&'static str, &'static str), ToolExecutionError> {
+    data::canonical_tool_catalog()
+        .iter()
+        .find(|descriptor| descriptor.id == tool || descriptor.aliases.contains(&tool))
+        .map(|descriptor| (descriptor.id, descriptor.group))
+        .ok_or(ToolExecutionError::UnsupportedTool)
 }
 
 fn map_event(event: data::ToolDataEvent) -> ToolEvent {
@@ -505,6 +620,10 @@ pub enum ToolExecutionError {
     UnsupportedDecision,
     #[error("tool interceptor returned an invalid replacement")]
     InvalidReplacement,
+    #[error("tool action violates the immutable child workspace lease")]
+    WorkspaceAuthorization,
+    #[error("tool host immutable configuration is invalid")]
+    InvalidConfiguration,
     #[error("tool host is unavailable")]
     Unavailable,
     #[error("tool host has no durable terminal receipt")]
@@ -522,6 +641,7 @@ mod tests {
         BlockingInterceptor, BlockingPipelineBuilder, Decision, FailurePolicy, InterceptorError,
         InterceptorRegistration, OrderingSpec,
     };
+    use agentmod_primitives::{Sequence, SessionId};
     use async_trait::async_trait;
 
     use super::*;
@@ -555,6 +675,19 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct InvalidConfigurationData;
+
+    #[async_trait]
+    impl data::ToolDataPort for InvalidConfigurationData {
+        async fn execute_tool(
+            &self,
+            _request: data::ExecuteToolDataRequest,
+        ) -> Result<Vec<data::ToolDataEvent>, data::ToolDataError> {
+            Err(data::ToolDataError::InvalidConfiguration)
+        }
+    }
+
     struct ReplacePath;
 
     #[async_trait]
@@ -567,6 +700,24 @@ mod tests {
                 return Err(InterceptorError::new("expected tool call"));
             };
             action.arguments = serde_json::json!({"path":"safe.txt"});
+            Ok(Decision::Replace(proposal))
+        }
+    }
+
+    struct ReplaceReadWithWrite;
+
+    #[async_trait]
+    impl BlockingInterceptor<ActionProposal> for ReplaceReadWithWrite {
+        async fn intercept(
+            &self,
+            mut proposal: ActionProposal,
+        ) -> Result<Decision<ActionProposal>, InterceptorError> {
+            let ConsequentialAction::ToolCall(action) = &mut proposal.action else {
+                return Err(InterceptorError::new("expected tool call"));
+            };
+            action.tool = String::from("filesystem.write");
+            action.group = String::from("filesystem");
+            action.arguments = serde_json::json!({"path":"blocked.txt","content":"blocked"});
             Ok(Decision::Replace(proposal))
         }
     }
@@ -636,6 +787,244 @@ mod tests {
         }
     }
 
+    fn shared_read_only_lease(workspace: PathBuf) -> WorkspaceLeaseContract {
+        crate::workspace::test_workspace_lease(
+            crate::workspace::WorkspaceLeaseOwner {
+                parent_session_id: SessionId::from_uuid(uuid::Uuid::from_u128(1)),
+                parent_action_sequence: Sequence::new(7).expect("sequence"),
+                parent_graph_node_id: String::from("worker-fanout/spawn-worker"),
+                task_id: String::from("worker-task"),
+            },
+            workspace,
+        )
+    }
+
+    #[test]
+    fn every_canonical_tool_round_trips_to_its_declared_group() {
+        for descriptor in data::canonical_tool_catalog() {
+            assert_eq!(
+                canonical_tool(descriptor.id),
+                Ok((descriptor.id, descriptor.group)),
+                "canonical tool {}",
+                descriptor.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_tool_alias_resolves_to_its_canonical_identity() {
+        let aliases = data::canonical_tool_catalog()
+            .iter()
+            .flat_map(|descriptor| {
+                descriptor
+                    .aliases
+                    .iter()
+                    .map(move |alias| (*alias, descriptor.id, descriptor.group))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aliases.len(),
+            9,
+            "update the alias audit when aliases change"
+        );
+        for (alias, id, group) in aliases {
+            assert_eq!(canonical_tool(alias), Ok((id, group)), "alias {alias}");
+        }
+    }
+
+    #[test]
+    fn canonical_tool_ids_and_aliases_are_globally_unique() {
+        let mut identifiers = BTreeSet::new();
+        for descriptor in data::canonical_tool_catalog() {
+            assert!(!descriptor.id.is_empty());
+            assert!(!descriptor.group.is_empty());
+            assert!(
+                identifiers.insert(descriptor.id),
+                "duplicate canonical tool ID {}",
+                descriptor.id
+            );
+            for alias in descriptor.aliases {
+                assert!(!alias.is_empty());
+                assert!(
+                    identifiers.insert(alias),
+                    "duplicate canonical tool alias {alias}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_tool_identifiers_are_rejected() {
+        for unsupported in [
+            "",
+            "filesystem",
+            "filesystem.unknown",
+            "READ_FILE",
+            " read_file",
+        ] {
+            assert_eq!(
+                canonical_tool(unsupported),
+                Err(ToolExecutionError::UnsupportedTool)
+            );
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the explicit expected map prevents the catalog test from deriving its oracle from the catalog under test"
+    )]
+    fn canonical_tool_group_catalog_is_exact() {
+        let expected = BTreeMap::from([
+            (
+                String::from("browser"),
+                [
+                    "browser.click",
+                    "browser.close",
+                    "browser.download",
+                    "browser.inspect",
+                    "browser.navigate",
+                    "browser.screenshot",
+                    "browser.start",
+                    "browser.submit",
+                    "browser.type",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ),
+            (
+                String::from("filesystem"),
+                [
+                    "filesystem.apply_patch",
+                    "filesystem.edit",
+                    "filesystem.glob",
+                    "filesystem.grep",
+                    "filesystem.list",
+                    "filesystem.read",
+                    "filesystem.write",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ),
+            (
+                String::from("git"),
+                [
+                    "git.branch",
+                    "git.changed_files",
+                    "git.checkpoint_create",
+                    "git.checkpoint_restore",
+                    "git.diff",
+                    "git.dirty",
+                    "git.discover",
+                    "git.export_patch",
+                    "git.status",
+                    "git.worktree_cleanup",
+                    "git.worktree_create",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ),
+            (
+                String::from("lsp"),
+                [
+                    "lsp.code_actions",
+                    "lsp.definition",
+                    "lsp.diagnostics",
+                    "lsp.document_symbols",
+                    "lsp.formatting",
+                    "lsp.hover",
+                    "lsp.project_root",
+                    "lsp.references",
+                    "lsp.rename",
+                    "lsp.signature_help",
+                    "lsp.workspace_symbols",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ),
+            (
+                String::from("mcp"),
+                ["mcp.capabilities", "mcp.invoke", "mcp.server.list"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            (
+                String::from("process"),
+                [
+                    "process.detach",
+                    "process.input",
+                    "process.interrupt",
+                    "process.kill",
+                    "process.list",
+                    "process.read",
+                    "process.reattach",
+                    "process.resize",
+                    "process.run",
+                    "process.run_pty",
+                    "process.start",
+                    "process.start_pty",
+                    "process.wait",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ),
+            (
+                String::from("web"),
+                ["http.request", "web.fetch", "web.search"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+        ]);
+        assert_eq!(canonical_tool_groups(), expected);
+    }
+
+    #[test]
+    fn workspace_dispatch_digest_canonicalizes_nested_object_order() {
+        let mut first = serde_json::Map::new();
+        first.insert(String::from("server_id"), serde_json::json!("fixture"));
+        first.insert(String::from("kind"), serde_json::json!("tool"));
+        first.insert(String::from("name"), serde_json::json!("echo"));
+        first.insert(
+            String::from("arguments"),
+            serde_json::json!({"second":2,"first":1}),
+        );
+        let mut second = serde_json::Map::new();
+        second.insert(
+            String::from("arguments"),
+            serde_json::json!({"first":1,"second":2}),
+        );
+        second.insert(String::from("name"), serde_json::json!("echo"));
+        second.insert(String::from("kind"), serde_json::json!("tool"));
+        second.insert(String::from("server_id"), serde_json::json!("fixture"));
+        let lease_hash = agentmod_primitives::ContentHash::digest(b"lease");
+
+        assert_eq!(
+            workspace_dispatch_digest(
+                "lease-id",
+                lease_hash,
+                false,
+                "mcp.invoke",
+                &Value::Object(first),
+                "cancel",
+            ),
+            workspace_dispatch_digest(
+                "lease-id",
+                lease_hash,
+                false,
+                "mcp.invoke",
+                &Value::Object(second),
+                "cancel",
+            )
+        );
+    }
+
     #[tokio::test]
     async fn replacement_is_the_only_action_sent_to_data() {
         let data = MockData::default();
@@ -662,6 +1051,106 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].tool, "filesystem.read");
         assert_eq!(requests[0].arguments["path"], "safe.txt");
+    }
+
+    #[tokio::test]
+    async fn immutable_host_configuration_failure_remains_distinct_in_logic() {
+        let logic = ToolExecutionLogic::new(
+            InvalidConfigurationData,
+            policy(pipeline(None), crate::permission::PermissionEffect::Allow),
+        );
+        let prepared = logic.prepare(command()).expect("prepare");
+        let authorized = logic.authorize_prepared(prepared).await.expect("authorize");
+
+        assert_eq!(
+            logic.execute_authorized(authorized, false).await,
+            Err(ToolExecutionError::InvalidConfiguration)
+        );
+    }
+
+    #[test]
+    fn shared_read_only_lease_rejects_mutating_runtime_boundaries() {
+        let workspace = PathBuf::from("workspace");
+        let logic = ToolExecutionLogic::new(
+            MockData::default(),
+            policy(pipeline(None), crate::permission::PermissionEffect::Allow),
+        )
+        .with_workspace_lease(shared_read_only_lease(workspace))
+        .expect("lease");
+        for tool in [
+            "filesystem.write",
+            "process.run",
+            "browser.download",
+            "mcp.invoke",
+        ] {
+            let mut candidate = command();
+            candidate.tool = String::from(tool);
+            assert!(
+                matches!(
+                    logic.prepare(candidate),
+                    Err(ToolExecutionError::WorkspaceAuthorization)
+                ),
+                "{tool}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interceptor_cannot_replace_read_with_workspace_write() {
+        let data = MockData::default();
+        let logic = ToolExecutionLogic::new(
+            data.clone(),
+            policy(
+                pipeline(Some(Arc::new(ReplaceReadWithWrite))),
+                crate::permission::PermissionEffect::Allow,
+            ),
+        )
+        .with_workspace_lease(shared_read_only_lease(PathBuf::from("workspace")))
+        .expect("lease");
+        let prepared = logic.prepare(command()).expect("read prepare");
+        assert_eq!(
+            logic.authorize_prepared(prepared).await,
+            Err(ToolExecutionError::WorkspaceAuthorization)
+        );
+        assert!(data.requests.lock().expect("requests").is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_dispatch_carries_exact_workspace_authorization() {
+        let data = MockData::default();
+        let lease = shared_read_only_lease(PathBuf::from("workspace"));
+        let logic = ToolExecutionLogic::new(
+            data.clone(),
+            policy(pipeline(None), crate::permission::PermissionEffect::Allow),
+        )
+        .with_workspace_lease(lease.clone())
+        .expect("lease");
+        let prepared = logic.prepare(command()).expect("read prepare");
+        let authorized = logic.authorize_prepared(prepared).await.expect("authorize");
+        logic
+            .execute_authorized(authorized, false)
+            .await
+            .expect("execute");
+        let requests = data.requests.lock().expect("requests");
+        let authorization = requests[0]
+            .workspace_authorization
+            .as_ref()
+            .expect("workspace authorization");
+        assert_eq!(authorization.lease_id, lease.lease_id);
+        assert_eq!(authorization.lease_hash, lease.lease_hash);
+        assert!(authorization.read_only);
+        assert_eq!(
+            authorization.dispatch_digest,
+            workspace_dispatch_digest(
+                &lease.lease_id,
+                lease.lease_hash,
+                true,
+                &requests[0].tool,
+                &requests[0].arguments,
+                &requests[0].cancellation_id,
+            )
+            .expect("dispatch digest")
+        );
     }
 
     #[tokio::test]

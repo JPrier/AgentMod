@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-event-pipeline = { path = "../../core/event-pipeline" }
+agentmod-event-pipeline = { version = "0.1.0", path = "../../core/event-pipeline" }
 semver = "1.0"
 serde.workspace = true
 serde_json.workspace = true

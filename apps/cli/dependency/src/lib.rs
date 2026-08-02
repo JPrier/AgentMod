@@ -34,7 +34,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
-const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 4);
+const RUNTIME_PROTOCOL_VERSION: Version = Version::new(2, 5);
 const MAX_STYLE_MANIFEST_BYTES: u64 = 1_048_576;
 
 /// Dependency-owned style manifest format.
@@ -273,6 +273,7 @@ pub enum DependencyScheduleTrigger {
 pub enum DependencySchedulePayload {
     Prompt { prompt: String },
     Continuation { continuation_id: String },
+    GraphTrigger { run_id: String, node_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -438,6 +439,73 @@ pub struct DependencyResolveApprovalResponse {
     pub awaiting_continuation: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DependencyPluginLifecycleAction {
+    Disable,
+    Enable,
+    Quarantine,
+    Unquarantine,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyPluginLifecycleRequest {
+    pub session_id: SessionId,
+    pub plugin_id: String,
+    pub action: DependencyPluginLifecycleAction,
+    pub reason_code: Option<String>,
+    pub cancellation_id: CancellationId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyPluginLifecycleResponse {
+    pub session_id: SessionId,
+    pub plugin_id: String,
+    pub plugin_version: String,
+    pub state: String,
+    pub committed_sequence: Sequence,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DependencyMcpOAuthAction {
+    Begin,
+    Status,
+    Cancel { transaction_id: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyMcpOAuthRequest {
+    pub session_id: SessionId,
+    pub server_id: String,
+    pub action: DependencyMcpOAuthAction,
+    pub cancellation_id: CancellationId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyMcpOAuthBeginResponse {
+    pub server_id: String,
+    pub transaction_id: String,
+    pub authorization_url: String,
+    pub authorization_url_hash: String,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyMcpOAuthStatusResponse {
+    pub server_id: String,
+    pub status: String,
+    pub transaction_id: Option<String>,
+    pub expires_at_ms: Option<i64>,
+    pub scopes: Vec<String>,
+    pub status_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DependencyMcpOAuthResponse {
+    Begin(DependencyMcpOAuthBeginResponse),
+    Status(DependencyMcpOAuthStatusResponse),
+}
+
 /// Dependency-owned runtime availability.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DependencyRuntimeAvailability {
@@ -549,6 +617,20 @@ pub trait CliDependencyPort {
         &self,
         request: DependencyResolveApprovalRequest,
     ) -> Result<DependencyResolveApprovalResponse, DependencyError>;
+
+    fn change_plugin_lifecycle(
+        &self,
+        _request: DependencyPluginLifecycleRequest,
+    ) -> Result<DependencyPluginLifecycleResponse, DependencyError> {
+        Err(DependencyError::UnsupportedRuntimeRequest)
+    }
+
+    fn manage_mcp_oauth(
+        &self,
+        _request: DependencyMcpOAuthRequest,
+    ) -> Result<DependencyMcpOAuthResponse, DependencyError> {
+        Err(DependencyError::UnsupportedRuntimeRequest)
+    }
 
     fn list_styles(&self) -> Result<Vec<DependencyStyleSummary>, DependencyError> {
         Err(DependencyError::UnsupportedRuntimeRequest)
@@ -1442,6 +1524,127 @@ impl CliDependencyPort for LocalRuntimeClient {
         })
     }
 
+    fn change_plugin_lifecycle(
+        &self,
+        request: DependencyPluginLifecycleRequest,
+    ) -> Result<DependencyPluginLifecycleResponse, DependencyError> {
+        let wire_request = match request.action {
+            DependencyPluginLifecycleAction::Disable => RuntimeRequest::DisablePlugin {
+                session_id: request.session_id,
+                plugin_id: request.plugin_id.clone(),
+                cancellation_id: request.cancellation_id,
+            },
+            DependencyPluginLifecycleAction::Enable => RuntimeRequest::EnablePlugin {
+                session_id: request.session_id,
+                plugin_id: request.plugin_id.clone(),
+                cancellation_id: request.cancellation_id,
+            },
+            DependencyPluginLifecycleAction::Quarantine => RuntimeRequest::QuarantinePlugin {
+                session_id: request.session_id,
+                plugin_id: request.plugin_id.clone(),
+                reason_code: request
+                    .reason_code
+                    .clone()
+                    .ok_or(DependencyError::InvalidPluginLifecycleRequest)?,
+                cancellation_id: request.cancellation_id,
+            },
+            DependencyPluginLifecycleAction::Unquarantine => RuntimeRequest::UnquarantinePlugin {
+                session_id: request.session_id,
+                plugin_id: request.plugin_id.clone(),
+                cancellation_id: request.cancellation_id,
+            },
+        };
+        let RuntimeResponse::PluginLifecycleChanged {
+            session_id,
+            plugin_id,
+            plugin_version,
+            state,
+            committed_sequence,
+            replayed,
+        } = self.send_local(wire_request)?
+        else {
+            return Err(DependencyError::UnexpectedRuntimeResponse);
+        };
+        if session_id != request.session_id || plugin_id != request.plugin_id {
+            return Err(DependencyError::UnexpectedRuntimeResponse);
+        }
+        Ok(DependencyPluginLifecycleResponse {
+            session_id,
+            plugin_id,
+            plugin_version,
+            state,
+            committed_sequence,
+            replayed,
+        })
+    }
+
+    fn manage_mcp_oauth(
+        &self,
+        request: DependencyMcpOAuthRequest,
+    ) -> Result<DependencyMcpOAuthResponse, DependencyError> {
+        let wire = match &request.action {
+            DependencyMcpOAuthAction::Begin => RuntimeRequest::McpOAuthBegin {
+                session_id: request.session_id,
+                server_id: request.server_id.clone(),
+                cancellation_id: request.cancellation_id,
+            },
+            DependencyMcpOAuthAction::Status => RuntimeRequest::McpOAuthStatus {
+                session_id: request.session_id,
+                server_id: request.server_id.clone(),
+                cancellation_id: request.cancellation_id,
+            },
+            DependencyMcpOAuthAction::Cancel { transaction_id } => RuntimeRequest::McpOAuthCancel {
+                session_id: request.session_id,
+                server_id: request.server_id.clone(),
+                transaction_id: transaction_id.clone(),
+                cancellation_id: request.cancellation_id,
+            },
+        };
+        match self.send_local(wire)? {
+            RuntimeResponse::McpOAuthStarted {
+                server_id,
+                transaction_id,
+                authorization_url,
+                authorization_url_hash,
+                expires_at_ms,
+            } if matches!(request.action, DependencyMcpOAuthAction::Begin)
+                && server_id == request.server_id =>
+            {
+                Ok(DependencyMcpOAuthResponse::Begin(
+                    DependencyMcpOAuthBeginResponse {
+                        server_id,
+                        transaction_id,
+                        authorization_url,
+                        authorization_url_hash,
+                        expires_at_ms,
+                    },
+                ))
+            }
+            RuntimeResponse::McpOAuthStatus {
+                server_id,
+                status,
+                transaction_id,
+                expires_at_ms,
+                scopes,
+                status_hash,
+            } if !matches!(request.action, DependencyMcpOAuthAction::Begin)
+                && server_id == request.server_id =>
+            {
+                Ok(DependencyMcpOAuthResponse::Status(
+                    DependencyMcpOAuthStatusResponse {
+                        server_id,
+                        status,
+                        transaction_id,
+                        expires_at_ms,
+                        scopes,
+                        status_hash,
+                    },
+                ))
+            }
+            _ => Err(DependencyError::UnexpectedRuntimeResponse),
+        }
+    }
+
     fn upsert_schedule(
         &self,
         schedule: DependencySchedule,
@@ -1591,6 +1794,9 @@ fn to_wire_schedule(value: DependencySchedule) -> RuntimeScheduleSpec {
             DependencySchedulePayload::Continuation { continuation_id } => {
                 RuntimeSchedulePayload::Continuation { continuation_id }
             }
+            DependencySchedulePayload::GraphTrigger { run_id, node_id } => {
+                RuntimeSchedulePayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
     }
@@ -1657,6 +1863,9 @@ fn from_wire_schedule(value: RuntimeScheduleSpec) -> DependencySchedule {
             }
             RuntimeSchedulePayload::Continuation { continuation_id } => {
                 DependencySchedulePayload::Continuation { continuation_id }
+            }
+            RuntimeSchedulePayload::GraphTrigger { run_id, node_id } => {
+                DependencySchedulePayload::GraphTrigger { run_id, node_id }
             }
         },
         active: value.active,
@@ -1875,6 +2084,9 @@ pub enum DependencyError {
     /// The local adapter received a request it cannot represent.
     #[error("runtime client does not support the requested operation")]
     UnsupportedRuntimeRequest,
+    /// Plugin lifecycle action and reason shape is invalid.
+    #[error("plugin lifecycle request is invalid")]
+    InvalidPluginLifecycleRequest,
     /// The runtime returned a response for a different operation.
     #[error("runtime returned an unexpected response")]
     UnexpectedRuntimeResponse,

@@ -21,6 +21,11 @@ allow = [
 ]
 confidence-threshold = 0.8
 
+[[licenses.exceptions]]
+allow = ["CDLA-Permissive-2.0"]
+name = "webpki-roots"
+version = "1.0.9"
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

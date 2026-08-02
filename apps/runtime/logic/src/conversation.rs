@@ -62,6 +62,10 @@ pub struct ArtifactEntry {
     pub id: ConversationEntryId,
     /// Artifact ID.
     pub artifact_id: ArtifactId,
+    /// Portable runtime artifact-store reference, when the object is backed by
+    /// the content-addressed artifact dependency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_reference: Option<String>,
     /// Hash of exact artifact bytes.
     pub content_hash: ContentHash,
     /// MIME type.
@@ -87,6 +91,54 @@ pub struct ContextSummaryEntry {
     pub method: String,
     /// Optional full context snapshot.
     pub artifact_id: Option<ArtifactId>,
+}
+
+/// Exact immutable artifact provenance attached to plugin-retrieved memory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RetrievedMemoryArtifactProvenance {
+    /// Runtime-owned artifact identity.
+    pub artifact_id: ArtifactId,
+    /// Portable runtime artifact-store reference.
+    pub artifact_reference: String,
+    /// Hash of the exact artifact bytes.
+    pub content_hash: ContentHash,
+    /// Stable media type.
+    pub mime_type: String,
+    /// Exact artifact byte count.
+    pub byte_size: u64,
+}
+
+/// Canonical non-artifact reference attached to plugin-retrieved memory.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RetrievedMemoryReferenceProvenance {
+    /// Stable reference kind.
+    pub kind: String,
+    /// Bounded portable reference.
+    pub reference: String,
+    /// Hash of the exact referenced identity or value.
+    pub reference_hash: ContentHash,
+}
+
+/// Typed provenance for a plugin-retrieved memory value.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct RetrievedMemoryTypedProvenance {
+    /// Optional typed value retained without flattening it into provider text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<Value>,
+    /// Hash of the exact typed value or inline content.
+    pub value_hash: ContentHash,
+    /// Optional immutable artifact carrying a large value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<RetrievedMemoryArtifactProvenance>,
+    /// Ordered canonical non-artifact references.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<RetrievedMemoryReferenceProvenance>,
+    /// Stable runtime information-flow classification.
+    pub security_classification: String,
+    /// Exact plugin invocation that supplied this value.
+    pub plugin_invocation_id: String,
+    /// Hash of the sealed terminal plugin receipt.
+    pub plugin_terminal_receipt_hash: ContentHash,
 }
 
 /// Retrieved memory injected into a provider projection.
@@ -119,6 +171,10 @@ pub struct RetrievedMemoryEntry {
     pub created_at_millis: i64,
     /// Byte contribution to context.
     pub size_bytes: u64,
+    /// Defaulted plugin/typed provenance. Legacy built-in records leave this
+    /// absent, keeping their serialized identities unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typed_provenance: Option<Box<RetrievedMemoryTypedProvenance>>,
 }
 
 /// Provider-visible structured metadata.
@@ -426,5 +482,25 @@ mod tests {
             state.append(text("same", 2, "two")),
             Err(ConversationError::DuplicateEntry("same".into()))
         );
+    }
+
+    #[test]
+    fn retrieved_memory_typed_provenance_defaults_for_legacy_records() {
+        let legacy = serde_json::json!({
+            "id": "memory-1",
+            "provider": "file",
+            "query": "current",
+            "scope": "session:fixture",
+            "source": "fixture",
+            "reference": "memory:1",
+            "score": 0.5,
+            "content": "legacy memory",
+            "injection_sequence": 1,
+            "created_at_millis": 7,
+            "size_bytes": 13
+        });
+        let entry: RetrievedMemoryEntry =
+            serde_json::from_value(legacy).expect("legacy memory record");
+        assert!(entry.typed_provenance.is_none());
     }
 }

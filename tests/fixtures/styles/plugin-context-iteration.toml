@@ -1,0 +1,165 @@
+schema_version = 1
+kind = "custom"
+required_capabilities = ["memory.fixture", "model"]
+allowed_tool_groups = []
+allowed_providers = ["deterministic-mock"]
+allowed_plugins = ["fixture.plugin-context"]
+
+[identity]
+id = "__STYLE_ID__"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[graph]
+kind = "inline"
+source = '''
+format_version = 1
+entry = "research"
+
+[budget]
+max_steps = 16
+max_tokens = 250000
+max_cost_micros = 25000000
+max_duration_ms = 900000
+
+[declarations]
+capabilities = ["model"]
+providers = ["deterministic-mock"]
+
+[[variables]]
+name = "model_disposition"
+type = { kind = "enum", values = ["response_complete", "tool_requests"] }
+scope = "run"
+producer = "research"
+consumers = []
+mutability = "mutable"
+max_size_bytes = 64
+security_classification = "internal"
+
+[[variables]]
+name = "model_result"
+type = { kind = "node_result_reference" }
+scope = "run"
+producer = "research"
+consumers = ["done"]
+mutability = "mutable"
+max_size_bytes = 512
+security_classification = "internal"
+
+[[variables]]
+name = "iteration"
+type = { kind = "map", value_type = { kind = "boolean" }, max_entries = 1 }
+scope = "run"
+producer = "repeat"
+consumers = ["repeat"]
+mutability = "mutable"
+max_size_bytes = 128
+security_classification = "internal"
+
+[[nodes]]
+id = "research"
+kind = "model_call"
+provider = "deterministic-mock"
+write_variables = ["model_disposition", "model_result"]
+retry_limit = 1
+configuration = { type = "model_request", disposition_output = "model_disposition", result_output = "model_result" }
+
+[[nodes]]
+id = "repeat"
+kind = "loop"
+read_variables = ["iteration"]
+write_variables = ["iteration"]
+max_iterations = 3
+
+[[nodes]]
+id = "done"
+kind = "complete_session"
+read_variables = ["model_result"]
+
+[[edges]]
+from = "research"
+to = "repeat"
+
+[[edges]]
+from = "repeat"
+to = "research"
+condition = "iteration.remaining == true"
+label = "continue"
+
+[[edges]]
+from = "repeat"
+to = "done"
+condition = "iteration.remaining == false"
+label = "complete"
+'''
+
+[memory]
+provider = "__PROVIDER_ID__"
+scopes = ["session"]
+retrieval_timing = "iteration_start"
+max_items = 4
+max_injected_bytes = 16384
+write_policy = "never"
+injection_location = "before_current_input"
+
+[memory.plugin]
+plugin_id = "fixture.plugin-context"
+plugin_version = "1.0.0"
+provider_id = "__PROVIDER_ID__"
+provider_version = "1.0.0"
+declaration_hash = "__PROVIDER_HASH__"
+configuration_reference = "6e46dd10defc9b56c29a6ec56b508c21f54c08192194e4df25bf36f0c9c3c279"
+
+[memory.query]
+source = "current_input"
+include_active_artifacts = true
+include_style_context = true
+max_query_bytes = 16384
+
+[compaction]
+strategy = "none"
+reserved_context_tokens = 0
+max_provider_projection_tokens = 0
+preserve_unresolved_tasks = true
+preserve_active_processes = true
+preservation_requirements = [
+  "system_instructions",
+  "current_input",
+  "pending_control_state",
+  "artifact_references",
+  "memory_provenance",
+  "active_graph_state",
+  "tool_call_correlation",
+]
+
+[approvals]
+default = "allow"
+groups = {}
+
+[budgets]
+max_iterations = 4
+max_steps = 16
+max_tokens = 250000
+max_cost_micros = 25000000
+max_duration_ms = 900000
+
+[child_agents]
+max_children = 0
+max_concurrent = 0
+max_depth = 0
+per_child_token_budget = 0
+
+[retry]
+max_attempts = 2
+initial_backoff_ms = 0
+max_backoff_ms = 0
+retryable_failures = ["provider.unavailable"]
+
+[termination]
+allowed_outcomes = ["complete_session", "fail"]
+on_hard_limit = "fail"
+require_explicit_terminal_node = true
+
+[selection]
+requires_explicit_selection = true
+model_may_select = false

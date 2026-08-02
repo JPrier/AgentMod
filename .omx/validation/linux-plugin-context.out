@@ -1,0 +1,48 @@
+   Compiling agentmod-integration-tests v0.1.0 (/mnt/c/Users/jkpri/AgentMod/tests/integration)
+warning: unused imports: `PluginInvocationReceiptDataIdentity` and `PluginNodeReceiptDataPort`
+  --> tests/integration/tests/plugin_node_process.rs:35:9
+   |
+35 |         PluginInvocationReceiptDataIdentity, PluginNodeReceiptDataPort,
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `ContextBoundaryCompletedEvent`, `ContextBoundaryIdentity`, `ContextBoundaryOrigin`, `ContextBoundaryStartedEvent`, `ContextPhaseCompletedEvent`, `ContextPhaseIdentity`, `ContextPhaseStartedEvent`, `DrivePluginContextTransformCommand`, `PluginContextTransformTurnError`, `PluginContextTransformTurnPort`, and `ProductionPluginContextTransformTurn`
+   --> tests/integration/tests/plugin_node_process.rs:119:9
+    |
+119 |         DrivePluginContextTransformCommand, PluginContextTransformTurnError,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+120 |         PluginContextTransformTurnPort, ProductionPluginContextTransformTurn,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+124 |         ContextBoundaryCompletedEvent, ContextBoundaryIdentity, ContextBoundaryOrigin,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^
+125 |         ContextBoundaryStartedEvent, ContextPhaseCompletedEvent, ContextPhaseIdentity,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^
+126 |         ContextPhaseStartedEvent, PluginNodeInvocationState, PluginSetActivatedEvent,
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused imports: `AvailableContextTransform`, `ContextTransformLifecycle`, and `ContextTransformSelection`
+   --> tests/integration/tests/plugin_node_process.rs:137:5
+    |
+137 |     AvailableContextTransform, BuiltInStyle, CompiledSessionStyle, ContextTransformLifecycle,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^                                      ^^^^^^^^^^^^^^^^^^^^^^^^^
+138 |     ContextTransformSelection, GraphSource, StyleKind, built_in_manifest,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `agentmod-integration-tests` (test "plugin_node_process") generated 3 warnings (run `cargo fix --test "plugin_node_process"` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.96s
+     Running tests/plugin_node_process.rs (target/debug/deps/plugin_node_process-5b8de4ccacf30050)
+
+running 7 tests
+test isolated_plugin_node_success_invalid_timeout_and_unavailability ... ok
+test context_transform_uses_exact_isolated_protocol_and_fails_closed ... ok
+test plugin_node_state_receipt_survives_host_restart_without_rebinding ... ok
+test invalid_plugin_graph_outcome_is_rejected_once_and_never_redispatched ... ok
+test arbitrary_graph_c_mixes_runtime_and_plugin_executors_once ... ok
+test plugin_graph_approval_restart_and_denial_are_durable_and_effect_safe ... ok
+test production_coordinator_persists_receipts_and_never_redispatches_after_reconstruction ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.77s
+
+plugin Graph C registration/invocation/validation/restart/timeout/ambiguity E2E passed

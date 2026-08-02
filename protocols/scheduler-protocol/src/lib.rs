@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Current compatible wire version.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 2;
 
 /// Durable trigger.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -45,6 +45,13 @@ pub enum SchedulePayload {
     Continuation {
         /// Opaque runtime continuation.
         continuation_id: String,
+    },
+    /// Record a runtime-owned graph trigger without synthesizing a user turn.
+    GraphTrigger {
+        /// Immutable graph run identity.
+        run_id: String,
+        /// Owning graph node.
+        node_id: String,
     },
 }
 
@@ -120,6 +127,8 @@ pub enum SchedulerCommand {
     },
     /// Match a committed runtime event.
     FireRuntimeEvent {
+        /// Runtime session that committed the observation.
+        source_session_id: String,
         /// Canonical event ID used for idempotency.
         event_id: String,
         /// Event type.
@@ -127,6 +136,8 @@ pub enum SchedulerCommand {
     },
     /// Match bounded process output.
     FireProcessOutput {
+        /// Runtime session that committed the observation.
+        source_session_id: String,
         /// Stable output event ID used for idempotency.
         output_id: String,
         /// Process ID.
@@ -145,6 +156,22 @@ pub enum SchedulerCommand {
     Health,
 }
 
+/// Exact trigger observation bound into a durable occurrence claim.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ScheduleObservation {
+    /// Canonical runtime event that caused the claim.
+    RuntimeEvent {
+        /// Exact committed event identity.
+        event_id: String,
+    },
+    /// Exact bounded process-output observation that caused the claim.
+    ProcessOutput {
+        /// Stable output observation identity.
+        output_id: String,
+    },
+}
+
 /// Claimed execution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -156,6 +183,9 @@ pub struct ScheduledExecution {
     /// Unix timestamp when the worker durably claimed this occurrence.
     #[serde(default)]
     pub claimed_at_ms: i64,
+    /// Exact non-time observation that caused this claim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation: Option<ScheduleObservation>,
     /// Complete schedule snapshot.
     pub schedule: ScheduleSpec,
 }

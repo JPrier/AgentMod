@@ -42,7 +42,10 @@ each committed item as NDJSON before provider completion; `--json` retains
 backwards-compatible aggregation. Negotiated request-bound credits limit
 nonterminal delivery, and canonical session-event pages support
 reconnect-from-sequence without repeating effects. Interactive TUI rendering
-is live; continuous live subscription after catch-up remains incomplete.
+is live. After bounded catch-up, the TUI starts one bounded cursor worker that
+repeatedly reconnects from the last accepted canonical sequence, applies only
+unseen events, and propagates backpressure through a fixed-capacity channel.
+The worker stops on session replacement or frontend shutdown.
 
 OpenAI-compatible, OpenRouter, OpenAI, Anthropic, Gemini, and local HTTP
 adapters, authentication, live discovery, structured output, cost metadata, and

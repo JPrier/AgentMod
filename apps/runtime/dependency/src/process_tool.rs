@@ -372,6 +372,7 @@ impl ProcessCapabilityDependency {
         &self,
         command: DependencyToolCommand,
     ) -> Result<Vec<DependencyToolEvent>, ToolHostDependencyError> {
+        crate::tool::validate(&command)?;
         validate(&command)?;
         if !command.tool.starts_with("process.") {
             return Err(ToolHostDependencyError::UnsupportedTool);

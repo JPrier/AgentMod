@@ -1,0 +1,8 @@
+{
+  "name": "03-cargo-test-workspace",
+  "command": "cargo test --workspace --all-targets --all-features --locked",
+  "exit_code": 101,
+  "elapsed_ms": 160564,
+  "started_at": "2026-07-31T18:56:21.9701839Z",
+  "ended_at": "2026-07-31T18:59:02.5391605Z"
+}

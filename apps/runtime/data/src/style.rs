@@ -12,15 +12,20 @@ use agentmod_runtime_dependency::style::{
     SessionStyleDependencyError, SessionStyleDependencyPort,
 };
 use agentmod_session_style_sdk::{
-    ApprovalDecision, BuiltInStyle, CompileContext, DecisionCapability, ExecutionBudgetOverrides,
-    ManifestFormat, SessionStyleManifest, StyleCompilerLimits, compile_style, parse_json,
-    parse_toml, select_compaction_strategy, select_execution_budgets, select_memory_provider,
-    to_json,
+    ApprovalDecision, AvailableContextTransform, AvailablePluginCompactor,
+    AvailablePluginMemoryProvider, BuiltInStyle, CompileContext, ContextTransformLifecycle,
+    DecisionCapability, ExecutionBudgetOverrides, ManifestFormat, SessionStyleManifest,
+    StyleCompilerLimits, built_in_manifest_for_version, built_in_versions, compile_style,
+    parse_json, parse_toml, select_child_session_restrictions, select_compaction_strategy,
+    select_execution_budgets, select_memory_provider, to_json,
 };
 use serde::Serialize;
 use thiserror::Error;
 
 const MAX_IN_MEMORY_COMPILED_STYLES: usize = 256;
+
+/// Stable diagnostic code for two sources claiming one exact style identity.
+pub const DUPLICATE_STYLE_IDENTITY_DIAGNOSTIC_CODE: &str = "duplicate_style_identity";
 
 /// Runtime availability inputs used exclusively for session-style compilation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +42,12 @@ pub struct SessionStyleEnvironment {
     pub providers: BTreeSet<String>,
     /// Available plugin IDs.
     pub plugins: BTreeSet<String>,
+    /// Exact context-transform declarations from the authoritative plugin catalog.
+    pub context_transforms: Vec<SessionStyleContextTransformDescriptor>,
+    /// Exact memory-provider declarations from the authoritative plugin catalog.
+    pub plugin_memory_providers: Vec<SessionStylePluginMemoryProviderDescriptor>,
+    /// Exact compactor declarations from the authoritative plugin catalog.
+    pub plugin_compactors: Vec<SessionStylePluginCompactorDescriptor>,
     /// Available memory provider IDs.
     pub memory_providers: BTreeSet<String>,
     /// Available compaction strategy IDs.
@@ -45,6 +56,59 @@ pub struct SessionStyleEnvironment {
     pub supported_decisions: BTreeSet<SessionStyleDecisionCapability>,
     /// Resolved content-addressed graph source text.
     pub graph_references: BTreeMap<String, String>,
+}
+
+/// Data-owned exact plugin context-transform availability descriptor.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SessionStyleContextTransformDescriptor {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact transform identity.
+    pub transform_id: String,
+    /// Exact semantic version.
+    pub version: String,
+    /// Exact declaration hash as lowercase BLAKE3 hex.
+    pub declaration_hash: String,
+    /// Exact serialized lifecycle.
+    pub lifecycle: String,
+}
+
+/// Data-owned exact plugin memory-provider availability descriptor.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SessionStylePluginMemoryProviderDescriptor {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact activated plugin version.
+    pub plugin_version: String,
+    /// Stable provider identity.
+    pub provider_id: String,
+    /// Exact provider version.
+    pub provider_version: String,
+    /// Hash of the exact validated declaration.
+    pub declaration_hash: String,
+    /// Exact canonical plugin configuration hash.
+    pub configuration_reference: String,
+    /// Whether retrieval is declared.
+    pub has_retrieve: bool,
+    /// Whether consequential write is declared.
+    pub has_write: bool,
+}
+
+/// Data-owned exact plugin compactor availability descriptor.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct SessionStylePluginCompactorDescriptor {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact activated plugin version.
+    pub plugin_version: String,
+    /// Stable compactor identity.
+    pub compactor_id: String,
+    /// Exact compactor version.
+    pub compactor_version: String,
+    /// Hash of the exact validated declaration.
+    pub declaration_hash: String,
+    /// Exact canonical plugin configuration hash.
+    pub configuration_reference: String,
 }
 
 /// Data-owned decision capability made available by the running runtime API.
@@ -133,6 +197,42 @@ pub struct SessionStyleBudgetSelectionDataRequest {
     pub max_duration_ms: Option<u64>,
 }
 
+/// Data-owned child memory restriction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionStyleChildMemoryAccess {
+    /// Child receives no memory access.
+    None,
+    /// Child may retrieve but cannot write memory.
+    ReadOnly,
+    /// Child retains the compiled style's read/write memory access.
+    ReadWrite,
+}
+
+/// Request to compile one exact parent-restricted child-session style.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionStyleChildSelectionDataRequest {
+    /// Authoritative runtime availability inputs.
+    pub environment: SessionStyleEnvironment,
+    /// Canonical base manifest JSON.
+    pub manifest: String,
+    /// Exact tool groups granted by the parent.
+    pub tool_groups: BTreeSet<String>,
+    /// Exact parent-selected memory access.
+    pub memory_access: SessionStyleChildMemoryAccess,
+    /// Exact inherited provider selected by the parent, when enabled.
+    pub inherited_provider: Option<String>,
+    /// Optional maximum loop/research iterations.
+    pub max_iterations: Option<u32>,
+    /// Optional maximum graph transitions.
+    pub max_steps: Option<u64>,
+    /// Optional maximum provider tokens.
+    pub max_tokens: Option<u64>,
+    /// Optional maximum cost in configured currency micros.
+    pub max_cost_micros: Option<u64>,
+    /// Optional maximum wall-clock duration.
+    pub max_duration_ms: Option<u64>,
+}
+
 /// Source category exposed to runtime logic and endpoints.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -194,6 +294,8 @@ pub struct SessionStyleDiagnostic {
 pub struct SessionStyleExecutionSelections {
     /// Selected memory provider.
     pub memory_provider: String,
+    /// Exact plugin memory implementation, when selected.
+    pub plugin_memory: Option<SessionStylePluginMemorySelection>,
     /// Selected memory scopes.
     pub memory_scopes: Vec<String>,
     /// Selected retrieval lifecycle boundary.
@@ -210,6 +312,8 @@ pub struct SessionStyleExecutionSelections {
     pub memory_injection_location: String,
     /// Selected compaction strategy.
     pub compaction_strategy: String,
+    /// Exact plugin compactor implementation, when selected.
+    pub plugin_compactor: Option<SessionStylePluginCompactorSelection>,
     /// Optional compaction token trigger.
     pub compaction_trigger_tokens: Option<u64>,
     /// Reserved non-history context budget.
@@ -224,6 +328,8 @@ pub struct SessionStyleExecutionSelections {
     pub compaction_preservation_requirements: Vec<String>,
     /// Selected tool groups.
     pub tool_groups: Vec<String>,
+    /// Ordered exact plugin context-transform selections.
+    pub context_transforms: Vec<SessionStyleContextTransformSelection>,
     /// Hard iteration cap.
     pub max_iterations: u32,
     /// Hard step cap.
@@ -238,6 +344,57 @@ pub struct SessionStyleExecutionSelections {
     pub default_approval: String,
     /// Approval overrides by action/tool group.
     pub approval_groups: BTreeMap<String, String>,
+}
+
+/// Data-owned immutable plugin memory selection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SessionStylePluginMemorySelection {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact activated plugin version.
+    pub plugin_version: String,
+    /// Stable provider identity.
+    pub provider_id: String,
+    /// Exact provider version.
+    pub provider_version: String,
+    /// Hash of the exact validated declaration.
+    pub declaration_hash: String,
+    /// Hash of the immutable adapter configuration.
+    pub configuration_reference: String,
+}
+
+/// Data-owned immutable plugin compactor selection.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SessionStylePluginCompactorSelection {
+    /// Authoritative plugin identity.
+    pub plugin_id: String,
+    /// Exact activated plugin version.
+    pub plugin_version: String,
+    /// Stable compactor identity.
+    pub compactor_id: String,
+    /// Exact compactor version.
+    pub compactor_version: String,
+    /// Hash of the exact validated declaration.
+    pub declaration_hash: String,
+    /// Hash of the immutable adapter configuration.
+    pub configuration_reference: String,
+}
+
+/// Data-owned immutable selected plugin context transform.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SessionStyleContextTransformSelection {
+    /// Exact plugin identity.
+    pub plugin_id: String,
+    /// Exact transform identity.
+    pub transform_id: String,
+    /// Exact selected version.
+    pub version: String,
+    /// Exact declaration hash.
+    pub declaration_hash: String,
+    /// Exact lifecycle.
+    pub lifecycle: String,
+    /// Exact immutable adapter-configuration reference.
+    pub configuration_reference: String,
 }
 
 /// One built or discovered style record.
@@ -328,6 +485,16 @@ pub trait SessionStyleDataPort {
     fn select_session_style_budgets(
         &self,
         request: SessionStyleBudgetSelectionDataRequest,
+    ) -> Result<SessionStyleCatalogRecord, SessionStyleDataError>;
+
+    /// Applies parent-owned child restrictions and recompiles the manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid manifest, restriction, or environment.
+    fn select_session_child_style(
+        &self,
+        request: SessionStyleChildSelectionDataRequest,
     ) -> Result<SessionStyleCatalogRecord, SessionStyleDataError>;
 }
 
@@ -491,6 +658,48 @@ where
             format: SessionStyleManifestFormat::Json,
         })
     }
+
+    fn select_session_child_style(
+        &self,
+        request: SessionStyleChildSelectionDataRequest,
+    ) -> Result<SessionStyleCatalogRecord, SessionStyleDataError> {
+        let mut manifest = parse_json(&request.manifest)
+            .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?;
+        select_child_session_restrictions(
+            &mut manifest,
+            &request.tool_groups,
+            sdk_child_memory_access(request.memory_access),
+            ExecutionBudgetOverrides {
+                max_iterations: request.max_iterations,
+                max_steps: request.max_steps,
+                max_tokens: request.max_tokens,
+                max_cost_micros: request.max_cost_micros,
+                max_duration_ms: request.max_duration_ms,
+            },
+            request.inherited_provider.as_deref(),
+        )
+        .map_err(|error| SessionStyleDataError::InvalidComponentSelection(error.to_string()))?;
+        self.validate_session_style(SessionStyleValidationDataRequest {
+            environment: request.environment,
+            manifest: to_json(&manifest)
+                .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?,
+            format: SessionStyleManifestFormat::Json,
+        })
+    }
+}
+
+const fn sdk_child_memory_access(
+    value: SessionStyleChildMemoryAccess,
+) -> agentmod_session_style_sdk::ChildMemoryAccess {
+    match value {
+        SessionStyleChildMemoryAccess::None => agentmod_session_style_sdk::ChildMemoryAccess::None,
+        SessionStyleChildMemoryAccess::ReadOnly => {
+            agentmod_session_style_sdk::ChildMemoryAccess::ReadOnly
+        }
+        SessionStyleChildMemoryAccess::ReadWrite => {
+            agentmod_session_style_sdk::ChildMemoryAccess::ReadWrite
+        }
+    }
 }
 
 impl From<DependencyStyleManifestFormat> for SessionStyleManifestFormat {
@@ -518,8 +727,15 @@ fn built_in_records<D: SessionStyleDependencyPort>(
     ];
     built_ins
         .into_iter()
-        .map(|style| {
-            let manifest = agentmod_session_style_sdk::built_in_manifest(style);
+        .flat_map(|style| {
+            built_in_versions(style)
+                .iter()
+                .map(move |version| (style, *version))
+        })
+        .map(|manifest| {
+            let (style, version) = manifest;
+            let manifest = built_in_manifest_for_version(style, version)
+                .ok_or(SessionStyleDataError::InvalidCompiledRecord)?;
             let contents = to_json(&manifest).unwrap_or_default();
             compile_source(
                 data,
@@ -766,6 +982,67 @@ fn compile_context(
         tool_groups: environment.tool_groups.clone(),
         providers: environment.providers.clone(),
         plugins: environment.plugins.clone(),
+        context_transforms: environment
+            .context_transforms
+            .iter()
+            .map(|transform| {
+                Ok(AvailableContextTransform {
+                    plugin_id: transform.plugin_id.clone(),
+                    transform_id: transform.transform_id.clone(),
+                    version: transform.version.clone(),
+                    declaration_hash: transform
+                        .declaration_hash
+                        .parse()
+                        .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?,
+                    lifecycle: match transform.lifecycle.as_str() {
+                        "before_model_request" => ContextTransformLifecycle::BeforeModelRequest,
+                        _ => return Err(SessionStyleDataError::InvalidCompiledRecord),
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, SessionStyleDataError>>()?,
+        plugin_memory_providers: environment
+            .plugin_memory_providers
+            .iter()
+            .map(|provider| {
+                Ok(AvailablePluginMemoryProvider {
+                    plugin_id: provider.plugin_id.clone(),
+                    plugin_version: provider.plugin_version.clone(),
+                    provider_id: provider.provider_id.clone(),
+                    provider_version: provider.provider_version.clone(),
+                    declaration_hash: provider
+                        .declaration_hash
+                        .parse()
+                        .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?,
+                    configuration_reference: provider
+                        .configuration_reference
+                        .parse()
+                        .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?,
+                    has_retrieve: provider.has_retrieve,
+                    has_write: provider.has_write,
+                })
+            })
+            .collect::<Result<Vec<_>, SessionStyleDataError>>()?,
+        plugin_compactors: environment
+            .plugin_compactors
+            .iter()
+            .map(|compactor| {
+                Ok(AvailablePluginCompactor {
+                    plugin_id: compactor.plugin_id.clone(),
+                    plugin_version: compactor.plugin_version.clone(),
+                    compactor_id: compactor.compactor_id.clone(),
+                    compactor_version: compactor.compactor_version.clone(),
+                    declaration_hash: compactor
+                        .declaration_hash
+                        .parse()
+                        .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?,
+                    configuration_reference: compactor
+                        .configuration_reference
+                        .parse()
+                        .map_err(|_| SessionStyleDataError::InvalidCompiledRecord)?,
+                })
+            })
+            .collect::<Result<Vec<_>, SessionStyleDataError>>()?,
         memory_providers: environment.memory_providers.clone(),
         compaction_strategies: environment.compaction_strategies.clone(),
         supported_decisions: environment
@@ -791,6 +1068,16 @@ fn selections(
 ) -> Result<SessionStyleExecutionSelections, SessionStyleDataError> {
     Ok(SessionStyleExecutionSelections {
         memory_provider: compiled.memory.provider.clone(),
+        plugin_memory: compiled.memory.plugin.as_ref().map(|plugin| {
+            SessionStylePluginMemorySelection {
+                plugin_id: plugin.plugin_id.clone(),
+                plugin_version: plugin.plugin_version.clone(),
+                provider_id: plugin.provider_id.clone(),
+                provider_version: plugin.provider_version.clone(),
+                declaration_hash: plugin.declaration_hash.to_hex(),
+                configuration_reference: plugin.configuration_reference.to_hex(),
+            }
+        }),
         memory_scopes: compiled
             .memory
             .scopes
@@ -805,6 +1092,16 @@ fn selections(
         memory_write_policy: serialized_enum_name(&compiled.memory.write_policy)?,
         memory_injection_location: serialized_enum_name(&compiled.memory.injection_location)?,
         compaction_strategy: serialized_enum_name(&compiled.compaction.strategy)?,
+        plugin_compactor: compiled.compaction.plugin.as_ref().map(|plugin| {
+            SessionStylePluginCompactorSelection {
+                plugin_id: plugin.plugin_id.clone(),
+                plugin_version: plugin.plugin_version.clone(),
+                compactor_id: plugin.compactor_id.clone(),
+                compactor_version: plugin.compactor_version.clone(),
+                declaration_hash: plugin.declaration_hash.to_hex(),
+                configuration_reference: plugin.configuration_reference.to_hex(),
+            }
+        }),
         compaction_trigger_tokens: compiled.compaction.trigger_tokens,
         compaction_reserved_context_tokens: compiled.compaction.reserved_context_tokens,
         compaction_max_provider_projection_tokens: compiled
@@ -819,6 +1116,20 @@ fn selections(
             .map(serialized_enum_name)
             .collect::<Result<_, _>>()?,
         tool_groups: compiled.allowed_tool_groups.clone(),
+        context_transforms: compiled
+            .context_transforms
+            .iter()
+            .map(|transform| {
+                Ok(SessionStyleContextTransformSelection {
+                    plugin_id: transform.plugin_id.clone(),
+                    transform_id: transform.transform_id.clone(),
+                    version: transform.version.clone(),
+                    declaration_hash: transform.declaration_hash.to_hex(),
+                    lifecycle: serialized_enum_name(&transform.lifecycle)?,
+                    configuration_reference: transform.configuration_reference.to_hex(),
+                })
+            })
+            .collect::<Result<Vec<_>, SessionStyleDataError>>()?,
         max_iterations: compiled.budgets.max_iterations,
         max_steps: compiled.budgets.max_steps,
         max_tokens: compiled.budgets.max_tokens,
@@ -876,9 +1187,11 @@ fn add_duplicate_conflicts(records: &mut [SessionStyleCatalogRecord]) {
                 .unwrap_or_default()
                 > 1
         {
-            record.status = SessionStyleCatalogStatus::Invalid;
+            if record.status != SessionStyleCatalogStatus::Disabled {
+                record.status = SessionStyleCatalogStatus::Invalid;
+            }
             record.diagnostics.push(SessionStyleDiagnostic {
-                code: "duplicate_style_identity".into(),
+                code: DUPLICATE_STYLE_IDENTITY_DIAGNOSTIC_CODE.into(),
                 path: "identity".into(),
                 message: format!("multiple sources define style `{id}` version `{version}`"),
                 help: "retain exactly one source for this style ID and version".into(),
@@ -899,7 +1212,8 @@ mod tests {
     use super::*;
     use agentmod_runtime_dependency::style::{
         DependencyStyleCacheLoadRequest, DependencyStyleCacheRecord,
-        DependencyStyleCacheStoreRequest, DependencyStyleDiscovery, DependencyStyleManifestRecord,
+        DependencyStyleCacheStoreRequest, DependencyStyleDisabledMarker, DependencyStyleDiscovery,
+        DependencyStyleManifestRecord,
     };
 
     #[derive(Default)]
@@ -940,6 +1254,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the test environment spells out the complete service-provided native tool catalog"
+    )]
     fn environment() -> SessionStyleEnvironment {
         SessionStyleEnvironment {
             runtime_api_version: "1.0.0".into(),
@@ -956,12 +1274,120 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect(),
-            tool_groups: BTreeMap::from([(
-                "filesystem".into(),
-                ["filesystem.read".into()].into_iter().collect(),
-            )]),
-            providers: ["mock".into()].into_iter().collect(),
+            tool_groups: BTreeMap::from([
+                (
+                    "browser".into(),
+                    [
+                        "browser.start",
+                        "browser.navigate",
+                        "browser.inspect",
+                        "browser.screenshot",
+                        "browser.click",
+                        "browser.type",
+                        "browser.submit",
+                        "browser.download",
+                        "browser.close",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                ),
+                (
+                    "filesystem".into(),
+                    [
+                        "filesystem.read",
+                        "filesystem.list",
+                        "filesystem.glob",
+                        "filesystem.grep",
+                        "filesystem.write",
+                        "filesystem.edit",
+                        "filesystem.apply_patch",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                ),
+                (
+                    "git".into(),
+                    [
+                        "git.discover",
+                        "git.status",
+                        "git.diff",
+                        "git.changed_files",
+                        "git.branch",
+                        "git.dirty",
+                        "git.worktree_create",
+                        "git.worktree_cleanup",
+                        "git.checkpoint_create",
+                        "git.checkpoint_restore",
+                        "git.export_patch",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                ),
+                (
+                    "lsp".into(),
+                    [
+                        "lsp.project_root",
+                        "lsp.diagnostics",
+                        "lsp.document_symbols",
+                        "lsp.workspace_symbols",
+                        "lsp.definition",
+                        "lsp.references",
+                        "lsp.hover",
+                        "lsp.signature_help",
+                        "lsp.rename",
+                        "lsp.formatting",
+                        "lsp.code_actions",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                ),
+                (
+                    "mcp".into(),
+                    ["mcp.server.list", "mcp.capabilities", "mcp.invoke"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                ),
+                (
+                    "process".into(),
+                    [
+                        "process.run",
+                        "process.start",
+                        "process.run_pty",
+                        "process.start_pty",
+                        "process.read",
+                        "process.input",
+                        "process.resize",
+                        "process.wait",
+                        "process.interrupt",
+                        "process.kill",
+                        "process.detach",
+                        "process.reattach",
+                        "process.list",
+                    ]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                ),
+                (
+                    "web".into(),
+                    ["http.request", "web.fetch", "web.search"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                ),
+            ]),
+            providers: ["deterministic-mock".into(), "mock".into()]
+                .into_iter()
+                .collect(),
             plugins: ["runtime.security".into()].into_iter().collect(),
+            context_transforms: Vec::new(),
+            plugin_memory_providers: Vec::new(),
+            plugin_compactors: Vec::new(),
             memory_providers: ["file".into(), "none".into()].into_iter().collect(),
             compaction_strategies: ["summary".into(), "artifact_handoff".into(), "none".into()]
                 .into_iter()
@@ -979,18 +1405,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn all_built_ins_are_available_and_cache_hits_after_first_read() {
-        let data = super::super::RuntimeData::new(MockDependency::default());
-        let request = || SessionStyleCatalogDataRequest {
+    fn catalog_request() -> SessionStyleCatalogDataRequest {
+        SessionStyleCatalogDataRequest {
             environment: environment(),
             user_style_root: None,
             project_style_root: None,
             plugin_style_roots: Vec::new(),
             cache_root: None,
-        };
-        let first = data.session_style_catalog(request()).expect("catalog");
-        assert_eq!(first.records.len(), 5);
+        }
+    }
+
+    #[test]
+    fn all_built_ins_are_available_and_cache_hits_after_first_read() {
+        let data = super::super::RuntimeData::new(MockDependency::default());
+        let first = data
+            .session_style_catalog(catalog_request())
+            .expect("catalog");
+        assert_eq!(first.records.len(), 13);
         assert!(
             first
                 .records
@@ -1013,9 +1444,96 @@ mod tests {
                 .contains(&String::from("memory_provenance"))
         );
         let second = data
-            .session_style_catalog(request())
+            .session_style_catalog(catalog_request())
             .expect("cached catalog");
         assert!(second.records.iter().all(|record| record.cache_hit));
+    }
+
+    #[test]
+    fn catalog_exposes_current_and_historical_built_ins_exactly() {
+        let data = super::super::RuntimeData::new(MockDependency::default());
+        let catalog = data
+            .session_style_catalog(catalog_request())
+            .expect("catalog");
+
+        for (style, id, versions) in [
+            (
+                BuiltInStyle::PersistentChat,
+                "persistent-chat",
+                &["1.1.0", "1.2.0"][..],
+            ),
+            (
+                BuiltInStyle::EphemeralTurn,
+                "ephemeral-turn",
+                &["1.1.0", "1.2.0"][..],
+            ),
+            (
+                BuiltInStyle::ResearchLoop,
+                "research-loop",
+                &["1.1.0", "1.2.0", "1.3.0"][..],
+            ),
+            (
+                BuiltInStyle::DeclarativeGraph,
+                "declarative-graph",
+                &["1.1.0", "1.2.0"][..],
+            ),
+            (
+                BuiltInStyle::PlannerWorker,
+                "planner-worker",
+                &["1.1.0", "1.2.0", "1.3.0", "1.4.0"][..],
+            ),
+        ] {
+            let exposed = catalog
+                .records
+                .iter()
+                .filter(|record| record.id.as_deref() == Some(id))
+                .map(|record| record.version.as_deref().expect("version"))
+                .collect::<BTreeSet<_>>();
+            assert_eq!(exposed, versions.iter().copied().collect());
+
+            for &version in versions {
+                let record = catalog
+                    .records
+                    .iter()
+                    .find(|record| {
+                        record.id.as_deref() == Some(id)
+                            && record.version.as_deref() == Some(version)
+                    })
+                    .expect("exact built-in version");
+                assert_eq!(record.status, SessionStyleCatalogStatus::Available);
+                assert_eq!(record.source.kind, SessionStyleSourceKind::BuiltIn);
+                let expected =
+                    built_in_manifest_for_version(style, version).expect("shipped version");
+                assert_eq!(
+                    record.canonical_manifest_json.as_deref(),
+                    to_json(&expected).ok().as_deref()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn catalog_does_not_synthesize_unknown_built_in_versions() {
+        let data = super::super::RuntimeData::new(MockDependency::default());
+        let catalog = data
+            .session_style_catalog(catalog_request())
+            .expect("catalog");
+
+        for (id, version) in [
+            ("ephemeral-turn", "1.0.0"),
+            ("ephemeral-turn", "1.3.0"),
+            ("persistent-chat", "1.3.0"),
+            ("declarative-graph", "1.0.0"),
+            ("declarative-graph", "1.3.0"),
+            ("research-loop", "1.0.0"),
+            ("research-loop", "1.4.0"),
+            ("planner-worker", "1.0.0"),
+            ("planner-worker", "1.5.0"),
+        ] {
+            assert!(!catalog.records.iter().any(|record| {
+                record.id.as_deref() == Some(id) && record.version.as_deref() == Some(version)
+            }));
+        }
     }
 
     #[test]
@@ -1040,6 +1558,172 @@ mod tests {
         assert_eq!(selections.compaction_strategy, "artifact_handoff");
         assert!(record.compiled_hash.is_some());
         assert!(record.cache_key.is_some());
+    }
+
+    #[test]
+    fn ordered_context_transform_selection_survives_fresh_runtime_compilation() {
+        let declaration_hash = ContentHash::digest(b"runtime transform declaration");
+        let configuration_reference = ContentHash::digest(b"runtime transform configuration");
+        let mut manifest =
+            agentmod_session_style_sdk::built_in_manifest(BuiltInStyle::PersistentChat);
+        manifest
+            .allowed_plugins
+            .push(String::from("fixture.context"));
+        manifest.context_transforms = vec![agentmod_session_style_sdk::ContextTransformSelection {
+            plugin_id: String::from("fixture.context"),
+            transform_id: String::from("fixture.redact"),
+            version: String::from("1.0.0"),
+            declaration_hash,
+            lifecycle: agentmod_session_style_sdk::ContextTransformLifecycle::BeforeModelRequest,
+            configuration_reference,
+        }];
+        let manifest =
+            agentmod_session_style_sdk::to_json(&manifest).expect("canonical manifest JSON");
+        let mut runtime = environment();
+        runtime.plugins.insert(String::from("fixture.context"));
+        runtime.context_transforms = vec![SessionStyleContextTransformDescriptor {
+            plugin_id: String::from("fixture.context"),
+            transform_id: String::from("fixture.redact"),
+            version: String::from("1.0.0"),
+            declaration_hash: declaration_hash.to_hex(),
+            lifecycle: String::from("before_model_request"),
+        }];
+
+        let compile = |data: &super::super::RuntimeData<MockDependency>| {
+            data.validate_session_style(SessionStyleValidationDataRequest {
+                environment: runtime.clone(),
+                manifest: manifest.clone(),
+                format: SessionStyleManifestFormat::Json,
+            })
+            .expect("runtime style compilation")
+        };
+        let first_data = super::super::RuntimeData::new(MockDependency::default());
+        let first = compile(&first_data);
+        assert_eq!(first.status, SessionStyleCatalogStatus::Available);
+        let selected = &first
+            .selections
+            .as_ref()
+            .expect("compiled selections")
+            .context_transforms;
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].plugin_id, "fixture.context");
+        assert_eq!(selected[0].transform_id, "fixture.redact");
+        assert_eq!(selected[0].version, "1.0.0");
+        assert_eq!(selected[0].declaration_hash, declaration_hash.to_hex());
+        assert_eq!(
+            selected[0].configuration_reference,
+            configuration_reference.to_hex()
+        );
+
+        let restarted_data = super::super::RuntimeData::new(MockDependency::default());
+        let restarted = compile(&restarted_data);
+        assert_eq!(restarted.cache_key, first.cache_key);
+        assert_eq!(restarted.compiled_hash, first.compiled_hash);
+        assert_eq!(
+            restarted
+                .selections
+                .expect("restart selections")
+                .context_transforms,
+            *selected
+        );
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle = serde_json::from_str(
+            restarted
+                .compiled_json
+                .as_deref()
+                .expect("compiled binding payload"),
+        )
+        .expect("compiled binding reload");
+        assert_eq!(compiled.context_transforms.len(), 1);
+        assert_eq!(
+            compiled.context_transforms[0].configuration_reference,
+            configuration_reference
+        );
+    }
+
+    #[test]
+    fn exact_plugin_memory_and_compactor_selections_survive_fresh_runtime_compilation() {
+        let memory_hash = ContentHash::digest(b"exact memory declaration");
+        let memory_configuration = ContentHash::digest(b"exact memory configuration");
+        let compactor_hash = ContentHash::digest(b"exact compactor declaration");
+        let compactor_configuration = ContentHash::digest(b"exact compactor configuration");
+        let mut manifest =
+            agentmod_session_style_sdk::built_in_manifest(BuiltInStyle::PersistentChat);
+        manifest
+            .allowed_plugins
+            .push(String::from("fixture.context"));
+        manifest.memory.provider = String::from("fixture.memory");
+        manifest.memory.plugin = Some(agentmod_session_style_sdk::PluginMemorySelection {
+            plugin_id: String::from("fixture.context"),
+            plugin_version: String::from("2.3.4"),
+            provider_id: String::from("fixture.memory"),
+            provider_version: String::from("1.4.0"),
+            declaration_hash: memory_hash,
+            configuration_reference: memory_configuration,
+        });
+        manifest.compaction.strategy = agentmod_session_style_sdk::CompactionStrategy::Plugin;
+        manifest.compaction.plugin = Some(agentmod_session_style_sdk::PluginCompactorSelection {
+            plugin_id: String::from("fixture.context"),
+            plugin_version: String::from("2.3.4"),
+            compactor_id: String::from("fixture.compactor"),
+            compactor_version: String::from("3.1.0"),
+            declaration_hash: compactor_hash,
+            configuration_reference: compactor_configuration,
+        });
+        let manifest =
+            agentmod_session_style_sdk::to_json(&manifest).expect("canonical manifest JSON");
+        let mut runtime = environment();
+        runtime.plugins.insert(String::from("fixture.context"));
+        runtime.plugin_memory_providers = vec![SessionStylePluginMemoryProviderDescriptor {
+            plugin_id: String::from("fixture.context"),
+            plugin_version: String::from("2.3.4"),
+            provider_id: String::from("fixture.memory"),
+            provider_version: String::from("1.4.0"),
+            declaration_hash: memory_hash.to_hex(),
+            configuration_reference: memory_configuration.to_hex(),
+            has_retrieve: true,
+            has_write: true,
+        }];
+        runtime.plugin_compactors = vec![SessionStylePluginCompactorDescriptor {
+            plugin_id: String::from("fixture.context"),
+            plugin_version: String::from("2.3.4"),
+            compactor_id: String::from("fixture.compactor"),
+            compactor_version: String::from("3.1.0"),
+            declaration_hash: compactor_hash.to_hex(),
+            configuration_reference: compactor_configuration.to_hex(),
+        }];
+
+        let compile = |data: &super::super::RuntimeData<MockDependency>| {
+            data.validate_session_style(SessionStyleValidationDataRequest {
+                environment: runtime.clone(),
+                manifest: manifest.clone(),
+                format: SessionStyleManifestFormat::Json,
+            })
+            .expect("runtime style compilation")
+        };
+        let first = compile(&super::super::RuntimeData::new(MockDependency::default()));
+        assert_eq!(first.status, SessionStyleCatalogStatus::Available);
+        let selections = first.selections.as_ref().expect("compiled selections");
+        assert_eq!(
+            selections
+                .plugin_memory
+                .as_ref()
+                .expect("plugin memory")
+                .declaration_hash,
+            memory_hash.to_hex()
+        );
+        assert_eq!(
+            selections
+                .plugin_compactor
+                .as_ref()
+                .expect("plugin compactor")
+                .configuration_reference,
+            compactor_configuration.to_hex()
+        );
+
+        let restarted = compile(&super::super::RuntimeData::new(MockDependency::default()));
+        assert_eq!(restarted.cache_key, first.cache_key);
+        assert_eq!(restarted.compiled_hash, first.compiled_hash);
+        assert_eq!(restarted.selections, first.selections);
     }
 
     #[test]
@@ -1073,9 +1757,78 @@ mod tests {
     }
 
     #[test]
+    fn child_selection_compiles_parent_limits_and_inherited_provider() {
+        let data = super::super::RuntimeData::new(MockDependency::default());
+        let manifest = agentmod_session_style_sdk::to_json(
+            &agentmod_session_style_sdk::built_in_manifest(BuiltInStyle::EphemeralTurn),
+        )
+        .expect("manifest");
+        let mut selected_environment = environment();
+        selected_environment
+            .providers
+            .insert(String::from("inherited-mock"));
+        let record = data
+            .select_session_child_style(SessionStyleChildSelectionDataRequest {
+                environment: selected_environment,
+                manifest,
+                tool_groups: BTreeSet::from([String::from("filesystem")]),
+                memory_access: SessionStyleChildMemoryAccess::None,
+                inherited_provider: Some(String::from("inherited-mock")),
+                max_iterations: None,
+                max_steps: None,
+                max_tokens: Some(2_000),
+                max_cost_micros: Some(200_000),
+                max_duration_ms: None,
+            })
+            .expect("child selection");
+
+        assert_eq!(record.status, SessionStyleCatalogStatus::Available);
+        let selections = record.selections.expect("compiled selections");
+        assert_eq!(selections.max_tokens, 2_000);
+        assert_eq!(selections.max_cost_micros, 200_000);
+        assert_eq!(selections.memory_provider, "none");
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle = serde_json::from_str(
+            record
+                .compiled_json
+                .as_deref()
+                .expect("compiled descriptor"),
+        )
+        .expect("compiled descriptor");
+        assert_eq!(compiled.allowed_providers, ["inherited-mock"]);
+        assert!(
+            compiled
+                .graph
+                .nodes
+                .iter()
+                .filter(|node| node.provider.is_some())
+                .all(|node| node.provider.as_deref() == Some("inherited-mock"))
+        );
+    }
+
+    #[test]
+    fn child_memory_access_maps_explicitly_to_every_sdk_variant() {
+        assert_eq!(
+            sdk_child_memory_access(SessionStyleChildMemoryAccess::None),
+            agentmod_session_style_sdk::ChildMemoryAccess::None
+        );
+        assert_eq!(
+            sdk_child_memory_access(SessionStyleChildMemoryAccess::ReadOnly),
+            agentmod_session_style_sdk::ChildMemoryAccess::ReadOnly
+        );
+        assert_eq!(
+            sdk_child_memory_access(SessionStyleChildMemoryAccess::ReadWrite),
+            agentmod_session_style_sdk::ChildMemoryAccess::ReadWrite
+        );
+    }
+
+    #[test]
     fn invalid_and_exact_duplicate_entries_are_reported() {
         let style = agentmod_session_style_sdk::to_toml(
-            &agentmod_session_style_sdk::built_in_manifest(BuiltInStyle::PersistentChat),
+            &agentmod_session_style_sdk::built_in_manifest_for_version(
+                BuiltInStyle::PersistentChat,
+                "1.1.0",
+            )
+            .expect("frozen persistent version"),
         )
         .expect("toml");
         let data = super::super::RuntimeData::new(MockDependency {
@@ -1115,9 +1868,56 @@ mod tests {
     }
 
     #[test]
+    fn disabled_marker_quarantines_all_versions_even_when_sources_conflict() {
+        let style = agentmod_session_style_sdk::to_toml(
+            &agentmod_session_style_sdk::built_in_manifest(BuiltInStyle::EphemeralTurn),
+        )
+        .expect("toml");
+        let data = super::super::RuntimeData::new(MockDependency {
+            discovery: DependencyStyleDiscovery {
+                manifests: vec![dependency_manifest("duplicate.toml", &style)],
+                disabled_markers: vec![DependencyStyleDisabledMarker {
+                    style_id: String::from("ephemeral-turn"),
+                    source_kind: DependencyStyleSourceKind::User,
+                    source_locator: String::from("ephemeral-turn.disabled"),
+                }],
+                ..DependencyStyleDiscovery::default()
+            },
+            ..MockDependency::default()
+        });
+        let catalog = data
+            .session_style_catalog(catalog_request())
+            .expect("catalog");
+        let records = catalog
+            .records
+            .iter()
+            .filter(|record| record.id.as_deref() == Some("ephemeral-turn"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(records.len(), 3);
+        assert!(
+            records
+                .iter()
+                .all(|record| record.status == SessionStyleCatalogStatus::Disabled)
+        );
+        assert!(
+            records
+                .iter()
+                .filter(|record| record.version.as_deref() == Some("1.2.0"))
+                .all(|record| record.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == DUPLICATE_STYLE_IDENTITY_DIAGNOSTIC_CODE
+                }))
+        );
+    }
+
+    #[test]
     fn different_style_versions_coexist() {
         let style = agentmod_session_style_sdk::to_toml(
-            &agentmod_session_style_sdk::built_in_manifest(BuiltInStyle::PersistentChat),
+            &agentmod_session_style_sdk::built_in_manifest_for_version(
+                BuiltInStyle::PersistentChat,
+                "1.1.0",
+            )
+            .expect("frozen persistent version"),
         )
         .expect("toml");
         let data = super::super::RuntimeData::new(MockDependency {

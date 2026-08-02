@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "platform": "Windows",
+  "date": "2026-07-31",
+  "repository": "C:\\Users\\jkpri\\AgentMod",
+  "git_head": "abbf97b82687a4d1e7463aab33382258d6d38fd9",
+  "validation_directory": "C:\\Users\\jkpri\\AgentMod\\.omx\\validation\\2026-07-31-windows-converged-20260731-150541",
+  "overall_status": "passed",
+  "github_actions_claimed": false,
+  "source_integrity": {
+    "tracked_diff_hash_before": "70b37f18e8b1013b57686060c566f5528e22ca01",
+    "tracked_diff_hash_after": "70b37f18e8b1013b57686060c566f5528e22ca01",
+    "tracked_unchanged": true,
+    "untracked_file_count_before": 148,
+    "untracked_file_count_after": 148,
+    "untracked_manifest_sha256_before": "ec8c7297af70368d88cb26f470af66cae7a1f5c7258dfc82f9902d3d17e71e43",
+    "untracked_manifest_sha256_after": "ec8c7297af70368d88cb26f470af66cae7a1f5c7258dfc82f9902d3d17e71e43",
+    "untracked_manifest_byte_identical": true,
+    "excluded_paths": [
+      ".omx/validation/**"
+    ],
+    "source_or_test_changes_by_validator": "none"
+  },
+  "test_totals": {
+    "workspace": {
+      "suites": 116,
+      "passed": 1230,
+      "failed": 0,
+      "ignored": 11
+    },
+    "documentation": {
+      "suites": 74,
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "xtask_architecture": {
+      "passed": 2,
+      "failed": 0
+    }
+  },
+  "architecture": {
+    "packages_checked": 90,
+    "violations": 0
+  },
+  "supply_chain": {
+    "cargo_deny": "advisories ok, bans ok, licenses ok, sources ok",
+    "cargo_audit_vulnerabilities": 0,
+    "cargo_audit_allowed_warnings": 1,
+    "allowed_warning": "RUSTSEC-2025-0057: fxhash 0.2.1 unmaintained"
+  },
+  "commands": [
+    {
+      "name": "01-cargo-fmt",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "status": "passed",
+      "elapsed_ms": 3100,
+      "started_at": "2026-07-31T19:06:23.989668Z",
+      "ended_at": "2026-07-31T19:06:27.0945627Z",
+      "log": "01-cargo-fmt.log"
+    },
+    {
+      "name": "02-cargo-clippy",
+      "command": "cargo clippy --workspace --all-targets --all-features -- -D warnings",
+      "exit_code": 0,
+      "status": "passed",
+      "elapsed_ms": 59114,
+      "started_at": "2026-07-31T19:06:33.9448512Z",
+      "ended_at": "2026-07-31T19:07:33.063947Z",
+      "log": "02-cargo-clippy.log"
+    },
+    {
+      "name": "03-cargo-test-workspace",
+      "command": "cargo test --workspace --all-targets --all-features --locked",
+      "exit_code": 0,
+      "status": "passed",
+      "elapsed_ms": 78306,
+      "started_at": "2026-07-31T19:07:40.3512325Z",
+      "ended_at": "2026-07-31T19:08:58.6629612Z",
+      "log": "03-cargo-test-workspace.log"
+    },
+    {
+      "name": "04-cargo-test-doc",
+      "command": "cargo test --workspace --doc --all-features --locked",
+      "exit_code": 0,
+      "status": "passed",
+      "elapsed_ms": 24153,
+      "started_at": "2026-07-31T19:09:05.9046327Z",
+      "ended_at": "2026-07-31T19:09:30.0664159Z",
+      "log": "04-cargo-test-doc.log"
+    },
+    {
+      "name": "05-xtask-architecture",
+      "command": "cargo run --locked -p xtask -- architecture --manifest-path Cargo.toml",
+      "exit_code": 0,
+      "status": "passed",
+      "elapsed_ms": 8021,
+      "started_at": "2026-07-31T19:09:41.5042628Z",
+      "ended_at": "2026-07-31T19:09:49.5303525Z",
+      "log": "05-xtask-architecture.log"
+    },
+    {
+      "name": "06-xtask-architecture-test",
+      "command": "cargo test --locked -p xtask --test architecture",
+      "exit_code": 0,
+      "status": "passed",
+      "elapsed_ms": 496,
+      "started_at": "2026-07-31T19:09:56.043607Z",
+      "ended_at": "2026-07-31T19:09:56.544357Z",
+      "log": "06-xtask-architecture-test.log"
+    },
+    {
+      "name": "07-cargo-deny",
+      "command": "cargo deny check",
+      "exit_code": 0,
+      "status": "passed",
+      "elapsed_ms": 2487,
+      "started_at": "2026-07-31T19:10:03.8615891Z",
+      "ended_at": "2026-07-31T19:10:06.3538037Z",
+      "log": "07-cargo-deny.log"
+    },
+    {
+      "name": "08-cargo-audit",
+      "command": "cargo audit",
+      "exit_code": 0,
+      "status": "passed",
+      "elapsed_ms": 2015,
+      "started_at": "2026-07-31T19:10:12.8400098Z",
+      "ended_at": "2026-07-31T19:10:14.8597766Z",
+      "log": "08-cargo-audit.log"
+    }
+  ],
+  "failures": [],
+  "notes": [
+    "All eight required commands executed sequentially on native Windows.",
+    "No GitHub Actions or macOS result is claimed by this artifact.",
+    "The untracked before/after manifests contain sorted path and Git blob hash records and are byte-identical."
+  ]
+}

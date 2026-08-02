@@ -1,0 +1,12 @@
+{
+  "index": 21,
+  "name": "21-runtime_typed_summary",
+  "script": "runtime_typed_summary.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_typed_summary.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 1406,
+  "started_at": "2026-07-31T19:28:30.7503161Z",
+  "ended_at": "2026-07-31T19:28:32.1612429Z",
+  "log": "21-runtime_typed_summary.log"
+}

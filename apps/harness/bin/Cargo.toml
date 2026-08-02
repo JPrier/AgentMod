@@ -8,11 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-harness-data = { path = "../data" }
-agentmod-harness-dependency = { path = "../dependency" }
-agentmod-harness-logic = { path = "../logic" }
-agentmod-harness-protocol = { path = "../../../protocols/harness-protocol" }
-agentmod-harness-service = { path = "../service" }
+agentmod-harness-data = { version = "0.1.0", path = "../data" }
+agentmod-harness-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-harness-logic = { version = "0.1.0", path = "../logic" }
+agentmod-harness-protocol = { version = "0.1.0", path = "../../../protocols/harness-protocol" }
+agentmod-harness-service = { version = "0.1.0", path = "../service" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
 

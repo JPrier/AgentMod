@@ -39,6 +39,21 @@ pub struct DependencyToolCommand {
     pub tool: String,
     pub arguments: Value,
     pub cancellation_id: String,
+    /// Exact workspace lease authorization for child-session dispatch.
+    pub workspace_authorization: Option<DependencyWorkspaceAuthorization>,
+}
+
+/// Dependency-owned workspace authorization bound to one exact tool action.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DependencyWorkspaceAuthorization {
+    /// Stable immutable workspace lease identity.
+    pub lease_id: String,
+    /// Complete persisted workspace lease hash.
+    pub lease_hash: ContentHash,
+    /// Whether workspace-mutating actions are prohibited.
+    pub read_only: bool,
+    /// Hash of the exact lease/tool/arguments/cancellation dispatch.
+    pub dispatch_digest: ContentHash,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,15 +128,17 @@ pub enum ToolHostKind {
 }
 
 struct Connection {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    child: Mutex<Child>,
+    stdin: Mutex<ChildStdin>,
+    stdout: Mutex<BufReader<ChildStdout>>,
+    execution: Mutex<()>,
 }
 
 #[derive(Clone)]
 pub struct ProcessToolHostDependency {
     config: Arc<ToolHostDependencyConfig>,
-    connections: Arc<Mutex<HashMap<String, Connection>>>,
+    connections: Arc<Mutex<HashMap<String, Arc<Connection>>>>,
+    active: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[async_trait]
@@ -186,6 +203,7 @@ impl ProcessToolHostDependency {
         Ok(Self {
             config: Arc::new(config),
             connections: Arc::new(Mutex::new(HashMap::new())),
+            active: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -206,7 +224,11 @@ impl ProcessToolHostDependency {
             .envs(host_environment())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(if self.config.kind == ToolHostKind::Mcp {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
             .kill_on_drop(true);
         let authorization_key = encode_hex(&self.config.authorization_key);
         match self.config.kind {
@@ -289,6 +311,11 @@ impl ProcessToolHostDependency {
             ToolHostKind::Mcp => {
                 let session_id = uuid::Uuid::parse_str(session_id)
                     .map_err(|_| ToolHostDependencyError::InvalidRequest)?;
+                let state_root = self
+                    .config
+                    .state_root
+                    .as_ref()
+                    .ok_or(ToolHostDependencyError::InvalidConfiguration)?;
                 let replay_root = self
                     .config
                     .state_root
@@ -313,7 +340,17 @@ impl ProcessToolHostDependency {
                     .env("AGENTMOD_MCP_SESSION", session_id.to_string())
                     .env("AGENTMOD_MCP_REPLAY_ROOT", replay_root)
                     .env("AGENTMOD_MCP_HTTP_STATE_ROOT", http_state_root);
-                if let Some(servers) = std::env::var_os("AGENTMOD_MCP_SERVERS_JSON") {
+                if let Some(key) = std::env::var_os("AGENTMOD_MCP_OAUTH_KEY") {
+                    command.env("AGENTMOD_MCP_OAUTH_KEY", key);
+                }
+                let bound_servers = crate::registry::load_session_mcp_bootstrap(
+                    state_root,
+                    &session_id.to_string(),
+                )
+                .map_err(|_| ToolHostDependencyError::InvalidConfiguration)?;
+                if let Some(servers) = bound_servers {
+                    prepare_mcp_host_bootstrap(&mut command, &servers)?;
+                } else if let Some(servers) = std::env::var_os("AGENTMOD_MCP_SERVERS_JSON") {
                     command.env("AGENTMOD_MCP_SERVERS_JSON", servers);
                 }
             }
@@ -330,9 +367,10 @@ impl ProcessToolHostDependency {
             .take()
             .ok_or(ToolHostDependencyError::Unavailable)?;
         Ok(Connection {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
+            child: Mutex::new(child),
+            stdin: Mutex::new(stdin),
+            stdout: Mutex::new(BufReader::new(stdout)),
+            execution: Mutex::new(()),
         })
     }
 
@@ -364,42 +402,63 @@ impl ProcessToolHostDependency {
             command.session_id,
             command.workspace.to_string_lossy()
         );
-        let mut connections = self.connections.lock().await;
-        if !connections.contains_key(&connection_key) {
-            let connection = self.connect(&command.session_id, &command.workspace)?;
-            connections.insert(connection_key.clone(), connection);
+        let connection = {
+            let mut connections = self.connections.lock().await;
+            if let Some(connection) = connections.get(&connection_key) {
+                Arc::clone(connection)
+            } else {
+                let connection = Arc::new(self.connect(&command.session_id, &command.workspace)?);
+                connections.insert(connection_key.clone(), Arc::clone(&connection));
+                connection
+            }
+        };
+        let _execution = connection.execution.lock().await;
+        {
+            let mut active = self.active.lock().await;
+            if active.contains_key(&command.cancellation_id) {
+                return Err(ToolHostDependencyError::InvalidRequest);
+            }
+            active.insert(command.cancellation_id.clone(), connection_key);
         }
-        let connection = connections
-            .get_mut(&connection_key)
-            .ok_or(ToolHostDependencyError::Unavailable)?;
-        let mut bytes = serde_json::to_vec(&wire).map_err(|_| ToolHostDependencyError::Protocol)?;
-        bytes.push(b'\n');
-        connection
-            .stdin
-            .write_all(&bytes)
-            .await
-            .map_err(|_| ToolHostDependencyError::Transport)?;
-        connection
-            .stdin
-            .flush()
-            .await
-            .map_err(|_| ToolHostDependencyError::Transport)?;
-        let mut events = Vec::new();
-        loop {
-            let frame = read_frame(&mut connection.stdout, self.config.maximum_frame_bytes).await?;
-            let event: ToolHostEvent =
-                serde_json::from_slice(&frame).map_err(|_| ToolHostDependencyError::Protocol)?;
-            let terminal = matches!(
-                event,
-                ToolHostEvent::Completed { .. }
-                    | ToolHostEvent::Failed { .. }
-                    | ToolHostEvent::Cancelled { .. }
-            );
-            events.push(map_event(event)?);
-            if terminal {
-                return Ok(events);
+        let result = async {
+            let mut bytes =
+                serde_json::to_vec(&wire).map_err(|_| ToolHostDependencyError::Protocol)?;
+            bytes.push(b'\n');
+            {
+                let mut stdin = connection.stdin.lock().await;
+                stdin
+                    .write_all(&bytes)
+                    .await
+                    .map_err(|_| ToolHostDependencyError::Transport)?;
+                stdin
+                    .flush()
+                    .await
+                    .map_err(|_| ToolHostDependencyError::Transport)?;
+            }
+            let mut stdout = connection.stdout.lock().await;
+            let mut events = Vec::new();
+            loop {
+                let frame = read_frame(&mut stdout, self.config.maximum_frame_bytes).await?;
+                let event: ToolHostEvent = serde_json::from_slice(&frame)
+                    .map_err(|_| ToolHostDependencyError::Protocol)?;
+                if tool_host_event_call_id(&event) != Some(command.call_id.as_str()) {
+                    continue;
+                }
+                let terminal = matches!(
+                    event,
+                    ToolHostEvent::Completed { .. }
+                        | ToolHostEvent::Failed { .. }
+                        | ToolHostEvent::Cancelled { .. }
+                );
+                events.push(map_event(event)?);
+                if terminal {
+                    return Ok(events);
+                }
             }
         }
+        .await;
+        self.active.lock().await.remove(&command.cancellation_id);
+        result
     }
 
     fn grant(
@@ -445,6 +504,53 @@ impl ProcessToolHostDependency {
     }
 }
 
+fn prepare_mcp_host_bootstrap(
+    command: &mut Command,
+    servers_json: &str,
+) -> Result<(), ToolHostDependencyError> {
+    let mut servers: Vec<serde_json::Value> = serde_json::from_str(servers_json)
+        .map_err(|_| ToolHostDependencyError::InvalidConfiguration)?;
+    if servers.is_empty() || servers.len() > 64 {
+        return Err(ToolHostDependencyError::InvalidConfiguration);
+    }
+    for (server_index, server) in servers.iter_mut().enumerate() {
+        let Some(server) = server.as_object_mut() else {
+            return Err(ToolHostDependencyError::InvalidConfiguration);
+        };
+        if !matches!(
+            server.get("transport").and_then(Value::as_str),
+            Some("streamable_http" | "legacy_sse")
+        ) {
+            continue;
+        }
+        let Some(headers) = server.remove("headers") else {
+            continue;
+        };
+        let Some(headers) = headers.as_object() else {
+            return Err(ToolHostDependencyError::InvalidConfiguration);
+        };
+        let mut references = serde_json::Map::new();
+        for (header_index, (name, value)) in headers.iter().enumerate() {
+            let value = value
+                .as_str()
+                .ok_or(ToolHostDependencyError::InvalidConfiguration)?;
+            let environment = format!("AGENTMOD_MCP_BOUND_HEADER_{server_index}_{header_index}");
+            command.env(&environment, value);
+            references.insert(name.clone(), Value::String(environment));
+        }
+        server.insert(
+            String::from("header_environments"),
+            Value::Object(references),
+        );
+    }
+    command.env(
+        "AGENTMOD_MCP_SERVERS_JSON",
+        serde_json::to_string(&servers)
+            .map_err(|_| ToolHostDependencyError::InvalidConfiguration)?,
+    );
+    Ok(())
+}
+
 #[async_trait]
 impl ToolHostDependencyPort for ProcessToolHostDependency {
     async fn execute(
@@ -461,19 +567,58 @@ impl ToolHostDependencyPort for ProcessToolHostDependency {
             Err(_) => Err(ToolHostDependencyError::Timeout),
         };
         if result.is_err()
-            && let Some(mut connection) = self.connections.lock().await.remove(&key)
+            && let Some(connection) = self.connections.lock().await.remove(&key)
         {
-            let _ = connection.child.start_kill();
-            let _ = connection.child.wait().await;
+            let mut child = connection.child.lock().await;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
         }
         result
     }
 
+    async fn cancel(
+        &self,
+        request: DependencyCancelToolRequest,
+    ) -> Result<bool, ToolHostDependencyError> {
+        if self.config.kind != ToolHostKind::Mcp || request.cancellation_id.trim().is_empty() {
+            return Ok(false);
+        }
+        let cancellation_id = CancellationId::from_str(&request.cancellation_id)
+            .map_err(|_| ToolHostDependencyError::InvalidRequest)?;
+        let Some(connection_key) = self
+            .active
+            .lock()
+            .await
+            .get(&request.cancellation_id)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let Some(connection) = self.connections.lock().await.get(&connection_key).cloned() else {
+            return Ok(false);
+        };
+        let mut bytes = serde_json::to_vec(&ToolHostCommand::Cancel { cancellation_id })
+            .map_err(|_| ToolHostDependencyError::Protocol)?;
+        bytes.push(b'\n');
+        let mut stdin = connection.stdin.lock().await;
+        stdin
+            .write_all(&bytes)
+            .await
+            .map_err(|_| ToolHostDependencyError::Transport)?;
+        stdin
+            .flush()
+            .await
+            .map_err(|_| ToolHostDependencyError::Transport)?;
+        Ok(true)
+    }
+
     async fn shutdown(&self) {
         let connections = std::mem::take(&mut *self.connections.lock().await);
-        for (_, mut connection) in connections {
-            let _ = connection.child.start_kill();
-            let _ = connection.child.wait().await;
+        self.active.lock().await.clear();
+        for (_, connection) in connections {
+            let mut child = connection.child.lock().await;
+            let _ = child.start_kill();
+            let _ = child.wait().await;
         }
     }
 }
@@ -495,7 +640,7 @@ fn host_environment() -> impl Iterator<Item = (String, std::ffi::OsString)> {
         .filter_map(|key| std::env::var_os(key).map(|value| ((*key).to_owned(), value)))
 }
 
-fn validate(command: &DependencyToolCommand) -> Result<(), ToolHostDependencyError> {
+pub(crate) fn validate(command: &DependencyToolCommand) -> Result<(), ToolHostDependencyError> {
     if command.execution_id.trim().is_empty()
         || command.execution_id.len() > 512
         || command.session_id.trim().is_empty()
@@ -507,7 +652,108 @@ fn validate(command: &DependencyToolCommand) -> Result<(), ToolHostDependencyErr
     {
         return Err(ToolHostDependencyError::InvalidRequest);
     }
+    if let Some(authorization) = &command.workspace_authorization {
+        let expected = workspace_dispatch_digest(
+            &authorization.lease_id,
+            authorization.lease_hash,
+            authorization.read_only,
+            &command.tool,
+            &command.arguments,
+            &command.cancellation_id,
+        )?;
+        if authorization.lease_id.trim().is_empty()
+            || authorization.lease_id.len() > 128
+            || authorization.lease_hash == ContentHash::from_bytes([0; 32])
+            || authorization.dispatch_digest != expected
+            || (authorization.read_only && workspace_mutating_tool(&command.tool))
+        {
+            return Err(ToolHostDependencyError::Authorization);
+        }
+    }
     Ok(())
+}
+
+/// Requires exact lease authorization whenever the session has a durable
+/// dependency-owned workspace binding. This prevents direct data/dependency
+/// callers from omitting the optional wire field for child sessions.
+pub(crate) fn validate_bound_workspace_authorization(
+    command: &DependencyToolCommand,
+    lease_root: &std::path::Path,
+) -> Result<(), ToolHostDependencyError> {
+    let binding = crate::workspace::load_workspace_session_binding(lease_root, &command.session_id)
+        .map_err(|_| ToolHostDependencyError::Authorization)?;
+    match (binding, command.workspace_authorization.as_ref()) {
+        (None, None) => Ok(()),
+        (None, Some(_)) | (Some(_), None) => Err(ToolHostDependencyError::Authorization),
+        (Some(binding), Some(authorization)) => {
+            let workspace = command
+                .workspace
+                .canonicalize()
+                .map_err(|_| ToolHostDependencyError::Authorization)?;
+            if binding.record_version != 1
+                || binding.effective_root != workspace
+                || binding.lease_id != authorization.lease_id
+                || binding.lease_hash != authorization.lease_hash.to_hex()
+                || binding.read_only != authorization.read_only
+            {
+                Err(ToolHostDependencyError::Authorization)
+            } else {
+                validate(command)
+            }
+        }
+    }
+}
+
+/// Hashes the exact workspace lease and tool dispatch checked independently by
+/// the runtime dependency immediately before crossing the host boundary.
+///
+/// # Errors
+///
+/// Returns an invalid-request error when arguments cannot be encoded.
+pub fn workspace_dispatch_digest(
+    lease_id: &str,
+    lease_hash: ContentHash,
+    read_only: bool,
+    tool: &str,
+    arguments: &Value,
+    cancellation_id: &str,
+) -> Result<ContentHash, ToolHostDependencyError> {
+    serde_json::to_vec(&(
+        "agentmod.workspace-tool-dispatch@1",
+        lease_id,
+        lease_hash,
+        read_only,
+        tool,
+        normalize_json(arguments),
+        cancellation_id,
+    ))
+    .map(|bytes| ContentHash::digest(&bytes))
+    .map_err(|_| ToolHostDependencyError::InvalidRequest)
+}
+
+fn workspace_mutating_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "filesystem.write"
+            | "filesystem.edit"
+            | "filesystem.apply_patch"
+            | "write_file"
+            | "edit_file"
+            | "apply_patch"
+            | "process.run"
+            | "process.start"
+            | "process.run_pty"
+            | "process.start_pty"
+            | "process.input"
+            | "run_command"
+            | "git.branch"
+            | "git.worktree_create"
+            | "git.worktree_cleanup"
+            | "git.checkpoint_create"
+            | "git.checkpoint_restore"
+            | "browser.download"
+            | "mcp.invoke"
+    )
 }
 
 fn canonical_tool_name(
@@ -601,6 +847,9 @@ fn canonical_tool_name(
         (ToolHostKind::Mcp, "mcp.server.list") => Ok("mcp.server.list"),
         (ToolHostKind::Mcp, "mcp.capabilities") => Ok("mcp.capabilities"),
         (ToolHostKind::Mcp, "mcp.invoke") => Ok("mcp.invoke"),
+        (ToolHostKind::Mcp, "mcp.oauth.begin") => Ok("mcp.oauth.begin"),
+        (ToolHostKind::Mcp, "mcp.oauth.status") => Ok("mcp.oauth.status"),
+        (ToolHostKind::Mcp, "mcp.oauth.cancel") => Ok("mcp.oauth.cancel"),
         _ => Err(ToolHostDependencyError::UnsupportedTool),
     }
 }
@@ -862,7 +1111,7 @@ fn canonical_mcp_digest(
             reject_unknown(object, &[])?;
             json!({})
         }
-        "mcp.capabilities" => {
+        "mcp.capabilities" | "mcp.oauth.begin" | "mcp.oauth.status" => {
             reject_unknown(object, &["server_id"])?;
             json!({"server_id":required_value(object, "server_id")?})
         }
@@ -873,6 +1122,13 @@ fn canonical_mcp_digest(
                 "kind":required_value(object, "kind")?,
                 "name":required_value(object, "name")?,
                 "arguments":object.get("arguments").cloned().unwrap_or(Value::Null),
+            })
+        }
+        "mcp.oauth.cancel" => {
+            reject_unknown(object, &["server_id", "transaction_id"])?;
+            json!({
+                "server_id":required_value(object, "server_id")?,
+                "transaction_id":required_value(object, "transaction_id")?,
             })
         }
         _ => return Err(ToolHostDependencyError::UnsupportedTool),
@@ -1171,6 +1427,18 @@ fn map_event(event: ToolHostEvent) -> Result<DependencyToolEvent, ToolHostDepend
     })
 }
 
+fn tool_host_event_call_id(event: &ToolHostEvent) -> Option<&str> {
+    match event {
+        ToolHostEvent::Started { call_id }
+        | ToolHostEvent::Progress { call_id, .. }
+        | ToolHostEvent::Output { call_id, .. }
+        | ToolHostEvent::Completed { call_id, .. }
+        | ToolHostEvent::Failed { call_id, .. }
+        | ToolHostEvent::Cancelled { call_id } => Some(call_id),
+        ToolHostEvent::Groups { .. } | ToolHostEvent::Tools { .. } => None,
+    }
+}
+
 async fn read_frame(
     reader: &mut BufReader<ChildStdout>,
     maximum: usize,
@@ -1236,6 +1504,89 @@ pub enum ToolHostDependencyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        LocalRuntimeDependencies,
+        workspace::{DependencyBindWorkspaceSessionRequest, WorkspaceLeaseDependencyPort},
+    };
+    use tempfile::tempdir;
+
+    #[test]
+    fn durable_child_binding_rejects_omitted_and_read_only_write_authorization() {
+        let temporary = tempdir().expect("temporary");
+        let workspace = temporary.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        let lease_root = temporary.path().join("leases");
+        let session_id = uuid::Uuid::from_u128(41).to_string();
+        let lease_hash = ContentHash::digest(b"lease");
+        LocalRuntimeDependencies
+            .bind_workspace_session(DependencyBindWorkspaceSessionRequest {
+                lease_root: lease_root.clone(),
+                session_id: session_id.clone(),
+                lease_id: String::from("lease-bound"),
+                lease_hash: lease_hash.to_hex(),
+                effective_root: workspace.clone(),
+                read_only: true,
+            })
+            .expect("bind");
+        let mut command = DependencyToolCommand {
+            execution_id: String::from("tool-call:read"),
+            receipt_only: false,
+            session_id,
+            workspace,
+            call_id: String::from("read"),
+            tool: String::from("filesystem.read"),
+            arguments: serde_json::json!({"path":"input.txt"}),
+            cancellation_id: uuid::Uuid::from_u128(42).to_string(),
+            workspace_authorization: None,
+        };
+        assert_eq!(
+            validate_bound_workspace_authorization(&command, &lease_root),
+            Err(ToolHostDependencyError::Authorization)
+        );
+        let digest = workspace_dispatch_digest(
+            "lease-bound",
+            lease_hash,
+            true,
+            &command.tool,
+            &command.arguments,
+            &command.cancellation_id,
+        )
+        .expect("digest");
+        command.workspace_authorization = Some(DependencyWorkspaceAuthorization {
+            lease_id: String::from("lease-bound"),
+            lease_hash,
+            read_only: true,
+            dispatch_digest: digest,
+        });
+        validate_bound_workspace_authorization(&command, &lease_root).expect("read");
+
+        for mutating_tool in [
+            "filesystem.write",
+            "process.run",
+            "browser.download",
+            "mcp.invoke",
+        ] {
+            command.tool = String::from(mutating_tool);
+            command
+                .workspace_authorization
+                .as_mut()
+                .expect("authorization")
+                .dispatch_digest = workspace_dispatch_digest(
+                "lease-bound",
+                lease_hash,
+                true,
+                &command.tool,
+                &command.arguments,
+                &command.cancellation_id,
+            )
+            .expect("mutating dispatch digest");
+            assert_eq!(
+                validate_bound_workspace_authorization(&command, &lease_root),
+                Err(ToolHostDependencyError::Authorization),
+                "{mutating_tool}"
+            );
+        }
+    }
 
     #[test]
     fn git_digest_matches_sorted_tool_contract() {
@@ -1329,6 +1680,7 @@ mod tests {
                     tool: "lsp.formatting".into(),
                     arguments,
                     cancellation_id: "018f6f83-7b80-7000-8000-000000000002".into(),
+                    workspace_authorization: None,
                 },
                 "lsp.formatting",
                 digest,

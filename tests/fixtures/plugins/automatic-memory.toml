@@ -1,0 +1,161 @@
+schema_version = 1
+category = "memory"
+scope = "session"
+classification = "blocking"
+trust = "approved_third_party"
+isolation = "process"
+required_capabilities = []
+provided_capabilities = ["memory.fixture"]
+subscribed_events = []
+timeout_ms = 10000
+state_migration_version = 1
+
+[identity]
+id = "fixture.automatic-memory"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[entrypoint]
+kind = "process"
+program = "__PLUGIN_PROGRAM__"
+args = __PLUGIN_ARGS__
+
+[authorities]
+read = ["invocation_state"]
+proposed_write = []
+
+[permissions]
+tools = []
+network = []
+
+[ordering]
+stage = 0
+priority = 0
+before = []
+after = []
+
+[configuration]
+schema_id = "fixture.automatic-memory.config"
+schema_version = 1
+required = false
+
+[configuration.source]
+kind = "inline_json"
+document = '{"type":"object","additionalProperties":false}'
+
+[failure_policy]
+kind = "reject"
+
+[[memory_providers]]
+provider_id = "fixture.memory.success"
+version = "1.0.0"
+runtime_api = "^1.0"
+capabilities = ["memory.fixture"]
+
+[memory_providers.retrieve]
+handler = "memory_retrieve"
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object","required":["items"]}'
+timeout_ms = 500
+idempotency = "idempotent"
+state_scope = "session"
+external_effects = false
+
+[memory_providers.retrieve.failure_policy]
+kind = "reject"
+
+[memory_providers.retrieve.required_permissions]
+tools = []
+network = []
+
+[memory_providers.write]
+handler = "memory_write"
+input_schema = '{"type":"object","required":["scope","boundary","value","value_hash"]}'
+output_schema = '{"type":"object","required":["accepted"]}'
+timeout_ms = 5000
+idempotency = "non_idempotent"
+state_scope = "session"
+external_effects = true
+
+[memory_providers.write.failure_policy]
+kind = "reject"
+
+[memory_providers.write.required_permissions]
+tools = []
+network = []
+
+[[memory_providers]]
+provider_id = "fixture.memory.invalid"
+version = "1.0.0"
+runtime_api = "^1.0"
+capabilities = ["memory.fixture"]
+
+[memory_providers.retrieve]
+handler = "memory_retrieve"
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object","required":["items"]}'
+timeout_ms = 500
+idempotency = "idempotent"
+state_scope = "session"
+external_effects = false
+
+[memory_providers.retrieve.failure_policy]
+kind = "reject"
+
+[memory_providers.retrieve.required_permissions]
+tools = []
+network = []
+
+[memory_providers.write]
+handler = "wrong_identity_memory_write"
+input_schema = '{"type":"object","required":["scope","boundary","value","value_hash"]}'
+output_schema = '{"type":"object","required":["accepted"]}'
+timeout_ms = 5000
+idempotency = "non_idempotent"
+state_scope = "session"
+external_effects = true
+
+[memory_providers.write.failure_policy]
+kind = "reject"
+
+[memory_providers.write.required_permissions]
+tools = []
+network = []
+
+[[memory_providers]]
+provider_id = "fixture.memory.timeout"
+version = "1.0.0"
+runtime_api = "^1.0"
+capabilities = ["memory.fixture"]
+
+[memory_providers.retrieve]
+handler = "memory_retrieve"
+input_schema = '{"type":"object"}'
+output_schema = '{"type":"object","required":["items"]}'
+timeout_ms = 500
+idempotency = "idempotent"
+state_scope = "session"
+external_effects = false
+
+[memory_providers.retrieve.failure_policy]
+kind = "reject"
+
+[memory_providers.retrieve.required_permissions]
+tools = []
+network = []
+
+[memory_providers.write]
+handler = "timeout_memory_write"
+input_schema = '{"type":"object","required":["scope","boundary","value","value_hash"]}'
+output_schema = '{"type":"object","required":["accepted"]}'
+timeout_ms = 50
+idempotency = "non_idempotent"
+state_scope = "session"
+external_effects = true
+
+[memory_providers.write.failure_policy]
+kind = "reject"
+
+[memory_providers.write.required_permissions]
+tools = []
+network = []

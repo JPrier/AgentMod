@@ -1,0 +1,12 @@
+{
+  "index": 3,
+  "name": "03-runtime_ephemeral_turn",
+  "script": "runtime_ephemeral_turn.ps1",
+  "command": "powershell -NoProfile -ExecutionPolicy Bypass -File tests\\e2e\\runtime_ephemeral_turn.ps1",
+  "exit_code": 1,
+  "status": "failed",
+  "elapsed_ms": 15303,
+  "started_at": "2026-07-31T19:14:18.5515963Z",
+  "ended_at": "2026-07-31T19:14:33.8551107Z",
+  "log": "03-runtime_ephemeral_turn.log"
+}

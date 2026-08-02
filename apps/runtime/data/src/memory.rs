@@ -4,7 +4,7 @@ use agentmod_runtime_dependency::memory::{
     DependencyMemoryQueryRequest, DependencyMemoryWriteRequest, FileMemoryDependency,
     MemoryDependencyError, MemoryDependencyPort, NoMemoryDependency, SqliteFtsMemoryDependency,
 };
-use std::path::Path;
+use std::{path::Path, time::Duration};
 use thiserror::Error;
 
 /// Data-owned memory scope.
@@ -202,13 +202,31 @@ impl RuntimeMemoryData {
     /// Creates the first-party provider set below an explicit runtime-owned root.
     #[must_use]
     pub fn first_party(root: &Path) -> Self {
+        Self::first_party_with_post_persist_delay(root, Duration::ZERO)
+    }
+
+    /// Creates the first-party provider set with a deterministic post-persist
+    /// response delay for every durable provider.
+    #[must_use]
+    pub fn first_party_with_post_persist_delay(root: &Path, post_persist_delay: Duration) -> Self {
         Self {
             none: MemoryData::new(NoMemoryDependency),
-            file: MemoryData::new(FileMemoryDependency::new(root.join("file.jsonl"))),
-            sqlite_fts: MemoryData::new(SqliteFtsMemoryDependency::new(
-                root.join("sqlite-fts.sqlite3"),
-            )),
+            file: MemoryData::new(
+                FileMemoryDependency::new(root.join("file.jsonl"))
+                    .with_post_persist_delay(post_persist_delay),
+            ),
+            sqlite_fts: MemoryData::new(
+                SqliteFtsMemoryDependency::new(root.join("sqlite-fts.sqlite3"))
+                    .with_post_commit_delay(post_persist_delay),
+            ),
         }
+    }
+
+    /// Compatibility constructor retained for the current composition root.
+    /// The delay now applies to both file and `SQLite` durable providers.
+    #[must_use]
+    pub fn first_party_with_file_delay(root: &Path, post_persist_delay: Duration) -> Self {
+        Self::first_party_with_post_persist_delay(root, post_persist_delay)
     }
 
     fn selected(&self, provider: &str) -> Result<&dyn MemoryDataPort, MemoryDataError> {
@@ -378,5 +396,15 @@ mod tests {
             .expect("none")
             .is_empty()
         );
+    }
+
+    #[test]
+    fn provider_neutral_crash_cut_delay_reaches_both_durable_providers() {
+        let root = tempfile::tempdir().expect("root");
+        let delay = Duration::from_millis(41);
+        let data = RuntimeMemoryData::first_party_with_post_persist_delay(root.path(), delay);
+
+        assert_eq!(data.file.dependency.post_persist_delay(), delay);
+        assert_eq!(data.sqlite_fts.dependency.post_commit_delay(), delay);
     }
 }

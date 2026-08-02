@@ -8,9 +8,12 @@ mod parsing;
 mod validation;
 
 pub use model::{
-    AuthorityManifest, AuthorityTarget, ConfigurationSchemaMetadata, ConfigurationSchemaSource,
-    Entrypoint, FailurePolicy, IsolationMode, OrderingManifest, PermissionManifest, PluginCategory,
-    PluginClassification, PluginIdentity, PluginManifest, PluginScope, TrustLevel,
+    AuthorityManifest, AuthorityTarget, CompactorManifest, ConfigurationSchemaMetadata,
+    ConfigurationSchemaSource, ContextTransformIdempotency, ContextTransformLifecycle,
+    ContextTransformManifest, Entrypoint, FailurePolicy, IsolationMode, MemoryProviderManifest,
+    MemoryRetrieveManifest, MemoryWriteManifest, NodeExecutorIdempotency, NodeExecutorManifest,
+    OrderingManifest, PermissionManifest, PluginCategory, PluginClassification, PluginIdentity,
+    PluginManifest, PluginOperationIdempotency, PluginScope, TrustLevel,
 };
 pub use parsing::{ManifestFormat, ManifestParseError, parse_json, parse_toml, to_json, to_toml};
 pub use validation::{

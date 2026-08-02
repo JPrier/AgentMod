@@ -1,13 +1,14 @@
 //! Business-facing immutable artifact persistence datasets.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use agentmod_runtime_dependency::artifact::{
     ArtifactDependencyError, ArtifactDependencyPort, DependencyAbortArtifactRequest,
     DependencyArtifactCompression, DependencyArtifactLimits, DependencyArtifactRetention,
     DependencyArtifactSecurity, DependencyFinalizeArtifactRequest,
-    DependencyInspectArtifactRequest, DependencyStartArtifactRequest,
-    DependencyWriteArtifactChunkRequest, LocalArtifactDependency,
+    DependencyInspectArtifactRequest, DependencyReadArtifactRangeRequest,
+    DependencyStartArtifactRequest, DependencyWriteArtifactChunkRequest, LocalArtifactDependency,
 };
 use thiserror::Error;
 
@@ -71,6 +72,10 @@ pub struct PersistedArtifactDataRecord {
     pub creation_event: String,
     /// Original producer.
     pub producer: String,
+    /// Exact security classification retained by the dependency.
+    pub security: ArtifactSecurityRecord,
+    /// Exact retention contract retained by the dependency.
+    pub retention: ArtifactRetentionRecord,
     /// Lowercase BLAKE3 content digest.
     pub content_hash: String,
     /// Whether an identical immutable object was reused.
@@ -84,6 +89,28 @@ pub struct InspectArtifactDataRequest {
     pub store_root: PathBuf,
     /// Exact portable immutable reference.
     pub artifact_reference: String,
+}
+
+/// Data-owned bounded immutable artifact range request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadArtifactRangeDataRequest {
+    /// Session-scoped artifact store root.
+    pub store_root: PathBuf,
+    /// Exact portable immutable reference.
+    pub artifact_reference: String,
+    /// Zero-based byte offset.
+    pub offset: u64,
+    /// Exact bounded byte count.
+    pub length: u64,
+}
+
+/// Data-owned bounded immutable artifact range result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadArtifactRangeDataRecord {
+    /// Exact requested bytes.
+    pub bytes: Vec<u8>,
+    /// Full immutable object size.
+    pub artifact_bytes: u64,
 }
 
 /// Narrow artifact data interface consumed by runtime logic.
@@ -109,12 +136,26 @@ pub trait ArtifactDataPort {
         &self,
         request: InspectArtifactDataRequest,
     ) -> Result<PersistedArtifactDataRecord, ArtifactDataError>;
+
+    /// Reads an exact bounded range from an immutable object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArtifactDataError`] for invalid ranges, missing/corrupt
+    /// objects, dependency failures, or malformed dependency responses.
+    fn read_artifact_range(
+        &self,
+        _request: ReadArtifactRangeDataRequest,
+    ) -> Result<ReadArtifactRangeDataRecord, ArtifactDataError> {
+        Err(ArtifactDataError::InvalidRequest)
+    }
 }
 
 /// First-party artifact data router with explicit hard bounds.
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeArtifactData {
     limits: DependencyArtifactLimits,
+    finalize_post_persist_delay: Duration,
 }
 
 impl RuntimeArtifactData {
@@ -127,11 +168,29 @@ impl RuntimeArtifactData {
                 max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES_U64,
                 max_range_bytes: DEFAULT_MAX_ARTIFACT_BYTES_U64,
             },
+            finalize_post_persist_delay: Duration::ZERO,
+        }
+    }
+
+    /// Creates the first-party router with a post-finalize crash-cut window.
+    ///
+    /// The delay begins only after dependency-owned content and metadata are
+    /// durable and atomically visible.
+    #[must_use]
+    pub const fn first_party_with_finalize_delay(delay: Duration) -> Self {
+        Self {
+            limits: DependencyArtifactLimits {
+                max_chunk_bytes: DEFAULT_CHUNK_BYTES as u64,
+                max_artifact_bytes: DEFAULT_MAX_ARTIFACT_BYTES_U64,
+                max_range_bytes: DEFAULT_MAX_ARTIFACT_BYTES_U64,
+            },
+            finalize_post_persist_delay: delay,
         }
     }
 
     fn store(&self, root: &Path) -> Result<LocalArtifactDependency, ArtifactDataError> {
         LocalArtifactDependency::new(root.to_owned(), self.limits)
+            .map(|store| store.with_post_finalize_delay(self.finalize_post_persist_delay))
             .map_err(ArtifactDataError::Dependency)
     }
 }
@@ -196,6 +255,8 @@ impl ArtifactDataPort for RuntimeArtifactData {
             byte_size: metadata.byte_size,
             creation_event: metadata.creation_event,
             producer: metadata.producer,
+            security: metadata.security.into(),
+            retention: metadata.retention.into(),
             content_hash: metadata.content_hash,
             deduplicated: finalized.deduplicated,
         })
@@ -231,8 +292,47 @@ impl ArtifactDataPort for RuntimeArtifactData {
             byte_size: metadata.byte_size,
             creation_event: metadata.creation_event,
             producer: metadata.producer,
+            security: metadata.security.into(),
+            retention: metadata.retention.into(),
             content_hash: metadata.content_hash,
             deduplicated: true,
+        })
+    }
+
+    fn read_artifact_range(
+        &self,
+        request: ReadArtifactRangeDataRequest,
+    ) -> Result<ReadArtifactRangeDataRecord, ArtifactDataError> {
+        if request.store_root.as_os_str().is_empty()
+            || request.length == 0
+            || request.length > DEFAULT_MAX_ARTIFACT_BYTES_U64
+        {
+            return Err(ArtifactDataError::InvalidRequest);
+        }
+        let reference = agentmod_runtime_dependency::artifact::ArtifactReference::parse(
+            request.artifact_reference,
+        )
+        .map_err(ArtifactDataError::Dependency)?;
+        let response = self
+            .store(&request.store_root)?
+            .read_range(DependencyReadArtifactRangeRequest {
+                artifact_reference: reference,
+                offset: request.offset,
+                length: request.length,
+            })
+            .map_err(|error| {
+                if error == ArtifactDependencyError::ArtifactNotFound {
+                    ArtifactDataError::NotFound
+                } else {
+                    ArtifactDataError::Dependency(error)
+                }
+            })?;
+        if u64::try_from(response.bytes.len()).ok() != Some(request.length) {
+            return Err(ArtifactDataError::InvalidDependencyRecord);
+        }
+        Ok(ReadArtifactRangeDataRecord {
+            bytes: response.bytes,
+            artifact_bytes: response.artifact_bytes,
         })
     }
 }
@@ -253,6 +353,28 @@ impl From<ArtifactRetentionRecord> for DependencyArtifactRetention {
             ArtifactRetentionRecord::Permanent => Self::Permanent,
             ArtifactRetentionRecord::Session => Self::Session,
             ArtifactRetentionRecord::UntilUnixMilliseconds(value) => {
+                Self::UntilUnixMilliseconds(value)
+            }
+        }
+    }
+}
+
+impl From<DependencyArtifactSecurity> for ArtifactSecurityRecord {
+    fn from(value: DependencyArtifactSecurity) -> Self {
+        match value {
+            DependencyArtifactSecurity::Standard => Self::Standard,
+            DependencyArtifactSecurity::Private => Self::Private,
+            DependencyArtifactSecurity::Secret => Self::Secret,
+        }
+    }
+}
+
+impl From<DependencyArtifactRetention> for ArtifactRetentionRecord {
+    fn from(value: DependencyArtifactRetention) -> Self {
+        match value {
+            DependencyArtifactRetention::Permanent => Self::Permanent,
+            DependencyArtifactRetention::Session => Self::Session,
+            DependencyArtifactRetention::UntilUnixMilliseconds(value) => {
                 Self::UntilUnixMilliseconds(value)
             }
         }
@@ -320,5 +442,44 @@ mod tests {
             });
         assert_eq!(result, Err(ArtifactDataError::InvalidRequest));
         assert!(!root.path().join("artifacts").exists());
+    }
+
+    #[test]
+    fn reads_only_the_requested_verified_artifact_range() {
+        let root = tempfile::tempdir().expect("root");
+        let store_root = root.path().join("artifacts");
+        let data = RuntimeArtifactData::first_party();
+        let persisted = data
+            .persist_artifact(PersistArtifactDataRequest {
+                store_root: store_root.clone(),
+                creation_event: String::from("event-range"),
+                producer: String::from("runtime.style"),
+                mime_type: String::from("text/plain"),
+                bytes: b"0123456789".to_vec(),
+                security: ArtifactSecurityRecord::Private,
+                retention: ArtifactRetentionRecord::Session,
+            })
+            .expect("persist range fixture");
+
+        let range = data
+            .read_artifact_range(ReadArtifactRangeDataRequest {
+                store_root: store_root.clone(),
+                artifact_reference: persisted.artifact_reference,
+                offset: 3,
+                length: 4,
+            })
+            .expect("verified range");
+        assert_eq!(range.bytes, b"3456");
+        assert_eq!(range.artifact_bytes, 10);
+
+        assert_eq!(
+            data.read_artifact_range(ReadArtifactRangeDataRequest {
+                store_root,
+                artifact_reference: format!("artifact:blake3:{}", "0".repeat(64)),
+                offset: 0,
+                length: 1,
+            }),
+            Err(ArtifactDataError::NotFound)
+        );
     }
 }

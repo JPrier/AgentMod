@@ -58,6 +58,38 @@ mod tests {
         )
     }
 
+    fn assert_exact_builtin_style_catalog(
+        styles: &[agentmod_runtime_protocol::RuntimeStyleSummary],
+    ) {
+        assert_eq!(
+            styles
+                .iter()
+                .map(|style| (style.id.as_str(), style.version.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("declarative-graph", "1.1.0"),
+                ("declarative-graph", "1.2.0"),
+                ("ephemeral-turn", "1.1.0"),
+                ("ephemeral-turn", "1.2.0"),
+                ("persistent-chat", "1.1.0"),
+                ("persistent-chat", "1.2.0"),
+                ("planner-worker", "1.1.0"),
+                ("planner-worker", "1.2.0"),
+                ("planner-worker", "1.3.0"),
+                ("planner-worker", "1.4.0"),
+                ("research-loop", "1.1.0"),
+                ("research-loop", "1.2.0"),
+                ("research-loop", "1.3.0"),
+            ]
+        );
+        assert!(styles.iter().all(|style| {
+            style.availability == agentmod_runtime_protocol::RuntimeStyleAvailability::Available
+                && style.source == agentmod_runtime_protocol::RuntimeStyleSourceKind::BuiltIn
+                && style.style_content_hash.len() == 64
+                && style.compiled_cache_key.len() == 64
+        }));
+    }
+
     #[test]
     fn runtime_endpoint_creates_and_lists_a_complete_durable_session() {
         let storage = tempfile::tempdir().expect("storage");
@@ -132,10 +164,7 @@ mod tests {
         else {
             panic!("styles response")
         };
-        assert_eq!(styles.len(), 5);
-        assert!(styles.iter().all(|style| {
-            style.availability == agentmod_runtime_protocol::RuntimeStyleAvailability::Available
-        }));
+        assert_exact_builtin_style_catalog(&styles);
 
         let create = |style: &str| {
             let RuntimeResponse::SessionCreated { session_id } = service
@@ -157,7 +186,7 @@ mod tests {
         let ephemeral = create("ephemeral-turn@1.1.0");
 
         for (session_id, expected_style, expected_version) in [
-            (persistent, "persistent-chat", "1.1.0"),
+            (persistent, "persistent-chat", "1.2.0"),
             (ephemeral, "ephemeral-turn", "1.1.0"),
         ] {
             let RuntimeResponse::SessionInspected { state, .. } = service
@@ -321,7 +350,7 @@ mod tests {
         let introspection = &state["style_introspection"];
         assert_eq!(introspection["style"]["id"], "persistent-chat");
         assert_eq!(introspection["harness"]["id"], "fixture");
-        assert_eq!(introspection["graph"]["entry_node"], "respond");
+        assert_eq!(introspection["graph"]["entry_node"], "prepare-context");
         assert_eq!(
             introspection["remaining_budgets"]["steps"],
             state["style_binding"]["budgets"]["max_steps"]

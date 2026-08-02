@@ -10,6 +10,7 @@ use agentmod_cli_dependency::{
     DependencyCreateDeferredTurnRequest, DependencyCreateSessionRequest,
     DependencyExecutionBudgetOverrides, DependencyHarnessDescriptor,
     DependencyInspectSessionRequest, DependencyInspectStyleRequest, DependencyListSessionsRequest,
+    DependencyPluginLifecycleAction, DependencyPluginLifecycleRequest,
     DependencyResolveApprovalRequest, DependencyRunTurnRequest, DependencyRunTurnStream,
     DependencyRunTurnStreamItem, DependencyRuntimeAvailability, DependencyRuntimeHealthRequest,
     DependencySchedule, DependencySchedulePayload, DependencyScheduleTrigger,
@@ -258,6 +259,7 @@ pub enum ScheduleDataTrigger {
 pub enum ScheduleDataPayload {
     Prompt { prompt: String },
     Continuation { continuation_id: String },
+    GraphTrigger { run_id: String, node_id: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -438,6 +440,73 @@ pub struct ResolveApprovalDataRecord {
     pub awaiting_continuation: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PluginLifecycleActionData {
+    Disable,
+    Enable,
+    Quarantine,
+    Unquarantine,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginLifecycleDataRequest {
+    pub session_id: SessionId,
+    pub plugin_id: String,
+    pub action: PluginLifecycleActionData,
+    pub reason_code: Option<String>,
+    pub cancellation_id: CancellationId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginLifecycleDataRecord {
+    pub session_id: SessionId,
+    pub plugin_id: String,
+    pub plugin_version: String,
+    pub state: String,
+    pub committed_sequence: Sequence,
+    pub replayed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpOAuthActionData {
+    Begin,
+    Status,
+    Cancel { transaction_id: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpOAuthDataRequest {
+    pub session_id: SessionId,
+    pub server_id: String,
+    pub action: McpOAuthActionData,
+    pub cancellation_id: CancellationId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpOAuthBeginDataRecord {
+    pub server_id: String,
+    pub transaction_id: String,
+    pub authorization_url: String,
+    pub authorization_url_hash: String,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpOAuthStatusDataRecord {
+    pub server_id: String,
+    pub status: String,
+    pub transaction_id: Option<String>,
+    pub expires_at_ms: Option<i64>,
+    pub scopes: Vec<String>,
+    pub status_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum McpOAuthDataRecord {
+    Begin(McpOAuthBeginDataRecord),
+    Status(McpOAuthStatusDataRecord),
+}
+
 /// Narrow CLI data interface consumed only by CLI logic.
 pub trait CliDataPort {
     /// Builds the normalized runtime health dataset.
@@ -531,6 +600,24 @@ pub trait CliDataPort {
         &self,
         request: ResolveApprovalDataRequest,
     ) -> Result<ResolveApprovalDataRecord, DataError>;
+
+    fn change_plugin_lifecycle(
+        &self,
+        _request: PluginLifecycleDataRequest,
+    ) -> Result<PluginLifecycleDataRecord, DataError> {
+        Err(DataError::RuntimeClient {
+            detail: String::from("plugin lifecycle management is unavailable"),
+        })
+    }
+
+    fn manage_mcp_oauth(
+        &self,
+        _request: McpOAuthDataRequest,
+    ) -> Result<McpOAuthDataRecord, DataError> {
+        Err(DataError::RuntimeClient {
+            detail: String::from("MCP OAuth management is unavailable"),
+        })
+    }
 
     fn list_styles(&self) -> Result<Vec<StyleSummaryDataRecord>, DataError> {
         Err(style_unavailable())
@@ -738,6 +825,87 @@ where
             })
             .map_err(|_| DataError::RuntimeClient {
                 detail: String::from("create session failed"),
+            })
+    }
+
+    fn change_plugin_lifecycle(
+        &self,
+        request: PluginLifecycleDataRequest,
+    ) -> Result<PluginLifecycleDataRecord, DataError> {
+        self.dependency
+            .change_plugin_lifecycle(DependencyPluginLifecycleRequest {
+                session_id: request.session_id,
+                plugin_id: request.plugin_id,
+                action: match request.action {
+                    PluginLifecycleActionData::Disable => DependencyPluginLifecycleAction::Disable,
+                    PluginLifecycleActionData::Enable => DependencyPluginLifecycleAction::Enable,
+                    PluginLifecycleActionData::Quarantine => {
+                        DependencyPluginLifecycleAction::Quarantine
+                    }
+                    PluginLifecycleActionData::Unquarantine => {
+                        DependencyPluginLifecycleAction::Unquarantine
+                    }
+                },
+                reason_code: request.reason_code,
+                cancellation_id: request.cancellation_id,
+            })
+            .map(|response| PluginLifecycleDataRecord {
+                session_id: response.session_id,
+                plugin_id: response.plugin_id,
+                plugin_version: response.plugin_version,
+                state: response.state,
+                committed_sequence: response.committed_sequence,
+                replayed: response.replayed,
+            })
+            .map_err(|_| DataError::RuntimeClient {
+                detail: String::from("change plugin lifecycle failed"),
+            })
+    }
+
+    fn manage_mcp_oauth(
+        &self,
+        request: McpOAuthDataRequest,
+    ) -> Result<McpOAuthDataRecord, DataError> {
+        self.dependency
+            .manage_mcp_oauth(agentmod_cli_dependency::DependencyMcpOAuthRequest {
+                session_id: request.session_id,
+                server_id: request.server_id,
+                action: match request.action {
+                    McpOAuthActionData::Begin => {
+                        agentmod_cli_dependency::DependencyMcpOAuthAction::Begin
+                    }
+                    McpOAuthActionData::Status => {
+                        agentmod_cli_dependency::DependencyMcpOAuthAction::Status
+                    }
+                    McpOAuthActionData::Cancel { transaction_id } => {
+                        agentmod_cli_dependency::DependencyMcpOAuthAction::Cancel { transaction_id }
+                    }
+                },
+                cancellation_id: request.cancellation_id,
+            })
+            .map(|response| match response {
+                agentmod_cli_dependency::DependencyMcpOAuthResponse::Begin(value) => {
+                    McpOAuthDataRecord::Begin(McpOAuthBeginDataRecord {
+                        server_id: value.server_id,
+                        transaction_id: value.transaction_id,
+                        authorization_url: value.authorization_url,
+                        authorization_url_hash: value.authorization_url_hash,
+                        expires_at_ms: value.expires_at_ms,
+                    })
+                }
+                agentmod_cli_dependency::DependencyMcpOAuthResponse::Status(value) => {
+                    McpOAuthDataRecord::Status(McpOAuthStatusDataRecord {
+                        server_id: value.server_id,
+                        status: value.status,
+                        transaction_id: value.transaction_id,
+                        expires_at_ms: value.expires_at_ms,
+                        scopes: value.scopes,
+                        status_hash: value.status_hash,
+                    })
+                }
+            })
+            .map_err(|_| DataError::RuntimeClient {
+                detail: String::from("MCP OAuth management failed"),
             })
     }
 
@@ -1076,6 +1244,9 @@ fn to_dependency_schedule(value: ScheduleDataRecord) -> DependencySchedule {
             ScheduleDataPayload::Continuation { continuation_id } => {
                 DependencySchedulePayload::Continuation { continuation_id }
             }
+            ScheduleDataPayload::GraphTrigger { run_id, node_id } => {
+                DependencySchedulePayload::GraphTrigger { run_id, node_id }
+            }
         },
         active: value.active,
     }
@@ -1140,6 +1311,9 @@ fn from_dependency_schedule(value: DependencySchedule) -> ScheduleDataRecord {
             DependencySchedulePayload::Prompt { prompt } => ScheduleDataPayload::Prompt { prompt },
             DependencySchedulePayload::Continuation { continuation_id } => {
                 ScheduleDataPayload::Continuation { continuation_id }
+            }
+            DependencySchedulePayload::GraphTrigger { run_id, node_id } => {
+                ScheduleDataPayload::GraphTrigger { run_id, node_id }
             }
         },
         active: value.active,

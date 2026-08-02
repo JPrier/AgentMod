@@ -30,6 +30,7 @@ use agentmod_runtime_data::{
         ChildMessageParentLinkData,
     },
     continuation::ContinuationDataPort,
+    execution_plan::ExecutionPlanDataPort,
     harness::HarnessDataPort,
     identity::{
         AllocateEventIdentityDataRequest, EventIdentityDataError, EventIdentityDataPort,
@@ -133,7 +134,7 @@ use crate::{
         NodeWorkIdentity, SessionTermination, canonical_initial_variables_json,
         canonical_user_event_artifacts, execute_native_node, native_executor_key,
     },
-    node_executor::{RuntimeExecutabilityError, revalidate_runtime_execution_plan},
+    node_executor::RuntimeExecutabilityError,
     parallel_driver::{BranchEffectDispatchClass, BranchEffectKind, NativePureBranchExecutor},
     parallel_turn::{
         ApplyParallelBranchEffectOutputCommand, ApplyParallelJoinMergesCommand,
@@ -1083,6 +1084,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -1496,6 +1498,7 @@ where
         + ContinuationDataPort
         + MemoryDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -2893,6 +2896,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -5789,7 +5793,9 @@ where
     /// with the same invocation identity and bytes.
     #[allow(
         clippy::too_many_arguments,
-        reason = "generic completion binds the canonical graph cursor, provider phase, conversation projection, and journal position"
+        clippy::too_many_lines,
+        dead_code,
+        reason = "generic completion binds the canonical graph cursor, provider phase, conversation projection, and journal position; retained for the typed-summary completion path"
     )]
     fn commit_generic_complete_turn_assistant(
         &self,
@@ -7893,6 +7899,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -7981,6 +7988,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -8318,6 +8326,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -8423,8 +8432,12 @@ where
             .map_err(RunTurnError::Persistence)?;
         validate_child_execution_defaults(&loaded.state, command)?;
         if let Some(binding) = loaded.state.style_binding.as_ref() {
-            revalidate_runtime_execution_plan(&self.data, binding)
-                .map_err(RunTurnError::RuntimeExecutability)?;
+            crate::execution_plan::validate_session_resume_plan(
+                &self.data,
+                &session_directory,
+                binding,
+            )
+            .map_err(execution_plan_resume_error)?;
         }
         if !loaded
             .state
@@ -9464,8 +9477,12 @@ where
             .map_err(RunTurnError::Persistence)?;
         validate_child_execution_defaults(&preflight.state, &command)?;
         if let Some(binding) = preflight.state.style_binding.as_ref() {
-            revalidate_runtime_execution_plan(&self.data, binding)
-                .map_err(RunTurnError::RuntimeExecutability)?;
+            crate::execution_plan::validate_session_resume_plan(
+                &self.data,
+                &session_directory,
+                binding,
+            )
+            .map_err(execution_plan_resume_error)?;
         }
         validate_generic_request_contract_before_recovery(&preflight.state, &command)?;
         let preflight = self.recover_style_control_gaps(
@@ -15591,8 +15608,12 @@ where
             .style_binding
             .as_ref()
             .ok_or(RunTurnError::StyleMigrationRequired)?;
-        revalidate_runtime_execution_plan(&self.data, style_binding)
-            .map_err(RunTurnError::RuntimeExecutability)?;
+        crate::execution_plan::validate_session_resume_plan(
+            &self.data,
+            &binding.session_directory,
+            style_binding,
+        )
+        .map_err(execution_plan_resume_error)?;
         let canonical_contract = loaded
             .state
             .style_execution
@@ -15649,6 +15670,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -15713,8 +15735,12 @@ where
                 .style_binding
                 .as_ref()
                 .ok_or(RunTurnError::StyleMigrationRequired)?;
-            revalidate_runtime_execution_plan(&self.data, binding)
-                .map_err(RunTurnError::RuntimeExecutability)?;
+            crate::execution_plan::validate_session_resume_plan(
+                &self.data,
+                &session_directory,
+                binding,
+            )
+            .map_err(execution_plan_resume_error)?;
             let execution = loaded
                 .state
                 .style_execution
@@ -15980,6 +16006,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -16090,6 +16117,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -18162,6 +18190,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -18223,8 +18252,12 @@ where
                 .style_binding
                 .as_ref()
                 .ok_or(RunTurnError::StyleMigrationRequired)?;
-            revalidate_runtime_execution_plan(&self.data, binding)
-                .map_err(RunTurnError::RuntimeExecutability)?;
+            crate::execution_plan::validate_session_resume_plan(
+                &self.data,
+                &session_directory,
+                binding,
+            )
+            .map_err(execution_plan_resume_error)?;
             let execution = state
                 .state
                 .style_execution
@@ -18513,6 +18546,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -18575,6 +18609,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -18618,8 +18653,12 @@ where
             .style_binding
             .as_ref()
             .ok_or(RunTurnError::StyleMigrationRequired)?;
-        revalidate_runtime_execution_plan(&self.data, binding)
-            .map_err(RunTurnError::RuntimeExecutability)?;
+        crate::execution_plan::validate_session_resume_plan(
+            &self.data,
+            &session_directory,
+            binding,
+        )
+        .map_err(execution_plan_resume_error)?;
         let execution = loaded
             .state
             .style_execution
@@ -18738,6 +18777,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -18881,6 +18921,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -27973,6 +28014,40 @@ fn generic_node_declares_recorded_time(execution: &ActiveStyleTurn) -> bool {
         })
 }
 
+/// Maps an execution-plan validation failure into a stable turn error.
+fn execution_plan_resume_error(
+    error: crate::execution_plan::ExecutionPlanLogicError,
+) -> RunTurnError {
+    let diagnostic =
+        |code: &str, message: String| crate::node_executor::RuntimeExecutabilityDiagnostic {
+            code: String::from(code),
+            node_id: None,
+            node_kind: None,
+            message,
+        };
+    match error {
+        crate::execution_plan::ExecutionPlanLogicError::MigrationRequired(_) => {
+            RunTurnError::StyleMigrationRequired
+        }
+        crate::execution_plan::ExecutionPlanLogicError::Revalidate(error) => {
+            RunTurnError::RuntimeExecutability(error)
+        }
+        crate::execution_plan::ExecutionPlanLogicError::IdentityDrift(drift) => {
+            RunTurnError::RuntimeExecutability(RuntimeExecutabilityError::Unsupported {
+                diagnostics: vec![diagnostic(&drift.code, drift.message)],
+            })
+        }
+        crate::execution_plan::ExecutionPlanLogicError::Data(error) => {
+            RunTurnError::RuntimeExecutability(RuntimeExecutabilityError::Unsupported {
+                diagnostics: vec![diagnostic("EPLAN-401", error.to_string())],
+            })
+        }
+        other => RunTurnError::RuntimeExecutability(RuntimeExecutabilityError::Unsupported {
+            diagnostics: vec![diagnostic("EPLAN-400", other.to_string())],
+        }),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RunTurnError {
     #[error("turn request is invalid")]
@@ -29667,6 +29742,30 @@ mod tests {
             _succeeded: bool,
         ) -> Result<bool, RuntimeScheduleDataError> {
             Ok(true)
+        }
+    }
+
+    impl ExecutionPlanDataPort for MockTurnData {
+        fn store_execution_plan(
+            &self,
+            _request: agentmod_runtime_data::execution_plan::StoreExecutionPlanDataRequest,
+        ) -> Result<
+            agentmod_runtime_data::execution_plan::StoreExecutionPlanDataRecord,
+            agentmod_runtime_data::execution_plan::ExecutionPlanDataError,
+        > {
+            Err(agentmod_runtime_data::execution_plan::ExecutionPlanDataError::InvalidPayload)
+        }
+
+        fn load_execution_plan(
+            &self,
+            _request: agentmod_runtime_data::execution_plan::LoadExecutionPlanDataRequest,
+        ) -> Result<
+            agentmod_runtime_data::execution_plan::LoadExecutionPlanDataResult,
+            agentmod_runtime_data::execution_plan::ExecutionPlanDataError,
+        > {
+            // Mock turn sessions replay canonical events without a durable
+            // plan file; resume falls back to binding revalidation.
+            Ok(agentmod_runtime_data::execution_plan::LoadExecutionPlanDataResult::Missing)
         }
     }
 

@@ -50,12 +50,14 @@ mod tests {
         permission::{PermissionEffect, PermissionMatcher, PermissionPolicy, PermissionRule},
     };
 
-    fn runtime_logic() -> RuntimeLogic<RuntimeData<LocalRuntimeDependencies>> {
-        RuntimeLogic::new(
-            RuntimeData::new(LocalRuntimeDependencies).with_node_executors(
-                RuntimeNodeExecutorData::native().expect("native node-executor registry"),
-            ),
+    fn runtime_data() -> RuntimeData<LocalRuntimeDependencies> {
+        RuntimeData::new(LocalRuntimeDependencies).with_node_executors(
+            RuntimeNodeExecutorData::native().expect("native node-executor registry"),
         )
+    }
+
+    fn runtime_logic() -> RuntimeLogic<RuntimeData<LocalRuntimeDependencies>> {
+        RuntimeLogic::new(runtime_data())
     }
 
     fn assert_exact_builtin_style_catalog(
@@ -123,6 +125,7 @@ mod tests {
             "events.jsonl",
             "style.json",
             "style.lock",
+            "execution-plan.json",
             "workspace.json",
             "continuations",
             "snapshots",
@@ -814,5 +817,205 @@ mod tests {
             "approved content"
         );
         assert!(!directory.path().join("unsafe.txt").exists());
+    }
+    #[test]
+    fn created_session_retains_immutable_plan_file_and_restart_validates_exactly() {
+        use agentmod_runtime_logic::{
+            execution_plan::{ExecutionPlanRestartOutcome, validate_session_resume_plan},
+            persistence::SessionPersistenceLogicPort,
+        };
+
+        let storage = tempfile::tempdir().expect("storage");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions_root = storage.path().join("sessions");
+        let service = RuntimeService::new(
+            runtime_logic(),
+            RuntimeServiceConfig {
+                session_root: sessions_root.clone(),
+                version: String::from("test"),
+                styles: agentmod_runtime_service::RuntimeStyleServiceConfig::native(&sessions_root),
+            },
+        );
+        let RuntimeResponse::SessionCreated { session_id } = service
+            .handle_wire(&RuntimeRequest::CreateSession {
+                workspace: workspace.path().display().to_string(),
+                style: String::from("persistent-chat"),
+                harness: None,
+                memory: None,
+                compaction: None,
+                budgets: None,
+            })
+            .expect("create session")
+        else {
+            panic!("created response")
+        };
+        let session_directory = sessions_root.join(session_id.to_string());
+        assert!(session_directory.join("execution-plan.json").exists());
+
+        // The persisted plan must survive a fresh data stack restart and
+        // validate exactly against the live registry.
+        let restarted = runtime_data();
+        let loaded =
+            agentmod_runtime_logic::persistence::SessionPersistenceLogic::new(restarted.clone())
+                .load_session(agentmod_runtime_logic::persistence::LoadSessionCommand {
+                    session_directory: session_directory.clone(),
+                    expected_session_id: session_id,
+                })
+                .expect("load persisted session");
+        let binding = loaded.state.style_binding.as_ref().expect("style binding");
+        let outcome = agentmod_runtime_logic::execution_plan::validate_persisted_execution_plan(
+            &restarted,
+            &session_directory,
+            binding,
+        )
+        .expect("restart validation");
+        assert_eq!(outcome, ExecutionPlanRestartOutcome::Valid);
+        validate_session_resume_plan(&restarted, &session_directory, binding)
+            .expect("resume validation");
+
+        // A truncated plan file must fail closed with a stable corruption code.
+        let path = session_directory.join("execution-plan.json");
+        let bytes = std::fs::read(&path).expect("read plan file");
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("truncate");
+        let error = agentmod_runtime_logic::execution_plan::validate_persisted_execution_plan(
+            &restarted,
+            &session_directory,
+            binding,
+        )
+        .expect_err("corrupt plan must fail closed");
+        assert!(
+            matches!(
+                error,
+                agentmod_runtime_logic::execution_plan::ExecutionPlanLogicError::Data(
+                    agentmod_runtime_data::execution_plan::ExecutionPlanDataError::CorruptFile { .. }
+                )
+            ),
+            "unexpected error {error:?}"
+        );
+    }
+
+    #[test]
+    fn branch_with_recompiled_style_creates_distinct_plan_and_leaves_parent_unchanged() {
+        let storage = tempfile::tempdir().expect("storage");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions_root = storage.path().join("sessions");
+        let service = RuntimeService::new(
+            runtime_logic(),
+            RuntimeServiceConfig {
+                session_root: sessions_root.clone(),
+                version: String::from("test"),
+                styles: agentmod_runtime_service::RuntimeStyleServiceConfig::native(&sessions_root),
+            },
+        );
+        let create = |style: &str| {
+            let RuntimeResponse::SessionCreated { session_id } = service
+                .handle_wire(&RuntimeRequest::CreateSession {
+                    workspace: workspace.path().display().to_string(),
+                    style: style.to_owned(),
+                    harness: None,
+                    memory: None,
+                    compaction: None,
+                    budgets: None,
+                })
+                .expect("create session")
+            else {
+                panic!("created response")
+            };
+            session_id
+        };
+        let parent = create("persistent-chat");
+        let parent_directory = sessions_root.join(parent.to_string());
+        let parent_plan =
+            std::fs::read(parent_directory.join("execution-plan.json")).expect("parent plan file");
+        assert!(!parent_plan.is_empty());
+
+        // Branch with a recompiled style; the child must retain its own plan
+        // file and the parent directory must stay byte-identical.
+        let RuntimeResponse::SessionBranched {
+            session_id: child, ..
+        } = service
+            .handle_wire(&RuntimeRequest::BranchSession {
+                session_id: parent,
+                at: agentmod_primitives::Sequence::FIRST,
+                style: Some(String::from("ephemeral-turn")),
+            })
+            .expect("branch with recompiled style")
+        else {
+            panic!("branched response")
+        };
+        let child_directory = sessions_root.join(child.to_string());
+        let child_plan =
+            std::fs::read(child_directory.join("execution-plan.json")).expect("child plan file");
+        assert!(!child_plan.is_empty());
+        assert_ne!(parent_plan, child_plan, "child plan must be distinct");
+        assert_eq!(
+            std::fs::read(parent_directory.join("execution-plan.json")).expect("parent plan"),
+            parent_plan,
+            "parent plan must remain unchanged"
+        );
+    }
+
+    #[test]
+    fn plan_inspection_projection_replays_identity_without_live_registry() {
+        let storage = tempfile::tempdir().expect("storage");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let sessions_root = storage.path().join("sessions");
+        let service = RuntimeService::new(
+            runtime_logic(),
+            RuntimeServiceConfig {
+                session_root: sessions_root.clone(),
+                version: String::from("test"),
+                styles: agentmod_runtime_service::RuntimeStyleServiceConfig::native(&sessions_root),
+            },
+        );
+        let RuntimeResponse::SessionCreated { session_id } = service
+            .handle_wire(&RuntimeRequest::CreateSession {
+                workspace: workspace.path().display().to_string(),
+                style: String::from("persistent-chat"),
+                harness: None,
+                memory: None,
+                compaction: None,
+                budgets: None,
+            })
+            .expect("create session")
+        else {
+            panic!("created response")
+        };
+        let session_directory = sessions_root.join(session_id.to_string());
+
+        // Pure replay: inspect with a data stack that has NO live registry.
+        let replay_data = RuntimeData::new(LocalRuntimeDependencies);
+        let projection = agentmod_runtime_logic::execution_plan::inspect_execution_plan_file(
+            &replay_data,
+            &session_directory,
+        )
+        .expect("pure plan inspection");
+        assert!(projection.migration.is_none());
+        assert_eq!(
+            projection.plan_hash.to_hex().len(),
+            64,
+            "plan hash must be exact"
+        );
+        assert!(!projection.node_executors.is_empty());
+        assert!(
+            projection
+                .node_executors
+                .iter()
+                .all(|node| { !node.executor_id.is_empty() && !node.executor_version.is_empty() })
+        );
+
+        // The separate live availability pass reports state without changing
+        // the pure projection.
+        let capabilities =
+            agentmod_runtime_logic::node_executor::inspect_node_executor_capabilities(
+                &runtime_data(),
+            )
+            .expect("live capabilities");
+        let availability = agentmod_runtime_logic::execution_plan::availability_projection(
+            &capabilities,
+            &projection,
+        );
+        assert!(availability.registry_hash_matches);
+        assert!(availability.nodes.iter().all(|node| node.compatible));
     }
 }

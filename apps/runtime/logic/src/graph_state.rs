@@ -115,7 +115,10 @@ impl SessionGraphState {
     ///
     /// Returns [`GraphStateLogicError`] when the event cannot be applied
     /// exactly (tampering or ordering violation).
-    pub fn apply_graph_event(&mut self, event: &GraphStateEvent) -> Result<(), GraphStateLogicError> {
+    pub fn apply_graph_event(
+        &mut self,
+        event: &GraphStateEvent,
+    ) -> Result<(), GraphStateLogicError> {
         if matches!(event, GraphStateEvent::VariablesInitialized { .. }) {
             return Err(GraphStateLogicError::RepeatedInitialization);
         }
@@ -164,8 +167,7 @@ impl SessionGraphState {
             session_id,
             state: reducer.state().clone(),
             ledger,
-            applied: u64::try_from(graph_events.len() + budget_events.len())
-                .unwrap_or(u64::MAX),
+            applied: u64::try_from(graph_events.len() + budget_events.len()).unwrap_or(u64::MAX),
         })
     }
 
@@ -205,7 +207,12 @@ impl GraphStateReadPort for SessionGraphState {
 
     fn verdict(&self, expression: &Expression, scope: &VariableScope) -> ConditionVerdict {
         let counters = self.ledger.budget_environment();
-        agentmod_graph_state::expression::evaluate_condition(&self.state, &counters, expression, scope)
+        agentmod_graph_state::expression::evaluate_condition(
+            &self.state,
+            &counters,
+            expression,
+            scope,
+        )
     }
 
     fn environment(&self, scope: &VariableScope) -> Value {
@@ -252,9 +259,7 @@ pub enum GraphStateLogicError {
 mod tests {
     use std::collections::BTreeSet;
 
-    use agentmod_graph_state::budget::{
-        BudgetDimension, BudgetLimits, UsageEvidence, UsageKind,
-    };
+    use agentmod_graph_state::budget::{BudgetDimension, BudgetLimits, UsageEvidence, UsageKind};
     use agentmod_graph_state::declare::{
         MutabilityPolicy, SecurityClassification, VariableDeclaration, VariableType,
     };
@@ -370,13 +375,12 @@ mod tests {
             port.read("steps", &VariableScope::Run).expect("read"),
             ReadOutcome::Unassigned
         );
-        assert_eq!(
-            port.budget().remaining(BudgetDimension::ModelRequests),
-            2
-        );
-        let expression =
-            Expression::parse("counters.model_requests.remaining >= 1", agentmod_expression_engine::ExpressionLimits::default())
-                .expect("parse");
+        assert_eq!(port.budget().remaining(BudgetDimension::ModelRequests), 2);
+        let expression = Expression::parse(
+            "counters.model_requests.remaining >= 1",
+            agentmod_expression_engine::ExpressionLimits::default(),
+        )
+        .expect("parse");
         assert_eq!(
             port.verdict(&expression, &VariableScope::Run),
             ConditionVerdict::Eligible

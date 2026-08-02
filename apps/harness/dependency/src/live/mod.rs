@@ -686,17 +686,37 @@ fn execute_live(
     let mut received_any = false;
     let mut stream_parser = sse::SseParser::new();
     let mut saw_stream_error = false;
-    let mut buffer = [0_u8; 8192];
+    // The blocking response read runs on a background thread so a wire
+    // cancellation can interrupt an in-flight slow exchange between chunks.
+    // This mirrors the async cancellation semantics without introducing a
+    // second asynchronous execution model into the dependency layer.
+    let (chunk_sender, chunk_receiver) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = match response.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) => {
+                    let _ = chunk_sender.send(Err(error.to_string()));
+                    return;
+                }
+            };
+            if chunk_sender.send(Ok(buffer[..read].to_vec())).is_err() {
+                return;
+            }
+        }
+        let _ = chunk_sender.send(Ok(Vec::new()));
+    });
     loop {
         if cancelled.load(Ordering::SeqCst) {
             events.push(DependencyProviderEvent::Cancelled);
             return Ok(DependencyProviderExecutionResponse { events });
         }
-        let read = match response.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(read) => read,
-            Err(error) => {
-                let message = error.to_string();
+        let chunk = match chunk_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(chunk)) if chunk.is_empty() => break,
+            Ok(Ok(chunk)) => chunk,
+            Ok(Err(message)) => {
                 let classified = if received_any {
                     retry::classify_ambiguous_disconnect(&message)
                 } else {
@@ -709,8 +729,9 @@ fn execute_live(
                 ));
                 return Ok(DependencyProviderExecutionResponse { events });
             }
+            Err(_timeout) => continue,
         };
-        let parsed = match stream_parser.push(&buffer[..read]) {
+        let parsed = match stream_parser.push(&chunk) {
             Ok(parsed) => parsed,
             Err(sse::SseParseError::Oversized) => {
                 events.push(failed_event(

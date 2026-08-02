@@ -1,0 +1,21 @@
+[package]
+name = "agentmod-harness-fixture-logic"
+description = "Business behavior for the independent AgentMod harness fixture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-harness-fixture-data = { path = "../data" }
+async-trait.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "harness-fixture"
+layer = "logic"

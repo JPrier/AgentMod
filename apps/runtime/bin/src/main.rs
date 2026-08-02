@@ -195,6 +195,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             authorization_key: ProcessHarnessDependency::generate_authorization_key(),
             maximum_connections: harness_maximum_connections,
             maximum_pending_connections: harness_maximum_pending_connections,
+            test_gate_root: harness_test_gate_root.clone(),
+        })?;
+        let independent_harness = ProcessHarnessDependency::new(HarnessDependencyConfig {
+            program: std::env::var("AGENTMOD_INDEPENDENT_HARNESS_PROGRAM")
+                .or_else(|_| std::env::var("AGENTMOD_FIXTURE_HARNESS_PROGRAM"))
+                .map_or_else(|_| sibling_binary("agentmod-harness-fixture"), PathBuf::from)
+                .to_string_lossy()
+                .into_owned(),
+            arguments: Vec::new(),
+            maximum_frame_bytes: 16 * 1024 * 1024,
+            request_timeout: std::time::Duration::from_secs(120),
+            frame_pacing: std::time::Duration::from_millis(0),
+            authorization_key: ProcessHarnessDependency::generate_authorization_key(),
+            maximum_connections: harness_maximum_connections,
+            maximum_pending_connections: harness_maximum_pending_connections,
             test_gate_root: harness_test_gate_root,
         })?;
         let harnesses = HarnessRegistryDependency::new(vec![
@@ -216,6 +231,25 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     available: true,
                 },
                 Arc::new(fixture_harness),
+            ),
+            (
+                DependencyHarnessDescriptor {
+                    id: String::from("independent"),
+                    version: String::from("1.0.0"),
+                    capabilities: [
+                        "cancellation",
+                        "streaming",
+                        "structured_context_replacement",
+                        "structured_output",
+                        "token_usage",
+                        "tool_calls",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+                    available: true,
+                },
+                Arc::new(independent_harness),
             ),
             (
                 DependencyHarnessDescriptor {

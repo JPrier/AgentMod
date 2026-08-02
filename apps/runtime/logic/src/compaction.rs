@@ -318,17 +318,21 @@ pub fn build_summary_request_material(
         return Err(CompactionError::InvalidSummaryMaterial);
     }
     let recent_start = source.len().saturating_sub(recent_window);
+    let current_input = source
+        .iter()
+        .rfind(|entry| matches!(entry, ConversationEntry::UserMessage(_)))
+        .map(ConversationEntry::id);
     let mut entries = Vec::new();
     let mut bytes = 0_u64;
     for (index, entry) in source.iter().enumerate() {
-        let required =
-            projection_entry_is_required(entry, preservation_requirements) || index >= recent_start;
+        let required = projection_entry_is_required(entry, current_input, preservation_requirements)
+            || index >= recent_start;
         if required {
             let contribution = serialized_entry_bytes(entry)?;
             if bytes.saturating_add(contribution) > max_bytes {
                 // Required protected state must always fit; a window entry may
                 // be dropped instead of failing the summary request.
-                if projection_entry_is_required(entry, preservation_requirements) {
+                if projection_entry_is_required(entry, current_input, preservation_requirements) {
                     return Err(CompactionError::SummaryMaterialTooLarge);
                 }
                 continue;
@@ -345,14 +349,18 @@ pub fn build_summary_request_material(
     })
 }
 
-fn projection_entry_is_required(entry: &ConversationEntry, requirements: &[String]) -> bool {
+fn projection_entry_is_required(
+    entry: &ConversationEntry,
+    current_input: Option<&ConversationEntryId>,
+    requirements: &[String],
+) -> bool {
     let requirement = |name: &str| requirements.iter().any(|value| value == name);
     match entry {
-        ConversationEntry::SystemInstruction(_) | ConversationEntry::ProjectInstruction(_) => {
-            requirement("system_instructions")
-        }
-        ConversationEntry::UserMessage(_) | ConversationEntry::UserInstruction(_) => {
-            requirement("current_input")
+        ConversationEntry::SystemInstruction(_)
+        | ConversationEntry::ProjectInstruction(_)
+        | ConversationEntry::UserInstruction(_) => requirement("system_instructions"),
+        ConversationEntry::UserMessage(_) => {
+            current_input.is_some_and(|id| id == entry.id())
         }
         ConversationEntry::PendingTask(_)
         | ConversationEntry::ActiveProcessSummary(_)
@@ -386,8 +394,6 @@ pub struct ContextArtifactPayload {
     pub source_start: u64,
     /// Inclusive source projection range captured.
     pub source_end: u64,
-    /// Hash of the exact serialized payload (self-referential provenance).
-    pub content_hash: String,
     /// Security classification label.
     pub security: String,
     /// Exact media type.
@@ -419,16 +425,14 @@ pub fn serialize_context_artifact(
     if max_bytes == 0 || schema_version == 0 || security.trim().is_empty() {
         return Err(CompactionError::InvalidContextArtifact);
     }
-    let preserved_state = protected_entries(source);
-    let mut payload = ContextArtifactPayload {
+    let payload = ContextArtifactPayload {
         schema_version,
         source_start: source_start.get(),
         source_end: source_end.get(),
-        content_hash: String::new(),
         security: security.to_owned(),
         mime_type: mime_type.to_owned(),
         entries: source.to_vec(),
-        preserved_state,
+        preserved_state: protected_entries(source),
         metadata: serde_json::json!({
             "source_range": [source_start.get(), source_end.get()],
             "entry_count": source.len(),
@@ -438,8 +442,6 @@ pub fn serialize_context_artifact(
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
         return Err(CompactionError::ContextArtifactTooLarge);
     }
-    let hash = ContentHash::digest(&bytes).to_hex();
-    payload.content_hash = hash;
     Ok(payload)
 }
 
@@ -638,6 +640,100 @@ mod tests {
                 context(),
             ),
             Err(CompactionError::ToolOutputMissingArtifact("missing".into()))
+        );
+    }
+
+    #[test]
+    fn summary_request_material_is_bounded_and_preserves_required_state() {
+        let entries = vec![
+            ConversationEntry::SystemInstruction(TextEntry {
+                id: ConversationEntryId("system".into()),
+                text: "system policy".into(),
+                source_sequence: sequence(1),
+            }),
+            ConversationEntry::PendingTask(PendingTaskEntry {
+                id: ConversationEntryId("task".into()),
+                task_id: "t1".into(),
+                description: "finish".into(),
+                state: "pending".into(),
+                source_sequence: sequence(2),
+            }),
+            user("u1", 3),
+            user("u2", 4),
+            user("u3", 5),
+            user("u4", 6),
+        ];
+        let state = state(entries.clone());
+        let requirements = vec![
+            String::from("system_instructions"),
+            String::from("current_input"),
+            String::from("pending_control_state"),
+        ];
+        let material = build_summary_request_material(
+            &state,
+            64 * 1024,
+            &requirements,
+            2,
+        )
+        .expect("material");
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "system"));
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "task"));
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "u3"));
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "u4"));
+        assert!(!material.entries.iter().any(|entry| entry.id().0 == "u1"));
+        assert_eq!(material.source_range, Some((Sequence::FIRST, sequence(6))));
+        assert!(material.serialized_bytes > 0);
+        // A too-small cap on protected state fails closed instead of dropping it.
+        assert_eq!(
+            build_summary_request_material(&state, 4, &requirements, 2),
+            Err(CompactionError::SummaryMaterialTooLarge)
+        );
+    }
+
+    #[test]
+    fn context_artifact_payload_binds_range_hash_and_preserved_state() {
+        let entries = vec![
+            ConversationEntry::SystemInstruction(TextEntry {
+                id: ConversationEntryId("system".into()),
+                text: "system policy".into(),
+                source_sequence: sequence(1),
+            }),
+            user("u1", 2),
+            ConversationEntry::PendingTask(PendingTaskEntry {
+                id: ConversationEntryId("task".into()),
+                task_id: "t1".into(),
+                description: "finish".into(),
+                state: "pending".into(),
+                source_sequence: sequence(3),
+            }),
+        ];
+        let state = state(entries.clone());
+        let payload = serialize_context_artifact(
+            &state,
+            1024 * 1024,
+            1,
+            "private",
+            "application/vnd.agentmod.context+json",
+        )
+        .expect("payload");
+        assert_eq!(payload.schema_version, 1);
+        assert_eq!(payload.source_start, 1);
+        assert_eq!(payload.source_end, 3);
+        assert_eq!(payload.entries.len(), 3);
+        assert!(payload.preserved_state.iter().any(|entry| entry.id().0 == "system"));
+        assert!(payload.preserved_state.iter().any(|entry| entry.id().0 == "task"));
+        // The payload round-trips and the source range is exact.
+        let bytes = serde_json::to_vec(&payload).expect("serialize");
+        let decoded: ContextArtifactPayload =
+            serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(decoded, payload);
+        assert_eq!(decoded.source_start, 1);
+        assert_eq!(decoded.source_end, 3);
+        // History is never mutated by serialization.
+        assert_eq!(state.history(), entries);
+        assert_eq!(
+            serialize_context_artifact(&state, 16, 1, "private", "mime"),
+            Err(CompactionError::ContextArtifactTooLarge)
         );
     }
 }

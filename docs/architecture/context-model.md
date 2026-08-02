@@ -73,11 +73,49 @@ discard evidence without redispatching the model.
 Projection pressure uses a deterministic approximate-token estimator over the
 complete provider wire representation and a separate exact 16-MiB serialized
 safety cap. Provider token counters and compaction checkpoints are
-replay-derived. No compaction, sliding-window compaction, and tool-output
-eviction execute live. Typed-summary, artifact-handoff, and context-artifact
-modes fail closed when no approved material is available.
+replay-derived. No compaction, sliding-window, tool-output-eviction, typed
+summary, and artifact-handoff strategies all execute live.
 
-Automatic style-selected memory writes, plugin-provided memory or compaction
-implementations, plugin-composed context transforms, and strategy-specific
-cancellation after an ambiguous external interceptor effect remain integration
-work.
+Typed-summary compaction runs only under the selected style's pressure rules.
+The runtime builds a bounded typed request material from protected state plus
+a bounded recent window (never a fabricated user message), prepares it as a
+normal model-request proposal through the session's style, plugin, user, and
+mandatory policies, and dispatches it through the selected harness with an
+explicitly configured provider/model or the session's deterministic fixture.
+Canonical `context.summary_proposed/approved/started/completed` events bind the
+provider/model/harness identity, the exact request hash, the bounded summary
+text, and provider-reported usage; summary usage counts toward the style token
+budget. Terminal evidence is reused on restart and a started-but-unfinished
+summary fails closed, so recovery can never duplicate the provider call. The
+approved summary becomes a typed `ContextSummary` projection entry with the
+exact source range, method, and optional artifact.
+
+Artifact-handoff compaction serializes the complete selected context into an
+immutable content-addressed payload that binds the source range, exact hash,
+security classification, and media type
+(`application/vnd.agentmod.context+json`). The write follows the canonical
+artifact outbox (`context.artifact_proposed/approved/dispatched/completed`)
+with reconcile-first recovery; the store's content addressing makes a
+re-dispatched write idempotent. The replacement projection carries a bounded
+typed `ArtifactReference` entry while protected runtime state and the current
+input are restored, and canonical history is never mutated. Branch and
+restart recovery reuse committed receipts without rewriting artifacts.
+
+A style may select automatic memory writes with a trigger boundary, eligible
+content categories, scope, provider, record/byte bounds, a cross-restart
+deduplication policy, retention, approval mode, and failure behavior. Writes
+are proposed at turn completion, research-finding persistence, child
+completion, reviewer approval, and explicit memory-extraction nodes. Every
+write follows proposal -> interceptors -> user policy -> mandatory policy ->
+dispatch evidence -> memory provider -> canonical reference, recorded by the
+`memory.write_proposed/approved/dispatched/completed` outbox. `RequireUserApproval`
+routes through a durable approval continuation resolved by the standard
+approval endpoint. Exact duplicate prevention uses a canonical write identity
+plus a provider deduplication key, so an identical turn after restart never
+duplicates a provider write.
+
+Stable plugin-facing ports for plugin memory, plugin compaction, and context
+transform lifecycle boundaries are defined in `context_ports`; runtime
+validation rejects fabricated roles, undeclared secrets, required-state
+removal, duplicate entries, and context-limit violations. Plugin-host
+transport adapts these ports in a later workstream.

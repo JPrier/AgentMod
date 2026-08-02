@@ -269,3 +269,45 @@ platforms = ["windows", "linux", "macos"]
 evidence = ["protocols/scheduler-protocol/src/lib.rs", "protocols/runtime-protocol/src/lib.rs", "apps/scheduler/ARCHITECTURE.md", "apps/scheduler/dependency/src/lib.rs", "apps/scheduler/data/src/lib.rs", "apps/scheduler/logic/src/lib.rs", "apps/scheduler/service/src/lib.rs", "apps/runtime/dependency/src/scheduler.rs", "apps/runtime/data/src/scheduler.rs", "apps/runtime/logic/src/scheduler.rs", "apps/runtime/service/src/turn.rs", "apps/cli/service/src/lib.rs", "tests/e2e/scheduler_worker.ps1", "tests/e2e/scheduler_worker.sh", "tests/e2e/runtime_scheduler.ps1", "tests/e2e/runtime_scheduler.sh", "tests/e2e/runtime_scheduler_recovery.ps1", "tests/e2e/runtime_scheduler_recovery.sh", "tests/e2e/runtime_process_restart.ps1", "tests/e2e/runtime_process_restart.sh"]
 status = "partial"
 limitation = "The isolated worker plus runtime/CLI prove authenticated supervision, complete policy-bearing schedules, automatic bounded polling, one-time and bounded recurring claims, committed runtime-event delivery, exact process/output-range delivery, corruption rejection, scheduler.fired provenance, normal intercepted prompt execution, idempotent terminal completion, restart reconciliation without redispatch, and a restart-persistent, exact-proof, resume-once deferred continuation that cannot use manual approval. TUI management remains incomplete; Windows delivery/recovery evidence ran locally and Unix automation is present but not executed in this environment."
+
+[[requirement]]
+id = "E2E-26"
+capability = "live-context-completion"
+owner = "sdk/runtime"
+tests = [
+  "summary_outbox_follows_proposal_approval_start_completion_ordering",
+  "summary_evidence_hash_must_match_text_and_completion_requires_start",
+  "memory_write_outbox_follows_proposal_approval_dispatch_receipt_ordering",
+  "memory_write_dispatch_without_approval_and_duplicate_proposal_are_rejected",
+  "memory_write_failure_is_terminal_without_dispatch",
+  "summary_request_material_is_bounded_and_preserves_required_state",
+  "context_artifact_payload_binds_range_hash_and_preserved_state",
+  "plugin_cannot_fabricate_user_role_or_duplicate_entries",
+  "plugin_cannot_remove_required_pending_state_or_exceed_limits",
+  "plugin_cannot_expose_undeclared_secrets_or_write_invalid_memory",
+  "legitimate_retained_projection_passes_validation",
+  "file_memory_deduplication_key_survives_adapter_recreation",
+  "sqlite_deduplication_key_is_scoped_and_idempotent_across_recreation",
+  "legacy_schema_one_records_still_verify_after_dedup_field_lands",
+  "task05_context_fixtures_compile",
+  "runtime_context_completion"
+]
+platforms = ["windows", "linux", "macos"]
+evidence = [
+  "sdk/session-style-sdk/src/model.rs",
+  "sdk/session-style-sdk/src/validation.rs",
+  "apps/runtime/dependency/src/memory.rs",
+  "apps/runtime/data/src/memory.rs",
+  "apps/runtime/logic/src/session.rs",
+  "apps/runtime/logic/src/compaction.rs",
+  "apps/runtime/logic/src/turn.rs",
+  "apps/runtime/logic/src/context_ports.rs",
+  "apps/runtime/logic/src/continuation.rs",
+  "apps/runtime/data/src/continuation.rs",
+  "tests/e2e/runtime_context_completion.ps1",
+  "tests/e2e/runtime_context_completion.sh",
+  "docs/architecture/context-model.md",
+  "docs/reference/context-plugins.md"
+]
+status = "partial"
+limitation = "Windows process E2E proves live typed-summary compaction, live artifact-handoff compaction with a persisted immutable artifact, automatic memory writes with provider receipts and canonical dedup, restart survival, and branch behavior. The Unix mirror is syntax-checked but not process-executed here; plugin-host transport for the stable context ports is a later workstream; TUI/CLI surfacing of the new evidence remains optional."

@@ -8,7 +8,8 @@ use std::{
 };
 
 use agentmod_harness_data::{
-    DataError, HarnessHealthData, HarnessHealthDataQuery, HarnessHealthRecord,
+    DataError, HarnessCatalogData, HarnessCatalogRecord, HarnessHealthData, HarnessHealthDataQuery,
+    HarnessHealthRecord,
 };
 use thiserror::Error;
 
@@ -75,6 +76,46 @@ pub trait HarnessHealthLogic {
     ) -> Result<HarnessHealthResult, LogicError>;
 }
 
+/// Logic-owned detailed provider/model catalog entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogicCatalogRecord {
+    /// Stable provider key.
+    pub provider_key: String,
+    /// Adapter version.
+    pub version: String,
+    /// Discoverable model IDs in stable order.
+    pub model_ids: Vec<String>,
+    /// Sorted capability names.
+    pub capabilities: Vec<String>,
+    /// Known context limit in tokens.
+    pub context_limit: Option<u64>,
+    /// Tool-call support.
+    pub tool_support: bool,
+    /// Image input support.
+    pub image_support: bool,
+    /// Structured-output support.
+    pub structured_output_support: bool,
+    /// Streaming support.
+    pub streaming_support: bool,
+    /// Pricing-record source.
+    pub pricing_source: String,
+    /// Whether the provider can accept work now.
+    pub ready: bool,
+}
+
+/// Harness provider/model catalog business interface exposed to service.
+pub trait HarnessCatalogLogic {
+    /// Reads the bounded detailed provider/model catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LogicError`] when catalog data is unavailable.
+    fn inspect_catalog(
+        &self,
+        include_unavailable: bool,
+    ) -> Result<Vec<LogicCatalogRecord>, LogicError>;
+}
+
 /// Provider-independent harness health use case.
 #[derive(Clone, Debug)]
 pub struct HarnessHealthManager<D> {
@@ -104,6 +145,38 @@ where
         let data_query = to_data_query(command)?;
         let record = self.data.read_health(data_query).map_err(map_data_error)?;
         Ok(to_logic_result(record))
+    }
+}
+
+impl<D> HarnessCatalogLogic for HarnessHealthManager<D>
+where
+    D: HarnessCatalogData,
+{
+    fn inspect_catalog(
+        &self,
+        include_unavailable: bool,
+    ) -> Result<Vec<LogicCatalogRecord>, LogicError> {
+        let records = self
+            .data
+            .read_catalog(include_unavailable)
+            .map_err(map_data_error)?;
+        Ok(records.into_iter().map(to_logic_catalog_record).collect())
+    }
+}
+
+fn to_logic_catalog_record(record: HarnessCatalogRecord) -> LogicCatalogRecord {
+    LogicCatalogRecord {
+        provider_key: record.provider_key,
+        version: record.version,
+        model_ids: record.model_ids,
+        capabilities: record.capabilities.into_iter().collect(),
+        context_limit: record.context_limit,
+        tool_support: record.tool_support,
+        image_support: record.image_support,
+        structured_output_support: record.structured_output_support,
+        streaming_support: record.streaming_support,
+        pricing_source: record.pricing_source,
+        ready: record.ready,
     }
 }
 

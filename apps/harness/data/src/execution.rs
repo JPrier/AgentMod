@@ -1,9 +1,12 @@
 //! Business-facing provider execution dataset construction.
 
+use async_trait::async_trait;
+
 use agentmod_harness_dependency::execution::{
     DependencyConversationEntry, DependencyProviderEvent, DependencyProviderExecutionRequest,
     DependencyProviderFailureKind, DependencyProviderOption, DependencyRetryClassification,
-    DependencyUsage, ProviderExecutionDependency, ProviderExecutionDependencyError,
+    DependencyUsage, ProviderCancellationDependency, ProviderExecutionDependency,
+    ProviderExecutionDependencyError,
 };
 
 use crate::HarnessHealthDataStore;
@@ -15,6 +18,13 @@ pub enum DataConversationEntry {
     System(String),
     /// User content.
     User(String),
+    /// Provider-visible image input.
+    Image {
+        /// Image media type.
+        media_type: String,
+        /// Base64-encoded image bytes.
+        data_base64: String,
+    },
     /// Visible assistant content.
     Assistant(String),
     /// Approved tool call.
@@ -92,6 +102,29 @@ pub struct DataUsageRecord {
     pub cache_read_tokens: u64,
     /// Cache writes.
     pub cache_write_tokens: u64,
+    /// Provider-reported reasoning tokens.
+    pub reasoning_tokens: u64,
+    /// True only when usage is estimated rather than provider-reported.
+    pub estimated: bool,
+}
+
+/// Data-owned pricing-record identity and computed cost.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DataCostRecord {
+    /// Stable pricing-record source.
+    pub source: String,
+    /// Pricing-record version.
+    pub version: String,
+    /// Computed input cost in micro-units of `currency`.
+    pub input_cost_micros: u64,
+    /// Computed output cost in micro-units of `currency`.
+    pub output_cost_micros: u64,
+    /// Computed cache-read cost in micro-units of `currency`.
+    pub cache_read_cost_micros: u64,
+    /// Computed cache-write cost in micro-units of `currency`.
+    pub cache_write_cost_micros: u64,
+    /// ISO-4217 currency code; empty when the pricing record is unknown.
+    pub currency: String,
 }
 
 /// Data-owned failure kind.
@@ -107,6 +140,20 @@ pub enum DataProviderFailureKind {
     PartialOutputFailure,
     /// Provider disconnected.
     Disconnected,
+    /// Provider rejected the supplied credentials.
+    AuthenticationFailed,
+    /// Provider reported overload or transient server failure.
+    ProviderOverloaded,
+    /// Provider rejected the request as invalid.
+    InvalidRequest,
+    /// Provider does not support the requested capability or model.
+    UnsupportedCapability,
+    /// Transport failed safely before any provider response.
+    TransportFailure,
+    /// Disconnect after dispatch whose outcome is ambiguous.
+    AmbiguousDisconnect,
+    /// The caller cancelled the request.
+    UserCancellation,
 }
 
 /// Data-owned retry classification.
@@ -153,6 +200,8 @@ pub enum DataProviderEvent {
         finish_reason: String,
         /// Usage.
         usage: DataUsageRecord,
+        /// Pricing-record identity and computed cost.
+        cost: Option<DataCostRecord>,
     },
     /// Cancelled request.
     Cancelled,
@@ -197,23 +246,39 @@ impl std::fmt::Display for HarnessExecutionDataError {
 impl std::error::Error for HarnessExecutionDataError {}
 
 /// Business provider execution data interface consumed by harness logic.
-pub trait HarnessExecutionData {
+#[async_trait]
+pub trait HarnessExecutionData: Send + Sync {
     /// Executes a provider dataset operation.
     ///
     /// # Errors
     ///
     /// Returns a translated data error without dependency-owned types.
-    fn execute(
+    async fn execute(
         &self,
         query: HarnessExecutionDataQuery,
     ) -> Result<HarnessExecutionRecord, HarnessExecutionDataError>;
 }
 
+/// Business provider cancellation data interface consumed by harness logic.
+#[async_trait]
+pub trait HarnessCancellationData: Send + Sync {
+    /// Requests cancellation of an in-flight provider exchange.
+    ///
+    /// # Errors
+    ///
+    /// Returns a translated data error without dependency-owned types.
+    async fn cancel(
+        &self,
+        cancellation_reference: &str,
+    ) -> Result<bool, HarnessExecutionDataError>;
+}
+
+#[async_trait]
 impl<D> HarnessExecutionData for HarnessHealthDataStore<D>
 where
     D: ProviderExecutionDependency,
 {
-    fn execute(
+    async fn execute(
         &self,
         query: HarnessExecutionDataQuery,
     ) -> Result<HarnessExecutionRecord, HarnessExecutionDataError> {
@@ -221,10 +286,27 @@ where
         let response = self
             .dependency
             .execute_provider(request)
+            .await
             .map_err(|error| map_dependency_error(&error))?;
         Ok(HarnessExecutionRecord {
             events: response.events.into_iter().map(map_event).collect(),
         })
+    }
+}
+
+#[async_trait]
+impl<D> HarnessCancellationData for HarnessHealthDataStore<D>
+where
+    D: ProviderCancellationDependency,
+{
+    async fn cancel(
+        &self,
+        cancellation_reference: &str,
+    ) -> Result<bool, HarnessExecutionDataError> {
+        self.dependency
+            .cancel_provider(cancellation_reference)
+            .await
+            .map_err(|error| map_dependency_error(&error))
     }
 }
 
@@ -251,6 +333,13 @@ fn map_entry(entry: DataConversationEntry) -> DependencyConversationEntry {
     match entry {
         DataConversationEntry::System(text) => DependencyConversationEntry::System(text),
         DataConversationEntry::User(text) => DependencyConversationEntry::User(text),
+        DataConversationEntry::Image {
+            media_type,
+            data_base64,
+        } => DependencyConversationEntry::Image {
+            media_type,
+            data_base64,
+        },
         DataConversationEntry::Assistant(text) => DependencyConversationEntry::Assistant(text),
         DataConversationEntry::ToolCall {
             call_id,
@@ -312,9 +401,11 @@ fn map_event(event: DependencyProviderEvent) -> DataProviderEvent {
         DependencyProviderEvent::Completed {
             finish_reason,
             usage,
+            cost,
         } => DataProviderEvent::Completed {
             finish_reason,
             usage: map_usage(usage),
+            cost: cost.map(map_cost),
         },
         DependencyProviderEvent::Cancelled => DataProviderEvent::Cancelled,
         DependencyProviderEvent::Failed {
@@ -335,6 +426,20 @@ const fn map_usage(usage: DependencyUsage) -> DataUsageRecord {
         output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        estimated: usage.estimated,
+    }
+}
+
+fn map_cost(cost: agentmod_harness_dependency::execution::DependencyCostMetadata) -> DataCostRecord {
+    DataCostRecord {
+        source: cost.source,
+        version: cost.version,
+        input_cost_micros: cost.input_cost_micros,
+        output_cost_micros: cost.output_cost_micros,
+        cache_read_cost_micros: cost.cache_read_cost_micros,
+        cache_write_cost_micros: cost.cache_write_cost_micros,
+        currency: cost.currency,
     }
 }
 
@@ -349,6 +454,21 @@ const fn map_failure_kind(kind: DependencyProviderFailureKind) -> DataProviderFa
             DataProviderFailureKind::PartialOutputFailure
         }
         DependencyProviderFailureKind::Disconnected => DataProviderFailureKind::Disconnected,
+        DependencyProviderFailureKind::AuthenticationFailed => {
+            DataProviderFailureKind::AuthenticationFailed
+        }
+        DependencyProviderFailureKind::ProviderOverloaded => {
+            DataProviderFailureKind::ProviderOverloaded
+        }
+        DependencyProviderFailureKind::InvalidRequest => DataProviderFailureKind::InvalidRequest,
+        DependencyProviderFailureKind::UnsupportedCapability => {
+            DataProviderFailureKind::UnsupportedCapability
+        }
+        DependencyProviderFailureKind::TransportFailure => DataProviderFailureKind::TransportFailure,
+        DependencyProviderFailureKind::AmbiguousDisconnect => {
+            DataProviderFailureKind::AmbiguousDisconnect
+        }
+        DependencyProviderFailureKind::UserCancellation => DataProviderFailureKind::UserCancellation,
     }
 }
 
@@ -380,8 +500,9 @@ mod tests {
         requests: Mutex<Vec<DependencyProviderExecutionRequest>>,
     }
 
+    #[async_trait]
     impl ProviderExecutionDependency for MockExecutionDependency {
-        fn execute_provider(
+        async fn execute_provider(
             &self,
             request: DependencyProviderExecutionRequest,
         ) -> Result<DependencyProviderExecutionResponse, ProviderExecutionDependencyError> {
@@ -399,15 +520,18 @@ mod tests {
                             output_tokens: 1,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
+                            estimated: false,
                         },
+                        cost: None,
                     },
                 ],
             })
         }
     }
 
-    #[test]
-    fn explicitly_maps_query_and_dependency_events() {
+    #[tokio::test]
+    async fn explicitly_maps_query_and_dependency_events() {
         let store = HarnessHealthDataStore::new(MockExecutionDependency {
             requests: Mutex::new(Vec::new()),
         });
@@ -424,6 +548,7 @@ mod tests {
                 cancellation_reference: "cancel".into(),
                 resumed_after_continuation: false,
             })
+            .await
             .expect("execution record");
         assert_eq!(
             record.events,
@@ -436,7 +561,10 @@ mod tests {
                         output_tokens: 1,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
+                        estimated: false,
                     },
+                    cost: None,
                 }
             ]
         );
@@ -448,6 +576,40 @@ mod tests {
                 .expect("request lock is not poisoned")[0]
                 .entries,
             [DependencyConversationEntry::User("hi".into())]
+        );
+    }
+
+    #[tokio::test]
+    async fn maps_image_entries_without_changing_other_fields() {
+        let store = HarnessHealthDataStore::new(MockExecutionDependency {
+            requests: Mutex::new(Vec::new()),
+        });
+        let _ = store
+            .execute(HarnessExecutionDataQuery {
+                provider: "mock".into(),
+                model: "model".into(),
+                entries: vec![DataConversationEntry::Image {
+                    media_type: "image/png".into(),
+                    data_base64: "aGVsbG8=".into(),
+                }],
+                options: Vec::new(),
+                authorization_grant: "grant".into(),
+                cancellation_reference: "cancel".into(),
+                resumed_after_continuation: false,
+            })
+            .await
+            .expect("execution record");
+        assert_eq!(
+            store
+                .dependency
+                .requests
+                .lock()
+                .expect("request lock is not poisoned")[0]
+                .entries,
+            [DependencyConversationEntry::Image {
+                media_type: "image/png".into(),
+                data_base64: "aGVsbG8=".into(),
+            }]
         );
     }
 }

@@ -6,6 +6,8 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
+
 use crate::StaticProviderCatalogDependency;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
@@ -20,6 +22,13 @@ pub enum DependencyConversationEntry {
     System(String),
     /// User content.
     User(String),
+    /// Provider-visible image input.
+    Image {
+        /// Image media type.
+        media_type: String,
+        /// Base64-encoded image bytes.
+        data_base64: String,
+    },
     /// Visible assistant content.
     Assistant(String),
     /// Approved tool request serialized as JSON text.
@@ -97,6 +106,29 @@ pub struct DependencyUsage {
     pub cache_read_tokens: u64,
     /// Provider-reported cache-write tokens.
     pub cache_write_tokens: u64,
+    /// Provider-reported reasoning tokens.
+    pub reasoning_tokens: u64,
+    /// True only when usage is estimated rather than provider-reported.
+    pub estimated: bool,
+}
+
+/// Pricing-record identity and computed cost for one provider exchange.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DependencyCostMetadata {
+    /// Stable pricing-record source.
+    pub source: String,
+    /// Pricing-record version.
+    pub version: String,
+    /// Computed input cost in micro-units of `currency`.
+    pub input_cost_micros: u64,
+    /// Computed output cost in micro-units of `currency`.
+    pub output_cost_micros: u64,
+    /// Computed cache-read cost in micro-units of `currency`.
+    pub cache_read_cost_micros: u64,
+    /// Computed cache-write cost in micro-units of `currency`.
+    pub cache_write_cost_micros: u64,
+    /// ISO-4217 currency code; empty when the pricing record is unknown.
+    pub currency: String,
 }
 
 /// Provider failure classification.
@@ -112,6 +144,20 @@ pub enum DependencyProviderFailureKind {
     PartialOutputFailure,
     /// Provider transport disconnected.
     Disconnected,
+    /// Provider rejected the supplied credentials.
+    AuthenticationFailed,
+    /// Provider reported overload or transient server failure.
+    ProviderOverloaded,
+    /// Provider rejected the request as invalid.
+    InvalidRequest,
+    /// Provider does not support the requested capability or model.
+    UnsupportedCapability,
+    /// Transport failed safely before any provider response.
+    TransportFailure,
+    /// Disconnect after dispatch whose outcome is ambiguous.
+    AmbiguousDisconnect,
+    /// The caller cancelled the request.
+    UserCancellation,
 }
 
 /// Provider-neutral retry classification.
@@ -158,6 +204,8 @@ pub enum DependencyProviderEvent {
         finish_reason: String,
         /// Provider usage.
         usage: DependencyUsage,
+        /// Pricing-record identity and computed cost.
+        cost: Option<DependencyCostMetadata>,
     },
     /// Provider request was cancelled.
     Cancelled,
@@ -205,21 +253,39 @@ impl std::fmt::Display for ProviderExecutionDependencyError {
 impl std::error::Error for ProviderExecutionDependencyError {}
 
 /// External provider execution interface consumed only by harness data.
-pub trait ProviderExecutionDependency {
+#[async_trait]
+pub trait ProviderExecutionDependency: Send + Sync {
     /// Executes one provider request into a bounded collected event stream.
     ///
     /// # Errors
     ///
     /// Returns a dependency error before execution for invalid selection,
     /// invalid bounds, or event overflow.
-    fn execute_provider(
+    async fn execute_provider(
         &self,
         request: DependencyProviderExecutionRequest,
     ) -> Result<DependencyProviderExecutionResponse, ProviderExecutionDependencyError>;
 }
 
+/// External provider cancellation interface consumed only by harness data.
+#[async_trait]
+pub trait ProviderCancellationDependency: Send + Sync {
+    /// Requests cancellation of an in-flight provider exchange.
+    ///
+    /// Returns whether an active exchange for the reference was found.
+    ///
+    /// # Errors
+    ///
+    /// Returns a dependency error when the request is malformed.
+    async fn cancel_provider(
+        &self,
+        cancellation_reference: &str,
+    ) -> Result<bool, ProviderExecutionDependencyError>;
+}
+
+#[async_trait]
 impl ProviderExecutionDependency for StaticProviderCatalogDependency {
-    fn execute_provider(
+    async fn execute_provider(
         &self,
         request: DependencyProviderExecutionRequest,
     ) -> Result<DependencyProviderExecutionResponse, ProviderExecutionDependencyError> {
@@ -256,7 +322,10 @@ impl ProviderExecutionDependency for StaticProviderCatalogDependency {
                             output_tokens: 6,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
+                            estimated: false,
                         },
+                        None,
                     ),
                 ],
             });
@@ -283,7 +352,10 @@ impl ProviderExecutionDependency for StaticProviderCatalogDependency {
                             output_tokens: 5,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
+                            estimated: false,
                         },
+                        None,
                     ),
                 ],
             });
@@ -441,7 +513,10 @@ fn planner_worker_events(
                 output_tokens: 16,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                reasoning_tokens: 0,
+                estimated: false,
             },
+            None,
         ),
     ])
 }
@@ -459,19 +534,21 @@ fn scenario_events(
         output_tokens: 7,
         cache_read_tokens: 3,
         cache_write_tokens: 1,
+        reasoning_tokens: 0,
+        estimated: false,
     };
     let events = match scenario {
         "text" => vec![
             DependencyProviderEvent::Started,
             DependencyProviderEvent::TextDelta(text),
-            completed("stop", usage),
+            completed("stop", usage, None),
         ],
         "streaming_text" => vec![
             DependencyProviderEvent::Started,
             DependencyProviderEvent::TextDelta("alpha ".into()),
             DependencyProviderEvent::TextDelta("beta ".into()),
             DependencyProviderEvent::TextDelta(text),
-            completed("stop", usage),
+            completed("stop", usage, None),
         ],
         "one_tool_call" => {
             let mut events = vec![DependencyProviderEvent::Started];
@@ -813,7 +890,10 @@ fn coding_task_events(tool_result_count: usize) -> Vec<DependencyProviderEvent> 
                     output_tokens: 9,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                    estimated: false,
                 },
+                None,
             ));
         }
     }
@@ -892,10 +972,15 @@ fn append_tool_call(
     });
 }
 
-fn completed(reason: &str, usage: DependencyUsage) -> DependencyProviderEvent {
+fn completed(
+    reason: &str,
+    usage: DependencyUsage,
+    cost: Option<DependencyCostMetadata>,
+) -> DependencyProviderEvent {
     DependencyProviderEvent::Completed {
         finish_reason: reason.into(),
         usage,
+        cost,
     }
 }
 
@@ -911,12 +996,22 @@ fn failed(
     }
 }
 
+#[async_trait]
+impl ProviderCancellationDependency for StaticProviderCatalogDependency {
+    async fn cancel_provider(
+        &self,
+        _cancellation_reference: &str,
+    ) -> Result<bool, ProviderExecutionDependencyError> {
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn deterministic_scenarios_cover_required_provider_behaviors() {
+    #[tokio::test]
+    async fn deterministic_scenarios_cover_required_provider_behaviors() {
         let dependency = StaticProviderCatalogDependency::built_in();
         for scenario in [
             "text",
@@ -942,7 +1037,7 @@ mod tests {
             "disconnected",
         ] {
             let response = dependency
-                .execute_provider(request(scenario))
+                .execute_provider(request(scenario)).await
                 .expect("documented scenario");
             assert!(matches!(
                 response.events.first(),
@@ -952,10 +1047,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn usage_retry_tool_calls_and_cancellation_are_normalized() {
+    #[tokio::test]
+    async fn usage_retry_tool_calls_and_cancellation_are_normalized() {
         let dependency = StaticProviderCatalogDependency::built_in();
-        let text = dependency.execute_provider(request("text")).expect("text");
+        let text = dependency.execute_provider(request("text")).await.expect("text");
         assert!(matches!(
             text.events.last(),
             Some(DependencyProviderEvent::Completed {
@@ -967,7 +1062,7 @@ mod tests {
             })
         ));
         let tools = dependency
-            .execute_provider(request("multiple_tool_calls"))
+            .execute_provider(request("multiple_tool_calls")).await
             .expect("tools");
         assert_eq!(
             tools
@@ -978,7 +1073,7 @@ mod tests {
             2
         );
         let rate_limit = dependency
-            .execute_provider(request("rate_limit"))
+            .execute_provider(request("rate_limit")).await
             .expect("rate limit");
         assert!(matches!(
             rate_limit.events.last(),
@@ -988,7 +1083,7 @@ mod tests {
             })
         ));
         let cancelled = dependency
-            .execute_provider(request("cancelled"))
+            .execute_provider(request("cancelled")).await
             .expect("cancelled");
         assert_eq!(
             cancelled.events.last(),
@@ -996,8 +1091,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn planner_worker_fixture_is_stateless_and_phase_driven() {
+    #[tokio::test]
+    async fn planner_worker_fixture_is_stateless_and_phase_driven() {
         let dependency = StaticProviderCatalogDependency::built_in();
         let mut plan = request("planner_worker");
         plan.options.extend([
@@ -1010,7 +1105,7 @@ mod tests {
                 value: String::from("0"),
             },
         ]);
-        let plan = dependency.execute_provider(plan).expect("planner response");
+        let plan = dependency.execute_provider(plan).await.expect("planner response");
         assert!(plan.events.iter().any(|event| matches!(
             event,
             DependencyProviderEvent::TextDelta(text)
@@ -1026,7 +1121,7 @@ mod tests {
             ),
         }];
         let worker = dependency
-            .execute_provider(worker)
+            .execute_provider(worker).await
             .expect("worker response");
         assert!(worker.events.iter().any(|event| matches!(
             event,
@@ -1047,7 +1142,7 @@ mod tests {
             },
         ]);
         let rejected = dependency
-            .execute_provider(rejected)
+            .execute_provider(rejected).await
             .expect("reject once response");
         assert!(rejected.events.iter().any(|event| matches!(
             event,
@@ -1057,19 +1152,19 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn provider_continuations_are_stable_within_and_unique_across_requests() {
+    #[tokio::test]
+    async fn provider_continuations_are_stable_within_and_unique_across_requests() {
         let dependency = StaticProviderCatalogDependency::built_in();
         let first = dependency
-            .execute_provider(request("approval_multi"))
+            .execute_provider(request("approval_multi")).await
             .expect("first request");
         let repeated = dependency
-            .execute_provider(request("approval_multi"))
+            .execute_provider(request("approval_multi")).await
             .expect("repeated request identity");
         let mut second_request = request("approval_multi");
         second_request.cancellation_reference = "cancel-2".into();
         let second = dependency
-            .execute_provider(second_request)
+            .execute_provider(second_request).await
             .expect("second request");
         let continuations = |response: &DependencyProviderExecutionResponse| {
             response
@@ -1120,11 +1215,11 @@ mod tests {
         request
     }
 
-    #[test]
-    fn process_action_fixture_is_constrained_and_normalizes_json_arguments() {
+    #[tokio::test]
+    async fn process_action_fixture_is_constrained_and_normalizes_json_arguments() {
         let dependency = StaticProviderCatalogDependency::built_in();
         let response = dependency
-            .execute_provider(request("process_action"))
+            .execute_provider(request("process_action")).await
             .expect("valid process action");
         assert!(response.events.iter().any(|event| matches!(
             event,
@@ -1143,7 +1238,7 @@ mod tests {
             .expect("tool option")
             .value = "filesystem.write".into();
         assert!(matches!(
-            dependency.execute_provider(unsupported),
+            dependency.execute_provider(unsupported).await,
             Err(ProviderExecutionDependencyError::InvalidRequest(_))
         ));
 
@@ -1155,13 +1250,13 @@ mod tests {
             .expect("arguments option")
             .value = "[]".into();
         assert!(matches!(
-            dependency.execute_provider(malformed),
+            dependency.execute_provider(malformed).await,
             Err(ProviderExecutionDependencyError::InvalidRequest(_))
         ));
     }
 
-    #[test]
-    fn process_action_fixture_accepts_bounded_base64_json_arguments() {
+    #[tokio::test]
+    async fn process_action_fixture_accepts_bounded_base64_json_arguments() {
         let dependency = StaticProviderCatalogDependency::built_in();
         let mut value = request("process_action");
         value
@@ -1172,7 +1267,7 @@ mod tests {
             value: STANDARD.encode(br#"{"process_id":"process-1"}"#),
         });
         let response = dependency
-            .execute_provider(value)
+            .execute_provider(value).await
             .expect("base64 arguments");
         assert!(response.events.iter().any(|event| matches!(
             event,
@@ -1195,46 +1290,46 @@ mod tests {
         format!("{payload}.{}", signature.to_hex())
     }
 
-    #[test]
-    fn secure_catalog_rejects_tampering_and_initial_replay() {
+    #[tokio::test]
+    async fn secure_catalog_rejects_tampering_and_initial_replay() {
         let key = [7_u8; 32];
         let dependency = StaticProviderCatalogDependency::secure(key);
         let mut first = request("text");
         first.authorization_grant = signed_grant(&key, uuid::Uuid::from_u128(101));
         dependency
-            .execute_provider(first.clone())
+            .execute_provider(first.clone()).await
             .expect("first authorized request");
         assert!(
-            dependency.execute_provider(first).is_err(),
+            dependency.execute_provider(first).await.is_err(),
             "an initial provider request cannot replay its nonce"
         );
 
         let mut tampered = request("text");
         tampered.authorization_grant = signed_grant(&key, uuid::Uuid::from_u128(102));
         tampered.authorization_grant.push('0');
-        assert!(dependency.execute_provider(tampered).is_err());
+        assert!(dependency.execute_provider(tampered).await.is_err());
     }
 
-    #[test]
-    fn secure_catalog_allows_explicit_continuation_use_only_after_initial_use() {
+    #[tokio::test]
+    async fn secure_catalog_allows_explicit_continuation_use_only_after_initial_use() {
         let key = [9_u8; 32];
         let dependency = StaticProviderCatalogDependency::secure(key);
         let grant = signed_grant(&key, uuid::Uuid::from_u128(103));
         let mut resumed_first = request("text");
         resumed_first.authorization_grant = grant.clone();
         resumed_first.resumed_after_continuation = true;
-        assert!(dependency.execute_provider(resumed_first).is_err());
+        assert!(dependency.execute_provider(resumed_first).await.is_err());
 
         let mut initial = request("text");
         initial.authorization_grant = grant.clone();
         dependency
-            .execute_provider(initial)
+            .execute_provider(initial).await
             .expect("initial authorized request");
         let mut resumed = request("text");
         resumed.authorization_grant = grant;
         resumed.resumed_after_continuation = true;
         dependency
-            .execute_provider(resumed)
+            .execute_provider(resumed).await
             .expect("explicit continuation use");
     }
 }

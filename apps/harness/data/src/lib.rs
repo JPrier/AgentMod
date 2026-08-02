@@ -5,8 +5,8 @@ pub mod execution;
 use std::collections::BTreeSet;
 
 use agentmod_harness_dependency::{
-    DependencyError, ProviderCatalogDependency, ProviderCatalogProbeRequest,
-    ProviderCatalogProbeResponse,
+    DependencyCatalogRecord, DependencyError, ProviderCatalogDependency,
+    ProviderCatalogDetailDependency, ProviderCatalogProbeRequest, ProviderCatalogProbeResponse,
 };
 use thiserror::Error;
 
@@ -52,6 +52,46 @@ pub trait HarnessHealthData {
     ///
     /// Returns [`DataError`] when provider records cannot be read or counted.
     fn read_health(&self, query: HarnessHealthDataQuery) -> Result<HarnessHealthRecord, DataError>;
+}
+
+/// Data-owned detailed provider/model catalog entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HarnessCatalogRecord {
+    /// Stable provider key.
+    pub provider_key: String,
+    /// Adapter version.
+    pub version: String,
+    /// Discoverable model IDs in stable order.
+    pub model_ids: Vec<String>,
+    /// Sorted capability names.
+    pub capabilities: BTreeSet<String>,
+    /// Known context limit in tokens.
+    pub context_limit: Option<u64>,
+    /// Tool-call support.
+    pub tool_support: bool,
+    /// Image input support.
+    pub image_support: bool,
+    /// Structured-output support.
+    pub structured_output_support: bool,
+    /// Streaming support.
+    pub streaming_support: bool,
+    /// Pricing-record source.
+    pub pricing_source: String,
+    /// Whether the provider can accept work now.
+    pub ready: bool,
+}
+
+/// Business-facing provider/model catalog data interface.
+pub trait HarnessCatalogData {
+    /// Reads the bounded detailed provider/model catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataError`] when provider records cannot be read.
+    fn read_catalog(
+        &self,
+        include_unavailable: bool,
+    ) -> Result<Vec<HarnessCatalogRecord>, DataError>;
 }
 
 /// Provider health data assembler backed by one catalog dependency.
@@ -130,6 +170,44 @@ fn map_dependency_error(error: DependencyError) -> DataError {
         DependencyError::InvalidAuthorizationKey => DataError::ProviderHealthUnavailable {
             detail: String::from("harness authorization is unavailable"),
         },
+    }
+}
+
+impl<D> HarnessCatalogData for HarnessHealthDataStore<D>
+where
+    D: ProviderCatalogDetailDependency,
+{
+    fn read_catalog(
+        &self,
+        include_unavailable: bool,
+    ) -> Result<Vec<HarnessCatalogRecord>, DataError> {
+        let response = self
+            .dependency
+            .probe_catalog_details(ProviderCatalogProbeRequest {
+                include_unavailable,
+            })
+            .map_err(map_dependency_error)?;
+        Ok(response
+            .providers
+            .into_iter()
+            .map(map_catalog_record)
+            .collect())
+    }
+}
+
+fn map_catalog_record(record: DependencyCatalogRecord) -> HarnessCatalogRecord {
+    HarnessCatalogRecord {
+        provider_key: record.provider_key,
+        version: record.version,
+        model_ids: record.model_ids,
+        capabilities: record.capabilities,
+        context_limit: record.context_limit,
+        tool_support: record.tool_support,
+        image_support: record.image_support,
+        structured_output_support: record.structured_output_support,
+        streaming_support: record.streaming_support,
+        pricing_source: record.pricing_source,
+        ready: record.ready,
     }
 }
 

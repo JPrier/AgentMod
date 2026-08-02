@@ -11,6 +11,7 @@ repository.workspace = true
 agentmod-harness-logic = { path = "../logic" }
 agentmod-harness-protocol = { path = "../../../protocols/harness-protocol" }
 agentmod-primitives = { path = "../../../core/primitives" }
+async-trait.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
@@ -21,3 +22,6 @@ workspace = true
 kind = "process-layer"
 process = "harness"
 layer = "service"
+
+[dev-dependencies]
+tokio.workspace = true

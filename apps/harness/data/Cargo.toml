@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 agentmod-harness-dependency = { path = "../dependency" }
+async-trait.workspace = true
 thiserror.workspace = true
 
 [lints]
@@ -18,3 +19,6 @@ workspace = true
 kind = "process-layer"
 process = "harness"
 layer = "data"
+
+[dev-dependencies]
+tokio.workspace = true

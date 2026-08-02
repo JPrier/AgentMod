@@ -459,17 +459,25 @@ name = "agentmod-harness-data"
 version = "0.1.0"
 dependencies = [
  "agentmod-harness-dependency",
+ "async-trait",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
 name = "agentmod-harness-dependency"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "blake3",
+ "reqwest",
+ "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "url",
  "uuid",
 ]
 
@@ -478,7 +486,9 @@ name = "agentmod-harness-logic"
 version = "0.1.0"
 dependencies = [
  "agentmod-harness-data",
+ "async-trait",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
@@ -497,8 +507,10 @@ dependencies = [
  "agentmod-harness-logic",
  "agentmod-harness-protocol",
  "agentmod-primitives",
+ "async-trait",
  "serde_json",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

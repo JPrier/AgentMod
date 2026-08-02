@@ -304,6 +304,20 @@ impl ProcessHarnessDependency {
                             return Ok(DependencyReply::Events(events));
                         }
                     }
+                    wire::HarnessReply::Failed {
+                        code,
+                        message,
+                        retryable,
+                    } if events.is_empty() => {
+                        return Ok(DependencyReply::Failed {
+                            code,
+                            message,
+                            retryable,
+                        });
+                    }
+                    wire::HarnessReply::Catalog { .. } => {
+                        return Err(HarnessDependencyError::Protocol);
+                    }
                     reply if events.is_empty() => return Ok(from_wire(reply)),
                     _ => return Err(HarnessDependencyError::Protocol),
                 }
@@ -392,6 +406,9 @@ impl ProcessHarnessDependency {
                         return Ok(());
                     }
                     wire::HarnessReply::Health { .. } => {
+                        return Err(HarnessDependencyError::Protocol);
+                    }
+                    wire::HarnessReply::Catalog { .. } => {
                         return Err(HarnessDependencyError::Protocol);
                     }
                 }
@@ -682,6 +699,11 @@ fn from_wire(v: wire::HarnessReply) -> DependencyReply {
             DependencyReply::Events(events.into_iter().map(map_event).collect())
         }
         wire::HarnessReply::Event { event, .. } => DependencyReply::Events(vec![map_event(event)]),
+        wire::HarnessReply::Catalog { .. } => DependencyReply::Failed {
+            code: String::from("protocol"),
+            message: String::from("unexpected harness catalog reply"),
+            retryable: false,
+        },
     }
 }
 fn map_event(v: wire::HarnessEvent) -> DependencyEvent {

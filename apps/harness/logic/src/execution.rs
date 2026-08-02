@@ -1,9 +1,11 @@
 //! Provider-neutral harness execution business behavior.
 
+use async_trait::async_trait;
+
 use agentmod_harness_data::execution::{
     DataConversationEntry, DataProviderEvent, DataProviderFailureKind, DataProviderOption,
-    DataRetryClassification, DataUsageRecord, HarnessExecutionData, HarnessExecutionDataError,
-    HarnessExecutionDataQuery,
+    DataRetryClassification, DataUsageRecord, HarnessCancellationData, HarnessExecutionData,
+    HarnessExecutionDataError, HarnessExecutionDataQuery,
 };
 
 use crate::HarnessHealthManager;
@@ -15,6 +17,13 @@ pub enum LogicConversationEntry {
     System(String),
     /// User content.
     User(String),
+    /// Provider-visible image input.
+    Image {
+        /// Image media type.
+        media_type: String,
+        /// Base64-encoded image bytes.
+        data_base64: String,
+    },
     /// Visible assistant content.
     Assistant(String),
     /// Approved tool request.
@@ -92,6 +101,29 @@ pub struct LogicUsage {
     pub cache_read_tokens: u64,
     /// Cache-write tokens.
     pub cache_write_tokens: u64,
+    /// Provider-reported reasoning tokens.
+    pub reasoning_tokens: u64,
+    /// True only when usage is estimated rather than provider-reported.
+    pub estimated: bool,
+}
+
+/// Logic-owned pricing-record identity and computed cost.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LogicCostRecord {
+    /// Stable pricing-record source.
+    pub source: String,
+    /// Pricing-record version.
+    pub version: String,
+    /// Computed input cost in micro-units of `currency`.
+    pub input_cost_micros: u64,
+    /// Computed output cost in micro-units of `currency`.
+    pub output_cost_micros: u64,
+    /// Computed cache-read cost in micro-units of `currency`.
+    pub cache_read_cost_micros: u64,
+    /// Computed cache-write cost in micro-units of `currency`.
+    pub cache_write_cost_micros: u64,
+    /// ISO-4217 currency code; empty when the pricing record is unknown.
+    pub currency: String,
 }
 
 /// Logic-owned provider failure kind.
@@ -107,6 +139,20 @@ pub enum LogicProviderFailureKind {
     PartialOutputFailure,
     /// Disconnection.
     Disconnected,
+    /// Provider rejected the supplied credentials.
+    AuthenticationFailed,
+    /// Provider reported overload or transient server failure.
+    ProviderOverloaded,
+    /// Provider rejected the request as invalid.
+    InvalidRequest,
+    /// Provider does not support the requested capability or model.
+    UnsupportedCapability,
+    /// Transport failed safely before any provider response.
+    TransportFailure,
+    /// Disconnect after dispatch whose outcome is ambiguous.
+    AmbiguousDisconnect,
+    /// The caller cancelled the request.
+    UserCancellation,
 }
 
 /// Logic-owned retry classification.
@@ -153,6 +199,8 @@ pub enum LogicProviderEvent {
         finish_reason: String,
         /// Usage.
         usage: LogicUsage,
+        /// Pricing-record identity and computed cost.
+        cost: Option<LogicCostRecord>,
     },
     /// Provider cancelled.
     Cancelled,
@@ -215,7 +263,8 @@ pub struct ContinueProviderCommand {
 }
 
 /// Continuation business interface exposed only to harness service.
-pub trait HarnessContinuationLogic {
+#[async_trait]
+pub trait HarnessContinuationLogic: Send + Sync {
     /// Resolves one pending proposal exactly once.
     ///
     /// Approved decisions issue a fresh provider request; they never claim to
@@ -225,7 +274,7 @@ pub trait HarnessContinuationLogic {
     ///
     /// Returns [`ExecutionLogicError`] for unknown/duplicate continuations,
     /// invalid replacement context, poisoned state, or provider-data failure.
-    fn continue_provider(
+    async fn continue_provider(
         &self,
         command: ContinueProviderCommand,
     ) -> Result<ExecuteProviderResult, ExecutionLogicError>;
@@ -271,23 +320,41 @@ impl std::fmt::Display for ExecutionLogicError {
 impl std::error::Error for ExecutionLogicError {}
 
 /// Provider execution business interface exposed only to harness service.
-pub trait HarnessExecutionLogic {
+#[async_trait]
+pub trait HarnessExecutionLogic: Send + Sync {
     /// Validates and coordinates one approved provider execution.
     ///
     /// # Errors
     ///
     /// Returns logic-owned validation or data-availability errors.
-    fn execute_provider(
+    async fn execute_provider(
         &self,
         command: ExecuteProviderCommand,
     ) -> Result<ExecuteProviderResult, ExecutionLogicError>;
 }
 
+/// Provider cancellation business interface exposed only to harness service.
+#[async_trait]
+pub trait HarnessCancellationLogic: Send + Sync {
+    /// Requests cancellation of one in-flight provider exchange.
+    ///
+    /// Returns whether an active exchange for the reference was found.
+    ///
+    /// # Errors
+    ///
+    /// Returns logic-owned validation or data-availability errors.
+    async fn cancel_provider(
+        &self,
+        cancellation_reference: &str,
+    ) -> Result<bool, ExecutionLogicError>;
+}
+
+#[async_trait]
 impl<D> HarnessExecutionLogic for HarnessHealthManager<D>
 where
     D: HarnessExecutionData,
 {
-    fn execute_provider(
+    async fn execute_provider(
         &self,
         command: ExecuteProviderCommand,
     ) -> Result<ExecuteProviderResult, ExecutionLogicError> {
@@ -296,6 +363,7 @@ where
         let record = self
             .data
             .execute(to_data_query(command, false))
+            .await
             .map_err(|error| map_data_error(&error))?;
         let events: Vec<_> = record.events.into_iter().map(map_event).collect();
         self.remember_pending(&pending_command, &events)?;
@@ -303,11 +371,12 @@ where
     }
 }
 
+#[async_trait]
 impl<D> HarnessContinuationLogic for HarnessHealthManager<D>
 where
     D: HarnessExecutionData,
 {
-    fn continue_provider(
+    async fn continue_provider(
         &self,
         command: ContinueProviderCommand,
     ) -> Result<ExecuteProviderResult, ExecutionLogicError> {
@@ -350,12 +419,34 @@ where
                 let record = self
                     .data
                     .execute(to_data_query(resumed.clone(), true))
+                    .await
                     .map_err(|error| map_data_error(&error))?;
                 let events: Vec<_> = record.events.into_iter().map(map_event).collect();
                 self.remember_pending(&resumed, &events)?;
                 Ok(ExecuteProviderResult { events })
             }
         }
+    }
+}
+
+#[async_trait]
+impl<D> HarnessCancellationLogic for HarnessHealthManager<D>
+where
+    D: HarnessCancellationData,
+{
+    async fn cancel_provider(
+        &self,
+        cancellation_reference: &str,
+    ) -> Result<bool, ExecutionLogicError> {
+        if cancellation_reference.trim().is_empty() {
+            return Err(ExecutionLogicError::InvalidCommand(
+                "cancellation reference is required".into(),
+            ));
+        }
+        self.data
+            .cancel(cancellation_reference)
+            .await
+            .map_err(|error| map_data_error(&error))
     }
 }
 
@@ -454,6 +545,13 @@ fn map_entry(entry: LogicConversationEntry) -> DataConversationEntry {
     match entry {
         LogicConversationEntry::System(text) => DataConversationEntry::System(text),
         LogicConversationEntry::User(text) => DataConversationEntry::User(text),
+        LogicConversationEntry::Image {
+            media_type,
+            data_base64,
+        } => DataConversationEntry::Image {
+            media_type,
+            data_base64,
+        },
         LogicConversationEntry::Assistant(text) => DataConversationEntry::Assistant(text),
         LogicConversationEntry::ToolCall {
             call_id,
@@ -515,9 +613,11 @@ fn map_event(event: DataProviderEvent) -> LogicProviderEvent {
         DataProviderEvent::Completed {
             finish_reason,
             usage,
+            cost,
         } => LogicProviderEvent::Completed {
             finish_reason,
             usage: map_usage(usage),
+            cost: cost.map(map_cost),
         },
         DataProviderEvent::Cancelled => LogicProviderEvent::Cancelled,
         DataProviderEvent::Failed {
@@ -538,6 +638,20 @@ const fn map_usage(usage: DataUsageRecord) -> LogicUsage {
         output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        estimated: usage.estimated,
+    }
+}
+
+fn map_cost(cost: agentmod_harness_data::execution::DataCostRecord) -> LogicCostRecord {
+    LogicCostRecord {
+        source: cost.source,
+        version: cost.version,
+        input_cost_micros: cost.input_cost_micros,
+        output_cost_micros: cost.output_cost_micros,
+        cache_read_cost_micros: cost.cache_read_cost_micros,
+        cache_write_cost_micros: cost.cache_write_cost_micros,
+        currency: cost.currency,
     }
 }
 
@@ -552,6 +666,19 @@ const fn map_failure_kind(kind: DataProviderFailureKind) -> LogicProviderFailure
             LogicProviderFailureKind::PartialOutputFailure
         }
         DataProviderFailureKind::Disconnected => LogicProviderFailureKind::Disconnected,
+        DataProviderFailureKind::AuthenticationFailed => {
+            LogicProviderFailureKind::AuthenticationFailed
+        }
+        DataProviderFailureKind::ProviderOverloaded => LogicProviderFailureKind::ProviderOverloaded,
+        DataProviderFailureKind::InvalidRequest => LogicProviderFailureKind::InvalidRequest,
+        DataProviderFailureKind::UnsupportedCapability => {
+            LogicProviderFailureKind::UnsupportedCapability
+        }
+        DataProviderFailureKind::TransportFailure => LogicProviderFailureKind::TransportFailure,
+        DataProviderFailureKind::AmbiguousDisconnect => {
+            LogicProviderFailureKind::AmbiguousDisconnect
+        }
+        DataProviderFailureKind::UserCancellation => LogicProviderFailureKind::UserCancellation,
     }
 }
 
@@ -588,8 +715,9 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    #[async_trait]
     impl HarnessExecutionData for MockExecutionData {
-        fn execute(
+        async fn execute(
             &self,
             query: HarnessExecutionDataQuery,
         ) -> Result<HarnessExecutionRecord, HarnessExecutionDataError> {
@@ -603,8 +731,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl HarnessExecutionData for MultiToolData {
-        fn execute(
+        async fn execute(
             &self,
             _query: HarnessExecutionDataQuery,
         ) -> Result<HarnessExecutionRecord, HarnessExecutionDataError> {
@@ -632,13 +761,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn validates_maps_and_normalizes_execution() {
+    #[tokio::test]
+    async fn validates_maps_and_normalizes_execution() {
         let manager = HarnessHealthManager::new(MockExecutionData {
             queries: Mutex::new(Vec::new()),
         });
         let result = manager
             .execute_provider(command())
+            .await
             .expect("execution result");
         assert_eq!(result.events, [LogicProviderEvent::Cancelled]);
         assert_eq!(
@@ -652,15 +782,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn rejects_missing_authorization_before_data_call() {
+    #[tokio::test]
+    async fn rejects_missing_authorization_before_data_call() {
         let manager = HarnessHealthManager::new(MockExecutionData {
             queries: Mutex::new(Vec::new()),
         });
         let mut command = command();
         command.authorization_grant.clear();
         assert!(matches!(
-            manager.execute_provider(command),
+            manager.execute_provider(command).await,
             Err(ExecutionLogicError::InvalidCommand(_))
         ));
         assert!(
@@ -673,25 +803,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolving_one_batch_continuation_invalidates_its_siblings() {
+    #[tokio::test]
+    async fn resolving_one_batch_continuation_invalidates_its_siblings() {
         let manager = HarnessHealthManager::new(MultiToolData {
             calls: AtomicUsize::new(0),
         });
         manager
             .execute_provider(command())
+            .await
             .expect("initial multi-tool request");
         manager
             .continue_provider(ContinueProviderCommand {
                 continuation_reference: "continuation-1".into(),
                 decision: LogicContinuationDecision::Continue,
             })
+            .await
             .expect("resolve batch");
         assert_eq!(
-            manager.continue_provider(ContinueProviderCommand {
-                continuation_reference: "continuation-2".into(),
-                decision: LogicContinuationDecision::Continue,
-            }),
+            manager
+                .continue_provider(ContinueProviderCommand {
+                    continuation_reference: "continuation-2".into(),
+                    decision: LogicContinuationDecision::Continue,
+                })
+                .await,
             Err(ExecutionLogicError::UnknownContinuation)
         );
     }

@@ -35,18 +35,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             ready_provider_count: v.ready_provider_count,
                             capabilities: v.capabilities,
                         }],
-                        Err(_) => vec![failed("health_failed")],
+                        _ => vec![failed("health_failed")],
+                    }
+                }
+                Ok(HarnessCommand::Catalog) => {
+                    match service.handle_wire_command(&HarnessCommand::Catalog) {
+                        Ok(ServiceResponse::Catalog(providers)) => {
+                            vec![HarnessReply::Catalog { providers }]
+                        }
+                        _ => vec![failed("catalog_failed")],
                     }
                 }
                 Ok(command @ HarnessCommand::Execute { .. }) => service
                     .execute_wire(&command)
+                    .await
                     .map_or_else(|_| vec![failed("execution_failed")], incremental_replies),
                 Ok(command @ HarnessCommand::Continue { .. }) => service
                     .continue_wire(&command)
+                    .await
                     .map_or_else(|_| vec![failed("continuation_failed")], incremental_replies),
-                Ok(HarnessCommand::Cancel { .. }) => {
-                    vec![failed("cancellation_unsupported")]
-                }
+                Ok(HarnessCommand::Cancel { cancellation_id }) => match service
+                    .cancel_wire(&HarnessCommand::Cancel { cancellation_id })
+                    .await
+                {
+                    Ok(true) => vec![HarnessReply::Event {
+                        event: agentmod_harness_protocol::HarnessEvent::Cancelled,
+                        terminal: true,
+                    }],
+                    Ok(false) => vec![failed("no_active_cancellation")],
+                    Err(_) => vec![failed("cancellation_failed")],
+                },
                 Err(_) => vec![failed("invalid_json")],
             },
         };

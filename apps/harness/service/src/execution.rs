@@ -4,12 +4,12 @@ use std::str::FromStr;
 
 use agentmod_harness_logic::execution::{
     ContinueProviderCommand, ExecuteProviderCommand, ExecuteProviderResult, ExecutionLogicError,
-    HarnessContinuationLogic, HarnessExecutionLogic, LogicContinuationDecision,
-    LogicConversationEntry, LogicProviderEvent, LogicProviderFailureKind, LogicProviderOption,
-    LogicRetryClassification, LogicUsage,
+    HarnessCancellationLogic, HarnessContinuationLogic, HarnessExecutionLogic,
+    LogicContinuationDecision, LogicConversationEntry, LogicProviderEvent,
+    LogicProviderFailureKind, LogicProviderOption, LogicRetryClassification, LogicUsage,
 };
 use agentmod_harness_protocol::{
-    HarnessCommand, HarnessContinuationDecision, HarnessEvent, ProjectedEntry, Usage,
+    CostMetadata, HarnessCommand, HarnessContinuationDecision, HarnessEvent, ProjectedEntry, Usage,
 };
 use agentmod_primitives::ContinuationId;
 
@@ -22,6 +22,13 @@ pub enum ServiceConversationEntry {
     System(String),
     /// User content.
     User(String),
+    /// Provider-visible image input.
+    Image {
+        /// Image media type.
+        media_type: String,
+        /// Base64-encoded image bytes.
+        data_base64: String,
+    },
     /// Assistant content.
     Assistant(String),
     /// Tool call.
@@ -99,6 +106,29 @@ pub struct ServiceUsage {
     pub cache_read_tokens: u64,
     /// Cache-write tokens.
     pub cache_write_tokens: u64,
+    /// Provider-reported reasoning tokens.
+    pub reasoning_tokens: u64,
+    /// True only when usage is estimated rather than provider-reported.
+    pub estimated: bool,
+}
+
+/// Service-owned pricing-record identity and computed cost.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ServiceCostRecord {
+    /// Stable pricing-record source.
+    pub source: String,
+    /// Pricing-record version.
+    pub version: String,
+    /// Computed input cost in micro-units of `currency`.
+    pub input_cost_micros: u64,
+    /// Computed output cost in micro-units of `currency`.
+    pub output_cost_micros: u64,
+    /// Computed cache-read cost in micro-units of `currency`.
+    pub cache_read_cost_micros: u64,
+    /// Computed cache-write cost in micro-units of `currency`.
+    pub cache_write_cost_micros: u64,
+    /// ISO-4217 currency code; empty when the pricing record is unknown.
+    pub currency: String,
 }
 
 /// Service-owned provider event.
@@ -134,6 +164,8 @@ pub enum ServiceProviderEvent {
         finish_reason: String,
         /// Usage.
         usage: ServiceUsage,
+        /// Pricing-record identity and computed cost.
+        cost: Option<ServiceCostRecord>,
     },
     /// Provider cancellation.
     Cancelled,
@@ -220,12 +252,12 @@ where
     /// # Errors
     ///
     /// Returns service-owned mapping or execution errors.
-    pub fn execute_wire(
+    pub async fn execute_wire(
         &self,
         command: &HarnessCommand,
     ) -> Result<Vec<HarnessEvent>, ExecutionServiceError> {
         let request = from_wire_command(command)?;
-        let response = self.execute(request)?;
+        let response = self.execute(request).await?;
         response.events.into_iter().map(to_wire_event).collect()
     }
 
@@ -234,13 +266,14 @@ where
     /// # Errors
     ///
     /// Returns a translated logic failure.
-    pub fn execute(
+    pub async fn execute(
         &self,
         request: ServiceExecuteRequest,
     ) -> Result<ServiceExecuteResponse, ExecutionServiceError> {
         let result = self
             .logic
             .execute_provider(to_logic_command(request))
+            .await
             .map_err(|error| map_logic_error(&error))?;
         Ok(map_logic_result(result))
     }
@@ -256,7 +289,7 @@ where
     ///
     /// Returns service-owned mapping or translated logic errors. Duplicate
     /// resolution is rejected by harness logic.
-    pub fn continue_wire(
+    pub async fn continue_wire(
         &self,
         command: &HarnessCommand,
     ) -> Result<Vec<HarnessEvent>, ExecutionServiceError> {
@@ -284,10 +317,12 @@ where
                 reason: reason.clone(),
             },
         };
-        let response = self.continue_execution(ServiceContinueRequest {
-            continuation_reference: continuation_id.to_string(),
-            decision: service_decision,
-        })?;
+        let response = self
+            .continue_execution(ServiceContinueRequest {
+                continuation_reference: continuation_id.to_string(),
+                decision: service_decision,
+            })
+            .await?;
         response.events.into_iter().map(to_wire_event).collect()
     }
 
@@ -296,7 +331,7 @@ where
     /// # Errors
     ///
     /// Returns [`ExecutionServiceError`] for translated business failure.
-    pub fn continue_execution(
+    pub async fn continue_execution(
         &self,
         request: ServiceContinueRequest,
     ) -> Result<ServiceExecuteResponse, ExecutionServiceError> {
@@ -319,7 +354,46 @@ where
                 continuation_reference: request.continuation_reference,
                 decision,
             })
+            .await
             .map(map_logic_result)
+            .map_err(|error| map_logic_error(&error))
+    }
+}
+
+impl<L> HarnessService<L>
+where
+    L: HarnessCancellationLogic,
+{
+    /// Requests cancellation of one in-flight provider exchange.
+    ///
+    /// Returns whether an active exchange was found and cancelled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionServiceError`] for translated business failure.
+    pub async fn cancel_wire(
+        &self,
+        command: &HarnessCommand,
+    ) -> Result<bool, ExecutionServiceError> {
+        let HarnessCommand::Cancel { cancellation_id } = command else {
+            return Err(ExecutionServiceError::WrongCommand);
+        };
+        self.cancel_execution(&cancellation_id.to_string())
+            .await
+    }
+
+    /// Executes a service-owned cancellation request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ExecutionServiceError`] for translated business failure.
+    pub async fn cancel_execution(
+        &self,
+        cancellation_reference: &str,
+    ) -> Result<bool, ExecutionServiceError> {
+        self.logic
+            .cancel_provider(cancellation_reference)
+            .await
             .map_err(|error| map_logic_error(&error))
     }
 }
@@ -374,6 +448,13 @@ fn from_wire_entry(
     Ok(match entry {
         ProjectedEntry::System { text } => ServiceConversationEntry::System(text.clone()),
         ProjectedEntry::User { text } => ServiceConversationEntry::User(text.clone()),
+        ProjectedEntry::Image {
+            media_type,
+            data_base64,
+        } => ServiceConversationEntry::Image {
+            media_type: media_type.clone(),
+            data_base64: data_base64.clone(),
+        },
         ProjectedEntry::Assistant { text } => ServiceConversationEntry::Assistant(text.clone()),
         ProjectedEntry::ToolCall {
             call_id,
@@ -436,6 +517,13 @@ fn to_logic_entry(entry: ServiceConversationEntry) -> LogicConversationEntry {
     match entry {
         ServiceConversationEntry::System(text) => LogicConversationEntry::System(text),
         ServiceConversationEntry::User(text) => LogicConversationEntry::User(text),
+        ServiceConversationEntry::Image {
+            media_type,
+            data_base64,
+        } => LogicConversationEntry::Image {
+            media_type,
+            data_base64,
+        },
         ServiceConversationEntry::Assistant(text) => LogicConversationEntry::Assistant(text),
         ServiceConversationEntry::ToolCall {
             call_id,
@@ -503,9 +591,11 @@ fn map_logic_event(event: LogicProviderEvent) -> ServiceProviderEvent {
         LogicProviderEvent::Completed {
             finish_reason,
             usage,
+            cost,
         } => ServiceProviderEvent::Completed {
             finish_reason,
             usage: map_usage(usage),
+            cost: cost.map(map_cost),
         },
         LogicProviderEvent::Cancelled => ServiceProviderEvent::Cancelled,
         LogicProviderEvent::RuntimeRejected { reason } => ServiceProviderEvent::Failed {
@@ -531,6 +621,20 @@ const fn map_usage(usage: LogicUsage) -> ServiceUsage {
         output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        estimated: usage.estimated,
+    }
+}
+
+fn map_cost(cost: agentmod_harness_logic::execution::LogicCostRecord) -> ServiceCostRecord {
+    ServiceCostRecord {
+        source: cost.source,
+        version: cost.version,
+        input_cost_micros: cost.input_cost_micros,
+        output_cost_micros: cost.output_cost_micros,
+        cache_read_cost_micros: cost.cache_read_cost_micros,
+        cache_write_cost_micros: cost.cache_write_cost_micros,
+        currency: cost.currency,
     }
 }
 
@@ -541,6 +645,13 @@ const fn failure_code(kind: LogicProviderFailureKind) -> &'static str {
         LogicProviderFailureKind::RateLimited => "rate_limited",
         LogicProviderFailureKind::PartialOutputFailure => "partial_output_failure",
         LogicProviderFailureKind::Disconnected => "disconnected",
+        LogicProviderFailureKind::AuthenticationFailed => "authentication_failed",
+        LogicProviderFailureKind::ProviderOverloaded => "provider_overloaded",
+        LogicProviderFailureKind::InvalidRequest => "invalid_request",
+        LogicProviderFailureKind::UnsupportedCapability => "unsupported_capability",
+        LogicProviderFailureKind::TransportFailure => "transport_failure",
+        LogicProviderFailureKind::AmbiguousDisconnect => "ambiguous_disconnect",
+        LogicProviderFailureKind::UserCancellation => "user_cancellation",
     }
 }
 
@@ -579,6 +690,7 @@ fn to_wire_event(event: ServiceProviderEvent) -> Result<HarnessEvent, ExecutionS
         ServiceProviderEvent::Completed {
             finish_reason,
             usage,
+            cost,
         } => HarnessEvent::Completed {
             finish_reason,
             usage: Usage {
@@ -586,6 +698,17 @@ fn to_wire_event(event: ServiceProviderEvent) -> Result<HarnessEvent, ExecutionS
                 output_tokens: usage.output_tokens,
                 cache_read_tokens: usage.cache_read_tokens,
                 cache_write_tokens: usage.cache_write_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                estimated: usage.estimated,
+                cost: cost.map(|cost| CostMetadata {
+                    source: cost.source,
+                    version: cost.version,
+                    input_cost_micros: cost.input_cost_micros,
+                    output_cost_micros: cost.output_cost_micros,
+                    cache_read_cost_micros: cost.cache_read_cost_micros,
+                    cache_write_cost_micros: cost.cache_write_cost_micros,
+                    currency: cost.currency,
+                }),
             },
         },
         ServiceProviderEvent::Cancelled => HarnessEvent::Cancelled,
@@ -617,8 +740,9 @@ mod tests {
         commands: Mutex<Vec<ExecuteProviderCommand>>,
     }
 
+    #[async_trait::async_trait]
     impl HarnessExecutionLogic for MockExecutionLogic {
-        fn execute_provider(
+        async fn execute_provider(
             &self,
             command: ExecuteProviderCommand,
         ) -> Result<ExecuteProviderResult, ExecutionLogicError> {
@@ -636,20 +760,24 @@ mod tests {
                             output_tokens: 1,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
+                            estimated: false,
                         },
+                        cost: None,
                     },
                 ],
             })
         }
     }
 
-    #[test]
-    fn maps_execute_wire_to_logic_and_protocol_events() {
+    #[tokio::test]
+    async fn maps_execute_wire_to_logic_and_protocol_events() {
         let service = HarnessService::new(MockExecutionLogic {
             commands: Mutex::new(Vec::new()),
         });
         let events = service
             .execute_wire(&wire_command("streaming_text"))
+            .await
             .expect("wire execution");
         assert_eq!(
             events,
@@ -664,6 +792,9 @@ mod tests {
                         output_tokens: 1,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost: None,
                     },
                 }
             ]
@@ -680,6 +811,40 @@ mod tests {
                 key: "mock_scenario".into(),
                 value: "streaming_text".into()
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn maps_image_wire_entries_through_the_service_boundary() {
+        let service = HarnessService::new(MockExecutionLogic {
+            commands: Mutex::new(Vec::new()),
+        });
+        let mut command = wire_command("text");
+        let HarnessCommand::Execute { entries, .. } = &mut command else {
+            unreachable!("wire command is execute")
+        };
+        entries.push(ProjectedEntry::Image {
+            media_type: "image/png".into(),
+            data_base64: "aGVsbG8=".into(),
+        });
+        let _ = service
+            .execute_wire(&command)
+            .await
+            .expect("wire execution");
+        assert_eq!(
+            service
+                .logic
+                .commands
+                .lock()
+                .expect("command lock is not poisoned")[0]
+                .entries,
+            [
+                LogicConversationEntry::User("hi".into()),
+                LogicConversationEntry::Image {
+                    media_type: "image/png".into(),
+                    data_base64: "aGVsbG8=".into(),
+                },
+            ]
         );
     }
 

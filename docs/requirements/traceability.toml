@@ -146,9 +146,9 @@ capability = "planner-worker-reviewer"
 owner = "runtime"
 tests = ["runtime_planner_worker"]
 platforms = ["windows", "linux", "macos"]
-evidence = ["tests/e2e/runtime_planner_worker.ps1", "tests/e2e/runtime_planner_worker.sh", "apps/runtime/logic/src/child_session.rs", "apps/runtime/logic/src/turn.rs"]
+evidence = ["tests/e2e/runtime_planner_worker.ps1", "tests/e2e/runtime_planner_worker.sh", "apps/runtime/logic/src/child_session.rs", "apps/runtime/logic/src/turn.rs", "apps/runtime/logic/src/planner.rs", "apps/runtime/logic/src/workspace.rs", "apps/runtime/logic/src/result_package.rs", "apps/runtime/logic/src/integration.rs"]
 status = "partial"
-limitation = "The deterministic Windows process E2E proves two initial runtime-managed workers, exact joins, reviewer rejection, one revision worker, approval, daemon restart, and replayed inspection. Workers remain sequential; workspace isolation, immutable result/diff/test artifacts, durable child-creation approval, crash-while-child-active coverage, and Unix process execution remain incomplete."
+limitation = "The deterministic Windows process E2E proves validated structured tasks, two initial workers dispatched concurrently, exact joins, reviewer rejection, one revision worker, immutable result packages, integration results, approval, daemon restart, and replayed inspection. Unix process execution, dependency-side worktree/copy workspace hosts, and real write-tool enforcement in the child tool path remain incomplete."
 
 [[requirement]]
 id = "E2E-15"

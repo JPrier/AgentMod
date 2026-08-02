@@ -352,8 +352,9 @@ fn restrict_child_binding(
     command: &EnsureChildSessionCommand,
 ) -> Result<(), ChildSessionLogicError> {
     let mode = crate::workspace::task_workspace_mode(&command.workspace_mode, "shared_read_only");
+    let lease_held = mode == crate::workspace::modes::SHARED_SERIALIZED_WRITES;
     let retained =
-        crate::workspace::restrict_tool_groups(&mode, &command.tool_groups.iter().cloned().collect(), false);
+        crate::workspace::restrict_tool_groups(&mode, &command.tool_groups.iter().cloned().collect(), lease_held);
     binding
         .tool_groups
         .retain(|group| retained.iter().any(|retained| retained == group));

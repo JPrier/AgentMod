@@ -405,10 +405,7 @@ impl ProcessHarnessDependency {
                             .map_err(|_| HarnessDependencyError::Transport)?;
                         return Ok(());
                     }
-                    wire::HarnessReply::Health { .. } => {
-                        return Err(HarnessDependencyError::Protocol);
-                    }
-                    wire::HarnessReply::Catalog { .. } => {
+                    wire::HarnessReply::Health { .. } | wire::HarnessReply::Catalog { .. } => {
                         return Err(HarnessDependencyError::Protocol);
                     }
                 }

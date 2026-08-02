@@ -17,7 +17,78 @@ pub enum PluginClassData {
     Blocking,
     Observer,
     Tool,
+    GraphNode,
+    Memory,
+    Compaction,
+    ContextTransform,
     Extension,
+}
+
+/// Data-owned graph node executor declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NodeExecutorData {
+    pub executor_id: String,
+    pub version: String,
+    pub node_kind: String,
+    pub runtime_api: String,
+    pub required_capabilities: BTreeSet<String>,
+    pub input_schema: String,
+    pub output_schema: String,
+    pub timeout_ms: u64,
+    pub failure_policy: String,
+    pub idempotent: bool,
+    pub external_effect: bool,
+    pub read_authority: BTreeSet<String>,
+    pub state_scope: String,
+}
+
+/// Data-owned memory declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryDeclarationData {
+    pub scopes: BTreeSet<String>,
+    pub capabilities: BTreeSet<String>,
+    pub bounded_bytes: u64,
+}
+
+/// Data-owned compaction declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompactionDeclarationData {
+    pub strategy_id: String,
+    pub idempotent: bool,
+    pub bounded_bytes: u64,
+}
+
+/// Data-owned context transform boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextTransformBoundaryData {
+    BeforeMemoryRetrieval,
+    AfterMemoryRetrieval,
+    BeforeCompaction,
+    AfterCompaction,
+    BeforeProviderProjection,
+    BeforeTurnCompletion,
+}
+
+/// Data-owned context transform declaration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContextTransformData {
+    pub transform_id: String,
+    pub boundary: ContextTransformBoundaryData,
+    pub stage: u16,
+    pub priority: i32,
+    pub before: BTreeSet<String>,
+    pub after: BTreeSet<String>,
+}
+
+/// Data-owned observer delivery semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObserverDeliveryData {
+    BestEffort,
+    AtMostOnce,
+    AtLeastOnce {
+        max_attempts: u8,
+        retry_backoff_ms: u64,
+    },
 }
 
 /// Data-owned manifest.
@@ -52,6 +123,11 @@ pub struct ManifestData {
     pub schema_version_number: u32,
     pub schema_required: bool,
     pub schema_json: String,
+    pub node_executors: Vec<NodeExecutorData>,
+    pub memory: Option<MemoryDeclarationData>,
+    pub compaction: Option<CompactionDeclarationData>,
+    pub context_transforms: Vec<ContextTransformData>,
+    pub observer_delivery: ObserverDeliveryData,
 }
 
 /// Data-owned authorization.
@@ -77,6 +153,66 @@ pub struct InvocationData {
     pub readable_state: Value,
     pub authorization: AuthorizationData,
 }
+
+/// Graph node execution.
+#[derive(Clone, Debug)]
+pub struct NodeExecutionData {
+    pub plugin_id: String,
+    pub invocation_id: String,
+    pub executor_id: String,
+    pub node_id: String,
+    pub node_kind: String,
+    pub input: Value,
+    pub variables: Value,
+    pub readable_state: Value,
+    pub authorization: AuthorizationData,
+}
+
+/// Memory operation.
+#[derive(Clone, Debug)]
+pub struct MemoryOperationData {
+    pub plugin_id: String,
+    pub invocation_id: String,
+    pub scope: String,
+    pub query: String,
+    pub limit: usize,
+    pub entries: Vec<MemoryItemData>,
+    pub authorization: AuthorizationData,
+}
+
+/// Memory item.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryItemData {
+    pub reference: String,
+    pub content: String,
+    pub score: Option<f64>,
+    pub created_at_ms: i64,
+}
+
+/// Compaction proposal.
+#[derive(Clone, Debug)]
+pub struct CompactionData {
+    pub plugin_id: String,
+    pub invocation_id: String,
+    pub source_range_start: u64,
+    pub source_range_end: u64,
+    pub source_range_hash: String,
+    pub current_entries: Value,
+    pub proposal: Value,
+    pub authorization: AuthorizationData,
+}
+
+/// Context transform.
+#[derive(Clone, Debug)]
+pub struct ContextTransformOperationData {
+    pub plugin_id: String,
+    pub invocation_id: String,
+    pub transform_id: String,
+    pub boundary: ContextTransformBoundaryData,
+    pub payload: Value,
+    pub authorization: AuthorizationData,
+}
+
 /// Observation.
 #[derive(Clone, Debug)]
 pub struct ObservationData {
@@ -85,8 +221,11 @@ pub struct ObservationData {
     pub handler: String,
     pub event_type: String,
     pub event: Value,
+    pub event_range_start: u64,
+    pub event_range_end: u64,
     pub authorization: AuthorizationData,
 }
+
 /// State change.
 #[derive(Clone, Debug)]
 pub struct StateChangeData {
@@ -94,6 +233,7 @@ pub struct StateChangeData {
     pub reason: Option<String>,
     pub authorization: AuthorizationData,
 }
+
 /// Decision.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DecisionData {
@@ -101,7 +241,31 @@ pub enum DecisionData {
     Replace(Value),
     Reject(String),
     ToolResult(Value),
+    NodeResult(Value),
 }
+
+/// Memory result.
+#[derive(Clone, Debug, PartialEq)]
+pub enum MemoryResultData {
+    Describe {
+        scopes: BTreeSet<String>,
+        capabilities: BTreeSet<String>,
+        bounded_bytes: u64,
+    },
+    Retrieve {
+        items: Vec<MemoryItemData>,
+    },
+    Commit {
+        retained: bool,
+        references: Vec<String>,
+    },
+    Health {
+        healthy: bool,
+        item_count: u64,
+        retained_bytes: u64,
+    },
+}
+
 /// Audit.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuditData {
@@ -111,6 +275,7 @@ pub struct AuditData {
     pub outcome: String,
     pub attempts: u8,
 }
+
 /// Load result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadData {
@@ -118,6 +283,7 @@ pub struct LoadData {
     pub state_version: u32,
     pub attempts: u8,
 }
+
 /// Observation result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservationResultData {
@@ -125,12 +291,30 @@ pub struct ObservationResultData {
     pub queue_depth: usize,
     pub dropped: u64,
 }
+
+/// Durable delivery record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeliveryRecordData {
+    pub delivery_id: String,
+    pub plugin_id: String,
+    pub handler: String,
+    pub event_type: String,
+    pub event_range_start: u64,
+    pub event_range_end: u64,
+    pub attempts: u8,
+    pub max_attempts: u8,
+    pub retry_backoff_ms: u64,
+    pub next_retry_at_ms: i64,
+    pub terminal: Option<String>,
+}
+
 /// Health.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HealthData {
     pub loaded: usize,
     pub running: usize,
     pub observer_dropped: u64,
+    pub pending_deliveries: usize,
 }
 
 /// Data contract.
@@ -153,6 +337,23 @@ pub trait PluginDataPort: Send + Sync {
         authorization: AuthorizationData,
     ) -> Result<LoadData, PluginDataError>;
     async fn invoke(&self, request: InvocationData) -> Result<(DecisionData, u8), PluginDataError>;
+    async fn execute_node(
+        &self,
+        request: NodeExecutionData,
+    ) -> Result<(Value, u8), PluginDataError>;
+    async fn memory(
+        &self,
+        operation: String,
+        request: MemoryOperationData,
+    ) -> Result<(MemoryResultData, u8), PluginDataError>;
+    async fn compaction_propose(
+        &self,
+        request: CompactionData,
+    ) -> Result<(Value, u64, u8), PluginDataError>;
+    async fn context_transform(
+        &self,
+        request: ContextTransformOperationData,
+    ) -> Result<(Value, u8), PluginDataError>;
     async fn observe(
         &self,
         request: ObservationData,
@@ -163,7 +364,14 @@ pub trait PluginDataPort: Send + Sync {
         request: StateChangeData,
         quarantine: bool,
     ) -> Result<AuditData, PluginDataError>;
+    async fn reload(&self, request: StateChangeData) -> Result<AuditData, PluginDataError>;
+    async fn unquarantine(&self, request: StateChangeData) -> Result<AuditData, PluginDataError>;
     async fn health(&self) -> HealthData;
+    async fn audits(&self) -> Vec<AuditData>;
+    async fn deliveries(&self) -> Vec<DeliveryRecordData>;
+    async fn active_invocations(&self) -> usize;
+    async fn pending_deliveries(&self) -> usize;
+    async fn flush(&self) -> Result<(), PluginDataError>;
 }
 
 /// Data implementation.
@@ -236,9 +444,130 @@ impl<D: dependency::PluginDependencyPort> PluginDataPort for PluginData<D> {
                 dependency::DependencyDecision::Replace(v) => DecisionData::Replace(v),
                 dependency::DependencyDecision::Reject(v) => DecisionData::Reject(v),
                 dependency::DependencyDecision::ToolResult(v) => DecisionData::ToolResult(v),
+                dependency::DependencyDecision::NodeResult(v) => DecisionData::NodeResult(v),
             },
             a,
         ))
+    }
+    async fn execute_node(&self, r: NodeExecutionData) -> Result<(Value, u8), PluginDataError> {
+        self.dependency
+            .execute_node(dependency::DependencyNodeExecutionRequest {
+                plugin_id: r.plugin_id,
+                invocation_id: r.invocation_id,
+                executor_id: r.executor_id,
+                node_id: r.node_id,
+                node_kind: r.node_kind,
+                input: r.input,
+                variables: r.variables,
+                readable_state: r.readable_state,
+                authorization: map_auth(r.authorization),
+            })
+            .await
+            .map_err(map_error)
+    }
+    async fn memory(
+        &self,
+        operation: String,
+        r: MemoryOperationData,
+    ) -> Result<(MemoryResultData, u8), PluginDataError> {
+        let (result, attempts) = self
+            .dependency
+            .memory(
+                operation,
+                dependency::DependencyMemoryRequest {
+                    plugin_id: r.plugin_id,
+                    invocation_id: r.invocation_id,
+                    scope: r.scope,
+                    query: r.query,
+                    limit: r.limit,
+                    entries: r
+                        .entries
+                        .into_iter()
+                        .map(|item| dependency::DependencyMemoryItem {
+                            reference: item.reference,
+                            content: item.content,
+                            score: item.score,
+                            created_at_ms: item.created_at_ms,
+                        })
+                        .collect(),
+                    authorization: map_auth(r.authorization),
+                },
+            )
+            .await
+            .map_err(map_error)?;
+        let result = match result {
+            dependency::DependencyMemoryResult::Describe {
+                scopes,
+                capabilities,
+                bounded_bytes,
+            } => MemoryResultData::Describe {
+                scopes,
+                capabilities,
+                bounded_bytes,
+            },
+            dependency::DependencyMemoryResult::Retrieve { items } => MemoryResultData::Retrieve {
+                items: items
+                    .into_iter()
+                    .map(|item| MemoryItemData {
+                        reference: item.reference,
+                        content: item.content,
+                        score: item.score,
+                        created_at_ms: item.created_at_ms,
+                    })
+                    .collect(),
+            },
+            dependency::DependencyMemoryResult::Commit {
+                retained,
+                references,
+            } => MemoryResultData::Commit {
+                retained,
+                references,
+            },
+            dependency::DependencyMemoryResult::Health {
+                healthy,
+                item_count,
+                retained_bytes,
+            } => MemoryResultData::Health {
+                healthy,
+                item_count,
+                retained_bytes,
+            },
+        };
+        Ok((result, attempts))
+    }
+    async fn compaction_propose(
+        &self,
+        r: CompactionData,
+    ) -> Result<(Value, u64, u8), PluginDataError> {
+        self.dependency
+            .compaction_propose(dependency::DependencyCompactionRequest {
+                plugin_id: r.plugin_id,
+                invocation_id: r.invocation_id,
+                source_range_start: r.source_range_start,
+                source_range_end: r.source_range_end,
+                source_range_hash: r.source_range_hash,
+                current_entries: r.current_entries,
+                proposal: r.proposal,
+                authorization: map_auth(r.authorization),
+            })
+            .await
+            .map_err(map_error)
+    }
+    async fn context_transform(
+        &self,
+        r: ContextTransformOperationData,
+    ) -> Result<(Value, u8), PluginDataError> {
+        self.dependency
+            .context_transform(dependency::DependencyContextTransformRequest {
+                plugin_id: r.plugin_id,
+                invocation_id: r.invocation_id,
+                transform_id: r.transform_id,
+                boundary: map_boundary(r.boundary),
+                payload: r.payload,
+                authorization: map_auth(r.authorization),
+            })
+            .await
+            .map_err(map_error)
     }
     async fn observe(&self, r: ObservationData) -> Result<ObservationResultData, PluginDataError> {
         let v = self
@@ -249,6 +578,8 @@ impl<D: dependency::PluginDependencyPort> PluginDataPort for PluginData<D> {
                 handler: r.handler,
                 event_type: r.event_type,
                 event: r.event,
+                event_range_start: r.event_range_start,
+                event_range_end: r.event_range_end,
                 authorization: map_auth(r.authorization),
             })
             .await
@@ -280,12 +611,95 @@ impl<D: dependency::PluginDependencyPort> PluginDataPort for PluginData<D> {
         .map_err(map_error)?;
         Ok(map_audit(v))
     }
+    async fn reload(&self, r: StateChangeData) -> Result<AuditData, PluginDataError> {
+        self.dependency
+            .reload(dependency::DependencyStateChangeRequest {
+                plugin_id: r.plugin_id,
+                reason: r.reason,
+                authorization: map_auth(r.authorization),
+            })
+            .await
+            .map(map_audit)
+            .map_err(map_error)
+    }
+    async fn unquarantine(&self, r: StateChangeData) -> Result<AuditData, PluginDataError> {
+        self.dependency
+            .unquarantine(dependency::DependencyStateChangeRequest {
+                plugin_id: r.plugin_id,
+                reason: r.reason,
+                authorization: map_auth(r.authorization),
+            })
+            .await
+            .map(map_audit)
+            .map_err(map_error)
+    }
     async fn health(&self) -> HealthData {
         let v = self.dependency.health().await;
         HealthData {
             loaded: v.loaded,
             running: v.running,
             observer_dropped: v.observer_dropped,
+            pending_deliveries: v.pending_deliveries,
+        }
+    }
+    async fn audits(&self) -> Vec<AuditData> {
+        self.dependency
+            .audits()
+            .await
+            .into_iter()
+            .map(map_audit)
+            .collect()
+    }
+    async fn deliveries(&self) -> Vec<DeliveryRecordData> {
+        self.dependency
+            .deliveries()
+            .await
+            .into_iter()
+            .map(|record| DeliveryRecordData {
+                delivery_id: record.delivery_id,
+                plugin_id: record.plugin_id,
+                handler: record.handler,
+                event_type: record.event_type,
+                event_range_start: record.event_range_start,
+                event_range_end: record.event_range_end,
+                attempts: record.attempts,
+                max_attempts: record.max_attempts,
+                retry_backoff_ms: record.retry_backoff_ms,
+                next_retry_at_ms: record.next_retry_at_ms,
+                terminal: record.terminal,
+            })
+            .collect()
+    }
+    async fn active_invocations(&self) -> usize {
+        self.dependency.active_invocations().await
+    }
+    async fn pending_deliveries(&self) -> usize {
+        self.dependency.pending_deliveries().await
+    }
+    async fn flush(&self) -> Result<(), PluginDataError> {
+        self.dependency.flush().await.map_err(map_error)
+    }
+}
+
+fn map_boundary(v: ContextTransformBoundaryData) -> dependency::DependencyContextTransformBoundary {
+    match v {
+        ContextTransformBoundaryData::BeforeMemoryRetrieval => {
+            dependency::DependencyContextTransformBoundary::BeforeMemoryRetrieval
+        }
+        ContextTransformBoundaryData::AfterMemoryRetrieval => {
+            dependency::DependencyContextTransformBoundary::AfterMemoryRetrieval
+        }
+        ContextTransformBoundaryData::BeforeCompaction => {
+            dependency::DependencyContextTransformBoundary::BeforeCompaction
+        }
+        ContextTransformBoundaryData::AfterCompaction => {
+            dependency::DependencyContextTransformBoundary::AfterCompaction
+        }
+        ContextTransformBoundaryData::BeforeProviderProjection => {
+            dependency::DependencyContextTransformBoundary::BeforeProviderProjection
+        }
+        ContextTransformBoundaryData::BeforeTurnCompletion => {
+            dependency::DependencyContextTransformBoundary::BeforeTurnCompletion
         }
     }
 }
@@ -302,6 +716,12 @@ fn map_manifest(v: ManifestData) -> dependency::DependencyManifest {
             PluginClassData::Blocking => dependency::DependencyPluginClass::Blocking,
             PluginClassData::Observer => dependency::DependencyPluginClass::Observer,
             PluginClassData::Tool => dependency::DependencyPluginClass::Tool,
+            PluginClassData::GraphNode => dependency::DependencyPluginClass::GraphNode,
+            PluginClassData::Memory => dependency::DependencyPluginClass::Memory,
+            PluginClassData::Compaction => dependency::DependencyPluginClass::Compaction,
+            PluginClassData::ContextTransform => {
+                dependency::DependencyPluginClass::ContextTransform
+            }
             PluginClassData::Extension => dependency::DependencyPluginClass::Extension,
         },
         entrypoint: dependency::DependencyEntrypoint {
@@ -329,6 +749,62 @@ fn map_manifest(v: ManifestData) -> dependency::DependencyManifest {
             version: v.schema_version_number,
             required: v.schema_required,
             inline_json: v.schema_json,
+        },
+        node_executors: v
+            .node_executors
+            .into_iter()
+            .map(|executor| dependency::DependencyNodeExecutor {
+                executor_id: executor.executor_id,
+                version: executor.version,
+                node_kind: executor.node_kind,
+                runtime_api: executor.runtime_api,
+                required_capabilities: executor.required_capabilities,
+                input_schema: executor.input_schema,
+                output_schema: executor.output_schema,
+                timeout_ms: executor.timeout_ms,
+                failure_policy: executor.failure_policy,
+                idempotent: executor.idempotent,
+                external_effect: executor.external_effect,
+                read_authority: executor.read_authority,
+                state_scope: executor.state_scope,
+            })
+            .collect(),
+        memory: v
+            .memory
+            .map(|memory| dependency::DependencyMemoryDeclaration {
+                scopes: memory.scopes,
+                capabilities: memory.capabilities,
+                bounded_bytes: memory.bounded_bytes,
+            }),
+        compaction: v
+            .compaction
+            .map(|compaction| dependency::DependencyCompactionDeclaration {
+                strategy_id: compaction.strategy_id,
+                idempotent: compaction.idempotent,
+                bounded_bytes: compaction.bounded_bytes,
+            }),
+        context_transforms: v
+            .context_transforms
+            .into_iter()
+            .map(|transform| dependency::DependencyContextTransform {
+                transform_id: transform.transform_id,
+                boundary: map_boundary(transform.boundary),
+                stage: transform.stage,
+                priority: transform.priority,
+                before: transform.before,
+                after: transform.after,
+            })
+            .collect(),
+        observer_delivery: match v.observer_delivery {
+            ObserverDeliveryData::BestEffort => dependency::DependencyObserverDelivery::BestEffort,
+            ObserverDeliveryData::AtMostOnce => dependency::DependencyObserverDelivery::AtMostOnce,
+            ObserverDeliveryData::AtLeastOnce {
+                max_attempts,
+                retry_backoff_ms,
+            } => dependency::DependencyObserverDelivery::AtLeastOnce {
+                max_attempts,
+                retry_backoff_ms,
+            },
         },
     }
 }

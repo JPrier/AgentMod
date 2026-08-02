@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 
 use agentmod_plugin_host_dependency::{
-    DependencyConfigurationSchema, DependencyEntrypoint, DependencyManifest, DependencyPluginClass,
+    DependencyConfigurationSchema, DependencyContextTransform, DependencyEntrypoint,
+    DependencyManifest, DependencyNodeExecutor, DependencyObserverDelivery, DependencyPluginClass,
     IsolatedPluginDependency, PluginDependencyConfig, PluginDependencyError, PluginDependencyPort,
 };
 
@@ -85,5 +86,10 @@ fn manifest(id: &str, class: DependencyPluginClass) -> DependencyManifest {
             required: false,
             inline_json: "{\"type\":\"object\",\"additionalProperties\":false}".to_owned(),
         },
+        node_executors: Vec::new(),
+        memory: None,
+        compaction: None,
+        context_transforms: Vec::new(),
+        observer_delivery: DependencyObserverDelivery::BestEffort,
     }
 }

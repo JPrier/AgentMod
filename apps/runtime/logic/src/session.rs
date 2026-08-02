@@ -963,6 +963,148 @@ pub struct ReviewerFindingsCommittedEvent {
     pub findings: Vec<String>,
 }
 
+/// Stable identity for one live typed-summary compaction request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryIdentity {
+    /// Projection-local summary execution ID.
+    pub summary_id: String,
+    /// Hash of the exact provider/model/options/entries request.
+    pub request_hash: ContentHash,
+    /// Provider used for the summary model request.
+    pub provider: String,
+    /// Model used for the summary model request.
+    pub model: String,
+    /// Bounded summary schema version.
+    pub schema_version: u16,
+    /// Maximum provider-visible summary bytes.
+    pub max_summary_bytes: u32,
+    /// Inclusive source projection range being summarized.
+    pub source_range: Option<(Sequence, Sequence)>,
+}
+
+/// Canonical intent to begin a live typed-summary model request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryProposedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+}
+
+/// Records the final policy-approved summary action before dispatch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryApprovedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Digest bound into the short-lived harness grant.
+    pub action_digest: ContentHash,
+}
+
+/// Records provider dispatch of one summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryStartedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+}
+
+/// Terminal provider evidence for one summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryCompletedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Hash of the exact bounded summary text.
+    pub content_hash: ContentHash,
+    /// Bounded provider-visible summary text.
+    pub text: String,
+    /// Provider-reported input tokens.
+    pub input_tokens: u64,
+    /// Provider-reported output tokens.
+    pub output_tokens: u64,
+}
+
+/// Terminal failure for one summary request without provider evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryFailedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Stable failure code.
+    pub code: String,
+    /// Bounded failure detail.
+    pub message: String,
+}
+
+/// Canonical identity for one automatic memory write.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryWriteIdentity {
+    /// Canonical cross-restart write identity.
+    pub write_id: String,
+    /// Provider used for the write.
+    pub provider: String,
+    /// Normalized scope key.
+    pub scope: String,
+    /// Provenance label.
+    pub source: String,
+    /// Hash of the exact approved content.
+    pub content_hash: ContentHash,
+    /// Canonical duplicate-prevention key, when the selected policy uses one.
+    pub deduplication_key: Option<String>,
+}
+
+/// Canonical intent to begin one automatic memory-write proposal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryWriteProposedEvent {
+    /// Canonical write identity.
+    pub identity: MemoryWriteIdentity,
+    /// Logic proposal identifier.
+    pub proposal_id: String,
+    /// Maximum retained bytes.
+    pub max_bytes: u32,
+    /// Trigger boundary that proposed the write.
+    pub trigger: String,
+}
+
+/// Records the final policy-approved memory-write action.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryWriteApprovedEvent {
+    /// Canonical write identity.
+    pub identity: MemoryWriteIdentity,
+    /// Digest of the policy-approved action.
+    pub action_digest: ContentHash,
+}
+
+/// Records durable dispatch intent before the memory provider is called.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryWriteDispatchedEvent {
+    /// Canonical write identity.
+    pub identity: MemoryWriteIdentity,
+    /// Digest of the policy-approved action.
+    pub action_digest: ContentHash,
+}
+
+/// Terminal provider receipt for one automatic memory write.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryWriteCompletedEvent {
+    /// Canonical write identity.
+    pub identity: MemoryWriteIdentity,
+    /// Digest of the policy-approved action.
+    pub action_digest: ContentHash,
+    /// Provider-local stable reference.
+    pub reference: String,
+    /// Whether the provider retained the content.
+    pub retained: bool,
+    /// Whether an identical canonical write was already retained.
+    pub deduplicated: bool,
+}
+
+/// Terminal failure for one automatic memory write without a receipt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryWriteFailedEvent {
+    /// Canonical write identity.
+    pub identity: MemoryWriteIdentity,
+    /// Stable failure code.
+    pub code: String,
+    /// Bounded failure detail.
+    pub message: String,
+}
+
 /// Typed committed events consumed by the pure session reducer.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "event", content = "payload", rename_all = "snake_case")]
@@ -1069,6 +1211,26 @@ pub enum RuntimeCommittedEvent {
     ChildJoinCompleted(ChildJoinCompletedEvent),
     /// Records a structured reviewer decision.
     ReviewerFindingsCommitted(ReviewerFindingsCommittedEvent),
+    /// Begins one live typed-summary model request.
+    ContextSummaryProposed(ContextSummaryProposedEvent),
+    /// Records the final approved summary action before dispatch.
+    ContextSummaryApproved(ContextSummaryApprovedEvent),
+    /// Records provider dispatch of one summary request.
+    ContextSummaryStarted(ContextSummaryStartedEvent),
+    /// Records terminal provider evidence for one summary request.
+    ContextSummaryCompleted(ContextSummaryCompletedEvent),
+    /// Records a terminal summary failure without provider evidence.
+    ContextSummaryFailed(ContextSummaryFailedEvent),
+    /// Begins one automatic memory-write proposal.
+    MemoryWriteProposed(MemoryWriteProposedEvent),
+    /// Records the final approved memory-write action.
+    MemoryWriteApproved(MemoryWriteApprovedEvent),
+    /// Records durable dispatch intent before the memory provider is called.
+    MemoryWriteDispatched(MemoryWriteDispatchedEvent),
+    /// Records a terminal memory-write receipt.
+    MemoryWriteCompleted(MemoryWriteCompletedEvent),
+    /// Records a terminal memory-write failure.
+    MemoryWriteFailed(MemoryWriteFailedEvent),
 }
 
 impl RuntimeCommittedEvent {
@@ -1127,6 +1289,16 @@ impl RuntimeCommittedEvent {
             Self::TaskPlanCommitted(_) => "style.task_plan_committed",
             Self::ChildJoinCompleted(_) => "child_agent.join_completed",
             Self::ReviewerFindingsCommitted(_) => "style.reviewer_findings_committed",
+            Self::ContextSummaryProposed(_) => "context.summary_proposed",
+            Self::ContextSummaryApproved(_) => "context.summary_approved",
+            Self::ContextSummaryStarted(_) => "context.summary_started",
+            Self::ContextSummaryCompleted(_) => "context.summary_completed",
+            Self::ContextSummaryFailed(_) => "context.summary_failed",
+            Self::MemoryWriteProposed(_) => "memory.write_proposed",
+            Self::MemoryWriteApproved(_) => "memory.write_approved",
+            Self::MemoryWriteDispatched(_) => "memory.write_dispatched",
+            Self::MemoryWriteCompleted(_) => "memory.write_completed",
+            Self::MemoryWriteFailed(_) => "memory.write_failed",
         }
     }
 }
@@ -1281,6 +1453,130 @@ pub struct ArtifactPersistenceRecord {
     pub artifact_reference: Option<String>,
 }
 
+/// Replay-owned live typed-summary compaction outbox state.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSummaryState {
+    /// Proposal is canonical; no policy outcome is canonical yet.
+    Proposed,
+    /// Policy approved the exact request; no provider call is canonical yet.
+    Approved,
+    /// Provider dispatch is canonical; recovery must reuse exact evidence.
+    Started,
+    /// Terminal provider evidence is canonical.
+    Completed,
+    /// Terminal failure without provider evidence is canonical.
+    Failed,
+}
+
+/// Replay-owned live typed-summary compaction record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryRecord {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Latest durable outbox state.
+    pub state: ContextSummaryState,
+    /// Digest of the approved action, once policy succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<ContentHash>,
+    /// Canonical proposal sequence.
+    pub proposed_at: Sequence,
+    /// Canonical approval sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<Sequence>,
+    /// Canonical dispatch sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Sequence>,
+    /// Canonical terminal sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Sequence>,
+    /// Hash of the exact bounded summary text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<ContentHash>,
+    /// Bounded provider-visible summary text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Provider-reported input tokens.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Provider-reported output tokens.
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+impl ContextSummaryRecord {
+    /// Returns whether terminal provider evidence already exists.
+    #[must_use]
+    pub const fn has_terminal_evidence(&self) -> bool {
+        matches!(self.state, ContextSummaryState::Completed | ContextSummaryState::Failed)
+    }
+}
+
+/// Replay-owned automatic memory-write outbox state.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryWriteState {
+    /// Proposal is canonical; no policy outcome is canonical yet.
+    Proposed,
+    /// Policy approved the exact action; no provider call is canonical yet.
+    Approved,
+    /// Dispatch intent is canonical; recovery must use an exact terminal receipt.
+    Dispatched,
+    /// A terminal provider receipt is canonical.
+    Completed,
+    /// Terminal failure without a receipt is canonical.
+    Failed,
+}
+
+/// Replay-owned automatic memory-write outbox record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryWriteRecord {
+    /// Canonical write identity.
+    pub identity: MemoryWriteIdentity,
+    /// Logic proposal identifier.
+    pub proposal_id: String,
+    /// Maximum retained bytes.
+    pub max_bytes: u32,
+    /// Trigger boundary that proposed the write.
+    pub trigger: String,
+    /// Latest durable outbox state.
+    pub state: MemoryWriteState,
+    /// Digest of the approved action, once policy succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<ContentHash>,
+    /// Canonical proposal sequence.
+    pub proposed_at: Sequence,
+    /// Canonical approval sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<Sequence>,
+    /// Canonical dispatch sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_at: Option<Sequence>,
+    /// Canonical terminal sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Sequence>,
+    /// Provider-local stable reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
+    /// Whether the provider retained the content.
+    #[serde(default)]
+    pub retained: bool,
+    /// Whether an identical canonical write was already retained.
+    #[serde(default)]
+    pub deduplicated: bool,
+    /// Stable failure code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_code: Option<String>,
+}
+
+impl MemoryWriteRecord {
+    /// Returns whether a terminal receipt or failure already exists.
+    #[must_use]
+    pub const fn has_terminal_evidence(&self) -> bool {
+        matches!(self.state, MemoryWriteState::Completed | MemoryWriteState::Failed)
+    }
+}
+
 impl ArtifactPersistenceRecord {
     /// Returns the only restart action legal at this canonical cut.
     #[must_use]
@@ -1343,6 +1639,12 @@ pub struct SessionState {
     /// Restart/reconnect reconciliation state keyed by provider call ID.
     #[serde(default)]
     pub process_reconciliations: BTreeMap<String, ProcessReconciliationRecord>,
+    /// Live typed-summary compaction outbox keyed by summary execution ID.
+    #[serde(default)]
+    pub context_summaries: BTreeMap<String, ContextSummaryRecord>,
+    /// Automatic memory-write outbox keyed by canonical write identity.
+    #[serde(default)]
+    pub memory_writes: BTreeMap<String, MemoryWriteRecord>,
     /// Last applied sequence.
     pub last_sequence: Sequence,
     /// Integrity checksum of the last applied event.
@@ -1703,6 +2005,8 @@ fn initialize(
         planner_worker: PlannerWorkerState::default(),
         plugins: PluginExecutionState::default(),
         process_reconciliations: BTreeMap::new(),
+        context_summaries: BTreeMap::new(),
+        memory_writes: BTreeMap::new(),
         last_sequence: event.metadata.sequence,
         last_event_checksum: event.integrity_checksum,
     })
@@ -1987,6 +2291,36 @@ fn apply_payload(
         }
         RuntimeCommittedEvent::ReviewerFindingsCommitted(committed) => {
             apply_reviewer_findings_committed(state, committed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryProposed(proposed) => {
+            apply_context_summary_proposed(state, proposed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryApproved(approved) => {
+            apply_context_summary_approved(state, approved, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryStarted(started) => {
+            apply_context_summary_started(state, started, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryCompleted(completed) => {
+            apply_context_summary_completed(state, completed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryFailed(failed) => {
+            apply_context_summary_failed(state, failed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::MemoryWriteProposed(proposed) => {
+            apply_memory_write_proposed(state, proposed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::MemoryWriteApproved(approved) => {
+            apply_memory_write_approved(state, approved, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::MemoryWriteDispatched(dispatched) => {
+            apply_memory_write_dispatched(state, dispatched, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::MemoryWriteCompleted(completed) => {
+            apply_memory_write_completed(state, completed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::MemoryWriteFailed(failed) => {
+            apply_memory_write_failed(state, failed, event.metadata.sequence)
         }
         RuntimeCommittedEvent::ToolExecutionDispatched(dispatched) => {
             apply_tool_dispatch(state, dispatched, event.metadata.sequence)
@@ -2624,6 +2958,294 @@ fn apply_artifact_persistence_completed(
     record.completed_at = Some(sequence);
     record.artifact_id = Some(completed.artifact_id.clone());
     record.artifact_reference = Some(completed.artifact_reference.clone());
+    Ok(())
+}
+
+fn valid_summary_identity(identity: &ContextSummaryIdentity) -> bool {
+    !identity.summary_id.trim().is_empty()
+        && !identity.provider.trim().is_empty()
+        && !identity.model.trim().is_empty()
+        && identity.schema_version == 1
+        && identity.max_summary_bytes > 0
+        && identity.max_summary_bytes <= 1024 * 1024
+}
+
+fn apply_context_summary_proposed(
+    state: &mut SessionState,
+    proposed: &ContextSummaryProposedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let identity = &proposed.identity;
+    if !valid_summary_identity(identity)
+        || identity
+            .source_range
+            .is_some_and(|(start, end)| start > end)
+        || state.context_summaries.contains_key(&identity.summary_id)
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    state.context_summaries.insert(
+        identity.summary_id.clone(),
+        ContextSummaryRecord {
+            identity: identity.clone(),
+            state: ContextSummaryState::Proposed,
+            action_digest: None,
+            proposed_at: sequence,
+            approved_at: None,
+            started_at: None,
+            completed_at: None,
+            content_hash: None,
+            text: None,
+            input_tokens: 0,
+            output_tokens: 0,
+        },
+    );
+    Ok(())
+}
+
+fn summary_record_mut<'a>(
+    state: &'a mut SessionState,
+    identity: &ContextSummaryIdentity,
+) -> Result<&'a mut ContextSummaryRecord, SessionReducerError> {
+    let record = state
+        .context_summaries
+        .get_mut(&identity.summary_id)
+        .ok_or(SessionReducerError::InvalidSummaryTransition)?;
+    if record.identity != *identity {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    Ok(record)
+}
+
+fn apply_context_summary_approved(
+    state: &mut SessionState,
+    approved: &ContextSummaryApprovedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = summary_record_mut(state, &approved.identity)?;
+    if record.state != ContextSummaryState::Proposed
+        || record.action_digest.is_some()
+        || record.approved_at.is_some()
+        || record.started_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Approved;
+    record.action_digest = Some(approved.action_digest);
+    record.approved_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_context_summary_started(
+    state: &mut SessionState,
+    started: &ContextSummaryStartedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = summary_record_mut(state, &started.identity)?;
+    if record.state != ContextSummaryState::Approved
+        || record.approved_at.is_none()
+        || record.started_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Started;
+    record.started_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_context_summary_completed(
+    state: &mut SessionState,
+    completed: &ContextSummaryCompletedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let identity = &completed.identity;
+    if completed.text.trim().is_empty()
+        || u64::try_from(completed.text.len()).map_or(true, |len| len > u64::from(identity.max_summary_bytes))
+        || completed.content_hash != ContentHash::digest(completed.text.as_bytes())
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    let record = summary_record_mut(state, identity)?;
+    if record.state != ContextSummaryState::Started
+        || record.started_at.is_none()
+        || record.completed_at.is_some()
+        || record.content_hash.is_some()
+        || record.text.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Completed;
+    record.completed_at = Some(sequence);
+    record.content_hash = Some(completed.content_hash);
+    record.text = Some(completed.text.clone());
+    record.input_tokens = completed.input_tokens;
+    record.output_tokens = completed.output_tokens;
+    Ok(())
+}
+
+fn apply_context_summary_failed(
+    state: &mut SessionState,
+    failed: &ContextSummaryFailedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if failed.code.trim().is_empty() {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    let record = summary_record_mut(state, &failed.identity)?;
+    if record.state != ContextSummaryState::Started
+        || record.started_at.is_none()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Failed;
+    record.completed_at = Some(sequence);
+    Ok(())
+}
+
+fn valid_memory_write_identity(identity: &MemoryWriteIdentity) -> bool {
+    !identity.write_id.trim().is_empty()
+        && !identity.provider.trim().is_empty()
+        && !identity.scope.trim().is_empty()
+        && !identity.source.trim().is_empty()
+}
+
+fn apply_memory_write_proposed(
+    state: &mut SessionState,
+    proposed: &MemoryWriteProposedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let identity = &proposed.identity;
+    if !valid_memory_write_identity(identity)
+        || proposed.proposal_id.trim().is_empty()
+        || proposed.max_bytes == 0
+        || proposed.trigger.trim().is_empty()
+        || state.memory_writes.contains_key(&identity.write_id)
+    {
+        return Err(SessionReducerError::InvalidMemoryWriteTransition);
+    }
+    state.memory_writes.insert(
+        identity.write_id.clone(),
+        MemoryWriteRecord {
+            identity: identity.clone(),
+            proposal_id: proposed.proposal_id.clone(),
+            max_bytes: proposed.max_bytes,
+            trigger: proposed.trigger.clone(),
+            state: MemoryWriteState::Proposed,
+            action_digest: None,
+            proposed_at: sequence,
+            approved_at: None,
+            dispatched_at: None,
+            completed_at: None,
+            reference: None,
+            retained: false,
+            deduplicated: false,
+            failed_code: None,
+        },
+    );
+    Ok(())
+}
+
+fn memory_write_record_mut<'a>(
+    state: &'a mut SessionState,
+    identity: &MemoryWriteIdentity,
+) -> Result<&'a mut MemoryWriteRecord, SessionReducerError> {
+    let record = state
+        .memory_writes
+        .get_mut(&identity.write_id)
+        .ok_or(SessionReducerError::InvalidMemoryWriteTransition)?;
+    if record.identity != *identity {
+        return Err(SessionReducerError::InvalidMemoryWriteTransition);
+    }
+    Ok(record)
+}
+
+fn apply_memory_write_approved(
+    state: &mut SessionState,
+    approved: &MemoryWriteApprovedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = memory_write_record_mut(state, &approved.identity)?;
+    if record.state != MemoryWriteState::Proposed
+        || record.action_digest.is_some()
+        || record.approved_at.is_some()
+        || record.dispatched_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidMemoryWriteTransition);
+    }
+    record.state = MemoryWriteState::Approved;
+    record.action_digest = Some(approved.action_digest);
+    record.approved_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_memory_write_dispatched(
+    state: &mut SessionState,
+    dispatched: &MemoryWriteDispatchedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = memory_write_record_mut(state, &dispatched.identity)?;
+    if record.state != MemoryWriteState::Approved
+        || record.action_digest != Some(dispatched.action_digest)
+        || record.approved_at.is_none()
+        || record.dispatched_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidMemoryWriteTransition);
+    }
+    record.state = MemoryWriteState::Dispatched;
+    record.dispatched_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_memory_write_completed(
+    state: &mut SessionState,
+    completed: &MemoryWriteCompletedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if completed.reference.trim().is_empty() {
+        return Err(SessionReducerError::InvalidMemoryWriteTransition);
+    }
+    let record = memory_write_record_mut(state, &completed.identity)?;
+    if record.state != MemoryWriteState::Dispatched
+        || record.action_digest != Some(completed.action_digest)
+        || record.approved_at.is_none()
+        || record.dispatched_at.is_none()
+        || record.completed_at.is_some()
+        || record.reference.is_some()
+    {
+        return Err(SessionReducerError::InvalidMemoryWriteTransition);
+    }
+    record.state = MemoryWriteState::Completed;
+    record.completed_at = Some(sequence);
+    record.reference = Some(completed.reference.clone());
+    record.retained = completed.retained;
+    record.deduplicated = completed.deduplicated;
+    Ok(())
+}
+
+fn apply_memory_write_failed(
+    state: &mut SessionState,
+    failed: &MemoryWriteFailedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if failed.code.trim().is_empty() {
+        return Err(SessionReducerError::InvalidMemoryWriteTransition);
+    }
+    let record = memory_write_record_mut(state, &failed.identity)?;
+    if record.state != MemoryWriteState::Approved
+        || record.approved_at.is_none()
+        || record.dispatched_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidMemoryWriteTransition);
+    }
+    record.state = MemoryWriteState::Failed;
+    record.completed_at = Some(sequence);
+    record.failed_code = Some(failed.code.clone());
     Ok(())
 }
 
@@ -3988,6 +4610,12 @@ pub enum SessionReducerError {
     /// Artifact persistence did not follow proposal, approval, dispatch, receipt ordering.
     #[error("artifact persistence state transition is invalid")]
     InvalidArtifactPersistenceTransition,
+    /// A live typed-summary request violated canonical ordering or bounds.
+    #[error("typed-summary compaction state transition is invalid")]
+    InvalidSummaryTransition,
+    /// An automatic memory write violated canonical outbox ordering or bounds.
+    #[error("automatic memory-write state transition is invalid")]
+    InvalidMemoryWriteTransition,
     /// Child sessions did not follow proposal, atomic creation, and terminal ordering.
     #[error("child-agent state transition is invalid")]
     InvalidChildAgentTransition,
@@ -6152,5 +6780,290 @@ to = "done"
                 ..
             })
         ));
+    }
+
+    fn sequence(value: u64) -> Sequence {
+        Sequence::new(value).expect("sequence")
+    }
+
+    fn summary_identity() -> ContextSummaryIdentity {
+        ContextSummaryIdentity {
+            summary_id: String::from("summary:run:1"),
+            request_hash: ContentHash::digest(b"summary-request"),
+            provider: String::from("mock"),
+            model: String::from("deterministic-mock"),
+            schema_version: 1,
+            max_summary_bytes: 64 * 1024,
+            source_range: Some((Sequence::FIRST, sequence(8))),
+        }
+    }
+
+    fn reduce_all(events: Vec<EventEnvelope<RuntimeCommittedEvent>>) -> SessionState {
+        let mut state: Option<SessionState> = None;
+        for event in events {
+            state = Some(reduce(state, &event).expect("reduce"));
+        }
+        state.expect("initialized")
+    }
+
+    #[test]
+    fn summary_outbox_follows_proposal_approval_start_completion_ordering() {
+        let identity = summary_identity();
+        let events = vec![
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::ContextSummaryProposed(ContextSummaryProposedEvent {
+                    identity: identity.clone(),
+                }),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::ContextSummaryApproved(ContextSummaryApprovedEvent {
+                    identity: identity.clone(),
+                    action_digest: ContentHash::digest(b"approved-summary"),
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::ContextSummaryStarted(ContextSummaryStartedEvent {
+                    identity: identity.clone(),
+                }),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                    identity: identity.clone(),
+                    content_hash: ContentHash::digest(b"bounded summary"),
+                    text: String::from("bounded summary"),
+                    input_tokens: 12,
+                    output_tokens: 3,
+                }),
+            ),
+        ];
+        let state = reduce_all(events);
+        let record = state
+            .context_summaries
+            .get(&identity.summary_id)
+            .expect("record");
+        assert_eq!(record.state, ContextSummaryState::Completed);
+        assert!(record.has_terminal_evidence());
+        assert_eq!(record.text.as_deref(), Some("bounded summary"));
+        assert_eq!(record.input_tokens, 12);
+    }
+
+    #[test]
+    fn summary_evidence_hash_must_match_text_and_completion_requires_start() {
+        let identity = summary_identity();
+        let bad_hash = envelope(
+            2,
+            RuntimeCommittedEvent::ContextSummaryProposed(ContextSummaryProposedEvent {
+                identity: identity.clone(),
+            }),
+        );
+        let approved = envelope(
+            3,
+            RuntimeCommittedEvent::ContextSummaryApproved(ContextSummaryApprovedEvent {
+                identity: identity.clone(),
+                action_digest: ContentHash::digest(b"approved"),
+            }),
+        );
+        let completed_without_start = envelope(
+            4,
+            RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                identity: identity.clone(),
+                content_hash: ContentHash::digest(b"summary"),
+                text: String::from("summary"),
+                input_tokens: 1,
+                output_tokens: 1,
+            }),
+        );
+        assert!(matches!(
+            reduce_all(vec![created(), bad_hash.clone()]).context_summaries.get("summary:run:1").map(|r| r.state),
+            Some(ContextSummaryState::Proposed)
+        ));
+        assert!(matches!(
+            reduce(
+                Some(reduce_all(vec![created(), bad_hash])),
+                &approved
+            )
+            .and_then(|state| reduce(Some(state), &completed_without_start))
+            .map(|_| ()),
+            Err(SessionReducerError::InvalidSummaryTransition)
+        ));
+
+        let hash_mismatch = envelope(
+            2,
+            RuntimeCommittedEvent::ContextSummaryProposed(ContextSummaryProposedEvent {
+                identity: summary_identity(),
+            }),
+        );
+        let approved = envelope(
+            3,
+            RuntimeCommittedEvent::ContextSummaryApproved(ContextSummaryApprovedEvent {
+                identity: summary_identity(),
+                action_digest: ContentHash::digest(b"approved"),
+            }),
+        );
+        let started = envelope(
+            4,
+            RuntimeCommittedEvent::ContextSummaryStarted(ContextSummaryStartedEvent {
+                identity: summary_identity(),
+            }),
+        );
+        let mismatched = envelope(
+            5,
+            RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                identity: summary_identity(),
+                content_hash: ContentHash::digest(b"different"),
+                text: String::from("summary"),
+                input_tokens: 1,
+                output_tokens: 1,
+            }),
+        );
+        let state = reduce_all(vec![created(), hash_mismatch, approved, started]);
+        assert!(matches!(
+            reduce(Some(state), &mismatched),
+            Err(SessionReducerError::InvalidSummaryTransition)
+        ));
+    }
+
+    fn memory_write_identity() -> MemoryWriteIdentity {
+        MemoryWriteIdentity {
+            write_id: String::from("write:turn:1:abc"),
+            provider: String::from("file"),
+            scope: String::from("session:s1"),
+            source: String::from("auto:turn_completion"),
+            content_hash: ContentHash::digest(b"durable fact"),
+            deduplication_key: Some(String::from("canonical:write:turn:1")),
+        }
+    }
+
+    #[test]
+    fn memory_write_outbox_follows_proposal_approval_dispatch_receipt_ordering() {
+        let identity = memory_write_identity();
+        let events = vec![
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::MemoryWriteProposed(MemoryWriteProposedEvent {
+                    identity: identity.clone(),
+                    proposal_id: String::from("memory-write:1"),
+                    max_bytes: 4096,
+                    trigger: String::from("turn_completion"),
+                }),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::MemoryWriteApproved(MemoryWriteApprovedEvent {
+                    identity: identity.clone(),
+                    action_digest: ContentHash::digest(b"approved-write"),
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::MemoryWriteDispatched(MemoryWriteDispatchedEvent {
+                    identity: identity.clone(),
+                    action_digest: ContentHash::digest(b"approved-write"),
+                }),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::MemoryWriteCompleted(MemoryWriteCompletedEvent {
+                    identity: identity.clone(),
+                    action_digest: ContentHash::digest(b"approved-write"),
+                    reference: String::from("memory-ref-1"),
+                    retained: true,
+                    deduplicated: false,
+                }),
+            ),
+        ];
+        let state = reduce_all(events);
+        let record = state
+            .memory_writes
+            .get(&identity.write_id)
+            .expect("record");
+        assert_eq!(record.state, MemoryWriteState::Completed);
+        assert_eq!(record.reference.as_deref(), Some("memory-ref-1"));
+        assert!(record.has_terminal_evidence());
+    }
+
+    #[test]
+    fn memory_write_dispatch_without_approval_and_duplicate_proposal_are_rejected() {
+        let identity = memory_write_identity();
+        let proposed = envelope(
+            2,
+            RuntimeCommittedEvent::MemoryWriteProposed(MemoryWriteProposedEvent {
+                identity: identity.clone(),
+                proposal_id: String::from("memory-write:1"),
+                max_bytes: 4096,
+                trigger: String::from("turn_completion"),
+            }),
+        );
+        let dispatched_without_approval = envelope(
+            3,
+            RuntimeCommittedEvent::MemoryWriteDispatched(MemoryWriteDispatchedEvent {
+                identity: identity.clone(),
+                action_digest: ContentHash::digest(b"approved-write"),
+            }),
+        );
+        let state = reduce_all(vec![created(), proposed]);
+        assert!(matches!(
+            reduce(Some(state.clone()), &dispatched_without_approval),
+            Err(SessionReducerError::InvalidMemoryWriteTransition)
+        ));
+        let duplicate = envelope(
+            3,
+            RuntimeCommittedEvent::MemoryWriteProposed(MemoryWriteProposedEvent {
+                identity: memory_write_identity(),
+                proposal_id: String::from("memory-write:2"),
+                max_bytes: 4096,
+                trigger: String::from("turn_completion"),
+            }),
+        );
+        assert!(matches!(
+            reduce(Some(state), &duplicate),
+            Err(SessionReducerError::InvalidMemoryWriteTransition)
+        ));
+    }
+
+    #[test]
+    fn memory_write_failure_is_terminal_without_dispatch() {
+        let identity = memory_write_identity();
+        let events = vec![
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::MemoryWriteProposed(MemoryWriteProposedEvent {
+                    identity: identity.clone(),
+                    proposal_id: String::from("memory-write:1"),
+                    max_bytes: 4096,
+                    trigger: String::from("turn_completion"),
+                }),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::MemoryWriteApproved(MemoryWriteApprovedEvent {
+                    identity: identity.clone(),
+                    action_digest: ContentHash::digest(b"approved-write"),
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::MemoryWriteFailed(MemoryWriteFailedEvent {
+                    identity: identity.clone(),
+                    code: String::from("approval_required"),
+                    message: String::from("user policy requires approval"),
+                }),
+            ),
+        ];
+        let state = reduce_all(events);
+        let record = state
+            .memory_writes
+            .get(&identity.write_id)
+            .expect("record");
+        assert_eq!(record.state, MemoryWriteState::Failed);
+        assert_eq!(record.failed_code.as_deref(), Some("approval_required"));
+        assert!(record.has_terminal_evidence());
     }
 }

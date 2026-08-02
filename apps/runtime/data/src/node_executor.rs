@@ -139,6 +139,16 @@ impl RuntimeNodeExecutorData {
     /// Unsupported categories remain inspectable with `available = false`;
     /// compilation alone therefore cannot make them executable.
     ///
+    /// The six native control-flow implementations owned by TASK-03
+    /// (`runtime.child-message`, `runtime.join`, `runtime.parallel`,
+    /// `runtime.delay`, `runtime.schedule`, `runtime.event-emission`) stay
+    /// `available = false` until the generic dispatcher is wired into the
+    /// runtime turn adapter: flipping them available before that wiring would
+    /// let a structurally valid graph pass runtime-executability validation
+    /// and then fail at dispatch, violating fail-closed. Their implementation
+    /// contracts and mock dispatcher integration live in
+    /// `agentmod-runtime-logic::node_executors`.
+    ///
     /// # Errors
     ///
     /// Returns [`NodeExecutorDataError`] only if the checked-in first-party

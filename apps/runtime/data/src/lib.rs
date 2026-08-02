@@ -8,6 +8,7 @@ pub mod identity;
 pub mod journal;
 pub mod memory;
 pub mod node_executor;
+pub mod node_executors;
 pub mod plugin;
 pub mod registry;
 pub mod scheduler;

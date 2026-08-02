@@ -13,6 +13,7 @@ pub mod interception;
 pub mod introspection;
 pub mod memory;
 pub mod node_executor;
+pub mod node_executors;
 pub mod permission;
 pub mod persistence;
 pub mod plugin;

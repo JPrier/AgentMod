@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use agentmod_primitives::{ArtifactId, ContentHash, Sequence};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::conversation::{
@@ -283,7 +284,166 @@ fn ensure_unique_ids(replacement: &[ConversationEntry]) -> Result<(), Compaction
     Ok(())
 }
 
-/// Deterministic compaction failure.
+/// Bounded material for one live typed-summary model request.
+///
+/// The request never fabricates a user message: protected runtime state and a
+/// bounded recent window are projected exactly as typed canonical entries.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SummaryRequestMaterial {
+    /// Projection entries sent to the summary provider.
+    pub entries: Vec<ConversationEntry>,
+    /// Inclusive source projection range covered by the material.
+    pub source_range: Option<(Sequence, Sequence)>,
+    /// Exact serialized request bytes.
+    pub serialized_bytes: u64,
+}
+
+/// Builds a bounded typed-summary request from protected state plus a recent
+/// window of ordinary entries.
+///
+/// # Errors
+///
+/// Returns [`CompactionError::MissingSourceRange`] when the projection has no
+/// source range, or [`CompactionError::SummaryMaterialTooLarge`] when required
+/// protected state cannot fit the byte cap.
+pub fn build_summary_request_material(
+    conversation: &ConversationState,
+    max_bytes: u64,
+    preservation_requirements: &[String],
+    recent_window: usize,
+) -> Result<SummaryRequestMaterial, CompactionError> {
+    let source = conversation.provider_projection();
+    let source_range = projection_range(source).ok_or(CompactionError::MissingSourceRange)?;
+    if max_bytes == 0 || recent_window == 0 {
+        return Err(CompactionError::InvalidSummaryMaterial);
+    }
+    let recent_start = source.len().saturating_sub(recent_window);
+    let mut entries = Vec::new();
+    let mut bytes = 0_u64;
+    for (index, entry) in source.iter().enumerate() {
+        let required =
+            projection_entry_is_required(entry, preservation_requirements) || index >= recent_start;
+        if required {
+            let contribution = serialized_entry_bytes(entry)?;
+            if bytes.saturating_add(contribution) > max_bytes {
+                // Required protected state must always fit; a window entry may
+                // be dropped instead of failing the summary request.
+                if projection_entry_is_required(entry, preservation_requirements) {
+                    return Err(CompactionError::SummaryMaterialTooLarge);
+                }
+                continue;
+            }
+            bytes = bytes.saturating_add(contribution);
+            entries.push(entry.clone());
+        }
+    }
+    ensure_unique_ids(&entries)?;
+    Ok(SummaryRequestMaterial {
+        entries,
+        source_range: Some(source_range),
+        serialized_bytes: bytes,
+    })
+}
+
+fn projection_entry_is_required(entry: &ConversationEntry, requirements: &[String]) -> bool {
+    let requirement = |name: &str| requirements.iter().any(|value| value == name);
+    match entry {
+        ConversationEntry::SystemInstruction(_) | ConversationEntry::ProjectInstruction(_) => {
+            requirement("system_instructions")
+        }
+        ConversationEntry::UserMessage(_) | ConversationEntry::UserInstruction(_) => {
+            requirement("current_input")
+        }
+        ConversationEntry::PendingTask(_)
+        | ConversationEntry::ActiveProcessSummary(_)
+        | ConversationEntry::ChildAgentHandoff(_) => requirement("pending_control_state"),
+        ConversationEntry::ArtifactReference(_)
+        | ConversationEntry::Attachment(_)
+        | ConversationEntry::Image(_) => requirement("artifact_references"),
+        ConversationEntry::RetrievedMemory(_) => requirement("memory_provenance"),
+        ConversationEntry::ProviderVisibleMetadata(_) => requirement("active_graph_state"),
+        ConversationEntry::ToolCallRequest(_) | ConversationEntry::ToolResult(_) => {
+            requirement("tool_call_correlation")
+        }
+        ConversationEntry::ContextSummary(_) | ConversationEntry::RuntimeAnnotation(_) => true,
+        ConversationEntry::AssistantMessage(_) => false,
+    }
+}
+
+fn serialized_entry_bytes(entry: &ConversationEntry) -> Result<u64, CompactionError> {
+    serde_json::to_vec(entry)
+        .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        .map_err(|_| CompactionError::SummaryMaterialTooLarge)
+}
+
+/// Immutable content-addressed context payload for artifact-handoff compaction.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextArtifactPayload {
+    /// Bounded payload schema version.
+    pub schema_version: u16,
+    /// Inclusive source projection range captured.
+    pub source_start: u64,
+    /// Inclusive source projection range captured.
+    pub source_end: u64,
+    /// Hash of the exact serialized payload (self-referential provenance).
+    pub content_hash: String,
+    /// Security classification label.
+    pub security: String,
+    /// Exact media type.
+    pub mime_type: String,
+    /// Complete selected context entries.
+    pub entries: Vec<ConversationEntry>,
+    /// Protected state surviving the replacement, as typed entries.
+    pub preserved_state: Vec<ConversationEntry>,
+    /// Bounded metadata describing the captured range.
+    pub metadata: serde_json::Value,
+}
+
+/// Serializes the complete selected context into a bounded artifact payload.
+///
+/// # Errors
+///
+/// Returns [`CompactionError`] when the projection has no source range or the
+/// payload exceeds the hard byte bound.
+pub fn serialize_context_artifact(
+    conversation: &ConversationState,
+    max_bytes: u64,
+    schema_version: u16,
+    security: &str,
+    mime_type: &str,
+) -> Result<ContextArtifactPayload, CompactionError> {
+    let source = conversation.provider_projection();
+    let (source_start, source_end) =
+        projection_range(source).ok_or(CompactionError::MissingSourceRange)?;
+    if max_bytes == 0 || schema_version == 0 || security.trim().is_empty() {
+        return Err(CompactionError::InvalidContextArtifact);
+    }
+    let preserved_state = protected_entries(source);
+    let mut payload = ContextArtifactPayload {
+        schema_version,
+        source_start: source_start.get(),
+        source_end: source_end.get(),
+        content_hash: String::new(),
+        security: security.to_owned(),
+        mime_type: mime_type.to_owned(),
+        entries: source.to_vec(),
+        preserved_state,
+        metadata: serde_json::json!({
+            "source_range": [source_start.get(), source_end.get()],
+            "entry_count": source.len(),
+        }),
+    };
+    let bytes = serde_json::to_vec(&payload).map_err(|_| CompactionError::InvalidContextArtifact)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
+        return Err(CompactionError::ContextArtifactTooLarge);
+    }
+    let hash = ContentHash::digest(&bytes).to_hex();
+    payload.content_hash = hash;
+    Ok(payload)
+}
+
+/// Deterministic failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CompactionError {
     /// Projection commit must have a stable ID.
@@ -310,6 +470,18 @@ pub enum CompactionError {
     /// Generated replacement entry IDs must be unique.
     #[error("compaction generated duplicate projection entry ID: {0}")]
     DuplicateProjectionEntry(String),
+    /// A summary request material could not be bounded.
+    #[error("summary request material is invalid or exceeds its byte bound")]
+    SummaryMaterialTooLarge,
+    /// Summary request bounds are invalid.
+    #[error("summary request bounds are invalid")]
+    InvalidSummaryMaterial,
+    /// A context artifact payload could not be constructed.
+    #[error("context artifact payload is invalid")]
+    InvalidContextArtifact,
+    /// A context artifact payload exceeds its hard byte bound.
+    #[error("context artifact payload exceeds the hard byte bound")]
+    ContextArtifactTooLarge,
 }
 
 #[cfg(test)]

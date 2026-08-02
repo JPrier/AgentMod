@@ -1,11 +1,11 @@
 //! Runtime business semantics for durable continuation creation and resolution.
 
-use agentmod_primitives::{ContinuationId, TimestampMillis};
+use agentmod_primitives::{ContentHash, ContinuationId, TimestampMillis};
 use agentmod_runtime_data::continuation::{
     ContinuationDataError, ContinuationDataPort, ContinuationPayloadRecord, ContinuationRecord,
     ContinuationStateRecord, ContinuationWakeRecord, CreateContinuationDataRequest,
-    DeferredTurnPayloadRecord, PendingToolCallPayloadRecord, ResolveContinuationDataRequest,
-    StyleApprovalPayloadRecord, ToolApprovalPayloadRecord,
+    DeferredTurnPayloadRecord, MemoryWritePayloadRecord, PendingToolCallPayloadRecord,
+    ResolveContinuationDataRequest, StyleApprovalPayloadRecord, ToolApprovalPayloadRecord,
 };
 use serde_json::Value;
 use thiserror::Error;
@@ -159,6 +159,8 @@ pub enum ContinuationPayload {
     StyleApproval(Box<StyleApprovalContinuation>),
     /// Complete provider turn deferred behind a scheduler-owned trigger.
     DeferredTurn(Box<DeferredTurnContinuation>),
+    /// An approved automatic memory write waiting for its user decision.
+    MemoryWrite(Box<MemoryWriteApprovalContinuation>),
     /// Storage-only marker for callers without an executable action.
     Opaque(String),
 }
@@ -194,6 +196,37 @@ pub struct StyleApprovalContinuation {
     pub step: u64,
     /// Canonical hash of caller-controlled graph inputs.
     pub request_reference: String,
+}
+
+/// Logic-owned restart-safe automatic memory-write approval payload.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MemoryWriteApprovalContinuation {
+    /// Canonical session containing the pending write.
+    pub session_id: String,
+    /// Canonical workspace text.
+    pub workspace: String,
+    /// Explicit session style.
+    pub style: String,
+    /// Stable cancellation identity for the owning execution.
+    pub cancellation_id: String,
+    /// Provider used for the write.
+    pub provider: String,
+    /// Normalized scope key.
+    pub scope: String,
+    /// Provenance label.
+    pub source: String,
+    /// Exact bounded content.
+    pub content: String,
+    /// Canonical duplicate-prevention key.
+    pub deduplication_key: Option<String>,
+    /// Canonical cross-restart write identity.
+    pub write_id: String,
+    /// Maximum retained bytes.
+    pub max_bytes: u32,
+    /// Trigger boundary that proposed the write.
+    pub trigger: String,
+    /// Hash of the exact content.
+    pub content_hash: ContentHash,
 }
 
 /// Logic-owned restart-safe deferred provider turn.
@@ -657,6 +690,21 @@ fn validate_payload(
         {
             Err(ContinuationLogicError::InvalidPayload)
         }
+        ContinuationPayload::MemoryWrite(write)
+            if write.session_id != session_id
+                || write.workspace.trim().is_empty()
+                || write.style.trim().is_empty()
+                || write.cancellation_id.trim().is_empty()
+                || write.provider.trim().is_empty()
+                || write.scope.trim().is_empty()
+                || write.source.trim().is_empty()
+                || write.content.trim().is_empty()
+                || write.write_id.trim().is_empty()
+                || write.max_bytes == 0
+                || write.trigger.trim().is_empty() =>
+        {
+            Err(ContinuationLogicError::InvalidPayload)
+        }
         ContinuationPayload::Opaque(label) if label.trim().is_empty() => {
             Err(ContinuationLogicError::InvalidPayload)
         }
@@ -722,6 +770,23 @@ fn to_data_payload(payload: ContinuationPayload) -> ContinuationPayloadRecord {
                 cancellation_id: turn.cancellation_id,
             }))
         }
+        ContinuationPayload::MemoryWrite(write) => {
+            ContinuationPayloadRecord::MemoryWrite(Box::new(MemoryWritePayloadRecord {
+                session_id: write.session_id,
+                workspace: write.workspace,
+                style: write.style,
+                cancellation_id: write.cancellation_id,
+                provider: write.provider,
+                scope: write.scope,
+                source: write.source,
+                content: write.content,
+                deduplication_key: write.deduplication_key,
+                write_id: write.write_id,
+                max_bytes: write.max_bytes,
+                trigger: write.trigger,
+                content_hash: write.content_hash,
+            }))
+        }
         ContinuationPayload::Opaque(label) => ContinuationPayloadRecord::Opaque { label },
     }
 }
@@ -782,6 +847,23 @@ fn from_data_payload(payload: ContinuationPayloadRecord) -> ContinuationPayload 
                 options: turn.options,
                 style: turn.style,
                 cancellation_id: turn.cancellation_id,
+            }))
+        }
+        ContinuationPayloadRecord::MemoryWrite(write) => {
+            ContinuationPayload::MemoryWrite(Box::new(MemoryWriteApprovalContinuation {
+                session_id: write.session_id,
+                workspace: write.workspace,
+                style: write.style,
+                cancellation_id: write.cancellation_id,
+                provider: write.provider,
+                scope: write.scope,
+                source: write.source,
+                content: write.content,
+                deduplication_key: write.deduplication_key,
+                write_id: write.write_id,
+                max_bytes: write.max_bytes,
+                trigger: write.trigger,
+                content_hash: write.content_hash,
             }))
         }
         ContinuationPayloadRecord::Opaque { label } => ContinuationPayload::Opaque(label),

@@ -16,7 +16,8 @@ use agentmod_event_model::{
 };
 use agentmod_event_pipeline::ActionCapabilities;
 use agentmod_primitives::{
-    CausationId, ContentHash, ContinuationId, Sequence, SessionId, TimestampMillis, Version,
+    ArtifactId, CausationId, ContentHash, ContinuationId, Sequence, SessionId, TimestampMillis,
+    Version,
 };
 use agentmod_runtime_data::{
     artifact::ArtifactDataPort,
@@ -38,15 +39,19 @@ use crate::{
     action::{ActionProposal, ConsequentialAction, ProposalId},
     artifact::{
         ArtifactPersistenceLogic, ArtifactRetention, ArtifactSecurity, PersistArtifactCommand,
+        PersistedArtifact,
     },
     child_session::{ChildSessionLogicPort, EnsureChildSessionCommand},
-    compaction::{CompactionContext, CompactionError, CompactionStrategy, compact_projection},
+    compaction::{
+        CompactionContext, CompactionError, CompactionStrategy, compact_projection,
+        build_summary_request_material, serialize_context_artifact,
+    },
     continuation::{
         ApprovalDisposition, ContinuationLogic, ContinuationLogicPort, ContinuationPayload,
         ContinuationState, ContinuationWakeCondition, ContinuationWakeProof,
         CreateContinuationCommand, DeferredTurnContinuation, LoadContinuationQuery,
-        PendingToolCallContinuation, ResolveApprovalCommand, StyleApprovalContinuation,
-        ToolApprovalContinuation, WakeContinuationCommand,
+        MemoryWriteApprovalContinuation, PendingToolCallContinuation, ResolveApprovalCommand,
+        StyleApprovalContinuation, ToolApprovalContinuation, WakeContinuationCommand,
     },
     conversation::{
         ChildHandoffEntry, ConversationEntry, ConversationEntryId, PendingTaskEntry,
@@ -61,7 +66,10 @@ use crate::{
         InterceptionOutcome, InterceptorAuditResult, InterceptorAuditStep, InterceptorScope,
         intercept_action,
     },
-    memory::{MemoryLogic, MemoryLogicError, MemoryLogicPort, MemoryScope, RetrieveMemoryCommand},
+    memory::{
+        MemoryLogic, MemoryLogicError, MemoryLogicPort, MemoryScope, MemoryWriteAuthorization,
+        RetrieveMemoryCommand, WriteMemoryCommand,
+    },
     persistence::{
         CommitDurability, CommitSessionEventCommand, LoadSessionCommand, LoadSessionResult,
         SessionPersistenceLogic, SessionPersistenceLogicError, SessionPersistenceLogicPort,
@@ -81,23 +89,29 @@ use crate::{
         ArtifactPersistenceProposedEvent, ArtifactPersistenceResumeAction,
         ChildAgentCompletedEvent, ChildAgentCreatedEvent, ChildAgentCreationApprovedEvent,
         ChildAgentCreationProposedEvent, ChildAgentExecutionIdentity, ChildAgentState,
-        ChildJoinCompletedEvent, ContextBoundaryCompletedEvent, ContextBoundaryIdentity,
-        ContextBoundaryOrigin, ContextBoundaryStartedEvent, ContextPhaseCompletedEvent,
-        ContextPhaseIdentity, ContextPhaseStartedEvent, ContextProjectionReplacedEvent,
-        ConversationEntryCommittedEvent, ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent,
-        ModelRequestCancelledEvent, ModelRequestFailedEvent, ModelRequestProposedEvent,
-        ModelRequestStartedEvent, ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent,
-        ModelToolCallProposedEvent, PlannedTask, PluginInvocationCompletedEvent,
-        PluginSetActivatedEvent, ProcessReconciliationCompletedEvent,
-        ProcessReconciliationStartedEvent, ProcessReconciliationStatus,
-        ReviewerFindingsCommittedEvent, RuntimeCommittedEvent, SchedulerDeliveryReconciledEvent,
-        SchedulerFiredEvent, SessionReducerError, StyleExecutionControlState,
-        StyleExecutionInitializedEvent, StyleExecutionTerminatedEvent, StyleNodeCompletedEvent,
-        StyleNodeEnteredEvent, StyleNodeFailedEvent, StyleTransitionSelectedEvent,
-        TaskPlanCommittedEvent, ToolCallApprovedEvent, ToolCallProposedEvent,
-        ToolExecutionCompletedEvent, ToolExecutionDispatchedEvent, ToolExecutionFailedEvent,
-        ToolExecutionStartedEvent, ToolExecutionState, ToolExecutionTerminalOutcome,
-        ToolOutputObservedEvent, reduce,
+        ChildJoinCompletedEvent, ContextArtifactApprovedEvent, ContextArtifactCompletedEvent,
+        ContextArtifactDispatchedEvent, ContextArtifactFailedEvent, ContextArtifactIdentity,
+        ContextArtifactProposedEvent, ContextArtifactState, ContextBoundaryCompletedEvent,
+        ContextBoundaryIdentity, ContextBoundaryOrigin, ContextBoundaryStartedEvent,
+        ContextPhaseCompletedEvent, ContextPhaseIdentity, ContextPhaseStartedEvent,
+        ContextProjectionReplacedEvent, ContextSummaryApprovedEvent, ContextSummaryCompletedEvent,
+        ContextSummaryFailedEvent, ContextSummaryIdentity, ContextSummaryProposedEvent,
+        ContextSummaryStartedEvent, ContextSummaryState, ConversationEntryCommittedEvent,
+        MemoryWriteApprovedEvent, MemoryWriteCompletedEvent, MemoryWriteDispatchedEvent,
+        MemoryWriteFailedEvent, MemoryWriteIdentity, MemoryWriteProposedEvent, MemoryWriteState,
+        ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent, ModelRequestCancelledEvent,
+        ModelRequestFailedEvent, ModelRequestProposedEvent, ModelRequestStartedEvent,
+        ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent, ModelToolCallProposedEvent,
+        PlannedTask, PluginInvocationCompletedEvent, PluginSetActivatedEvent,
+        ProcessReconciliationCompletedEvent, ProcessReconciliationStartedEvent,
+        ProcessReconciliationStatus, ReviewerFindingsCommittedEvent, RuntimeCommittedEvent,
+        SchedulerDeliveryReconciledEvent, SchedulerFiredEvent, SessionReducerError,
+        StyleExecutionControlState, StyleExecutionInitializedEvent, StyleExecutionTerminatedEvent,
+        StyleNodeCompletedEvent, StyleNodeEnteredEvent, StyleNodeFailedEvent,
+        StyleTransitionSelectedEvent, TaskPlanCommittedEvent, ToolCallApprovedEvent,
+        ToolCallProposedEvent, ToolExecutionCompletedEvent, ToolExecutionDispatchedEvent,
+        ToolExecutionFailedEvent, ToolExecutionStartedEvent, ToolExecutionState,
+        ToolExecutionTerminalOutcome, ToolOutputObservedEvent, reduce,
     },
     style_executor::{
         CompiledStyleExecutor, StyleAdapterKind, StyleExecutorError, StyleNodeCursor,
@@ -846,6 +860,19 @@ where
                             )?;
                         review
                     };
+                    if review.0 {
+                        // A reviewer approval may retain approved findings.
+                        execution.position = self
+                            .commit_style_memory_write_if_triggered(
+                                &persistence,
+                                session_id,
+                                &session_directory,
+                                &command,
+                                "reviewer_approval",
+                                execution.position,
+                            )
+                            .await?;
+                    }
                     self.complete_and_enter_next(
                         &persistence,
                         session_id,
@@ -1289,6 +1316,18 @@ where
                     summary,
                 }),
             )?;
+            // A completed child may satisfy the parent style's child-completion
+            // automatic memory-write trigger.
+            execution.position = self
+                .commit_style_memory_write_if_triggered(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    command,
+                    "child_completion",
+                    execution.position,
+                )
+                .await?;
         }
         let state = Self::load_state(persistence, session_id, session_directory)?;
         if !state
@@ -1942,6 +1981,18 @@ where
                                     execution,
                                     Some(format!("fresh-context:{}", command.cancellation_id)),
                                 )?;
+                                // An explicit memory-extraction node may retain
+                                // approved state before the model request.
+                                execution.position = self
+                                    .commit_style_memory_write_if_triggered(
+                                        &persistence,
+                                        session_id,
+                                        &session_directory,
+                                        &command,
+                                        "explicit_node",
+                                        execution.position,
+                                    )
+                                    .await?;
                                 if execution.current.directive != StyleNodeDirective::ModelCall {
                                     return Err(RunTurnError::UnexpectedStyleNode {
                                         expected: "model_call",
@@ -2205,10 +2256,29 @@ where
         } else {
             assistant_position.sequence
         };
+        // Style-selected automatic memory writes may retain approved turn
+        // state after a successful terminal completion.
+        let final_position = style_turn.as_ref().map_or(
+            JournalPosition {
+                sequence: last_sequence,
+                event_id: assistant_position.event_id,
+            },
+            |execution| execution.position,
+        );
+        let write_position = self
+            .commit_style_memory_write_if_triggered(
+                &persistence,
+                session_id,
+                &session_directory,
+                &command,
+                "turn_completion",
+                final_position,
+            )
+            .await?;
         Ok(RunTurnResult {
             events,
             first_committed_sequence: user_sequence,
-            last_committed_sequence: last_sequence,
+            last_committed_sequence: write_position.sequence,
             awaiting_continuation: None,
         })
     }
@@ -2516,6 +2586,18 @@ where
                     )
                     .await?;
                 let loop_iteration = execution.loop_iteration;
+                // Research findings are eligible automatic-memory-write content.
+                let write_position = self
+                    .commit_style_memory_write_if_triggered(
+                        &persistence,
+                        session_id,
+                        &session_directory,
+                        &command,
+                        "research_finding_persisted",
+                        execution.position,
+                    )
+                    .await?;
+                execution.position = write_position;
                 self.complete_and_enter_next_with(
                     &persistence,
                     session_id,
@@ -3365,6 +3447,7 @@ where
             let (workspace, style) = match &loaded_continuation.payload {
                 ContinuationPayload::ToolApproval(payload) => (&payload.workspace, &payload.style),
                 ContinuationPayload::StyleApproval(payload) => (&payload.workspace, &payload.style),
+                ContinuationPayload::MemoryWrite(payload) => (&payload.workspace, &payload.style),
                 ContinuationPayload::DeferredTurn(_) | ContinuationPayload::Opaque(_) => {
                     return Err(RunTurnError::InvalidContinuationPayload);
                 }
@@ -3574,6 +3657,20 @@ where
                 last_committed_sequence: result.last_committed_sequence,
                 awaiting_continuation: result.awaiting_continuation,
             });
+        }
+        if let ContinuationPayload::MemoryWrite(write) = &resolved.payload {
+            return self
+                .resolve_memory_write_approval(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    &command,
+                    continuation_id,
+                    &loaded,
+                    resolved.transitioned,
+                    write,
+                )
+                .await;
         }
         let ContinuationPayload::ToolApproval(payload_ref) = &resolved.payload else {
             return Err(RunTurnError::InvalidContinuationPayload);
@@ -4162,6 +4259,7 @@ where
         + HarnessDataPort
         + ContinuationDataPort
         + MemoryDataPort
+        + ArtifactDataPort
         + agentmod_runtime_data::tool::ToolDataPort,
 {
     fn record_scheduled_recovery(
@@ -4219,6 +4317,7 @@ where
         + HarnessDataPort
         + ContinuationDataPort
         + MemoryDataPort
+        + ArtifactDataPort
         + agentmod_runtime_data::tool::ToolDataPort,
 {
     #[allow(
@@ -4351,6 +4450,7 @@ where
         + HarnessDataPort
         + ContinuationDataPort
         + MemoryDataPort
+        + ArtifactDataPort
         + agentmod_runtime_data::tool::ToolDataPort,
 {
     #[allow(
@@ -4698,9 +4798,56 @@ where
                         context,
                     )
                     .map_err(RunTurnError::Compaction)?,
-                    "summary" => return Err(RunTurnError::ApprovedSummaryRequired),
+                    "summary" => {
+                        let (summary_text, summary_id, _, _, next_position) = self
+                            .execute_live_summary(
+                                persistence,
+                                session_id,
+                                session_directory,
+                                &state,
+                                &binding,
+                                command,
+                                committed_at,
+                                position,
+                            )
+                            .await?;
+                        position = next_position;
+                        compact_projection(
+                            &state.conversation,
+                            CompactionStrategy::Summary {
+                                summary_id,
+                                summary: summary_text,
+                                artifact_id: None,
+                            },
+                            context,
+                        )
+                        .map_err(RunTurnError::Compaction)?
+                    }
                     "artifact_handoff" => {
-                        return Err(RunTurnError::ApprovedArtifactHandoffRequired);
+                        let (artifact_id, content_hash, entry_id, next_position) = self
+                            .execute_live_artifact_handoff(
+                                persistence,
+                                session_id,
+                                session_directory,
+                                &state,
+                                &binding,
+                                command,
+                                committed_at,
+                                position,
+                            )
+                            .await?;
+                        position = next_position;
+                        compact_projection(
+                            &state.conversation,
+                            CompactionStrategy::ArtifactHandoff {
+                                entry_id,
+                                artifact_id,
+                                content_hash,
+                                label: format!("context-handoff:{}", command.cancellation_id),
+                            },
+                            context,
+                        )
+                        .map_err(RunTurnError::Compaction)?
                     }
                     _ => {
                         return Err(RunTurnError::UnsupportedCompactionStrategy(
@@ -4757,6 +4904,1023 @@ where
             position,
             boundary_identity,
         )
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "live summary keeps the normal proposal chain, canonical outbox, harness dispatch, and terminal-evidence reuse adjacent"
+    )]
+    async fn execute_live_summary(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        state: &crate::session::SessionState,
+        binding: &crate::session::SessionStyleBinding,
+        command: &RunTurnCommand,
+        committed_at: Sequence,
+        mut position: JournalPosition,
+    ) -> Result<(String, String, String, String, JournalPosition), RunTurnError> {
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle =
+            serde_json::from_str(&binding.compiled_style_json)
+                .map_err(|_| RunTurnError::StyleBindingInvalid)?;
+        let summary_config = compiled.compaction.summary.clone();
+        let summary_provider = summary_config
+            .as_ref()
+            .map_or_else(|| command.provider.clone(), |config| config.provider.clone());
+        let summary_model = summary_config
+            .as_ref()
+            .map_or_else(|| command.model.clone(), |config| config.model.clone());
+        let max_summary_bytes = compiled.compaction.summary_max_bytes.max(1);
+        let max_request_bytes = summary_config
+            .as_ref()
+            .map(|config| config.max_request_tokens.saturating_mul(4).max(1024))
+            .unwrap_or(1024 * 1024);
+        let material = build_summary_request_material(
+            &state.conversation,
+            max_request_bytes,
+            &binding.compaction.preservation_requirements,
+            DEFAULT_SLIDING_WINDOW_ENTRIES,
+        )
+        .map_err(RunTurnError::Compaction)?;
+        let summary_options = command.options.clone();
+        let request_hash = summary_request_hash(
+            &summary_provider,
+            &summary_model,
+            &summary_options,
+            &material.entries,
+        )?;
+        let summary_id = format!("summary:{}:{}", committed_at.get(), request_hash.to_hex());
+        let identity = ContextSummaryIdentity {
+            summary_id: summary_id.clone(),
+            request_hash,
+            provider: summary_provider.clone(),
+            model: summary_model.clone(),
+            schema_version: compiled.compaction.summary_schema_version,
+            max_summary_bytes,
+            source_range: material.source_range,
+        };
+        let existing = state.context_summaries.get(&summary_id).cloned();
+        if let Some(record) = existing.as_ref() {
+            match record.state {
+                ContextSummaryState::Completed => {
+                    let text = record
+                        .text
+                        .clone()
+                        .ok_or(RunTurnError::SummaryEvidenceIncomplete)?;
+                    return Ok((text, summary_id, summary_provider, summary_model, position));
+                }
+                ContextSummaryState::Started => {
+                    return Err(RunTurnError::AmbiguousSummaryProvider);
+                }
+                ContextSummaryState::Proposed
+                | ContextSummaryState::Approved
+                | ContextSummaryState::Failed => {}
+            }
+        }
+        let session_policy = self
+            .policy_for_state(state, &command.cancellation_id)
+            .await?;
+        let provider = ProviderExecutionLogic::new(self.data.clone(), session_policy.execution);
+        let prepared = provider
+            .prepare(ExecuteProviderCommand {
+                harness: binding.harness.clone(),
+                session_id: command.session_id.clone(),
+                provider: summary_provider.clone(),
+                model: summary_model.clone(),
+                entries: project(&material.entries),
+                options: summary_options.clone(),
+                cancellation_id: format!("summary:{}", command.cancellation_id),
+                style: state.style.clone(),
+                workspace: state.workspace.clone(),
+            })
+            .map_err(RunTurnError::Provider)?;
+        if existing.is_none() {
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ContextSummaryProposed(ContextSummaryProposedEvent {
+                    identity: identity.clone(),
+                }),
+            )?;
+        }
+        let authorized = provider
+            .authorize_prepared(prepared)
+            .await
+            .map_err(RunTurnError::Provider)?;
+        let action_digest = authorized
+            .executable
+            .digest()
+            .map_err(|_| RunTurnError::Event)?;
+        if !existing
+            .as_ref()
+            .is_some_and(|record| record.state == ContextSummaryState::Approved)
+        {
+            let invocation_position = self.commit_plugin_invocations(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                state,
+                &authorized.interceptor_audit,
+            )?;
+            position = invocation_position;
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ContextSummaryApproved(ContextSummaryApprovedEvent {
+                    identity: identity.clone(),
+                    action_digest,
+                }),
+            )?;
+        }
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextSummaryStarted(ContextSummaryStartedEvent {
+                identity: identity.clone(),
+            }),
+        )?;
+        let mut stream = provider
+            .execute_authorized_stream(authorized)
+            .await
+            .map_err(RunTurnError::Provider)?;
+        let mut text = String::new();
+        let mut usage = (0_u64, 0_u64);
+        let mut failed = None;
+        while let Some(event) = stream.next().await {
+            match event.map_err(RunTurnError::Provider)? {
+                ProviderEvent::Text(delta) => text.push_str(&delta),
+                ProviderEvent::Completed {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => usage = (input_tokens, output_tokens),
+                ProviderEvent::Failed { code, message, .. } => {
+                    failed = Some((code, message));
+                }
+                ProviderEvent::ToolProposed { .. }
+                | ProviderEvent::ToolDelta { .. }
+                | ProviderEvent::Cancelled => {
+                    failed = Some((
+                        String::from("summary_tool_or_cancel"),
+                        String::from("summary provider must return bounded text only"),
+                    ));
+                }
+                ProviderEvent::Started => {}
+            }
+        }
+        if let Some((code, message)) = failed {
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ContextSummaryFailed(ContextSummaryFailedEvent {
+                    identity: identity.clone(),
+                    code,
+                    message,
+                }),
+            )?;
+            return Err(RunTurnError::SummaryProviderFailed);
+        }
+        truncate_owned_utf8(&mut text, usize::try_from(max_summary_bytes).unwrap_or(usize::MAX));
+        let content_hash = ContentHash::digest(text.as_bytes());
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                identity: identity.clone(),
+                content_hash,
+                text: text.clone(),
+                input_tokens: usage.0,
+                output_tokens: usage.1,
+            }),
+        )?;
+        Ok((text, summary_id, summary_provider, summary_model, position))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "live artifact handoff keeps the serialized payload, proposal chain, artifact outbox, and replacement adjacent"
+    )]
+    async fn execute_live_artifact_handoff(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        state: &crate::session::SessionState,
+        binding: &crate::session::SessionStyleBinding,
+        command: &RunTurnCommand,
+        committed_at: Sequence,
+        mut position: JournalPosition,
+    ) -> Result<(ArtifactId, ContentHash, String, JournalPosition), RunTurnError> {
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle =
+            serde_json::from_str(&binding.compiled_style_json)
+                .map_err(|_| RunTurnError::StyleBindingInvalid)?;
+        let schema_version = compiled.compaction.summary_schema_version.max(1);
+        let payload = serialize_context_artifact(
+            &state.conversation,
+            MAX_PROVIDER_PROJECTION_BYTES,
+            schema_version,
+            "private",
+            "application/vnd.agentmod.context+json",
+        )
+        .map_err(RunTurnError::Compaction)?;
+        let bytes = serde_json::to_vec(&payload).map_err(|_| RunTurnError::Event)?;
+        let content_hash = ContentHash::digest(&bytes);
+        let execution_id = format!(
+            "context-artifact:{}:{}",
+            command.cancellation_id,
+            committed_at.get()
+        );
+        let source_range = payload
+            .metadata
+            .get("source_range")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|values| {
+                Some((
+                    Sequence::new(values.first()?.as_u64()?).ok()?,
+                    Sequence::new(values.get(1)?.as_u64()?).ok()?,
+                ))
+            });
+        let identity = ContextArtifactIdentity {
+            execution_id: execution_id.clone(),
+            proposal_id: format!("context-artifact:{}", committed_at.get()),
+            content_hash,
+            mime_type: String::from("application/vnd.agentmod.context+json"),
+            source_range,
+        };
+        let entry_id = format!("handoff:{}", committed_at.get());
+        let existing = state.context_artifacts.get(&execution_id).cloned();
+        if let Some(record) = existing.as_ref() {
+            match record.state {
+                ContextArtifactState::Completed => {
+                    let artifact_id = record
+                        .artifact_id
+                        .as_deref()
+                        .ok_or(RunTurnError::InvalidContextArtifactReceipt)?;
+                    let artifact_id = ArtifactId::from_str(artifact_id)
+                        .map_err(|_| RunTurnError::InvalidArtifact)?;
+                    return Ok((artifact_id, content_hash, entry_id, position));
+                }
+                ContextArtifactState::Dispatched => {
+                    let (artifact_id, reference) = self.reconcile_context_artifact(
+                        persistence,
+                        session_id,
+                        session_directory,
+                        &identity,
+                        &bytes,
+                        record,
+                    )?;
+                    (position.sequence, position.event_id) = self.commit_next(
+                        persistence,
+                        session_id,
+                        session_directory,
+                        position.sequence,
+                        position.event_id,
+                        RuntimeCommittedEvent::ContextArtifactCompleted(
+                            ContextArtifactCompletedEvent {
+                                identity: identity.clone(),
+                                action_digest: record
+                                    .action_digest
+                                    .ok_or(RunTurnError::InvalidContextArtifactReceipt)?,
+                                artifact_id: artifact_id.to_string(),
+                                artifact_reference: reference,
+                                mime_type: identity.mime_type.clone(),
+                                byte_size: u64::try_from(bytes.len())
+                                    .map_err(|_| RunTurnError::Event)?,
+                            },
+                        ),
+                    )?;
+                    return Ok((artifact_id, content_hash, entry_id, position));
+                }
+                ContextArtifactState::Failed => {
+                    return Err(RunTurnError::ApprovedArtifactHandoffRequired);
+                }
+                ContextArtifactState::Proposed | ContextArtifactState::Approved => {}
+            }
+        }
+        let command = PersistArtifactCommand {
+            proposal_id: identity.proposal_id.clone(),
+            style: state.style.clone(),
+            workspace: state.workspace.clone(),
+            store_root: session_directory.join("artifacts").join("context"),
+            creation_event: existing
+                .as_ref()
+                .map_or_else(|| position.event_id.to_string(), |record| record.proposed_event.to_string()),
+            producer: String::from("runtime.context"),
+            mime_type: identity.mime_type.clone(),
+            bytes: bytes.clone(),
+            security: ArtifactSecurity::Private,
+            retention: ArtifactRetention::Session,
+        };
+        let approved_digest = if let Some(record) = existing.as_ref() {
+            record
+                .action_digest
+                .ok_or(RunTurnError::InvalidContextArtifactReceipt)?
+        } else {
+            let reserved = self
+                .data
+                .allocate_event_identity(AllocateEventIdentityDataRequest)
+                .map_err(RunTurnError::Identity)?;
+            let event = Self::seal_event_with_identity(
+                session_id,
+                position
+                    .sequence
+                    .checked_next()
+                    .map_err(|_| RunTurnError::SequenceOverflow)?,
+                Some(CausationId::from_uuid(position.event_id.into_uuid())),
+                reserved,
+                RuntimeCommittedEvent::ContextArtifactProposed(ContextArtifactProposedEvent {
+                    identity: identity.clone(),
+                    byte_size: u64::try_from(bytes.len()).map_err(|_| RunTurnError::Event)?,
+                }),
+            )?;
+            position = JournalPosition {
+                sequence: event.metadata.sequence,
+                event_id: event.metadata.event_id,
+            };
+            persistence
+                .commit_event(CommitSessionEventCommand {
+                    session_directory: session_directory.to_owned(),
+                    event,
+                    durability: CommitDurability::Data,
+                })
+                .map_err(RunTurnError::Persistence)?;
+            let mut command = command.clone();
+            command.creation_event = position.event_id.to_string();
+            let prepared = self
+                .artifacts
+                .prepare(command)
+                .map_err(RunTurnError::ContextArtifact)?;
+            let authorized = self
+                .artifacts
+                .authorize_prepared(prepared)
+                .await
+                .map_err(RunTurnError::ContextArtifact)?;
+            let action_digest = authorized
+                .executable
+                .digest()
+                .map_err(|_| RunTurnError::Event)?;
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ContextArtifactApproved(ContextArtifactApprovedEvent {
+                    identity: identity.clone(),
+                    action_digest,
+                }),
+            )?;
+            action_digest
+        };
+        let (artifact_id, artifact_reference, receipt_position) = self
+            .persist_context_artifact_receipt(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                &identity,
+                approved_digest,
+                command.clone(),
+            )?;
+        position = receipt_position;
+        let artifact_id = ArtifactId::from_str(&artifact_id)
+            .map_err(|_| RunTurnError::InvalidArtifact)?;
+        let _ = artifact_reference;
+        Ok((artifact_id, content_hash, entry_id, position))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn persist_context_artifact_receipt(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        mut position: JournalPosition,
+        identity: &ContextArtifactIdentity,
+        action_digest: ContentHash,
+        command: PersistArtifactCommand,
+    ) -> Result<(String, String, JournalPosition), RunTurnError> {
+        let authorized = self
+            .artifacts
+            .restore_authorized(command, action_digest)
+            .map_err(RunTurnError::ContextArtifact)?;
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextArtifactDispatched(ContextArtifactDispatchedEvent {
+                identity: identity.clone(),
+                action_digest,
+            }),
+        )?;
+        let persisted = self
+            .artifacts
+            .persist_authorized(authorized)
+            .map_err(RunTurnError::ContextArtifact)?;
+        self.commit_context_artifact_completed(
+            persistence,
+            session_id,
+            session_directory,
+            position,
+            identity,
+            action_digest,
+            &persisted,
+        )
+    }
+
+    fn commit_context_artifact_completed(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        mut position: JournalPosition,
+        identity: &ContextArtifactIdentity,
+        action_digest: ContentHash,
+        persisted: &PersistedArtifact,
+    ) -> Result<(String, String, JournalPosition), RunTurnError> {
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextArtifactCompleted(ContextArtifactCompletedEvent {
+                identity: identity.clone(),
+                action_digest,
+                artifact_id: persisted.artifact_id.clone(),
+                artifact_reference: persisted.artifact_reference.clone(),
+                mime_type: persisted.mime_type.clone(),
+                byte_size: persisted.byte_size,
+            }),
+        )?;
+        Ok((
+            persisted.artifact_id.clone(),
+            persisted.artifact_reference.clone(),
+            position,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_context_artifact(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        identity: &ContextArtifactIdentity,
+        bytes: &[u8],
+        record: &crate::session::ContextArtifactRecord,
+    ) -> Result<(ArtifactId, String), RunTurnError> {
+        let _ = (persistence, session_id);
+        let command = PersistArtifactCommand {
+            proposal_id: identity.proposal_id.clone(),
+            style: String::new(),
+            workspace: String::new(),
+            store_root: session_directory.join("artifacts").join("context"),
+            creation_event: record.proposed_event.to_string(),
+            producer: String::from("runtime.context"),
+            mime_type: identity.mime_type.clone(),
+            bytes: bytes.to_vec(),
+            security: ArtifactSecurity::Private,
+            retention: ArtifactRetention::Session,
+        };
+        let approved_digest = record
+            .action_digest
+            .ok_or(RunTurnError::InvalidContextArtifactReceipt)?;
+        let reconciled = self
+            .artifacts
+            .reconcile(&command)
+            .map_err(RunTurnError::ContextArtifact)?;
+        let persisted = match reconciled {
+            Some(persisted) => persisted,
+            None => {
+                let authorized = self
+                    .artifacts
+                    .restore_authorized(command, approved_digest)
+                    .map_err(RunTurnError::ContextArtifact)?;
+                self.artifacts
+                    .persist_authorized(authorized)
+                    .map_err(RunTurnError::ContextArtifact)?
+            }
+        };
+        let artifact_id = ArtifactId::from_str(&persisted.artifact_id)
+            .map_err(|_| RunTurnError::InvalidArtifact)?;
+        Ok((artifact_id, persisted.artifact_reference))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "memory-write approval resolution binds the exact durable decision, canonical outbox, and provider receipt"
+    )]
+    async fn resolve_memory_write_approval(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        command: &ResolveTurnApprovalCommand,
+        continuation_id: ContinuationId,
+        loaded: &LoadSessionResult,
+        transitioned: bool,
+        write: &MemoryWriteApprovalContinuation,
+    ) -> Result<ResolveTurnApprovalResult, RunTurnError> {
+        if write.session_id != command.session_id
+            || loaded.state.workspace != write.workspace
+            || loaded.state.style != write.style
+        {
+            return Err(RunTurnError::InvalidContinuationPayload);
+        }
+        let expected_state = if command.approved {
+            ApprovalState::Approved
+        } else {
+            ApprovalState::Denied
+        };
+        let approval = loaded
+            .state
+            .approvals
+            .get(&continuation_id)
+            .ok_or(RunTurnError::InvalidContinuationPayload)?;
+        let mut position = JournalPosition {
+            sequence: loaded.state.last_sequence,
+            event_id: loaded.last_event_id,
+        };
+        if approval.state == ApprovalState::Pending {
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ApprovalResolved(ApprovalResolvedEvent {
+                    continuation_id,
+                    approved: command.approved,
+                }),
+            )?;
+        } else if approval.state != expected_state {
+            return Err(RunTurnError::InvalidContinuationPayload);
+        }
+        let identity = MemoryWriteIdentity {
+            write_id: write.write_id.clone(),
+            provider: write.provider.clone(),
+            scope: write.scope.clone(),
+            source: write.source.clone(),
+            content_hash: write.content_hash,
+            deduplication_key: write.deduplication_key.clone(),
+        };
+        let action_digest = memory_write_action_digest(write)?;
+        if !command.approved {
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::MemoryWriteFailed(MemoryWriteFailedEvent {
+                    identity,
+                    code: String::from("user_denied"),
+                    message: String::from("user denied the automatic memory write"),
+                }),
+            )?;
+            return Ok(ResolveTurnApprovalResult {
+                transitioned,
+                events: Vec::new(),
+                last_committed_sequence: position.sequence,
+                awaiting_continuation: None,
+            });
+        }
+        position = self.dispatch_approved_memory_write(
+            persistence,
+            session_id,
+            session_directory,
+            position,
+            &identity,
+            action_digest,
+            write,
+        )?;
+        Ok(ResolveTurnApprovalResult {
+            transitioned,
+            events: Vec::new(),
+            last_committed_sequence: position.sequence,
+            awaiting_continuation: None,
+        })
+    }
+
+    fn dispatch_approved_memory_write(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        mut position: JournalPosition,
+        identity: &MemoryWriteIdentity,
+        action_digest: ContentHash,
+        write: &MemoryWriteApprovalContinuation,
+    ) -> Result<JournalPosition, RunTurnError> {
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::MemoryWriteApproved(MemoryWriteApprovedEvent {
+                identity: identity.clone(),
+                action_digest,
+            }),
+        )?;
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::MemoryWriteDispatched(MemoryWriteDispatchedEvent {
+                identity: identity.clone(),
+                action_digest,
+            }),
+        )?;
+        let memory = MemoryLogic::new(self.data.clone());
+        let scope = memory_scope_from_key(&write.scope)?;
+        let result = memory
+            .write_memory(WriteMemoryCommand {
+                provider: write.provider.clone(),
+                scope,
+                source: write.source.clone(),
+                content: write.content.clone(),
+                created_at: TimestampMillis::new(now_millis()),
+                authorization: MemoryWriteAuthorization::Approved,
+                deduplication_key: write.deduplication_key.clone(),
+            })
+            .map_err(RunTurnError::Memory)?;
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::MemoryWriteCompleted(MemoryWriteCompletedEvent {
+                identity: identity.clone(),
+                action_digest,
+                reference: result.reference,
+                retained: result.retained,
+                deduplicated: result.deduplicated,
+            }),
+        )?;
+        Ok(position)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "automatic writes keep the proposal chain, approval modes, canonical outbox, provider dispatch, and restart deduplication adjacent"
+    )]
+    async fn commit_automatic_memory_write(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        state: &crate::session::SessionState,
+        binding: &crate::session::SessionStyleBinding,
+        command: &RunTurnCommand,
+        trigger: &str,
+        mut position: JournalPosition,
+    ) -> Result<JournalPosition, RunTurnError> {
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle =
+            serde_json::from_str(&binding.compiled_style_json)
+                .map_err(|_| RunTurnError::StyleBindingInvalid)?;
+        let Some(spec) = effective_auto_write(&compiled) else {
+            return Ok(position);
+        };
+        if spec.trigger != trigger {
+            return Ok(position);
+        }
+        let provider = spec
+            .provider
+            .clone()
+            .unwrap_or_else(|| compiled.memory.provider.clone());
+        if provider == "none" {
+            return Ok(position);
+        }
+        let scope_key = memory_scope_key(&spec.scope, session_id, &state.workspace)?;
+        let mut content = auto_write_content(state, &spec.categories, trigger)?;
+        if content.trim().is_empty() {
+            return Ok(position);
+        }
+        truncate_owned_utf8(&mut content, usize::try_from(spec.max_bytes).unwrap_or(usize::MAX));
+        let content_hash = ContentHash::digest(content.as_bytes());
+        let source = format!("auto:{}:{}", trigger, command.cancellation_id);
+        let dedup_key = match spec.dedup {
+            agentmod_session_style_sdk::MemoryDedupPolicy::None => None,
+            agentmod_session_style_sdk::MemoryDedupPolicy::ContentOnly => {
+                Some(format!("content:{}", content_hash.to_hex()))
+            }
+            agentmod_session_style_sdk::MemoryDedupPolicy::CanonicalIdentity => Some(format!(
+                "canonical:{}:{}:{}:{}",
+                provider,
+                scope_key,
+                source,
+                content_hash.to_hex()
+            )),
+        };
+        let write_id = format!("write:{}:{}", provider, content_hash.to_hex());
+        let identity = MemoryWriteIdentity {
+            write_id: write_id.clone(),
+            provider: provider.clone(),
+            scope: scope_key.clone(),
+            source: source.clone(),
+            content_hash,
+            deduplication_key: dedup_key.clone(),
+        };
+        let existing = state.memory_writes.get(&write_id).cloned();
+        if let Some(record) = existing.as_ref() {
+            if record.has_terminal_evidence() {
+                return Ok(position);
+            }
+            if record.state == MemoryWriteState::Dispatched {
+                // The write may have landed; the dedup key makes a re-dispatch
+                // idempotent and returns the existing reference.
+                let memory = MemoryLogic::new(self.data.clone());
+                let scope = memory_scope_from_key(&scope_key)?;
+                let result = memory
+                    .write_memory(WriteMemoryCommand {
+                        provider: provider.clone(),
+                        scope,
+                        source: source.clone(),
+                        content: content.clone(),
+                        created_at: TimestampMillis::new(now_millis()),
+                        authorization: MemoryWriteAuthorization::Approved,
+                        deduplication_key: dedup_key.clone(),
+                    })
+                    .map_err(RunTurnError::Memory)?;
+                let action_digest = record
+                    .action_digest
+                    .ok_or(RunTurnError::MemoryWriteReceiptMissing)?;
+                (position.sequence, position.event_id) = self.commit_next(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position.sequence,
+                    position.event_id,
+                    RuntimeCommittedEvent::MemoryWriteCompleted(MemoryWriteCompletedEvent {
+                        identity: identity.clone(),
+                        action_digest,
+                        reference: result.reference,
+                        retained: result.retained,
+                        deduplicated: result.deduplicated,
+                    }),
+                )?;
+                return Ok(position);
+            }
+        }
+        let proposal_id = format!("memory-write:{}", write_id);
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::MemoryWriteProposed(MemoryWriteProposedEvent {
+                identity: identity.clone(),
+                proposal_id: proposal_id.clone(),
+                max_bytes: spec.max_bytes,
+                trigger: trigger.to_owned(),
+            }),
+        )?;
+        let proposal = ActionProposal {
+            id: ProposalId(proposal_id),
+            action: ConsequentialAction::MemoryWrite {
+                scope: scope_key.clone(),
+                content_hash,
+            },
+            style: state.style.clone(),
+            workspace: state.workspace.clone(),
+            origin: String::from("runtime"),
+        };
+        let session_policy = self
+            .policy_for_state(state, &command.cancellation_id)
+            .await?;
+        let result = intercept_action(
+            proposal.clone(),
+            &session_policy.execution.style_pipeline,
+            &session_policy.execution.plugin_pipeline,
+            ActionCapabilities::all(),
+            &session_policy.execution.user_policy,
+            &session_policy.execution.mandatory_policy,
+        )
+        .await;
+        match result.outcome {
+            InterceptionOutcome::Approved { executable, .. } if executable == proposal => {
+                let invocation_position = self.commit_plugin_invocations(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position,
+                    state,
+                    &result.audit,
+                )?;
+                position = invocation_position;
+                let action_digest = executable
+                    .digest()
+                    .map_err(|_| RunTurnError::Event)?;
+                (position.sequence, position.event_id) = self.commit_next(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position.sequence,
+                    position.event_id,
+                    RuntimeCommittedEvent::MemoryWriteApproved(MemoryWriteApprovedEvent {
+                        identity: identity.clone(),
+                        action_digest,
+                    }),
+                )?;
+                let write = MemoryWriteApprovalContinuation {
+                    session_id: command.session_id.clone(),
+                    workspace: state.workspace.clone(),
+                    style: state.style.clone(),
+                    cancellation_id: command.cancellation_id.clone(),
+                    provider: provider.clone(),
+                    scope: scope_key.clone(),
+                    source: source.clone(),
+                    content,
+                    deduplication_key: dedup_key,
+                    write_id: write_id.clone(),
+                    max_bytes: spec.max_bytes,
+                    trigger: trigger.to_owned(),
+                    content_hash,
+                };
+                position = self.dispatch_approved_memory_write(
+                    persistence,
+                    session_id,
+                    session_directory,
+                    position,
+                    &identity,
+                    action_digest,
+                    &write,
+                )?;
+                Ok(position)
+            }
+            InterceptionOutcome::Approved { .. } => {
+                Err(RunTurnError::InvalidContextInterceptionReplacement)
+            }
+            InterceptionOutcome::RequireApproval { reason, .. } => match spec.approval {
+                agentmod_session_style_sdk::MemoryWriteApprovalMode::MandatoryOnly => {
+                    self.fail_memory_write(
+                        persistence,
+                        session_id,
+                        session_directory,
+                        position,
+                        &identity,
+                        String::from("approval_required"),
+                        reason,
+                        spec.failure,
+                    )
+                }
+                agentmod_session_style_sdk::MemoryWriteApprovalMode::RequireUserApproval => {
+                    let continuation_id =
+                        ContinuationId::from_uuid(position.event_id.into_uuid());
+                    ContinuationLogic::new(self.data.clone())
+                        .create_continuation(CreateContinuationCommand {
+                            session_id: command.session_id.clone(),
+                            id: continuation_id,
+                            wake_condition: ContinuationWakeCondition::Manual,
+                            payload: ContinuationPayload::MemoryWrite(Box::new(
+                                MemoryWriteApprovalContinuation {
+                                    session_id: command.session_id.clone(),
+                                    workspace: state.workspace.clone(),
+                                    style: state.style.clone(),
+                                    cancellation_id: command.cancellation_id.clone(),
+                                    provider,
+                                    scope: scope_key,
+                                    source,
+                                    content,
+                                    deduplication_key: dedup_key,
+                                    write_id,
+                                    max_bytes: spec.max_bytes,
+                                    trigger: trigger.to_owned(),
+                                    content_hash,
+                                },
+                            )),
+                            expires_at: None,
+                        })
+                        .map_err(RunTurnError::Continuation)?;
+                    (position.sequence, position.event_id) = self.commit_next(
+                        persistence,
+                        session_id,
+                        session_directory,
+                        position.sequence,
+                        position.event_id,
+                        RuntimeCommittedEvent::ApprovalRequested(ApprovalRequestedEvent {
+                            continuation_id,
+                            action_summary: reason,
+                        }),
+                    )?;
+                    Ok(position)
+                }
+            },
+            InterceptionOutcome::Rejected { reason }
+            | InterceptionOutcome::Cancelled { reason } => self.fail_memory_write(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                &identity,
+                String::from("policy_rejected"),
+                reason,
+                spec.failure,
+            ),
+            InterceptionOutcome::Deferred { .. }
+            | InterceptionOutcome::Forked { .. }
+            | InterceptionOutcome::Aborted { .. } => Err(RunTurnError::UnsupportedContextDecision(
+                "automatic memory write",
+            )),
+        }
+    }
+
+    fn fail_memory_write(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        mut position: JournalPosition,
+        identity: &MemoryWriteIdentity,
+        code: String,
+        message: String,
+        failure: agentmod_session_style_sdk::MemoryWriteFailureBehavior,
+    ) -> Result<JournalPosition, RunTurnError> {
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::MemoryWriteFailed(MemoryWriteFailedEvent {
+                identity: identity.clone(),
+                code,
+                message,
+            }),
+        )?;
+        match failure {
+            agentmod_session_style_sdk::MemoryWriteFailureBehavior::Skip => Ok(position),
+            agentmod_session_style_sdk::MemoryWriteFailureBehavior::FailTurn => {
+                Err(RunTurnError::AutomaticMemoryWriteFailed)
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "turn completion, iteration completion, child completion, reviewer approval, and explicit-node hooks share one coordinator"
+    )]
+    async fn commit_style_memory_write_if_triggered(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        command: &RunTurnCommand,
+        trigger: &str,
+        position: JournalPosition,
+    ) -> Result<JournalPosition, RunTurnError> {
+        let state = Self::load_state(persistence, session_id, session_directory)?;
+        let Some(binding) = state.style_binding.as_ref() else {
+            return Ok(position);
+        };
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle =
+            serde_json::from_str(&binding.compiled_style_json)
+                .map_err(|_| RunTurnError::StyleBindingInvalid)?;
+        let Some(spec) = effective_auto_write(&compiled) else {
+            return Ok(position);
+        };
+        if spec.trigger != trigger {
+            return Ok(position);
+        }
+        self.commit_automatic_memory_write(
+            persistence,
+            session_id,
+            session_directory,
+            &state,
+            binding,
+            command,
+            trigger,
+            position,
+        )
+        .await
     }
 
     #[allow(
@@ -7863,6 +9027,27 @@ fn context_request_hash(
     Ok(ContentHash::digest(&identity))
 }
 
+/// Exact identity of one live typed-summary model request.
+///
+/// Binds provider, model, canonical options, and the exact typed request
+/// entries so restart recovery can reuse terminal evidence without a second
+/// provider call.
+fn summary_request_hash(
+    provider: &str,
+    model: &str,
+    options: &Value,
+    entries: &[ConversationEntry],
+) -> Result<ContentHash, RunTurnError> {
+    let canonical_options = canonical_json_bytes(options).map_err(map_projection_measure_error)?;
+    let mut identity = Vec::from(b"agentmod.summary-request.v1".as_slice());
+    append_identity_field(&mut identity, provider.as_bytes())?;
+    append_identity_field(&mut identity, model.as_bytes())?;
+    append_identity_field(&mut identity, &canonical_options)?;
+    let entries_bytes = serde_json::to_vec(entries).map_err(|_| RunTurnError::Event)?;
+    append_identity_field(&mut identity, &entries_bytes)?;
+    Ok(ContentHash::digest(&identity))
+}
+
 fn append_identity_field(target: &mut Vec<u8>, value: &[u8]) -> Result<(), RunTurnError> {
     let length = u64::try_from(value.len()).map_err(|_| RunTurnError::ProjectionSizeOverflow)?;
     target.extend_from_slice(&length.to_le_bytes());
@@ -7981,6 +9166,195 @@ fn memory_scope(
         ))),
         other => Err(RunTurnError::UnsupportedMemoryScope(other.to_owned())),
     }
+}
+
+/// Normalized auto-write policy resolved from the compiled style.
+struct AutoWriteSpec {
+    trigger: String,
+    categories: Vec<agentmod_session_style_sdk::MemoryContentCategory>,
+    scope: agentmod_session_style_sdk::MemoryScope,
+    provider: Option<String>,
+    max_bytes: u32,
+    dedup: agentmod_session_style_sdk::MemoryDedupPolicy,
+    approval: agentmod_session_style_sdk::MemoryWriteApprovalMode,
+    failure: agentmod_session_style_sdk::MemoryWriteFailureBehavior,
+}
+
+/// Resolves the effective automatic memory-write policy, mapping the legacy
+/// `write_policy` field to bounded defaults when no explicit auto-write
+/// selection is present.
+fn effective_auto_write(
+    compiled: &agentmod_session_style_sdk::CompiledSessionStyle,
+) -> Option<AutoWriteSpec> {
+    use agentmod_session_style_sdk::{
+        MemoryAutoWriteTrigger, MemoryContentCategory, MemoryDedupPolicy, MemoryWriteApprovalMode,
+        MemoryWriteFailureBehavior,
+    };
+    if let Some(auto_write) = compiled.memory.auto_write.as_ref() {
+        if auto_write.trigger == MemoryAutoWriteTrigger::Never {
+            return None;
+        }
+        return Some(AutoWriteSpec {
+            trigger: auto_write_trigger_label(auto_write.trigger),
+            categories: auto_write.categories.clone(),
+            scope: auto_write.scope,
+            provider: auto_write.provider.clone(),
+            max_bytes: auto_write.max_bytes,
+            dedup: auto_write.dedup,
+            approval: auto_write.approval,
+            failure: auto_write.failure,
+        });
+    }
+    let trigger = match compiled.memory.write_policy {
+        agentmod_session_style_sdk::MemoryWritePolicy::TurnCompletion => "turn_completion",
+        agentmod_session_style_sdk::MemoryWritePolicy::IterationCompletion => {
+            "iteration_completion"
+        }
+        agentmod_session_style_sdk::MemoryWritePolicy::SessionCompletion => {
+            "session_completion"
+        }
+        agentmod_session_style_sdk::MemoryWritePolicy::ExplicitOnly => "explicit_node",
+        agentmod_session_style_sdk::MemoryWritePolicy::Never => return None,
+    };
+    Some(AutoWriteSpec {
+        trigger: trigger.to_owned(),
+        categories: vec![
+            MemoryContentCategory::AssistantText,
+            MemoryContentCategory::ToolResults,
+        ],
+        scope: agentmod_session_style_sdk::MemoryScope::Session,
+        provider: None,
+        max_bytes: 64 * 1024,
+        dedup: MemoryDedupPolicy::CanonicalIdentity,
+        approval: MemoryWriteApprovalMode::MandatoryOnly,
+        failure: MemoryWriteFailureBehavior::Skip,
+    })
+}
+
+fn auto_write_trigger_label(
+    trigger: agentmod_session_style_sdk::MemoryAutoWriteTrigger,
+) -> String {
+    use agentmod_session_style_sdk::MemoryAutoWriteTrigger;
+    match trigger {
+        MemoryAutoWriteTrigger::Never => "never".to_owned(),
+        MemoryAutoWriteTrigger::TurnCompletion => "turn_completion".to_owned(),
+        MemoryAutoWriteTrigger::IterationCompletion => "iteration_completion".to_owned(),
+        MemoryAutoWriteTrigger::SessionCompletion => "session_completion".to_owned(),
+        MemoryAutoWriteTrigger::ResearchFindingPersisted => "research_finding_persisted".to_owned(),
+        MemoryAutoWriteTrigger::ChildCompletion => "child_completion".to_owned(),
+        MemoryAutoWriteTrigger::ReviewerApproval => "reviewer_approval".to_owned(),
+        MemoryAutoWriteTrigger::ExplicitNode => "explicit_node".to_owned(),
+    }
+}
+
+fn memory_scope_key(
+    scope: &agentmod_session_style_sdk::MemoryScope,
+    session_id: SessionId,
+    workspace: &str,
+) -> Result<String, RunTurnError> {
+    use agentmod_session_style_sdk::MemoryScope;
+    match scope {
+        MemoryScope::Session => Ok(format!("session:{session_id}")),
+        MemoryScope::Project => Ok(format!("project:{workspace}")),
+        MemoryScope::User => Err(RunTurnError::MemoryScopeIdentityUnavailable(String::from(
+            "user",
+        ))),
+        MemoryScope::Runtime => Ok(String::from("runtime")),
+    }
+}
+
+fn memory_scope_from_key(key: &str) -> Result<MemoryScope, RunTurnError> {
+    if key == "runtime" {
+        return Ok(MemoryScope::Runtime);
+    }
+    let Some((kind, identity)) = key.split_once(':') else {
+        return Err(RunTurnError::UnsupportedMemoryScope(key.to_owned()));
+    };
+    match kind {
+        "session" => Ok(MemoryScope::Session(identity.to_owned())),
+        "project" => Ok(MemoryScope::Project(identity.to_owned())),
+        other => Err(RunTurnError::UnsupportedMemoryScope(other.to_owned())),
+    }
+}
+
+/// Builds bounded auto-write content from the eligible content categories.
+fn auto_write_content(
+    state: &crate::session::SessionState,
+    categories: &[agentmod_session_style_sdk::MemoryContentCategory],
+    trigger: &str,
+) -> Result<String, RunTurnError> {
+    use agentmod_session_style_sdk::MemoryContentCategory;
+    let mut lines = Vec::new();
+    for category in categories {
+        match category {
+            MemoryContentCategory::AssistantText => {
+                for entry in state.conversation.history().iter().rev().take(8) {
+                    if let ConversationEntry::AssistantMessage(entry) = entry {
+                        lines.push(entry.text.clone());
+                    }
+                }
+            }
+            MemoryContentCategory::UserConstraints => {
+                for entry in state.conversation.history().iter().rev().take(16) {
+                    match entry {
+                        ConversationEntry::UserInstruction(entry)
+                        | ConversationEntry::ProjectInstruction(entry) => {
+                            lines.push(entry.text.clone());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            MemoryContentCategory::ToolResults => {
+                for entry in state.conversation.history().iter().rev().take(16) {
+                    if let ConversationEntry::ToolResult(result) = entry
+                        && !result.content.trim().is_empty()
+                    {
+                        lines.push(result.content.clone());
+                    }
+                }
+            }
+            MemoryContentCategory::Findings | MemoryContentCategory::Reviews => {
+                let _ = trigger;
+            }
+            MemoryContentCategory::ArtifactReferences => {
+                for entry in state.conversation.history().iter().rev().take(8) {
+                    if let ConversationEntry::ArtifactReference(entry) = entry {
+                        lines.push(format!(
+                            "artifact {}: {}",
+                            entry.artifact_id, entry.label
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    lines.reverse();
+    let mut content = lines.join("\n");
+    content.truncate(256 * 1024);
+    Ok(content)
+}
+
+fn memory_write_action_digest(
+    write: &MemoryWriteApprovalContinuation,
+) -> Result<ContentHash, RunTurnError> {
+    let proposal = ActionProposal {
+        id: ProposalId(format!("memory-write:{}", write.write_id)),
+        action: ConsequentialAction::MemoryWrite {
+            scope: write.scope.clone(),
+            content_hash: write.content_hash,
+        },
+        style: write.style.clone(),
+        workspace: write.workspace.clone(),
+        origin: String::from("runtime"),
+    };
+    proposal.digest().map_err(|_| RunTurnError::Event)
+}
+
+fn now_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| i64::try_from(duration.as_millis()).unwrap_or(0))
 }
 
 fn construct_memory_query(
@@ -9029,6 +10403,20 @@ pub enum RunTurnError {
     ApprovedSummaryRequired,
     #[error("artifact-handoff compaction requires an approved immutable artifact")]
     ApprovedArtifactHandoffRequired,
+    #[error("summary provider dispatch may have started and requires terminal evidence")]
+    AmbiguousSummaryProvider,
+    #[error("terminal summary evidence is incomplete")]
+    SummaryEvidenceIncomplete,
+    #[error("summary provider returned a non-text terminal outcome")]
+    SummaryProviderFailed,
+    #[error("automatic memory write failed and the style selected fail-closed behavior")]
+    AutomaticMemoryWriteFailed,
+    #[error("automatic memory-write dispatch has no canonical approval digest")]
+    MemoryWriteReceiptMissing,
+    #[error("context artifact persistence failed: {0}")]
+    ContextArtifact(crate::artifact::ArtifactPersistenceError),
+    #[error("context artifact receipt does not match its approved dispatch")]
+    InvalidContextArtifactReceipt,
     #[error("compaction strategy `{0}` is not supported by the live adapter")]
     UnsupportedCompactionStrategy(String),
     #[error("provider projection budget is invalid")]

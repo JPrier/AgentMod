@@ -1,5 +1,6 @@
 //! Business-facing durable continuation datasets.
 
+use agentmod_primitives::ContentHash;
 use agentmod_runtime_dependency::continuation::{
     ContinuationDependencyError, ContinuationDependencyPort, DependencyContinuationRecord,
     DependencyContinuationState, DependencyCreateContinuationRequest,
@@ -55,6 +56,8 @@ pub enum ContinuationPayloadRecord {
     StyleApproval(Box<StyleApprovalPayloadRecord>),
     /// A complete provider turn deferred until an authenticated scheduler claim.
     DeferredTurn(Box<DeferredTurnPayloadRecord>),
+    /// An approved automatic memory write waiting for its user decision.
+    MemoryWrite(Box<MemoryWritePayloadRecord>),
     /// Generic fixture payload used by storage-only callers.
     Opaque {
         /// Stable non-secret label.
@@ -93,6 +96,37 @@ pub struct StyleApprovalPayloadRecord {
     pub step: u64,
     /// Canonical hash of caller-controlled graph inputs.
     pub request_reference: String,
+}
+
+/// Data-owned restart-safe automatic memory-write approval payload.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MemoryWritePayloadRecord {
+    /// Canonical session containing the pending write.
+    pub session_id: String,
+    /// Canonical workspace text.
+    pub workspace: String,
+    /// Explicit session style.
+    pub style: String,
+    /// Stable cancellation identity for the owning execution.
+    pub cancellation_id: String,
+    /// Provider used for the write.
+    pub provider: String,
+    /// Normalized scope key.
+    pub scope: String,
+    /// Provenance label.
+    pub source: String,
+    /// Exact bounded content.
+    pub content: String,
+    /// Canonical duplicate-prevention key.
+    pub deduplication_key: Option<String>,
+    /// Canonical cross-restart write identity.
+    pub write_id: String,
+    /// Maximum retained bytes.
+    pub max_bytes: u32,
+    /// Trigger boundary that proposed the write.
+    pub trigger: String,
+    /// Hash of the exact content.
+    pub content_hash: ContentHash,
 }
 
 /// Data-owned restart-safe deferred provider turn.

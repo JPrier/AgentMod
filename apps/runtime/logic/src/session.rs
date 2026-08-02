@@ -1105,6 +1105,76 @@ pub struct MemoryWriteFailedEvent {
     pub message: String,
 }
 
+/// Stable identity for one artifact-handoff compaction write.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextArtifactIdentity {
+    /// Projection-local artifact write execution ID.
+    pub execution_id: String,
+    /// Logic proposal identifier.
+    pub proposal_id: String,
+    /// Hash of the exact serialized context payload.
+    pub content_hash: ContentHash,
+    /// Media type of the context artifact.
+    pub mime_type: String,
+    /// Inclusive source projection range captured.
+    pub source_range: Option<(Sequence, Sequence)>,
+}
+
+/// Canonical intent to begin one artifact-handoff context write.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextArtifactProposedEvent {
+    /// Exact context-artifact identity.
+    pub identity: ContextArtifactIdentity,
+    /// Byte size of the exact serialized payload.
+    pub byte_size: u64,
+}
+
+/// Records the final policy-approved context-artifact action.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextArtifactApprovedEvent {
+    /// Exact context-artifact identity.
+    pub identity: ContextArtifactIdentity,
+    /// Digest of the policy-approved action.
+    pub action_digest: ContentHash,
+}
+
+/// Records durable dispatch intent before artifact storage is called.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextArtifactDispatchedEvent {
+    /// Exact context-artifact identity.
+    pub identity: ContextArtifactIdentity,
+    /// Digest of the policy-approved action.
+    pub action_digest: ContentHash,
+}
+
+/// Terminal artifact-store receipt for one artifact-handoff write.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextArtifactCompletedEvent {
+    /// Exact context-artifact identity.
+    pub identity: ContextArtifactIdentity,
+    /// Digest of the policy-approved action.
+    pub action_digest: ContentHash,
+    /// Content-addressed artifact ID.
+    pub artifact_id: String,
+    /// Portable immutable artifact reference.
+    pub artifact_reference: String,
+    /// Exact media type.
+    pub mime_type: String,
+    /// Exact byte count.
+    pub byte_size: u64,
+}
+
+/// Terminal failure for one artifact-handoff write without a receipt.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextArtifactFailedEvent {
+    /// Exact context-artifact identity.
+    pub identity: ContextArtifactIdentity,
+    /// Stable failure code.
+    pub code: String,
+    /// Bounded failure detail.
+    pub message: String,
+}
+
 /// Typed committed events consumed by the pure session reducer.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "event", content = "payload", rename_all = "snake_case")]
@@ -1231,6 +1301,16 @@ pub enum RuntimeCommittedEvent {
     MemoryWriteCompleted(MemoryWriteCompletedEvent),
     /// Records a terminal memory-write failure.
     MemoryWriteFailed(MemoryWriteFailedEvent),
+    /// Begins one artifact-handoff context write.
+    ContextArtifactProposed(ContextArtifactProposedEvent),
+    /// Records the final approved context-artifact action.
+    ContextArtifactApproved(ContextArtifactApprovedEvent),
+    /// Records durable dispatch intent before artifact storage is called.
+    ContextArtifactDispatched(ContextArtifactDispatchedEvent),
+    /// Records a terminal artifact-store receipt.
+    ContextArtifactCompleted(ContextArtifactCompletedEvent),
+    /// Records a terminal context-artifact failure.
+    ContextArtifactFailed(ContextArtifactFailedEvent),
 }
 
 impl RuntimeCommittedEvent {
@@ -1299,6 +1379,11 @@ impl RuntimeCommittedEvent {
             Self::MemoryWriteDispatched(_) => "memory.write_dispatched",
             Self::MemoryWriteCompleted(_) => "memory.write_completed",
             Self::MemoryWriteFailed(_) => "memory.write_failed",
+            Self::ContextArtifactProposed(_) => "context.artifact_proposed",
+            Self::ContextArtifactApproved(_) => "context.artifact_approved",
+            Self::ContextArtifactDispatched(_) => "context.artifact_dispatched",
+            Self::ContextArtifactCompleted(_) => "context.artifact_completed",
+            Self::ContextArtifactFailed(_) => "context.artifact_failed",
         }
     }
 }
@@ -1577,6 +1662,63 @@ impl MemoryWriteRecord {
     }
 }
 
+/// Replay-owned artifact-handoff compaction outbox state.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextArtifactState {
+    /// Proposal is canonical; no policy outcome is canonical yet.
+    Proposed,
+    /// Policy approved the exact action; no storage call is canonical yet.
+    Approved,
+    /// Dispatch intent is canonical; recovery must use an exact terminal receipt.
+    Dispatched,
+    /// A terminal artifact-store receipt is canonical.
+    Completed,
+    /// Terminal failure without a receipt is canonical.
+    Failed,
+}
+
+/// Replay-owned artifact-handoff compaction outbox record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextArtifactRecord {
+    /// Exact context-artifact identity.
+    pub identity: ContextArtifactIdentity,
+    /// Requested and persisted byte count.
+    pub byte_size: u64,
+    /// Latest durable outbox state.
+    pub state: ContextArtifactState,
+    /// Digest of the approved action, once policy succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<ContentHash>,
+    /// Canonical proposal sequence.
+    pub proposed_at: Sequence,
+    /// Canonical proposal event used as dependency creation provenance.
+    pub proposed_event: EventId,
+    /// Canonical approval sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<Sequence>,
+    /// Canonical dispatch sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_at: Option<Sequence>,
+    /// Canonical terminal sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Sequence>,
+    /// Content-addressed artifact ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    /// Portable immutable artifact reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_reference: Option<String>,
+}
+
+impl ContextArtifactRecord {
+    /// Returns whether a terminal receipt or failure already exists.
+    #[must_use]
+    pub const fn has_terminal_evidence(&self) -> bool {
+        matches!(self.state, ContextArtifactState::Completed | ContextArtifactState::Failed)
+    }
+}
+
 impl ArtifactPersistenceRecord {
     /// Returns the only restart action legal at this canonical cut.
     #[must_use]
@@ -1645,6 +1787,9 @@ pub struct SessionState {
     /// Automatic memory-write outbox keyed by canonical write identity.
     #[serde(default)]
     pub memory_writes: BTreeMap<String, MemoryWriteRecord>,
+    /// Artifact-handoff compaction outbox keyed by execution identity.
+    #[serde(default)]
+    pub context_artifacts: BTreeMap<String, ContextArtifactRecord>,
     /// Last applied sequence.
     pub last_sequence: Sequence,
     /// Integrity checksum of the last applied event.
@@ -2007,6 +2152,7 @@ fn initialize(
         process_reconciliations: BTreeMap::new(),
         context_summaries: BTreeMap::new(),
         memory_writes: BTreeMap::new(),
+        context_artifacts: BTreeMap::new(),
         last_sequence: event.metadata.sequence,
         last_event_checksum: event.integrity_checksum,
     })
@@ -2321,6 +2467,21 @@ fn apply_payload(
         }
         RuntimeCommittedEvent::MemoryWriteFailed(failed) => {
             apply_memory_write_failed(state, failed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextArtifactProposed(proposed) => {
+            apply_context_artifact_proposed(state, proposed, event.metadata.sequence, event.metadata.event_id)
+        }
+        RuntimeCommittedEvent::ContextArtifactApproved(approved) => {
+            apply_context_artifact_approved(state, approved, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextArtifactDispatched(dispatched) => {
+            apply_context_artifact_dispatched(state, dispatched, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextArtifactCompleted(completed) => {
+            apply_context_artifact_completed(state, completed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextArtifactFailed(failed) => {
+            apply_context_artifact_failed(state, failed, event.metadata.sequence)
         }
         RuntimeCommittedEvent::ToolExecutionDispatched(dispatched) => {
             apply_tool_dispatch(state, dispatched, event.metadata.sequence)
@@ -3082,6 +3243,16 @@ fn apply_context_summary_completed(
     record.text = Some(completed.text.clone());
     record.input_tokens = completed.input_tokens;
     record.output_tokens = completed.output_tokens;
+    if let Some(execution) = state.style_execution.as_mut() {
+        execution.input_tokens = execution
+            .input_tokens
+            .checked_add(completed.input_tokens)
+            .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+        execution.output_tokens = execution
+            .output_tokens
+            .checked_add(completed.output_tokens)
+            .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+    }
     Ok(())
 }
 
@@ -3236,9 +3407,10 @@ fn apply_memory_write_failed(
         return Err(SessionReducerError::InvalidMemoryWriteTransition);
     }
     let record = memory_write_record_mut(state, &failed.identity)?;
-    if record.state != MemoryWriteState::Approved
-        || record.approved_at.is_none()
-        || record.dispatched_at.is_some()
+    if !matches!(
+        record.state,
+        MemoryWriteState::Proposed | MemoryWriteState::Approved
+    ) || record.dispatched_at.is_some()
         || record.completed_at.is_some()
     {
         return Err(SessionReducerError::InvalidMemoryWriteTransition);
@@ -3246,6 +3418,155 @@ fn apply_memory_write_failed(
     record.state = MemoryWriteState::Failed;
     record.completed_at = Some(sequence);
     record.failed_code = Some(failed.code.clone());
+    Ok(())
+}
+
+fn valid_context_artifact_identity(identity: &ContextArtifactIdentity) -> bool {
+    !identity.execution_id.trim().is_empty()
+        && !identity.proposal_id.trim().is_empty()
+        && !identity.mime_type.trim().is_empty()
+        && identity
+            .source_range
+            .is_some_and(|(start, end)| start <= end)
+}
+
+fn apply_context_artifact_proposed(
+    state: &mut SessionState,
+    proposed: &ContextArtifactProposedEvent,
+    sequence: Sequence,
+    event_id: EventId,
+) -> Result<(), SessionReducerError> {
+    let identity = &proposed.identity;
+    if !valid_context_artifact_identity(identity)
+        || proposed.byte_size == 0
+        || state.context_artifacts.contains_key(&identity.execution_id)
+        || state.context_artifacts.values().any(|record| {
+            record.identity.proposal_id == identity.proposal_id
+        })
+    {
+        return Err(SessionReducerError::InvalidContextArtifactTransition);
+    }
+    state.context_artifacts.insert(
+        identity.execution_id.clone(),
+        ContextArtifactRecord {
+            identity: identity.clone(),
+            byte_size: proposed.byte_size,
+            state: ContextArtifactState::Proposed,
+            action_digest: None,
+            proposed_at: sequence,
+            proposed_event: event_id,
+            approved_at: None,
+            dispatched_at: None,
+            completed_at: None,
+            artifact_id: None,
+            artifact_reference: None,
+        },
+    );
+    Ok(())
+}
+
+fn context_artifact_record_mut<'a>(
+    state: &'a mut SessionState,
+    identity: &ContextArtifactIdentity,
+) -> Result<&'a mut ContextArtifactRecord, SessionReducerError> {
+    let record = state
+        .context_artifacts
+        .get_mut(&identity.execution_id)
+        .ok_or(SessionReducerError::InvalidContextArtifactTransition)?;
+    if record.identity != *identity {
+        return Err(SessionReducerError::InvalidContextArtifactTransition);
+    }
+    Ok(record)
+}
+
+fn apply_context_artifact_approved(
+    state: &mut SessionState,
+    approved: &ContextArtifactApprovedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = context_artifact_record_mut(state, &approved.identity)?;
+    if record.state != ContextArtifactState::Proposed
+        || record.action_digest.is_some()
+        || record.approved_at.is_some()
+        || record.dispatched_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidContextArtifactTransition);
+    }
+    record.state = ContextArtifactState::Approved;
+    record.action_digest = Some(approved.action_digest);
+    record.approved_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_context_artifact_dispatched(
+    state: &mut SessionState,
+    dispatched: &ContextArtifactDispatchedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = context_artifact_record_mut(state, &dispatched.identity)?;
+    if record.state != ContextArtifactState::Approved
+        || record.action_digest != Some(dispatched.action_digest)
+        || record.approved_at.is_none()
+        || record.dispatched_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidContextArtifactTransition);
+    }
+    record.state = ContextArtifactState::Dispatched;
+    record.dispatched_at = Some(sequence);
+    Ok(())
+}
+
+fn apply_context_artifact_completed(
+    state: &mut SessionState,
+    completed: &ContextArtifactCompletedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if completed.artifact_id.trim().is_empty()
+        || completed.artifact_reference.trim().is_empty()
+        || completed.mime_type.trim().is_empty()
+    {
+        return Err(SessionReducerError::InvalidContextArtifactTransition);
+    }
+    let record = context_artifact_record_mut(state, &completed.identity)?;
+    if record.state != ContextArtifactState::Dispatched
+        || record.action_digest != Some(completed.action_digest)
+        || record.identity.mime_type != completed.mime_type
+        || record.byte_size != completed.byte_size
+        || record.approved_at.is_none()
+        || record.dispatched_at.is_none()
+        || record.completed_at.is_some()
+        || record.artifact_id.is_some()
+        || record.artifact_reference.is_some()
+    {
+        return Err(SessionReducerError::InvalidContextArtifactTransition);
+    }
+    record.state = ContextArtifactState::Completed;
+    record.completed_at = Some(sequence);
+    record.artifact_id = Some(completed.artifact_id.clone());
+    record.artifact_reference = Some(completed.artifact_reference.clone());
+    Ok(())
+}
+
+fn apply_context_artifact_failed(
+    state: &mut SessionState,
+    failed: &ContextArtifactFailedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if failed.code.trim().is_empty() {
+        return Err(SessionReducerError::InvalidContextArtifactTransition);
+    }
+    let record = context_artifact_record_mut(state, &failed.identity)?;
+    if record.state != ContextArtifactState::Approved
+        || record.approved_at.is_none()
+        || record.dispatched_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidContextArtifactTransition);
+    }
+    record.state = ContextArtifactState::Failed;
+    record.completed_at = Some(sequence);
     Ok(())
 }
 
@@ -4616,6 +4937,9 @@ pub enum SessionReducerError {
     /// An automatic memory write violated canonical outbox ordering or bounds.
     #[error("automatic memory-write state transition is invalid")]
     InvalidMemoryWriteTransition,
+    /// An artifact-handoff context write violated canonical outbox ordering.
+    #[error("artifact-handoff context write state transition is invalid")]
+    InvalidContextArtifactTransition,
     /// Child sessions did not follow proposal, atomic creation, and terminal ordering.
     #[error("child-agent state transition is invalid")]
     InvalidChildAgentTransition,

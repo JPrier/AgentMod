@@ -94,8 +94,10 @@ pub struct RuntimeExecutabilityReport {
     pub registry_hash: ContentHash,
     /// Exact per-node resolutions.
     pub resolved_nodes: Vec<ResolvedNodeExecutor>,
-    /// Stable sorted diagnostics.
+    /// Stable sorted diagnostics that block execution.
     pub diagnostics: Vec<RuntimeExecutabilityDiagnostic>,
+    /// Stable sorted non-blocking advisories.
+    pub advisory_diagnostics: Vec<RuntimeExecutabilityDiagnostic>,
 }
 
 /// Lists the normalized executor capability registry through runtime data.
@@ -173,6 +175,7 @@ pub(crate) fn inspect_runtime_executability<D: NodeExecutorDataPort>(
 
     let mut resolved_nodes = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut advisory_diagnostics = Vec::new();
     for node in &executor.compiled().graph.nodes {
         match resolve_node(node, executor.compiled(), &by_kind, &runtime_api)? {
             Ok(resolved) => resolved_nodes.push(resolved),
@@ -180,23 +183,30 @@ pub(crate) fn inspect_runtime_executability<D: NodeExecutorDataPort>(
         }
     }
 
+    // Topology classification is no longer a condition of runtime
+    // executability: a graph executes because every node has an available
+    // resolved executor. The legacy adapter profile is retained only as a
+    // temporary compatibility advisory so operators can see that the generic
+    // dispatch path will be used.
     if diagnostics.is_empty() && executor.adapter_kind().is_none() {
-        diagnostics.push(diagnostic(
-            "NODEX006",
+        advisory_diagnostics.push(diagnostic(
+            "NODEX007",
             None,
             None,
             String::from(
-                "all nodes resolve, but this compiled topology has no complete runtime execution profile",
+                "all nodes resolve; this compiled topology has no legacy adapter profile and will use generic node dispatch",
             ),
         ));
     }
     diagnostics.sort();
+    advisory_diagnostics.sort();
     resolved_nodes.sort_by(|left, right| left.node_id.cmp(&right.node_id));
     Ok(RuntimeExecutabilityReport {
         executable: diagnostics.is_empty(),
         registry_hash,
         resolved_nodes,
         diagnostics,
+        advisory_diagnostics,
     })
 }
 
@@ -294,6 +304,35 @@ pub(crate) fn validate_runtime_executability<D: NodeExecutorDataPort>(
             diagnostics: report.diagnostics,
         })
     }
+}
+
+/// Converts exact resolved executor records into the generic dispatch plan.
+///
+/// This is the integration seam Task 1 persists as the immutable execution
+/// plan: dispatch is driven by these exact identities, never by topology
+/// profiles. The plan maps compiled node ID to the exact executor identity
+/// chosen from the capability registry at creation time.
+///
+/// Exercised by focused dispatch tests; consumed by Task 1 persistence when
+/// the immutable execution plan is retained in the session binding.
+#[must_use]
+#[allow(
+    dead_code,
+    reason = "Task 1 execution-plan persistence seam; exercised by dispatch_tests"
+)]
+pub(crate) fn dispatch_plan(
+    report: &RuntimeExecutabilityReport,
+) -> std::collections::BTreeMap<String, crate::node_execution::NodeExecutorIdentity> {
+    report
+        .resolved_nodes
+        .iter()
+        .map(|resolved| {
+            (
+                resolved.node_id.clone(),
+                crate::node_execution::NodeExecutorIdentity::from_resolved(resolved),
+            )
+        })
+        .collect()
 }
 
 fn source_allowed(
@@ -438,6 +477,9 @@ mod tests {
         assert!(!report.executable);
         assert_eq!(report.diagnostics[0].code, "NODEX003");
 
+        // An unknown topology whose nodes all resolve is executable through
+        // generic node dispatch: the legacy adapter profile is no longer a
+        // condition of runtime executability.
         let mut topology = binding(BuiltInStyle::PersistentChat);
         let mut compiled: agentmod_session_style_sdk::CompiledSessionStyle =
             serde_json::from_str(&topology.compiled_style_json).expect("compiled");
@@ -471,7 +513,23 @@ mod tests {
             serde_json::to_string(&compiled).expect("compiled serialization");
         topology.compiled_style_hash = ContentHash::digest(topology.compiled_style_json.as_bytes());
         let report = inspect_runtime_executability(&registry, &topology).expect("topology report");
-        assert!(!report.executable);
-        assert_eq!(report.diagnostics[0].code, "NODEX006");
+        assert!(report.executable, "{:?}", report.diagnostics);
+        assert_eq!(report.resolved_nodes.len(), 2);
+        assert_eq!(report.diagnostics.len(), 0);
+        assert_eq!(report.advisory_diagnostics[0].code, "NODEX007");
+
+        // The exact resolved identities form the dispatch plan: every compiled
+        // node has a resolved executor without any adapter profile.
+        let plan = dispatch_plan(&report);
+        assert_eq!(plan.len(), 2);
+        assert!(plan.contains_key("respond"));
+        assert!(plan.contains_key("done"));
+        let identities: Vec<_> = plan.into_values().collect();
+        for identity in identities {
+            assert_eq!(
+                identity.boundary,
+                crate::node_execution::ExecutorBoundary::RuntimeLogic
+            );
+        }
     }
 }

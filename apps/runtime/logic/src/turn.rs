@@ -1755,7 +1755,8 @@ where
             Some(binding) => {
                 let executor = CompiledStyleExecutor::from_binding(binding)
                     .map_err(RunTurnError::StyleExecutor)?;
-                if executor.adapter_kind().is_none() {
+                let entry_kind = executor.entry_kind().map_err(RunTurnError::StyleExecutor)?;
+                if !CompiledStyleExecutor::supported_entry_kinds().contains(&entry_kind) {
                     return Err(RunTurnError::UnsupportedStyleExecution(binding.id.clone()));
                 }
                 match binding.memory.retrieval_timing.as_str() {
@@ -1872,12 +1873,16 @@ where
                 let execution = style_turn
                     .as_mut()
                     .ok_or(RunTurnError::StyleGraphMismatch)?;
-                match execution.executor.adapter_kind().ok_or_else(|| {
-                    RunTurnError::UnsupportedStyleExecution(
-                        execution.executor.compiled().style_id.clone(),
-                    )
-                })? {
-                    StyleAdapterKind::PersistentTurn => {
+                // Generic node-kind dispatch: the driver follows the compiled
+                // entry and current node kinds instead of a topology adapter
+                // profile. Entry kinds without a runtime driver fail closed.
+                let fresh_context_graph = execution
+                    .executor
+                    .entry()
+                    .map(|entry| entry.directive == StyleNodeDirective::ContextTransform)
+                    .unwrap_or(false);
+                match (fresh_context_graph, execution.current.directive) {
+                    (false, StyleNodeDirective::ModelCall) => {
                         if resume_context
                             && latest_context_boundary_at_head(&state)
                                 .is_some_and(|identity| identity.boundary == "before_model_request")
@@ -1919,62 +1924,62 @@ where
                         )
                         .await
                     }
-                    StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop => {
-                        let (state, position) = match execution.current.directive {
-                            StyleNodeDirective::ContextTransform => {
-                                let (_state, position) = self
-                                    .compose_style_context(
-                                        &persistence,
-                                        session_id,
-                                        &session_directory,
-                                        state,
-                                        provider_position,
-                                        &command,
-                                        ContextCompositionBoundary::TurnStart,
-                                        context_origin,
-                                    )
-                                    .await?;
-                                execution.position = position;
-                                self.complete_and_enter_next(
-                                    &persistence,
-                                    session_id,
-                                    &session_directory,
-                                    execution,
-                                    Some(format!("fresh-context:{}", command.cancellation_id)),
-                                )?;
-                                if execution.current.directive != StyleNodeDirective::ModelCall {
-                                    return Err(RunTurnError::UnexpectedStyleNode {
-                                        expected: "model_call",
-                                        actual: execution.current.id.clone(),
-                                    });
-                                }
-                                (
-                                    Self::load_state(&persistence, session_id, &session_directory)?,
-                                    execution.position,
-                                )
-                            }
-                            StyleNodeDirective::ModelCall => (state, provider_position),
-                            _ => {
-                                return Err(RunTurnError::UnexpectedStyleNode {
-                                    expected: "context_transform or model_call",
-                                    actual: execution.current.id.clone(),
-                                });
-                            }
-                        };
+                    (true, StyleNodeDirective::ContextTransform) => {
+                        let (_state, position) = self
+                            .compose_style_context(
+                                &persistence,
+                                session_id,
+                                &session_directory,
+                                state,
+                                provider_position,
+                                &command,
+                                ContextCompositionBoundary::TurnStart,
+                                context_origin,
+                            )
+                            .await?;
+                        execution.position = position;
+                        self.complete_and_enter_next(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            execution,
+                            Some(format!("fresh-context:{}", command.cancellation_id)),
+                        )?;
+                        if execution.current.directive != StyleNodeDirective::ModelCall {
+                            return Err(RunTurnError::UnexpectedStyleNode {
+                                expected: "model_call",
+                                actual: execution.current.id.clone(),
+                            });
+                        }
                         self.compose_style_context(
                             &persistence,
                             session_id,
                             &session_directory,
-                            state,
-                            position,
+                            Self::load_state(&persistence, session_id, &session_directory)?,
+                            execution.position,
                             &command,
                             ContextCompositionBoundary::BeforeModelRequest,
                             context_origin,
                         )
                         .await
                     }
-                    StyleAdapterKind::PlannerWorkerReviewer
-                    | StyleAdapterKind::DeclarativeGraph => Err(RunTurnError::StyleGraphMismatch),
+                    (true, StyleNodeDirective::ModelCall) => {
+                        self.compose_style_context(
+                            &persistence,
+                            session_id,
+                            &session_directory,
+                            state,
+                            provider_position,
+                            &command,
+                            ContextCompositionBoundary::BeforeModelRequest,
+                            context_origin,
+                        )
+                        .await
+                    }
+                    _ => Err(RunTurnError::UnexpectedStyleNode {
+                        expected: "model_call or context_transform",
+                        actual: execution.current.id.clone(),
+                    }),
                 }
             }
             .await;
@@ -6473,28 +6478,13 @@ where
             )?;
         }
         let current = executor.entry().map_err(RunTurnError::StyleExecutor)?;
-        let expected_entry = match executor.adapter_kind() {
-            Some(StyleAdapterKind::PersistentTurn | StyleAdapterKind::PlannerWorkerReviewer) => {
-                StyleNodeDirective::ModelCall
-            }
-            Some(StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop) => {
-                StyleNodeDirective::ContextTransform
-            }
-            Some(StyleAdapterKind::DeclarativeGraph) => StyleNodeDirective::ConditionalBranch,
-            None => {
-                return Err(RunTurnError::UnsupportedStyleExecution(binding.id.clone()));
-            }
-        };
-        if current.directive != expected_entry {
-            return Err(RunTurnError::UnexpectedStyleNode {
-                expected: match expected_entry {
-                    StyleNodeDirective::ModelCall => "model_call",
-                    StyleNodeDirective::ContextTransform => "context_transform",
-                    StyleNodeDirective::ConditionalBranch => "conditional_branch",
-                    _ => unreachable!("supported entry adapter is exhaustive"),
-                },
-                actual: current.id,
-            });
+        // Generic entry dispatch: a graph starts when its entry node kind has
+        // a resolved executor and a runtime driver, regardless of the complete
+        // topology. The legacy topology-profile gate is removed.
+        if !CompiledStyleExecutor::supported_entry_kinds()
+            .contains(&current.kind(&executor.compiled().graph))
+        {
+            return Err(RunTurnError::UnsupportedStyleExecution(binding.id.clone()));
         }
         let max_steps = binding
             .budgets
@@ -6552,11 +6542,7 @@ where
         };
         let executor =
             CompiledStyleExecutor::from_binding(binding).map_err(RunTurnError::StyleExecutor)?;
-        let Some(adapter_kind) = executor.adapter_kind() else {
-            // Unsupported graphs must remain mutation-free until their runtime
-            // adapter exists.
-            return Ok(loaded);
-        };
+        let adapter_kind = executor.adapter_kind();
         let max_steps = binding
             .budgets
             .max_steps
@@ -6614,7 +6600,7 @@ where
             .map_err(RunTurnError::StyleExecutor)?;
         let recoverable_fresh_model_entry = matches!(
             adapter_kind,
-            StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop
+            Some(StyleAdapterKind::EphemeralTurn | StyleAdapterKind::ResearchLoop)
         ) && destination.directive
             == StyleNodeDirective::ModelCall
             && executor
@@ -6622,13 +6608,21 @@ where
                 .is_ok_and(|source| source.directive == StyleNodeDirective::ContextTransform);
         let recoverable_research_entry = matches!(
             adapter_kind,
-            StyleAdapterKind::ResearchLoop
-                | StyleAdapterKind::PlannerWorkerReviewer
-                | StyleAdapterKind::DeclarativeGraph
+            Some(
+                StyleAdapterKind::ResearchLoop
+                    | StyleAdapterKind::PlannerWorkerReviewer
+                    | StyleAdapterKind::DeclarativeGraph
+            )
         );
+        // Generic dispatch recovery: a topology without a legacy adapter
+        // profile may re-enter the destination only when the destination is a
+        // control-only node whose entry cannot fabricate external effects.
+        let recoverable_generic_entry =
+            adapter_kind.is_none() && !destination.directive.requires_effect_evidence();
         if destination.directive.requires_effect_evidence()
             && !recoverable_fresh_model_entry
             && !recoverable_research_entry
+            && !recoverable_generic_entry
         {
             return Err(RunTurnError::StyleControlRecoveryRequired {
                 node: destination.id,
@@ -6698,9 +6692,6 @@ where
         };
         let executor =
             CompiledStyleExecutor::from_binding(binding).map_err(RunTurnError::StyleExecutor)?;
-        if executor.adapter_kind().is_none() {
-            return Ok(None);
-        }
         let canonical = state
             .style_execution
             .as_ref()
@@ -6715,6 +6706,12 @@ where
         let current = executor
             .node(&entered.node_id)
             .map_err(RunTurnError::StyleExecutor)?;
+        // Generic recovery dispatch: the active node resumes when its compiled
+        // kind has a runtime driver, regardless of the complete topology.
+        if !CompiledStyleExecutor::supports_node_dispatch(current.kind(&executor.compiled().graph))
+        {
+            return Ok(None);
+        }
         Ok(Some(ActiveStyleTurn {
             executor,
             current,

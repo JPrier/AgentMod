@@ -10,7 +10,16 @@ use agentmod_session_style_sdk::CompiledSessionStyle;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::session::SessionStyleBinding;
+use crate::{
+    node_execution::{
+        DispatchError, ExecuteNodeCommand, NodeCursor, NodeExecutionInput, NodeExecutionOutcome,
+        NodeExecutorIdentity, NodePlan, OutcomeCompatibility, TransitionError, dispatch_node,
+        dispatch_style_error,
+        transition::{LoopState, TransitionSelectionOutcome, select_transition},
+        validate_outcome_for_kind,
+    },
+    session::SessionStyleBinding,
+};
 
 /// Runtime-owned adapter classification for one compiled graph node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,7 +45,13 @@ pub(crate) enum StyleNodeDirective {
     Fail,
 }
 
-/// Runtime adapter selected from the exact validated compiled graph.
+/// Temporary topology compatibility profile.
+///
+/// The generic node-dispatch engine ([`crate::node_execution`]) replaced
+/// topology recognition as a condition of runtime executability. These
+/// classifiers are retained only as temporary compatibility diagnostics while
+/// the legacy turn adapters are routed through the generic path; dispatch must
+/// not be driven by this value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StyleAdapterKind {
     PersistentTurn,
@@ -72,6 +87,17 @@ pub(crate) struct StyleNodeCursor {
     pub retry_limit: u32,
     pub max_iterations: Option<u32>,
     pub tool: Option<String>,
+}
+
+impl StyleNodeCursor {
+    /// Returns the raw compiled node kind for the exact graph.
+    pub(crate) fn kind(&self, graph: &agentmod_graph_engine::ExecutableGraph) -> NodeKind {
+        graph
+            .nodes
+            .get(self.index)
+            .filter(|node| node.index == self.index)
+            .map_or(NodeKind::Fail, |node| node.kind)
+    }
 }
 
 /// Pure transition selected after a node completes.
@@ -133,56 +159,217 @@ impl CompiledStyleExecutor {
     /// when its already-parsed expression evaluates true against `variables`.
     /// Multiple eligible edges are rejected instead of depending on incidental
     /// source order.
+    ///
+    /// Since the generic node-dispatch engine now owns deterministic
+    /// transition behavior, this method is a compatibility wrapper over
+    /// [`select_transition`] using the compiled graph as the temporary
+    /// execution plan and no completed outcome. Parallel fan-out (a future
+    /// Task 6 surface) maps to [`StyleExecutorError::AmbiguousTransition`]
+    /// exactly as the legacy single-path selector did.
     pub(crate) fn transition(
         &self,
         from_index: usize,
         variables: &Value,
     ) -> Result<Option<StyleTransition>, StyleExecutorError> {
         let from = self.cursor(from_index)?;
-        let mut eligible = self
+        let plan = self.dispatch_plan();
+        let selection = select_transition(
+            &self.compiled.graph,
+            from_index,
+            variables,
+            None,
+            &LoopState::default(),
+            &plan,
+        )
+        .map_err(StyleExecutorError::from_transition)?;
+        match selection {
+            TransitionSelectionOutcome::Selected(selected) => Ok(Some(StyleTransition {
+                from,
+                to: self.cursor(selected.to.index)?,
+                label: selected.label,
+            })),
+            TransitionSelectionOutcome::Parallel(parallel) => {
+                Err(StyleExecutorError::AmbiguousTransition {
+                    node: parallel.from.id,
+                })
+            }
+            TransitionSelectionOutcome::Terminal => Ok(None),
+        }
+    }
+
+    /// Returns the execution plan derived from the exact compiled graph.
+    ///
+    /// This is the temporary integration port until Task 1 persists the
+    /// immutable execution plan; the engine consumes the same `NodePlan`
+    /// contract either way.
+    pub(crate) fn dispatch_plan(&self) -> NodePlan {
+        NodePlan::from_graph(&self.compiled.graph)
+    }
+
+    /// Returns the compiled entry node kind.
+    pub(crate) fn entry_kind(&self) -> Result<NodeKind, StyleExecutorError> {
+        self.entry().map(|cursor| cursor.kind(&self.compiled.graph))
+    }
+
+    /// Returns the node kinds the runtime can dispatch at graph entry.
+    ///
+    /// This is the generic replacement for the legacy topology-profile entry
+    /// gate: a graph is startable when its entry node has a resolved executor
+    /// and a runtime adapter, regardless of the complete topology.
+    pub(crate) const fn supported_entry_kinds() -> &'static [NodeKind] {
+        &[
+            NodeKind::ContextTransform,
+            NodeKind::ModelCall,
+            NodeKind::ConditionalBranch,
+        ]
+    }
+
+    /// Whether the runtime owns a node adapter for the exact kind.
+    ///
+    /// Node behaviors not yet implemented by the runtime (Task 3 native
+    /// control-node executors) are deliberately excluded: dispatch fails with
+    /// a clear `NoResolvedExecutor` error instead of inventing behavior.
+    pub(crate) fn supports_node_dispatch(kind: NodeKind) -> bool {
+        matches!(
+            kind,
+            NodeKind::ContextTransform
+                | NodeKind::ModelCall
+                | NodeKind::ToolExecutionGate
+                | NodeKind::UserApproval
+                | NodeKind::SpawnChildAgent
+                | NodeKind::WaitForAgents
+                | NodeKind::Review
+                | NodeKind::Loop
+                | NodeKind::ConditionalBranch
+                | NodeKind::PersistArtifact
+                | NodeKind::CompleteTurn
+                | NodeKind::CompleteSession
+        )
+    }
+
+    /// Converts a style cursor into the engine cursor for the exact node.
+    ///
+    /// Exercised by focused dispatch tests; consumed by Task 3 node executors
+    /// and Task 7 plugin-host transports.
+    #[allow(
+        dead_code,
+        reason = "Task 3/7 node-executor seam; exercised by dispatch_tests"
+    )]
+    pub(crate) fn dispatch_cursor(
+        &self,
+        cursor: &StyleNodeCursor,
+    ) -> Result<NodeCursor, StyleExecutorError> {
+        let node = self
             .compiled
             .graph
-            .edges
-            .iter()
-            .filter(|edge| edge.from == from_index)
-            .filter_map(|edge| {
-                let eligible = edge
-                    .condition
-                    .as_ref()
-                    .map_or(Ok(true), |condition| condition.evaluate(variables));
-                match eligible {
-                    Ok(true) => Some(Ok(edge)),
-                    Ok(false) => None,
-                    Err(_) => Some(Err(StyleExecutorError::ConditionEvaluation {
-                        node: from.id.clone(),
-                    })),
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if eligible.len() > 1 {
-            return Err(StyleExecutorError::AmbiguousTransition {
-                node: from.id.clone(),
-            });
+            .nodes
+            .get(cursor.index)
+            .filter(|node| node.index == cursor.index)
+            .ok_or(StyleExecutorError::InvalidNodeIndex(cursor.index))?;
+        Ok(NodeCursor::from_executable(node))
+    }
+
+    /// Validates a typed outcome against the compiled node kind.
+    ///
+    /// Exercised by focused dispatch tests; consumed by Task 3 node executors.
+    #[allow(
+        dead_code,
+        reason = "Task 3 node-executor seam; exercised by dispatch_tests"
+    )]
+    pub(crate) fn validate_outcome(
+        &self,
+        cursor: &StyleNodeCursor,
+        outcome: &NodeExecutionOutcome,
+    ) -> Result<(), StyleExecutorError> {
+        let node = self
+            .compiled
+            .graph
+            .nodes
+            .get(cursor.index)
+            .filter(|node| node.index == cursor.index)
+            .ok_or(StyleExecutorError::InvalidNodeIndex(cursor.index))?;
+        match validate_outcome_for_kind(node.kind, outcome) {
+            OutcomeCompatibility::Consistent => Ok(()),
+            OutcomeCompatibility::Inconsistent => Err(StyleExecutorError::OutcomeInconsistent {
+                node: cursor.id.clone(),
+                kind: crate::node_execution::serialized_kind(node.kind),
+                outcome: outcome.class_name().to_owned(),
+            }),
         }
-        let Some(edge) = eligible.pop() else {
-            return if matches!(
-                from.directive,
-                StyleNodeDirective::CompleteTurn
-                    | StyleNodeDirective::CompleteSession
-                    | StyleNodeDirective::Fail
-            ) {
-                Ok(None)
-            } else {
-                Err(StyleExecutorError::MissingTransition {
-                    node: from.id.clone(),
-                })
-            };
-        };
-        Ok(Some(StyleTransition {
-            from,
-            to: self.cursor(edge.to)?,
-            label: edge.label.clone(),
-        }))
+    }
+
+    /// Builds a dispatch command for the exact cursor and resolved identity.
+    ///
+    /// Exercised by focused dispatch tests; consumed by Task 1 persisted
+    /// execution plans and Task 3 node executors.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a dispatch command binds the full exact node identity"
+    )]
+    #[allow(
+        dead_code,
+        reason = "Task 1/3 dispatch seam; exercised by dispatch_tests"
+    )]
+    pub(crate) fn dispatch_command(
+        &self,
+        cursor: &StyleNodeCursor,
+        executor: NodeExecutorIdentity,
+        input: NodeExecutionInput,
+        attempt: u32,
+        loop_iteration: u32,
+        step: u64,
+        max_steps: u64,
+    ) -> Result<ExecuteNodeCommand, StyleExecutorError> {
+        Ok(ExecuteNodeCommand {
+            node: self.dispatch_cursor(cursor)?,
+            executor,
+            input,
+            attempt,
+            loop_iteration,
+            step,
+            max_steps,
+        })
+    }
+
+    /// Dispatches one compiled node through the generic engine.
+    ///
+    /// This is the entry point Task 3 node executors (and Task 7 plugin-host
+    /// transports) plug into via [`NodeExecutorPort`]. Exercised by focused
+    /// dispatch tests.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a dispatch command binds the full exact node identity"
+    )]
+    #[allow(
+        dead_code,
+        reason = "Task 3/7 node-executor seam; exercised by dispatch_tests"
+    )]
+    pub(crate) fn dispatch<P>(
+        &self,
+        port: &P,
+        cursor: &StyleNodeCursor,
+        executor: NodeExecutorIdentity,
+        input: NodeExecutionInput,
+        attempt: u32,
+        loop_iteration: u32,
+        step: u64,
+        max_steps: u64,
+    ) -> Result<NodeExecutionOutcome, DispatchError>
+    where
+        P: crate::node_execution::NodeExecutorPort + ?Sized,
+    {
+        let command = self
+            .dispatch_command(
+                cursor,
+                executor,
+                input,
+                attempt,
+                loop_iteration,
+                step,
+                max_steps,
+            )
+            .map_err(|error| dispatch_style_error(&cursor.id, error))?;
+        dispatch_node(port, &command)
     }
 
     /// Returns the retained style descriptor for node adapters and inspection.
@@ -220,6 +407,9 @@ impl CompiledStyleExecutor {
     }
 
     /// Classifies the exact supported turn lifecycle from compiled semantics.
+    ///
+    /// Temporary compatibility diagnostic only; the generic dispatch engine
+    /// must not depend on this value.
     pub(crate) fn adapter_kind(&self) -> Option<StyleAdapterKind> {
         if self.supports_persistent_turn() {
             return Some(StyleAdapterKind::PersistentTurn);
@@ -507,6 +697,67 @@ pub enum StyleExecutorError {
     AmbiguousTransition { node: String },
     #[error("nonterminal graph node `{node}` has no eligible transition")]
     MissingTransition { node: String },
+    #[error(
+        "transition from node `{node}` targets `{to}`, which is absent from the execution plan"
+    )]
+    UnknownDestination {
+        /// Compiled source node ID.
+        node: String,
+        /// Destination node ID absent from the plan.
+        to: String,
+    },
+    #[error("outcome `{outcome}` is inconsistent with node `{node}` of kind `{kind}`")]
+    OutcomeInconsistent {
+        /// Compiled node ID.
+        node: String,
+        /// Serialized node kind.
+        kind: String,
+        /// Outcome class label.
+        outcome: String,
+    },
+    #[error("node `{node}` declared output above the compiled bound")]
+    OutputExceededBounds {
+        /// Compiled node ID.
+        node: String,
+    },
+    #[error("node `{node}` declared a write to an undeclared scope")]
+    UndeclaredVariableWrite {
+        /// Compiled node ID.
+        node: String,
+    },
+    #[error("node `{node}` would repeat beyond its compiled loop bound")]
+    LoopBudgetExceeded {
+        /// Compiled node ID.
+        node: String,
+    },
+}
+
+impl StyleExecutorError {
+    /// Maps a generic transition rejection into the style executor surface.
+    pub(crate) fn from_transition(error: TransitionError) -> Self {
+        match error {
+            TransitionError::InvalidNodeIndex(index) => Self::InvalidNodeIndex(index),
+            TransitionError::UnknownNode(id) => Self::UnknownNode(id),
+            TransitionError::ConditionEvaluation { node } => Self::ConditionEvaluation { node },
+            TransitionError::MissingTransition { node } => Self::MissingTransition { node },
+            TransitionError::AmbiguousTransition { node } => Self::AmbiguousTransition { node },
+            TransitionError::UnknownDestination { node, to } => {
+                Self::UnknownDestination { node, to }
+            }
+            TransitionError::OutcomeInconsistent { node, .. } => Self::OutcomeInconsistent {
+                node,
+                kind: String::from("<unknown>"),
+                outcome: String::from("<unknown>"),
+            },
+            TransitionError::UndeclaredVariableWrite { node, .. } => {
+                Self::UndeclaredVariableWrite { node }
+            }
+            TransitionError::OutputExceededBounds { node, .. } => {
+                Self::OutputExceededBounds { node }
+            }
+            TransitionError::LoopBudgetExceeded { node, .. } => Self::LoopBudgetExceeded { node },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -536,53 +787,7 @@ pub(crate) mod tests {
         let manifest = built_in_manifest(style);
         let manifest_json = to_json(&manifest).expect("manifest json");
         let plugin_set_hash = ContentHash::digest(b"plugins");
-        let context = CompileContext {
-            runtime_api_version: String::from("1.0.0"),
-            plugin_set_hash,
-            capabilities: [
-                "agents",
-                "approval",
-                "artifacts",
-                "context",
-                "events",
-                "model",
-                "scheduling",
-                "tools",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-            tool_groups: BTreeMap::from([(
-                String::from("filesystem"),
-                BTreeSet::from([String::from("filesystem.read")]),
-            )]),
-            providers: BTreeSet::from([String::from("mock")]),
-            plugins: BTreeSet::from([String::from("runtime.security")]),
-            memory_providers: ["none", "file", "sqlite-fts"]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            compaction_strategies: [
-                "none",
-                "sliding_window",
-                "summary",
-                "artifact_handoff",
-                "tool_output_eviction",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
-            supported_decisions: BTreeSet::from([
-                DecisionCapability::Continue,
-                DecisionCapability::Replace,
-                DecisionCapability::Reject,
-                DecisionCapability::RequireApproval,
-                DecisionCapability::Defer,
-                DecisionCapability::Cancel,
-                DecisionCapability::Fork,
-            ]),
-            graph_references: BTreeMap::new(),
-        };
+        let context = compile_context(plugin_set_hash);
         let compiled =
             compile_style(&manifest, &context, StyleCompilerLimits::default()).expect("compile");
         let compiled_json = serde_json::to_string(&compiled).expect("compiled json");
@@ -773,6 +978,57 @@ pub(crate) mod tests {
             })
             .expect("repeat transition");
         assert_eq!(repeat.to.id, "tool");
+    }
+
+    /// Shared compile context used by every fixture binding.
+    pub(crate) fn compile_context(plugin_set_hash: ContentHash) -> CompileContext {
+        CompileContext {
+            runtime_api_version: String::from("1.0.0"),
+            plugin_set_hash,
+            capabilities: [
+                "agents",
+                "approval",
+                "artifacts",
+                "context",
+                "events",
+                "model",
+                "scheduling",
+                "tools",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            tool_groups: BTreeMap::from([(
+                String::from("filesystem"),
+                BTreeSet::from([String::from("filesystem.read")]),
+            )]),
+            providers: BTreeSet::from([String::from("mock")]),
+            plugins: BTreeSet::from([String::from("runtime.security")]),
+            memory_providers: ["none", "file", "sqlite-fts"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            compaction_strategies: [
+                "none",
+                "sliding_window",
+                "summary",
+                "artifact_handoff",
+                "tool_output_eviction",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+            supported_decisions: BTreeSet::from([
+                DecisionCapability::Continue,
+                DecisionCapability::Replace,
+                DecisionCapability::Reject,
+                DecisionCapability::RequireApproval,
+                DecisionCapability::Defer,
+                DecisionCapability::Cancel,
+                DecisionCapability::Fork,
+            ]),
+            graph_references: BTreeMap::new(),
+        }
     }
 
     #[test]

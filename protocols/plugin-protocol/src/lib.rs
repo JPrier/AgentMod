@@ -6,7 +6,43 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Current plugin-host wire protocol.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 2;
+
+/// Canonical plugin invocation audit outcome codes.
+///
+/// These constants are the wire-stable outcome vocabulary. The runtime maps
+/// them into canonical audit events; the plugin host records them in its
+/// bounded audit ring.
+pub mod audit_outcome {
+    /// An invocation was proposed but has not started.
+    pub const PROPOSED: &str = "proposed";
+    /// An invocation started inside the plugin host.
+    pub const STARTED: &str = "started";
+    /// An invocation completed with a valid response.
+    pub const COMPLETED: &str = "completed";
+    /// The plugin explicitly rejected the operation.
+    pub const REJECTED_BY_PLUGIN: &str = "rejected_by_plugin";
+    /// Runtime validation rejected the returned result.
+    pub const REJECTED_BY_RUNTIME: &str = "rejected_by_runtime";
+    /// The invocation exceeded its deadline.
+    pub const TIMED_OUT: &str = "timed_out";
+    /// The invocation was cancelled.
+    pub const CANCELLED: &str = "cancelled";
+    /// The plugin worker process crashed.
+    pub const CRASHED: &str = "crashed";
+    /// The plugin returned an unparseable or out-of-schema response.
+    pub const INVALID_RESPONSE: &str = "invalid_response";
+    /// The plugin was placed in quarantine.
+    pub const QUARANTINED: &str = "quarantined";
+    /// An observer delivery attempt was made.
+    pub const OBSERVER_DELIVERY_ATTEMPTED: &str = "observer_delivery_attempted";
+    /// An observer delivery completed.
+    pub const OBSERVER_DELIVERY_COMPLETED: &str = "observer_delivery_completed";
+    /// An observer delivery failed.
+    pub const OBSERVER_DELIVERY_FAILED: &str = "observer_delivery_failed";
+    /// An observer delivery was dropped by the bounded queue.
+    pub const OBSERVER_DELIVERY_DROPPED: &str = "observer_delivery_dropped";
+}
 
 /// Plugin execution classification.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -18,6 +54,14 @@ pub enum PluginClass {
     Observer,
     /// Dynamically provided tool.
     Tool,
+    /// Plugin-provided graph node executor.
+    GraphNode,
+    /// Plugin-provided memory backend.
+    Memory,
+    /// Plugin-provided compaction strategy.
+    Compaction,
+    /// Plugin-provided context transform.
+    ContextTransform,
     /// Other declared extension category.
     Extension,
 }
@@ -47,6 +91,123 @@ pub struct PluginConfigurationSchema {
     pub inline_json: String,
 }
 
+/// Declared plugin-provided graph node executor.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginNodeExecutorDeclaration {
+    /// Stable executor ID.
+    pub executor_id: String,
+    /// Executor semantic version.
+    pub version: String,
+    /// Serialized graph node kind executed by this executor.
+    pub node_kind: String,
+    /// Runtime API requirement of this executor.
+    pub runtime_api: String,
+    /// Business capabilities required from the runtime.
+    #[serde(default)]
+    pub required_capabilities: BTreeSet<String>,
+    /// Bounded inline JSON Schema for node input.
+    pub input_schema: String,
+    /// Bounded inline JSON Schema for node output.
+    pub output_schema: String,
+    /// Per-node execution timeout in milliseconds.
+    pub timeout_ms: u64,
+    /// Node failure policy: reject, cancel, disable, continue, or retry.
+    pub failure_policy: String,
+    /// Whether repeated execution with identical input is safe.
+    pub idempotent: bool,
+    /// Whether execution performs a declared external effect.
+    pub external_effect: bool,
+    /// Readable state scopes for node input.
+    #[serde(default)]
+    pub read_authority: BTreeSet<String>,
+    /// State scope the node may propose to modify.
+    pub state_scope: String,
+}
+
+/// Plugin-provided memory backend declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginMemoryDeclaration {
+    /// Supported memory scopes.
+    #[serde(default)]
+    pub scopes: BTreeSet<String>,
+    /// Memory capabilities.
+    #[serde(default)]
+    pub capabilities: BTreeSet<String>,
+    /// Hard retained-byte bound.
+    pub bounded_bytes: u64,
+}
+
+/// Plugin-provided compaction strategy declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginCompactionDeclaration {
+    /// Stable strategy ID.
+    pub strategy_id: String,
+    /// Whether committing the identical replacement twice is safe.
+    pub idempotent: bool,
+    /// Maximum replacement byte size.
+    pub bounded_bytes: u64,
+}
+
+/// Context transform lifecycle boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginContextTransformBoundary {
+    /// Immediately before memory retrieval.
+    BeforeMemoryRetrieval,
+    /// Immediately after memory retrieval.
+    AfterMemoryRetrieval,
+    /// Immediately before compaction.
+    BeforeCompaction,
+    /// Immediately after compaction.
+    AfterCompaction,
+    /// Before the provider projection is finalized.
+    BeforeProviderProjection,
+    /// Before the turn completes.
+    BeforeTurnCompletion,
+}
+
+/// Plugin-provided context transform declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginContextTransformDeclaration {
+    /// Stable transform ID.
+    pub transform_id: String,
+    /// Lifecycle boundary at which the transform runs.
+    pub boundary: PluginContextTransformBoundary,
+    /// Ordering stage.
+    #[serde(default)]
+    pub stage: u16,
+    /// Priority within the stage.
+    #[serde(default)]
+    pub priority: i32,
+    /// Transform IDs that must execute after this transform.
+    #[serde(default)]
+    pub before: BTreeSet<String>,
+    /// Transform IDs that must execute before this transform.
+    #[serde(default)]
+    pub after: BTreeSet<String>,
+}
+
+/// Observer delivery semantics declared by a plugin.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, tag = "mode", rename_all = "snake_case")]
+pub enum PluginObserverDelivery {
+    /// Bounded fire-and-forget queue; drops are counted and audited.
+    BestEffort,
+    /// At most once; duplicate deliveries are dropped.
+    AtMostOnce,
+    /// At least once with a runtime-issued idempotency key and bounded retries.
+    AtLeastOnce {
+        /// Maximum delivery attempts including the first.
+        max_attempts: u8,
+        /// Delay between delivery attempts.
+        retry_backoff_ms: u64,
+    },
+}
+
 /// Wire form of a plugin manifest.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -63,7 +224,7 @@ pub struct PluginManifest {
     pub category: String,
     /// Invocation/model/turn/session/project/user/runtime scope.
     pub scope: String,
-    /// Blocking/observer/tool/extension class.
+    /// Blocking/observer/tool/graph-node/memory/compaction/context-transform class.
     pub class: PluginClass,
     /// Isolated executable.
     pub entrypoint: PluginEntrypoint,
@@ -114,10 +275,29 @@ pub struct PluginManifest {
     pub state_migration_version: u32,
     /// Configuration schema.
     pub configuration_schema: PluginConfigurationSchema,
+    /// Declared graph node executors.
+    #[serde(default)]
+    pub node_executors: Vec<PluginNodeExecutorDeclaration>,
+    /// Declared plugin memory backend, if any.
+    #[serde(default)]
+    pub memory: Option<PluginMemoryDeclaration>,
+    /// Declared plugin compaction strategy, if any.
+    #[serde(default)]
+    pub compaction: Option<PluginCompactionDeclaration>,
+    /// Declared context transforms.
+    #[serde(default)]
+    pub context_transforms: Vec<PluginContextTransformDeclaration>,
+    /// Declared observer delivery semantics.
+    #[serde(default = "default_observer_delivery")]
+    pub observer_delivery: PluginObserverDelivery,
 }
 
 const fn one() -> u8 {
     1
+}
+
+fn default_observer_delivery() -> PluginObserverDelivery {
+    PluginObserverDelivery::BestEffort
 }
 
 /// Short-lived authorization attached to consequential calls.
@@ -136,6 +316,20 @@ pub struct PluginAuthorization {
     pub grant: String,
     /// Opaque cancellation ID.
     pub cancellation_id: String,
+}
+
+/// Bounded plugin memory item returned by retrieval.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginMemoryItem {
+    /// Provider-local reference.
+    pub reference: String,
+    /// Bounded content.
+    pub content: String,
+    /// Provider relevance score.
+    pub score: Option<f64>,
+    /// Creation timestamp in milliseconds since the Unix epoch.
+    pub created_at_ms: i64,
 }
 
 /// Runtime/plugin-host command.
@@ -212,6 +406,107 @@ pub enum PluginCommand {
         /// Authorization.
         authorization: PluginAuthorization,
     },
+    /// Execute one declared plugin graph node.
+    ExecuteNode {
+        /// Loaded plugin ID.
+        plugin_id: String,
+        /// Unique invocation ID.
+        invocation_id: String,
+        /// Declared executor ID.
+        executor_id: String,
+        /// Compiled graph node ID.
+        node_id: String,
+        /// Serialized graph node kind.
+        node_kind: String,
+        /// Normalized node input.
+        input: Value,
+        /// Bounded runtime variable environment.
+        variables: Value,
+        /// Explicit readable state.
+        readable_state: Value,
+        /// Authorization.
+        authorization: PluginAuthorization,
+    },
+    /// Describe plugin memory scopes and capabilities.
+    MemoryDescribe {
+        /// Loaded plugin ID.
+        plugin_id: String,
+        /// Unique invocation ID.
+        invocation_id: String,
+        /// Authorization.
+        authorization: PluginAuthorization,
+    },
+    /// Retrieve bounded plugin memory.
+    MemoryRetrieve {
+        /// Loaded plugin ID.
+        plugin_id: String,
+        /// Unique invocation ID.
+        invocation_id: String,
+        /// Memory scope.
+        scope: String,
+        /// Normalized query.
+        query: String,
+        /// Maximum items.
+        limit: usize,
+        /// Authorization.
+        authorization: PluginAuthorization,
+    },
+    /// Commit an already-approved plugin memory write.
+    MemoryCommitWrite {
+        /// Loaded plugin ID.
+        plugin_id: String,
+        /// Unique invocation ID.
+        invocation_id: String,
+        /// Memory scope.
+        scope: String,
+        /// Bounded entries to commit.
+        entries: Vec<PluginMemoryItem>,
+        /// Authorization.
+        authorization: PluginAuthorization,
+    },
+    /// Report plugin memory health.
+    MemoryHealth {
+        /// Loaded plugin ID.
+        plugin_id: String,
+        /// Unique invocation ID.
+        invocation_id: String,
+        /// Authorization.
+        authorization: PluginAuthorization,
+    },
+    /// Propose a replacement projection.
+    CompactionPropose {
+        /// Loaded plugin ID.
+        plugin_id: String,
+        /// Unique invocation ID.
+        invocation_id: String,
+        /// Inclusive canonical source sequence range start.
+        source_range_start: u64,
+        /// Inclusive canonical source sequence range end.
+        source_range_end: u64,
+        /// Content hash of the exact source range.
+        source_range_hash: String,
+        /// Current provider-visible entries.
+        current_entries: Value,
+        /// Structured proposal supplied by the runtime.
+        proposal: Value,
+        /// Authorization.
+        authorization: PluginAuthorization,
+    },
+    /// Run one context transform at a lifecycle boundary.
+    ContextTransform {
+        /// Loaded plugin ID.
+        plugin_id: String,
+        /// Unique invocation ID.
+        invocation_id: String,
+        /// Declared transform ID.
+        transform_id: String,
+        /// Lifecycle boundary.
+        boundary: PluginContextTransformBoundary,
+        /// Bounded transform payload.
+        payload: Value,
+        /// Authorization.
+        authorization: PluginAuthorization,
+    },
     /// Cancel a running plugin invocation.
     Cancel {
         /// Plugin invocation to stop.
@@ -233,6 +528,27 @@ pub enum PluginCommand {
         /// Authorization.
         authorization: PluginAuthorization,
     },
+    /// Reload a plugin after an upgrade, preserving persisted state.
+    Reload {
+        /// Loaded plugin ID.
+        plugin_id: String,
+        /// Authorization.
+        authorization: PluginAuthorization,
+    },
+    /// Return a quarantined plugin to active service under policy.
+    Unquarantine {
+        /// Loaded plugin ID.
+        plugin_id: String,
+        /// Authorization.
+        authorization: PluginAuthorization,
+    },
+    /// Read a bounded audit slice.
+    AuditList {
+        /// Optional cursor: only audits after this invocation ID.
+        since_invocation_id: Option<String>,
+        /// Maximum entries.
+        limit: u16,
+    },
     /// Report plugin-host health and bounded audit state.
     Health,
 }
@@ -247,7 +563,7 @@ pub struct PluginAudit {
     pub invocation_id: Option<String>,
     /// Stable operation name.
     pub operation: String,
-    /// Stable outcome code.
+    /// Stable outcome code (see [`audit_outcome`]).
     pub outcome: String,
     /// Attempt count.
     pub attempts: u8,
@@ -308,6 +624,13 @@ pub enum PluginResponse {
         /// Audit result.
         audit: PluginAudit,
     },
+    /// Plugin graph node completed.
+    NodeResult {
+        /// Bounded normalized node output.
+        value: Value,
+        /// Audit result.
+        audit: PluginAudit,
+    },
     /// Observation was accepted or dropped by the bounded queue.
     Observation {
         /// Whether it entered the queue.
@@ -319,14 +642,82 @@ pub enum PluginResponse {
         /// Audit result.
         audit: PluginAudit,
     },
-    /// Plugin was disabled or quarantined.
+    /// Memory scopes and capabilities.
+    MemoryDescribed {
+        /// Supported scopes.
+        scopes: BTreeSet<String>,
+        /// Capabilities.
+        capabilities: BTreeSet<String>,
+        /// Hard retained-byte bound.
+        bounded_bytes: u64,
+        /// Audit result.
+        audit: PluginAudit,
+    },
+    /// Bounded memory retrieval result.
+    MemoryRetrieved {
+        /// Items.
+        items: Vec<PluginMemoryItem>,
+        /// Audit result.
+        audit: PluginAudit,
+    },
+    /// Approved memory write was committed.
+    MemoryWriteCommitted {
+        /// Whether the provider retained the entries.
+        retained: bool,
+        /// Provider-local references.
+        references: Vec<String>,
+        /// Audit result.
+        audit: PluginAudit,
+    },
+    /// Plugin memory health projection.
+    MemoryHealthResult {
+        /// Whether the backend is healthy.
+        healthy: bool,
+        /// Retained item count.
+        item_count: u64,
+        /// Retained bytes.
+        retained_bytes: u64,
+        /// Audit result.
+        audit: PluginAudit,
+    },
+    /// Replacement projection was accepted by the plugin.
+    CompactionProposalAccepted {
+        /// Structured replacement entries.
+        replacement: Value,
+        /// Measured replacement byte size.
+        size_bytes: u64,
+        /// Audit result.
+        audit: PluginAudit,
+    },
+    /// Context transform completed.
+    TransformResult {
+        /// Bounded transformed payload.
+        value: Value,
+        /// Audit result.
+        audit: PluginAudit,
+    },
+    /// A plugin invocation was cancelled.
+    Cancelled {
+        /// Cancelled invocation ID.
+        invocation_id: String,
+        /// Audit result.
+        audit: PluginAudit,
+    },
+    /// Plugin was disabled, quarantined, reloaded, or unquarantined.
     StateChanged {
         /// Plugin ID.
         plugin_id: String,
-        /// `disabled` or `quarantined`.
+        /// `disabled`, `quarantined`, `reloaded`, or `active`.
         state: String,
         /// Audit result.
         audit: PluginAudit,
+    },
+    /// Bounded audit slice.
+    AuditListed {
+        /// Audits in stable append order.
+        audits: Vec<PluginAudit>,
+        /// Whether older entries were truncated.
+        truncated: bool,
     },
     /// Health projection.
     Health {

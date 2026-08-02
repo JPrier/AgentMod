@@ -56,5 +56,12 @@
     "kind": "reject"
   },
   "timeout_ms": 5000,
-  "state_migration_version": 1
+  "state_migration_version": 1,
+  "node_executors": [],
+  "memory": null,
+  "compaction": null,
+  "context_transforms": [],
+  "observer_delivery": {
+    "mode": "best_effort"
+  }
 }

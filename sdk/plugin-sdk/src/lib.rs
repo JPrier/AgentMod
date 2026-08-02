@@ -10,7 +10,9 @@ mod validation;
 pub use model::{
     AuthorityManifest, AuthorityTarget, ConfigurationSchemaMetadata, ConfigurationSchemaSource,
     Entrypoint, FailurePolicy, IsolationMode, OrderingManifest, PermissionManifest, PluginCategory,
-    PluginClassification, PluginIdentity, PluginManifest, PluginScope, TrustLevel,
+    PluginClassification, PluginCompactionDeclaration, PluginContextTransformBoundary,
+    PluginContextTransformDeclaration, PluginIdentity, PluginManifest, PluginMemoryDeclaration,
+    PluginNodeExecutor, PluginObserverDelivery, PluginScope, TrustLevel,
 };
 pub use parsing::{ManifestFormat, ManifestParseError, parse_json, parse_toml, to_json, to_toml};
 pub use validation::{

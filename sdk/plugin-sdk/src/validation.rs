@@ -6,7 +6,8 @@ use semver::{Version, VersionReq};
 
 use crate::{
     AuthorityTarget, ConfigurationSchemaSource, Entrypoint, FailurePolicy, IsolationMode,
-    PluginCategory, PluginClassification, PluginManifest, PluginScope, TrustLevel,
+    PluginCategory, PluginClassification, PluginManifest, PluginObserverDelivery, PluginScope,
+    TrustLevel,
 };
 
 /// Current supported plugin manifest schema.
@@ -251,6 +252,11 @@ fn validate_intrinsic(
     validate_permissions(manifest, &plugin_path, &mut diagnostics);
     validate_ordering(manifest, &plugin_path, &mut diagnostics);
     validate_configuration(manifest, &plugin_path, &mut diagnostics);
+    validate_node_executors(manifest, context, &plugin_path, &mut diagnostics);
+    validate_memory(manifest, &plugin_path, &mut diagnostics);
+    validate_compaction(manifest, &plugin_path, &mut diagnostics);
+    validate_context_transforms(manifest, &plugin_path, &mut diagnostics);
+    validate_observer_delivery(manifest, &plugin_path, &mut diagnostics);
     if manifest.state_migration_version == 0 {
         diagnostics.push(error(
             "PLUG019",
@@ -680,6 +686,305 @@ fn validate_configuration(
             format!("{plugin_path}.configuration.source"),
             "configuration schema source is invalid, oversized, or unsafe",
             "supply an inline JSON object or safe relative .json path",
+        ));
+    }
+}
+
+fn validate_node_executors(
+    manifest: &PluginManifest,
+    context: &ValidationContext,
+    plugin_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if manifest.node_executors.len() > 32 {
+        diagnostics.push(error(
+            "PLUG025",
+            format!("{plugin_path}.node_executors"),
+            "node executor declarations exceed the deterministic bound",
+            "reduce the number of declared node executors",
+        ));
+    }
+    if manifest.category == PluginCategory::GraphNode && manifest.node_executors.is_empty() {
+        diagnostics.push(error(
+            "PLUG025",
+            format!("{plugin_path}.node_executors"),
+            "graph_node plugins must declare at least one node executor",
+            "declare a [[node_executors]] entry",
+        ));
+    }
+    for (index, executor) in manifest.node_executors.iter().enumerate() {
+        let path = format!("{plugin_path}.node_executors[{index}]");
+        if !is_identifier(&executor.executor_id) {
+            diagnostics.push(error(
+                "PLUG025",
+                format!("{path}.executor_id"),
+                "executor ID is not a safe lowercase identifier",
+                "use a stable lowercase dotted identifier",
+            ));
+        }
+        if Version::parse(&executor.version).is_err()
+            || VersionReq::parse(&executor.runtime_api).is_err()
+        {
+            diagnostics.push(error(
+                "PLUG025",
+                format!("{path}.runtime_api"),
+                "executor version or runtime API requirement is invalid",
+                "declare a semantic version and a semantic version requirement",
+            ));
+        }
+        if !is_capability(&executor.node_kind) {
+            diagnostics.push(error(
+                "PLUG025",
+                format!("{path}.node_kind"),
+                "node kind is not a safe lowercase capability",
+                "use a stable lowercase node kind name",
+            ));
+        }
+        if executor.input_schema.is_empty()
+            || executor.input_schema.len() > 65_536
+            || serde_json::from_str::<serde_json::Value>(&executor.input_schema)
+                .is_err_and(|_| true)
+            || serde_json::from_str::<serde_json::Value>(&executor.output_schema)
+                .is_err_and(|_| true)
+            || executor.output_schema.is_empty()
+            || executor.output_schema.len() > 65_536
+        {
+            diagnostics.push(error(
+                "PLUG025",
+                format!("{path}.schemas"),
+                "input or output schema is not a bounded JSON document",
+                "supply inline JSON Schema objects under 64 KiB",
+            ));
+        }
+        let maximum = context.maximum_timeout_ms.min(300_000);
+        if executor.timeout_ms == 0 || executor.timeout_ms > maximum {
+            diagnostics.push(error(
+                "PLUG025",
+                format!("{path}.timeout_ms"),
+                format!("executor timeout must be between 1 and {maximum} milliseconds"),
+                "choose a bounded node timeout",
+            ));
+        }
+        if !matches!(
+            executor.failure_policy.as_str(),
+            "reject" | "cancel" | "disable" | "continue" | "retry"
+        ) {
+            diagnostics.push(error(
+                "PLUG025",
+                format!("{path}.failure_policy"),
+                "executor failure policy is invalid",
+                "use reject, cancel, disable, continue, or retry",
+            ));
+        }
+        if executor.required_capabilities.len() > 128 {
+            diagnostics.push(bounds(plugin_path, "node_executors.capabilities"));
+        }
+        if !is_capability(&executor.state_scope) {
+            diagnostics.push(error(
+                "PLUG025",
+                format!("{path}.state_scope"),
+                "state scope is not a safe lowercase identifier",
+                "use a stable lowercase state-scope name",
+            ));
+        }
+        for (scope_index, scope) in executor.read_authority.iter().enumerate() {
+            if !is_capability(scope) {
+                diagnostics.push(error(
+                    "PLUG025",
+                    format!("{path}.read_authority[{scope_index}]"),
+                    "read authority scope is invalid",
+                    "use a stable lowercase scope name",
+                ));
+            }
+        }
+    }
+    validate_unique_executor_ids(manifest, plugin_path, diagnostics);
+}
+
+fn validate_unique_executor_ids(
+    manifest: &PluginManifest,
+    plugin_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut seen = BTreeSet::new();
+    for (index, executor) in manifest.node_executors.iter().enumerate() {
+        if !seen.insert(&executor.executor_id) {
+            diagnostics.push(error(
+                "PLUG025",
+                format!("{plugin_path}.node_executors[{index}].executor_id"),
+                format!("duplicate executor ID `{}`", executor.executor_id),
+                "remove the duplicate executor declaration",
+            ));
+        }
+    }
+}
+
+fn validate_memory(
+    manifest: &PluginManifest,
+    plugin_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let Some(memory) = &manifest.memory {
+        if manifest.category != PluginCategory::Memory {
+            diagnostics.push(error(
+                "PLUG026",
+                format!("{plugin_path}.memory"),
+                "memory declaration requires the memory plugin category",
+                "set category = \"memory\"",
+            ));
+        }
+        if memory.scopes.len() > 32 || memory.capabilities.len() > 64 {
+            diagnostics.push(bounds(plugin_path, "memory"));
+        }
+        for (index, scope) in memory.scopes.iter().enumerate() {
+            if !is_capability(scope) {
+                diagnostics.push(error(
+                    "PLUG026",
+                    format!("{plugin_path}.memory.scopes[{index}]"),
+                    "memory scope is invalid",
+                    "use session, project, user, or runtime",
+                ));
+            }
+        }
+        if memory.bounded_bytes == 0 || memory.bounded_bytes > (1_u64 << 40) {
+            diagnostics.push(error(
+                "PLUG026",
+                format!("{plugin_path}.memory.bounded_bytes"),
+                "memory byte bound must be positive and at most 1 TiB",
+                "choose a hard retained-byte bound",
+            ));
+        }
+    }
+    if manifest.category == PluginCategory::Memory && manifest.memory.is_none() {
+        diagnostics.push(error(
+            "PLUG026",
+            format!("{plugin_path}.memory"),
+            "memory plugins must declare memory",
+            "declare a [[memory]] entry",
+        ));
+    }
+}
+
+fn validate_compaction(
+    manifest: &PluginManifest,
+    plugin_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let Some(compaction) = &manifest.compaction {
+        if manifest.category != PluginCategory::Compaction {
+            diagnostics.push(error(
+                "PLUG027",
+                format!("{plugin_path}.compaction"),
+                "compaction declaration requires the compaction plugin category",
+                "set category = \"compaction\"",
+            ));
+        }
+        if !is_identifier(&compaction.strategy_id) {
+            diagnostics.push(error(
+                "PLUG027",
+                format!("{plugin_path}.compaction.strategy_id"),
+                "compaction strategy ID is not a safe lowercase identifier",
+                "use a stable lowercase dotted strategy ID",
+            ));
+        }
+        if compaction.bounded_bytes == 0 || compaction.bounded_bytes > (1_u64 << 40) {
+            diagnostics.push(error(
+                "PLUG027",
+                format!("{plugin_path}.compaction.bounded_bytes"),
+                "compaction byte bound must be positive and at most 1 TiB",
+                "choose a hard replacement bound",
+            ));
+        }
+    }
+    if manifest.category == PluginCategory::Compaction && manifest.compaction.is_none() {
+        diagnostics.push(error(
+            "PLUG027",
+            format!("{plugin_path}.compaction"),
+            "compaction plugins must declare a compaction strategy",
+            "declare a [[compaction]] entry",
+        ));
+    }
+}
+
+fn validate_context_transforms(
+    manifest: &PluginManifest,
+    plugin_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if manifest.context_transforms.len() > 64 {
+        diagnostics.push(bounds(plugin_path, "context_transforms"));
+    }
+    if manifest.category == PluginCategory::ContextTransform
+        && manifest.context_transforms.is_empty()
+    {
+        diagnostics.push(error(
+            "PLUG028",
+            format!("{plugin_path}.context_transforms"),
+            "context_transform plugins must declare at least one transform",
+            "declare a [[context_transforms]] entry",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for (index, transform) in manifest.context_transforms.iter().enumerate() {
+        let path = format!("{plugin_path}.context_transforms[{index}]");
+        if !is_identifier(&transform.transform_id) {
+            diagnostics.push(error(
+                "PLUG028",
+                format!("{path}.transform_id"),
+                "transform ID is not a safe lowercase identifier",
+                "use a stable lowercase dotted transform ID",
+            ));
+        }
+        if !seen.insert(&transform.transform_id) {
+            diagnostics.push(error(
+                "PLUG028",
+                format!("{path}.transform_id"),
+                "transform ID is duplicated within the plugin",
+                "use a distinct transform ID",
+            ));
+        }
+        for (field, values) in [("before", &transform.before), ("after", &transform.after)] {
+            for (dependency_index, target) in values.iter().enumerate() {
+                if target == &transform.transform_id || !is_identifier(target) {
+                    diagnostics.push(error(
+                        "PLUG028",
+                        format!("{path}.{field}[{dependency_index}]"),
+                        "transform ordering target is self-referential or invalid",
+                        "reference a different valid transform ID",
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn validate_observer_delivery(
+    manifest: &PluginManifest,
+    plugin_path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if let PluginObserverDelivery::AtLeastOnce {
+        max_attempts,
+        retry_backoff_ms,
+    } = manifest.observer_delivery
+    {
+        if !(1..=10).contains(&max_attempts) || retry_backoff_ms > 300_000 {
+            diagnostics.push(error(
+                "PLUG029",
+                format!("{plugin_path}.observer_delivery"),
+                "at-least-once delivery requires 1-10 attempts and bounded backoff",
+                "choose bounded retry policy",
+            ));
+        }
+    }
+    if manifest.classification == PluginClassification::Observer
+        && manifest.category != PluginCategory::Observer
+    {
+        diagnostics.push(error(
+            "PLUG030",
+            format!("{plugin_path}.classification"),
+            "observer classification conflicts with the declared category",
+            "set category = \"observer\" for observer plugins",
         ));
     }
 }

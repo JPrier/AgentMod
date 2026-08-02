@@ -1069,6 +1069,58 @@ pub enum RuntimeCommittedEvent {
     ChildJoinCompleted(ChildJoinCompletedEvent),
     /// Records a structured reviewer decision.
     ReviewerFindingsCommitted(ReviewerFindingsCommittedEvent),
+    /// Canonical child-agent message intent owned by a native control-flow node.
+    ChildMessageProposed(Box<crate::node_executors::events::ChildMessageProposedEvent>),
+    /// Canonical child-agent message delivery.
+    ChildMessageDelivered(Box<crate::node_executors::events::ChildMessageDeliveredEvent>),
+    /// Canonical child-agent message rejection.
+    ChildMessageRejected(Box<crate::node_executors::events::ChildMessageRejectedEvent>),
+    /// Canonical generic join initialization.
+    JoinInitialized(Box<crate::node_executors::events::JoinInitializedEvent>),
+    /// Canonical generic join participant success.
+    JoinParticipantCompleted(Box<crate::node_executors::events::JoinParticipantCompletedEvent>),
+    /// Canonical generic join participant failure.
+    JoinParticipantFailed(Box<crate::node_executors::events::JoinParticipantFailedEvent>),
+    /// Canonical generic join participant cancellation.
+    JoinParticipantCancelled(Box<crate::node_executors::events::JoinParticipantCancelledEvent>),
+    /// Canonical generic join release.
+    JoinReleased(Box<crate::node_executors::events::JoinReleasedEvent>),
+    /// Canonical parallel branch initialization.
+    ParallelBranchInitialized(Box<crate::node_executors::events::ParallelBranchInitializedEvent>),
+    /// Canonical parallel sub-branch dispatch.
+    ParallelBranchMemberDispatched(
+        Box<crate::node_executors::events::ParallelBranchMemberDispatchedEvent>,
+    ),
+    /// Canonical parallel sub-branch completion.
+    ParallelBranchMemberCompleted(
+        Box<crate::node_executors::events::ParallelBranchMemberCompletedEvent>,
+    ),
+    /// Canonical parallel sub-branch failure.
+    ParallelBranchMemberFailed(Box<crate::node_executors::events::ParallelBranchMemberFailedEvent>),
+    /// Canonical parallel sub-branch cancellation.
+    ParallelBranchMemberCancelled(
+        Box<crate::node_executors::events::ParallelBranchMemberCancelledEvent>,
+    ),
+    /// Canonical parallel branch terminal outcome.
+    ParallelBranchFinished(Box<crate::node_executors::events::ParallelBranchFinishedEvent>),
+    /// Canonical durable delay scheduling.
+    DelayScheduled(Box<crate::node_executors::events::DelayScheduledEvent>),
+    /// Canonical durable delay resume.
+    DelayResumed(Box<crate::node_executors::events::DelayResumedEvent>),
+    /// Canonical durable delay cancellation.
+    DelayCancelled(Box<crate::node_executors::events::DelayCancelledEvent>),
+    /// Canonical durable delay expiry.
+    DelayExpired(Box<crate::node_executors::events::DelayExpiredEvent>),
+    /// Canonical graph-owned schedule proposal.
+    GraphScheduleProposed(Box<crate::node_executors::events::GraphScheduleProposedEvent>),
+    /// Canonical graph-owned schedule creation.
+    GraphScheduleCreated(Box<crate::node_executors::events::GraphScheduleCreatedEvent>),
+    /// Canonical graph-owned schedule proposal rejection.
+    GraphScheduleRejected(Box<crate::node_executors::events::GraphScheduleRejectedEvent>),
+    /// Canonical graph-owned schedule removal.
+    GraphScheduleRemoved(Box<crate::node_executors::events::GraphScheduleRemovedEvent>),
+    /// Canonical declared user-space event emission.
+    UserEventEmitted(Box<crate::node_executors::events::UserEventEmittedEvent>),
 }
 
 impl RuntimeCommittedEvent {
@@ -1127,6 +1179,29 @@ impl RuntimeCommittedEvent {
             Self::TaskPlanCommitted(_) => "style.task_plan_committed",
             Self::ChildJoinCompleted(_) => "child_agent.join_completed",
             Self::ReviewerFindingsCommitted(_) => "style.reviewer_findings_committed",
+            Self::ChildMessageProposed(_) => "child_agent.message_proposed",
+            Self::ChildMessageDelivered(_) => "child_agent.message_delivered",
+            Self::ChildMessageRejected(_) => "child_agent.message_rejected",
+            Self::JoinInitialized(_) => "child_agent.join_initialized",
+            Self::JoinParticipantCompleted(_) => "child_agent.join_participant_completed",
+            Self::JoinParticipantFailed(_) => "child_agent.join_participant_failed",
+            Self::JoinParticipantCancelled(_) => "child_agent.join_participant_cancelled",
+            Self::JoinReleased(_) => "child_agent.join_released",
+            Self::ParallelBranchInitialized(_) => "parallel.branch_initialized",
+            Self::ParallelBranchMemberDispatched(_) => "parallel.branch_member_dispatched",
+            Self::ParallelBranchMemberCompleted(_) => "parallel.branch_member_completed",
+            Self::ParallelBranchMemberFailed(_) => "parallel.branch_member_failed",
+            Self::ParallelBranchMemberCancelled(_) => "parallel.branch_member_cancelled",
+            Self::ParallelBranchFinished(_) => "parallel.branch_finished",
+            Self::DelayScheduled(_) => "delay.scheduled",
+            Self::DelayResumed(_) => "delay.resumed",
+            Self::DelayCancelled(_) => "delay.cancelled",
+            Self::DelayExpired(_) => "delay.expired",
+            Self::GraphScheduleProposed(_) => "schedule.graph_proposed",
+            Self::GraphScheduleCreated(_) => "schedule.graph_created",
+            Self::GraphScheduleRejected(_) => "schedule.graph_rejected",
+            Self::GraphScheduleRemoved(_) => "schedule.graph_removed",
+            Self::UserEventEmitted(_) => "event.user_emitted",
         }
     }
 }
@@ -1340,6 +1415,10 @@ pub struct SessionState {
     /// Replay-owned plugin activation and blocking invocation projection.
     #[serde(default)]
     pub plugins: PluginExecutionState,
+    /// Replay-owned native control-flow node executor state (child messages,
+    /// joins, parallel branches, delays, schedules, and emitted events).
+    #[serde(default)]
+    pub node_executor: crate::node_executors::state::NodeExecutorState,
     /// Restart/reconnect reconciliation state keyed by provider call ID.
     #[serde(default)]
     pub process_reconciliations: BTreeMap<String, ProcessReconciliationRecord>,
@@ -1702,6 +1781,7 @@ fn initialize(
         child_agents: BTreeMap::new(),
         planner_worker: PlannerWorkerState::default(),
         plugins: PluginExecutionState::default(),
+        node_executor: crate::node_executors::state::NodeExecutorState::default(),
         process_reconciliations: BTreeMap::new(),
         last_sequence: event.metadata.sequence,
         last_event_checksum: event.integrity_checksum,
@@ -1988,6 +2068,213 @@ fn apply_payload(
         RuntimeCommittedEvent::ReviewerFindingsCommitted(committed) => {
             apply_reviewer_findings_committed(state, committed, event.metadata.sequence)
         }
+        RuntimeCommittedEvent::ChildMessageProposed(proposed) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::ChildMessageProposed(
+                    proposed.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::ChildMessageDelivered(delivered) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::ChildMessageDelivered(
+                    delivered.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::ChildMessageRejected(rejected) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::ChildMessageRejected(
+                    rejected.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::JoinInitialized(initialized) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::JoinInitialized(
+                    initialized.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::JoinParticipantCompleted(completed) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::JoinParticipantCompleted(
+                    completed.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::JoinParticipantFailed(failed) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::JoinParticipantFailed(
+                    failed.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::JoinParticipantCancelled(cancelled) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::JoinParticipantCancelled(
+                    cancelled.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::JoinReleased(released) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::JoinReleased(
+                    released.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::ParallelBranchInitialized(initialized) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::ParallelBranchInitialized(
+                    initialized.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::ParallelBranchMemberDispatched(dispatched) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::ParallelBranchMemberDispatched(
+                    dispatched.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::ParallelBranchMemberCompleted(completed) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::ParallelBranchMemberCompleted(
+                    completed.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::ParallelBranchMemberFailed(failed) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::ParallelBranchMemberFailed(
+                    failed.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::ParallelBranchMemberCancelled(cancelled) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::ParallelBranchMemberCancelled(
+                    cancelled.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::ParallelBranchFinished(finished) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::ParallelBranchFinished(
+                    finished.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::DelayScheduled(scheduled) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::DelayScheduled(
+                    scheduled.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::DelayResumed(resumed) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::DelayResumed(
+                    resumed.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::DelayCancelled(cancelled) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::DelayCancelled(
+                    cancelled.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::DelayExpired(expired) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::DelayExpired(
+                    expired.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::GraphScheduleProposed(proposed) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::GraphScheduleProposed(
+                    proposed.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::GraphScheduleCreated(created) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::GraphScheduleCreated(
+                    created.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::GraphScheduleRejected(rejected) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::GraphScheduleRejected(
+                    rejected.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::GraphScheduleRemoved(removed) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::GraphScheduleRemoved(
+                    removed.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
+        RuntimeCommittedEvent::UserEventEmitted(emitted) => state
+            .node_executor
+            .apply(
+                &crate::node_executors::events::NodeExecutorEventPayload::UserEventEmitted(
+                    emitted.as_ref().clone(),
+                ),
+                event.metadata.sequence.get(),
+            )
+            .map_err(SessionReducerError::NodeExecutor),
         RuntimeCommittedEvent::ToolExecutionDispatched(dispatched) => {
             apply_tool_dispatch(state, dispatched, event.metadata.sequence)
         }
@@ -4062,6 +4349,9 @@ pub enum SessionReducerError {
     /// Archived sessions cannot accept further events.
     #[error("archived session projection is immutable")]
     ArchivedSessionIsImmutable,
+    /// A native control-flow node event violated its reducer invariants.
+    #[error("native control-flow node event failed: {0}")]
+    NodeExecutor(crate::node_executors::state::NodeExecutorReducerError),
     /// Replay input was empty.
     #[error("cannot replay an empty event stream")]
     EmptyReplay,
@@ -4134,6 +4424,208 @@ mod tests {
                 style_binding: None,
             }),
         )
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the fixture commits every native control-flow event category through the canonical reducer"
+    )]
+    #[test]
+    fn native_control_flow_events_reduce_into_session_executor_state() {
+        use crate::node_executors::events::{
+            ChildMessageDeliveredEvent, ChildMessageProposedEvent, DelayResumedEvent,
+            DelayScheduledEvent, GraphScheduleCreatedEvent, GraphScheduleProposedEvent,
+            GraphScheduleTrigger, JoinInitializedEvent, JoinReleasedEvent, JoinTerminalState,
+            UserEventEmittedEvent,
+        };
+        use agentmod_primitives::ContentHash;
+        let identity = crate::node_executors::state::ExecutorIdentity {
+            session_id: String::from("fixture"),
+            run_id: String::from("run-1"),
+            node_id: String::from("message"),
+            attempt: 1,
+            loop_iteration: 0,
+            step: 4,
+        };
+        let events = vec![
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::ChildMessageProposed(Box::new(ChildMessageProposedEvent {
+                    message_id: identity.message_id("child-1", 1),
+                    idempotency_key: String::from("key-1"),
+                    parent_session_id: String::from("fixture"),
+                    child_session_id: String::from("child-1"),
+                    sequence: 1,
+                    node_id: String::from("message"),
+                    run_id: String::from("run-1"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 4,
+                    content: String::from("hello"),
+                    content_hash: ContentHash::digest(b"hello"),
+                    artifact_references: Vec::new(),
+                    classification:
+                        crate::node_executors::events::ChildMessageClassification::Instruction,
+                    expires_at_ms: None,
+                })),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::ChildMessageDelivered(Box::new(
+                    ChildMessageDeliveredEvent {
+                        message_id: identity.message_id("child-1", 1),
+                        child_session_id: String::from("child-1"),
+                        receipt: String::from("delivered"),
+                    },
+                )),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::DelayScheduled(Box::new(DelayScheduledEvent {
+                    delay_id: identity.delay_id(),
+                    node_id: String::from("wait"),
+                    run_id: String::from("run-1"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 5,
+                    session_id: String::from("fixture"),
+                    wake_time_ms: 1_700_000_005_000,
+                    continuation_id: identity.delay_continuation_id(),
+                    expires_at_ms: None,
+                })),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::DelayResumed(Box::new(DelayResumedEvent {
+                    delay_id: identity.delay_id(),
+                    wake_time_ms: 1_700_000_005_000,
+                    proof: String::from("scheduler.claim"),
+                })),
+            ),
+            envelope(
+                6,
+                RuntimeCommittedEvent::GraphScheduleProposed(Box::new(
+                    GraphScheduleProposedEvent {
+                        schedule_id: identity.schedule_id("key-1"),
+                        node_id: String::from("schedule"),
+                        run_id: String::from("run-1"),
+                        attempt: 1,
+                        loop_iteration: 0,
+                        step: 7,
+                        session_id: String::from("fixture"),
+                        idempotency_key: String::from("key-1"),
+                        trigger: GraphScheduleTrigger::AtMillis {
+                            wake_time_ms: 1_700_000_000_000,
+                        },
+                        style: String::from("persistent-chat@1.1.0"),
+                        workspace: String::from("fixture"),
+                        permission_policy: String::from("ask"),
+                        provider: String::from("mock"),
+                        model: String::from("fixture"),
+                        token_budget: 1_000,
+                        cost_budget_micros: 100,
+                    },
+                )),
+            ),
+            envelope(
+                7,
+                RuntimeCommittedEvent::GraphScheduleCreated(Box::new(GraphScheduleCreatedEvent {
+                    schedule_id: identity.schedule_id("key-1"),
+                    node_id: String::from("schedule"),
+                    run_id: String::from("run-1"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 7,
+                    session_id: String::from("fixture"),
+                    idempotency_key: String::from("key-1"),
+                    trigger: GraphScheduleTrigger::AtMillis {
+                        wake_time_ms: 1_700_000_000_000,
+                    },
+                    style: String::from("persistent-chat@1.1.0"),
+                    workspace: String::from("fixture"),
+                    permission_policy: String::from("ask"),
+                    provider: String::from("mock"),
+                    model: String::from("fixture"),
+                    token_budget: 1_000,
+                    cost_budget_micros: 100,
+                })),
+            ),
+            envelope(
+                8,
+                RuntimeCommittedEvent::JoinInitialized(Box::new(JoinInitializedEvent {
+                    join_id: identity.join_id(),
+                    node_id: String::from("join"),
+                    run_id: String::from("run-1"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 6,
+                    initialized_at_ms: 1_700_000_000_000,
+                    expected_participants: vec![String::from("child-1")],
+                    optional_participants: Vec::new(),
+                    min_success: 1,
+                    allowed_failures: 0,
+                    timeout_ms: None,
+                    ordering: crate::node_executors::events::JoinOrdering::DeclarationOrder,
+                    result_projection: crate::node_executors::events::JoinProjection::TypedResults,
+                    artifact_collection:
+                        crate::node_executors::events::JoinArtifactCollection::Bounded,
+                })),
+            ),
+            envelope(
+                9,
+                RuntimeCommittedEvent::JoinReleased(Box::new(JoinReleasedEvent {
+                    join_id: identity.join_id(),
+                    state: JoinTerminalState::Success,
+                    collected_result_references: Vec::new(),
+                    missing_participants: Vec::new(),
+                    reason: String::from("join complete"),
+                })),
+            ),
+            envelope(
+                10,
+                RuntimeCommittedEvent::UserEventEmitted(Box::new(UserEventEmittedEvent {
+                    emission_id: identity.emission_id("project", "progress"),
+                    node_id: String::from("emit"),
+                    run_id: String::from("run-1"),
+                    attempt: 1,
+                    loop_iteration: 0,
+                    step: 8,
+                    namespace: String::from("project"),
+                    event_type: String::from("progress"),
+                    sequence: 10,
+                    payload_json: String::from(r#"{"percent":42}"#),
+                    payload_hash: ContentHash::digest(br#"{"percent":42}"#),
+                    artifact_references: Vec::new(),
+                    metadata_json: String::from(r"{}"),
+                    correlation_id: String::from("correlation-1"),
+                    causation_id: String::from("causation-1"),
+                })),
+            ),
+        ];
+        let mut state = None;
+        for event in events {
+            state = Some(reduce(state, &event).expect("reduced event"));
+        }
+        let state = state.expect("reduced session");
+        assert_eq!(state.node_executor.child_messages.len(), 1);
+        assert_eq!(
+            state.node_executor.child_messages[&identity.message_id("child-1", 1)].state,
+            crate::node_executors::state::ChildMessageState::Delivered
+        );
+        assert_eq!(
+            state.node_executor.delays[&identity.delay_id()].state,
+            crate::node_executors::state::DelayState::Resumed
+        );
+        assert_eq!(
+            state.node_executor.schedules[&identity.schedule_id("key-1")].state,
+            crate::node_executors::state::GraphScheduleState::Active
+        );
+        assert_eq!(
+            state.node_executor.joins[&identity.join_id()].state,
+            crate::node_executors::state::JoinState::Success
+        );
+        assert_eq!(state.node_executor.emitted_events.len(), 1);
     }
 
     #[test]

@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod cancellation;
 pub mod continuation;
+pub mod execution_plan;
 pub mod fixture_file;
 pub mod harness;
 pub mod harness_registry;
@@ -84,6 +85,28 @@ impl RuntimeDependencyPort for LocalRuntimeDependencies {
             available,
             location: request.storage_root.to_string_lossy().into_owned(),
         })
+    }
+}
+
+impl execution_plan::ExecutionPlanDependencyPort for LocalRuntimeDependencies {
+    fn store_execution_plan(
+        &self,
+        request: execution_plan::DependencyStoreExecutionPlanRequest,
+    ) -> Result<
+        execution_plan::DependencyStoreExecutionPlanResponse,
+        execution_plan::ExecutionPlanDependencyError,
+    > {
+        execution_plan::LocalExecutionPlanDependency.store_execution_plan(request)
+    }
+
+    fn load_execution_plan(
+        &self,
+        request: execution_plan::DependencyLoadExecutionPlanRequest,
+    ) -> Result<
+        execution_plan::DependencyLoadExecutionPlanResult,
+        execution_plan::ExecutionPlanDependencyError,
+    > {
+        execution_plan::LocalExecutionPlanDependency.load_execution_plan(request)
     }
 }
 

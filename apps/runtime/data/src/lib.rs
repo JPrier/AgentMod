@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod cancellation;
 pub mod child_message;
 pub mod continuation;
+pub mod execution_plan;
 pub mod fixture_file;
 pub mod harness;
 pub mod harness_registry;

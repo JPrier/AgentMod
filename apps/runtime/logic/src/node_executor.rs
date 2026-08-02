@@ -935,6 +935,13 @@ fn serialized_node_kind(
         .ok_or(RuntimeExecutabilityError::InvalidNodeKind)
 }
 
+/// Computes the exact normalized live-registry hash used for availability
+/// comparisons outside this module.
+#[must_use]
+pub(crate) fn registry_hash_for(capabilities: &[NodeExecutorCapability]) -> ContentHash {
+    registry_hash(capabilities)
+}
+
 fn registry_hash(capabilities: &[NodeExecutorCapability]) -> ContentHash {
     let mut capabilities = capabilities.to_vec();
     capabilities.sort_by(|left, right| {

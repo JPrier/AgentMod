@@ -154,15 +154,15 @@ impl MemoryDependencyPort for FileMemoryDependency {
             .open(&self.path)
             .map_err(redacted_io)?;
         file.lock_exclusive().map_err(redacted_io)?;
-        if let Some(key) = request.deduplication_key.as_deref() {
-            if let Some(existing) = find_dedup_record(&file, request.scope.as_str(), key)? {
-                FileExt::unlock(&file).map_err(redacted_io)?;
-                return Ok(DependencyMemoryWriteResponse {
-                    id: existing.id,
-                    retained: true,
-                    deduplicated: true,
-                });
-            }
+        if let Some(key) = request.deduplication_key.as_deref()
+            && let Some(existing) = find_dedup_record(&file, request.scope.as_str(), key)?
+        {
+            FileExt::unlock(&file).map_err(redacted_io)?;
+            return Ok(DependencyMemoryWriteResponse {
+                id: existing.id,
+                retained: true,
+                deduplicated: true,
+            });
         }
         let record = StoredFileRecord {
             schema_version: 2,
@@ -302,7 +302,8 @@ impl MemoryDependencyPort for SqliteFtsMemoryDependency {
             let rows = existing
                 .query_map(params![key], |row| row.get::<_, String>(0))
                 .map_err(|_| MemoryDependencyError::Database)?;
-            let rows = rows.collect::<Result<Vec<_>, _>>()
+            let rows = rows
+                .collect::<Result<Vec<_>, _>>()
                 .map_err(|_| MemoryDependencyError::Database)?;
             if let Some(existing_id) = rows.into_iter().next() {
                 return Ok(DependencyMemoryWriteResponse {
@@ -431,8 +432,7 @@ impl StoredFileRecord {
             ))
         }
         .map_err(|_| MemoryDependencyError::Serialization)?;
-        let bytes = serde_json::to_vec(&tuple)
-            .map_err(|_| MemoryDependencyError::Serialization)?;
+        let bytes = serde_json::to_vec(&tuple).map_err(|_| MemoryDependencyError::Serialization)?;
         Ok(blake3::hash(&bytes).to_hex().to_string())
     }
 }

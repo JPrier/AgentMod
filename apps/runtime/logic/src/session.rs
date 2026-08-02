@@ -1593,7 +1593,10 @@ impl ContextSummaryRecord {
     /// Returns whether terminal provider evidence already exists.
     #[must_use]
     pub const fn has_terminal_evidence(&self) -> bool {
-        matches!(self.state, ContextSummaryState::Completed | ContextSummaryState::Failed)
+        matches!(
+            self.state,
+            ContextSummaryState::Completed | ContextSummaryState::Failed
+        )
     }
 }
 
@@ -1658,7 +1661,10 @@ impl MemoryWriteRecord {
     /// Returns whether a terminal receipt or failure already exists.
     #[must_use]
     pub const fn has_terminal_evidence(&self) -> bool {
-        matches!(self.state, MemoryWriteState::Completed | MemoryWriteState::Failed)
+        matches!(
+            self.state,
+            MemoryWriteState::Completed | MemoryWriteState::Failed
+        )
     }
 }
 
@@ -1715,7 +1721,10 @@ impl ContextArtifactRecord {
     /// Returns whether a terminal receipt or failure already exists.
     #[must_use]
     pub const fn has_terminal_evidence(&self) -> bool {
-        matches!(self.state, ContextArtifactState::Completed | ContextArtifactState::Failed)
+        matches!(
+            self.state,
+            ContextArtifactState::Completed | ContextArtifactState::Failed
+        )
     }
 }
 
@@ -2469,7 +2478,12 @@ fn apply_payload(
             apply_memory_write_failed(state, failed, event.metadata.sequence)
         }
         RuntimeCommittedEvent::ContextArtifactProposed(proposed) => {
-            apply_context_artifact_proposed(state, proposed, event.metadata.sequence, event.metadata.event_id)
+            apply_context_artifact_proposed(
+                state,
+                proposed,
+                event.metadata.sequence,
+                event.metadata.event_id,
+            )
         }
         RuntimeCommittedEvent::ContextArtifactApproved(approved) => {
             apply_context_artifact_approved(state, approved, event.metadata.sequence)
@@ -3246,7 +3260,8 @@ fn apply_context_summary_completed(
 ) -> Result<(), SessionReducerError> {
     let identity = &completed.identity;
     if completed.text.trim().is_empty()
-        || u64::try_from(completed.text.len()).map_or(true, |len| len > u64::from(identity.max_summary_bytes))
+        || u64::try_from(completed.text.len())
+            .map_or(true, |len| len > u64::from(identity.max_summary_bytes))
         || completed.content_hash != ContentHash::digest(completed.text.as_bytes())
     {
         return Err(SessionReducerError::InvalidSummaryTransition);
@@ -3465,9 +3480,10 @@ fn apply_context_artifact_proposed(
     if !valid_context_artifact_identity(identity)
         || proposed.byte_size == 0
         || state.context_artifacts.contains_key(&identity.execution_id)
-        || state.context_artifacts.values().any(|record| {
-            record.identity.proposal_id == identity.proposal_id
-        })
+        || state
+            .context_artifacts
+            .values()
+            .any(|record| record.identity.proposal_id == identity.proposal_id)
     {
         return Err(SessionReducerError::InvalidContextArtifactTransition);
     }
@@ -7233,16 +7249,16 @@ to = "done"
             }),
         );
         assert!(matches!(
-            reduce_all(vec![created(), bad_hash.clone()]).context_summaries.get("summary:run:1").map(|r| r.state),
+            reduce_all(vec![created(), bad_hash.clone()])
+                .context_summaries
+                .get("summary:run:1")
+                .map(|r| r.state),
             Some(ContextSummaryState::Proposed)
         ));
         assert!(matches!(
-            reduce(
-                Some(reduce_all(vec![created(), bad_hash])),
-                &approved
-            )
-            .and_then(|state| reduce(Some(state), &completed_without_start))
-            .map(|_| ()),
+            reduce(Some(reduce_all(vec![created(), bad_hash])), &approved)
+                .and_then(|state| reduce(Some(state), &completed_without_start))
+                .map(|_| ()),
             Err(SessionReducerError::InvalidSummaryTransition)
         ));
 
@@ -7333,10 +7349,7 @@ to = "done"
             ),
         ];
         let state = reduce_all(events);
-        let record = state
-            .memory_writes
-            .get(&identity.write_id)
-            .expect("record");
+        let record = state.memory_writes.get(&identity.write_id).expect("record");
         assert_eq!(record.state, MemoryWriteState::Completed);
         assert_eq!(record.reference.as_deref(), Some("memory-ref-1"));
         assert!(record.has_terminal_evidence());
@@ -7412,10 +7425,7 @@ to = "done"
             ),
         ];
         let state = reduce_all(events);
-        let record = state
-            .memory_writes
-            .get(&identity.write_id)
-            .expect("record");
+        let record = state.memory_writes.get(&identity.write_id).expect("record");
         assert_eq!(record.state, MemoryWriteState::Failed);
         assert_eq!(record.failed_code.as_deref(), Some("approval_required"));
         assert!(record.has_terminal_evidence());

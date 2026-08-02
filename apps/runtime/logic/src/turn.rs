@@ -43,8 +43,8 @@ use crate::{
     },
     child_session::{ChildSessionLogicPort, EnsureChildSessionCommand},
     compaction::{
-        CompactionContext, CompactionError, CompactionStrategy, compact_projection,
-        build_summary_request_material, serialize_context_artifact,
+        CompactionContext, CompactionError, CompactionStrategy, build_summary_request_material,
+        compact_projection, serialize_context_artifact,
     },
     continuation::{
         ApprovalDisposition, ContinuationLogic, ContinuationLogicPort, ContinuationPayload,
@@ -90,15 +90,15 @@ use crate::{
         ChildAgentCompletedEvent, ChildAgentCreatedEvent, ChildAgentCreationApprovedEvent,
         ChildAgentCreationProposedEvent, ChildAgentExecutionIdentity, ChildAgentState,
         ChildJoinCompletedEvent, ContextArtifactApprovedEvent, ContextArtifactCompletedEvent,
-        ContextArtifactDispatchedEvent, ContextArtifactFailedEvent, ContextArtifactIdentity,
-        ContextArtifactProposedEvent, ContextArtifactState, ContextBoundaryCompletedEvent,
-        ContextBoundaryIdentity, ContextBoundaryOrigin, ContextBoundaryStartedEvent,
-        ContextPhaseCompletedEvent, ContextPhaseIdentity, ContextPhaseStartedEvent,
-        ContextProjectionReplacedEvent, ContextSummaryApprovedEvent, ContextSummaryCompletedEvent,
-        ContextSummaryFailedEvent, ContextSummaryIdentity, ContextSummaryProposedEvent,
-        ContextSummaryStartedEvent, ContextSummaryState, ConversationEntryCommittedEvent,
-        MemoryWriteApprovedEvent, MemoryWriteCompletedEvent, MemoryWriteDispatchedEvent,
-        MemoryWriteFailedEvent, MemoryWriteIdentity, MemoryWriteProposedEvent, MemoryWriteState,
+        ContextArtifactDispatchedEvent, ContextArtifactIdentity, ContextArtifactProposedEvent,
+        ContextArtifactState, ContextBoundaryCompletedEvent, ContextBoundaryIdentity,
+        ContextBoundaryOrigin, ContextBoundaryStartedEvent, ContextPhaseCompletedEvent,
+        ContextPhaseIdentity, ContextPhaseStartedEvent, ContextProjectionReplacedEvent,
+        ContextSummaryApprovedEvent, ContextSummaryCompletedEvent, ContextSummaryFailedEvent,
+        ContextSummaryIdentity, ContextSummaryProposedEvent, ContextSummaryStartedEvent,
+        ContextSummaryState, ConversationEntryCommittedEvent, MemoryWriteApprovedEvent,
+        MemoryWriteCompletedEvent, MemoryWriteDispatchedEvent, MemoryWriteFailedEvent,
+        MemoryWriteIdentity, MemoryWriteProposedEvent, MemoryWriteState,
         ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent, ModelRequestCancelledEvent,
         ModelRequestFailedEvent, ModelRequestProposedEvent, ModelRequestStartedEvent,
         ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent, ModelToolCallProposedEvent,
@@ -3659,18 +3659,16 @@ where
             });
         }
         if let ContinuationPayload::MemoryWrite(write) = &resolved.payload {
-            return self
-                .resolve_memory_write_approval(
-                    &persistence,
-                    session_id,
-                    &session_directory,
-                    &command,
-                    continuation_id,
-                    &loaded,
-                    resolved.transitioned,
-                    write,
-                )
-                .await;
+            return self.resolve_memory_write_approval(
+                &persistence,
+                session_id,
+                &session_directory,
+                &command,
+                continuation_id,
+                &loaded,
+                resolved.transitioned,
+                write,
+            );
         }
         let ContinuationPayload::ToolApproval(payload_ref) = &resolved.payload else {
             return Err(RunTurnError::InvalidContinuationPayload);
@@ -4941,17 +4939,17 @@ where
             serde_json::from_str(&binding.compiled_style_json)
                 .map_err(|_| RunTurnError::StyleBindingInvalid)?;
         let summary_config = compiled.compaction.summary.clone();
-        let summary_provider = summary_config
-            .as_ref()
-            .map_or_else(|| command.provider.clone(), |config| config.provider.clone());
+        let summary_provider = summary_config.as_ref().map_or_else(
+            || command.provider.clone(),
+            |config| config.provider.clone(),
+        );
         let summary_model = summary_config
             .as_ref()
             .map_or_else(|| command.model.clone(), |config| config.model.clone());
         let max_summary_bytes = compiled.compaction.summary_max_bytes.max(1);
-        let max_request_bytes = summary_config
-            .as_ref()
-            .map(|config| config.max_request_tokens.saturating_mul(4).max(1024))
-            .unwrap_or(1024 * 1024);
+        let max_request_bytes = summary_config.as_ref().map_or(1024 * 1024, |config| {
+            config.max_request_tokens.saturating_mul(4).max(1024)
+        });
         let material = build_summary_request_material(
             &state.conversation,
             max_request_bytes,
@@ -5111,7 +5109,10 @@ where
             )?;
             return Err(RunTurnError::SummaryProviderFailed);
         }
-        truncate_owned_utf8(&mut text, usize::try_from(max_summary_bytes).unwrap_or(usize::MAX));
+        truncate_owned_utf8(
+            &mut text,
+            usize::try_from(max_summary_bytes).unwrap_or(usize::MAX),
+        );
         let content_hash = ContentHash::digest(text.as_bytes());
         (position.sequence, position.event_id) = self.commit_next(
             persistence,
@@ -5187,14 +5188,9 @@ where
         if let Some(record) = existing.as_ref() {
             match record.state {
                 ContextArtifactState::Completed => {
-                    let artifact_id = record
-                        .artifact_id
-                        .as_deref()
-                        .ok_or(RunTurnError::InvalidContextArtifactReceipt)?;
-                    let artifact_id = ArtifactId::from_uuid(uuid_from_hash(
-                        &record.identity.content_hash,
-                    ));
-                    let _ = artifact_id;
+                    if record.artifact_id.is_none() {
+                        return Err(RunTurnError::InvalidContextArtifactReceipt);
+                    }
                     return Ok((
                         ArtifactId::from_uuid(uuid_from_hash(&content_hash)),
                         content_hash,
@@ -5244,9 +5240,10 @@ where
             style: state.style.clone(),
             workspace: state.workspace.clone(),
             store_root: session_directory.join("artifacts").join("context"),
-            creation_event: existing
-                .as_ref()
-                .map_or_else(|| position.event_id.to_string(), |record| record.proposed_event.to_string()),
+            creation_event: existing.as_ref().map_or_else(
+                || position.event_id.to_string(),
+                |record| record.proposed_event.to_string(),
+            ),
             producer: String::from("runtime.context"),
             mime_type: identity.mime_type.clone(),
             bytes: bytes.clone(),
@@ -5314,7 +5311,7 @@ where
             )?;
             action_digest
         };
-        let (artifact_id, artifact_reference, receipt_position) = self
+        let (_artifact_store_id, _artifact_reference, receipt_position) = self
             .persist_context_artifact_receipt(
                 persistence,
                 session_id,
@@ -5326,7 +5323,6 @@ where
             )?;
         position = receipt_position;
         let artifact_id = ArtifactId::from_uuid(uuid_from_hash(&content_hash));
-        let _ = artifact_reference;
         Ok((artifact_id, content_hash, entry_id, position))
     }
 
@@ -5371,6 +5367,7 @@ where
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_context_artifact_completed(
         &self,
         persistence: &SessionPersistenceLogic<D>,
@@ -5433,17 +5430,16 @@ where
             .artifacts
             .reconcile(&command)
             .map_err(RunTurnError::ContextArtifact)?;
-        let persisted = match reconciled {
-            Some(persisted) => persisted,
-            None => {
-                let authorized = self
-                    .artifacts
-                    .restore_authorized(command, approved_digest)
-                    .map_err(RunTurnError::ContextArtifact)?;
-                self.artifacts
-                    .persist_authorized(authorized)
-                    .map_err(RunTurnError::ContextArtifact)?
-            }
+        let persisted = if let Some(persisted) = reconciled {
+            persisted
+        } else {
+            let authorized = self
+                .artifacts
+                .restore_authorized(command, approved_digest)
+                .map_err(RunTurnError::ContextArtifact)?;
+            self.artifacts
+                .persist_authorized(authorized)
+                .map_err(RunTurnError::ContextArtifact)?
         };
         Ok((
             ArtifactId::from_uuid(uuid_from_hash(&identity.content_hash)),
@@ -5455,7 +5451,7 @@ where
         clippy::too_many_arguments,
         reason = "memory-write approval resolution binds the exact durable decision, canonical outbox, and provider receipt"
     )]
-    async fn resolve_memory_write_approval(
+    fn resolve_memory_write_approval(
         &self,
         persistence: &SessionPersistenceLogic<D>,
         session_id: SessionId,
@@ -5547,6 +5543,7 @@ where
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_approved_memory_write(
         &self,
         persistence: &SessionPersistenceLogic<D>,
@@ -5614,6 +5611,7 @@ where
         clippy::too_many_lines,
         reason = "automatic writes keep the proposal chain, approval modes, canonical outbox, provider dispatch, and restart deduplication adjacent"
     )]
+    #[allow(clippy::too_many_arguments)]
     async fn commit_automatic_memory_write(
         &self,
         persistence: &SessionPersistenceLogic<D>,
@@ -5641,12 +5639,15 @@ where
         if provider == "none" {
             return Ok(position);
         }
-        let scope_key = memory_scope_key(&spec.scope, session_id, &state.workspace)?;
-        let mut content = auto_write_content(state, &spec.categories, trigger)?;
+        let scope_key = memory_scope_key(spec.scope, session_id, &state.workspace)?;
+        let mut content = auto_write_content(state, &spec.categories, trigger);
         if content.trim().is_empty() {
             return Ok(position);
         }
-        truncate_owned_utf8(&mut content, usize::try_from(spec.max_bytes).unwrap_or(usize::MAX));
+        truncate_owned_utf8(
+            &mut content,
+            usize::try_from(spec.max_bytes).unwrap_or(usize::MAX),
+        );
         let content_hash = ContentHash::digest(content.as_bytes());
         let source = format!("auto:{}:{}", trigger, command.cancellation_id);
         let dedup_key = match spec.dedup {
@@ -5712,7 +5713,7 @@ where
                 return Ok(position);
             }
         }
-        let proposal_id = format!("memory-write:{}", write_id);
+        let proposal_id = format!("memory-write:{write_id}");
         (position.sequence, position.event_id) = self.commit_next(
             persistence,
             session_id,
@@ -5759,9 +5760,7 @@ where
                     &result.audit,
                 )?;
                 position = invocation_position;
-                let action_digest = executable
-                    .digest()
-                    .map_err(|_| RunTurnError::Event)?;
+                let action_digest = executable.digest().map_err(|_| RunTurnError::Event)?;
                 let write = MemoryWriteApprovalContinuation {
                     session_id: command.session_id.clone(),
                     workspace: state.workspace.clone(),
@@ -5792,8 +5791,8 @@ where
                 Err(RunTurnError::InvalidContextInterceptionReplacement)
             }
             InterceptionOutcome::RequireApproval { reason, .. } => match spec.approval {
-                agentmod_session_style_sdk::MemoryWriteApprovalMode::MandatoryOnly => {
-                    self.fail_memory_write(
+                agentmod_session_style_sdk::MemoryWriteApprovalMode::MandatoryOnly => self
+                    .fail_memory_write(
                         persistence,
                         session_id,
                         session_directory,
@@ -5802,11 +5801,9 @@ where
                         String::from("approval_required"),
                         reason,
                         spec.failure,
-                    )
-                }
+                    ),
                 agentmod_session_style_sdk::MemoryWriteApprovalMode::RequireUserApproval => {
-                    let continuation_id =
-                        ContinuationId::from_uuid(position.event_id.into_uuid());
+                    let continuation_id = ContinuationId::from_uuid(position.event_id.into_uuid());
                     ContinuationLogic::new(self.data.clone())
                         .create_continuation(CreateContinuationCommand {
                             session_id: command.session_id.clone(),
@@ -5865,6 +5862,7 @@ where
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fail_memory_write(
         &self,
         persistence: &SessionPersistenceLogic<D>,
@@ -9222,9 +9220,7 @@ fn effective_auto_write(
         agentmod_session_style_sdk::MemoryWritePolicy::IterationCompletion => {
             "iteration_completion"
         }
-        agentmod_session_style_sdk::MemoryWritePolicy::SessionCompletion => {
-            "session_completion"
-        }
+        agentmod_session_style_sdk::MemoryWritePolicy::SessionCompletion => "session_completion",
         agentmod_session_style_sdk::MemoryWritePolicy::ExplicitOnly => "explicit_node",
         agentmod_session_style_sdk::MemoryWritePolicy::Never => return None,
     };
@@ -9243,9 +9239,7 @@ fn effective_auto_write(
     })
 }
 
-fn auto_write_trigger_label(
-    trigger: agentmod_session_style_sdk::MemoryAutoWriteTrigger,
-) -> String {
+fn auto_write_trigger_label(trigger: agentmod_session_style_sdk::MemoryAutoWriteTrigger) -> String {
     use agentmod_session_style_sdk::MemoryAutoWriteTrigger;
     match trigger {
         MemoryAutoWriteTrigger::Never => "never".to_owned(),
@@ -9260,7 +9254,7 @@ fn auto_write_trigger_label(
 }
 
 fn memory_scope_key(
-    scope: &agentmod_session_style_sdk::MemoryScope,
+    scope: agentmod_session_style_sdk::MemoryScope,
     session_id: SessionId,
     workspace: &str,
 ) -> Result<String, RunTurnError> {
@@ -9294,54 +9288,59 @@ fn auto_write_content(
     state: &crate::session::SessionState,
     categories: &[agentmod_session_style_sdk::MemoryContentCategory],
     trigger: &str,
-) -> Result<String, RunTurnError> {
+) -> String {
     use agentmod_session_style_sdk::MemoryContentCategory;
     let mut lines = Vec::new();
     for category in categories {
         match category {
             MemoryContentCategory::AssistantText => {
-                if let Some(entry) = state
-                    .conversation
-                    .history()
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        ConversationEntry::AssistantMessage(entry) => Some(entry.text.clone()),
-                        _ => None,
-                    })
+                if let Some(entry) =
+                    state
+                        .conversation
+                        .history()
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            ConversationEntry::AssistantMessage(entry) => Some(entry.text.clone()),
+                            _ => None,
+                        })
                 {
                     lines.push(entry);
                 }
             }
             MemoryContentCategory::UserConstraints => {
-                if let Some(entry) = state
-                    .conversation
-                    .history()
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        ConversationEntry::UserInstruction(entry)
-                        | ConversationEntry::ProjectInstruction(entry) => Some(entry.text.clone()),
-                        _ => None,
-                    })
+                if let Some(entry) =
+                    state
+                        .conversation
+                        .history()
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            ConversationEntry::UserInstruction(entry)
+                            | ConversationEntry::ProjectInstruction(entry) => {
+                                Some(entry.text.clone())
+                            }
+                            _ => None,
+                        })
                 {
                     lines.push(entry);
                 }
             }
             MemoryContentCategory::ToolResults => {
-                if let Some(entry) = state
-                    .conversation
-                    .history()
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        ConversationEntry::ToolResult(result)
-                            if !result.content.trim().is_empty() =>
-                        {
-                            Some(result.content.clone())
-                        }
-                        _ => None,
-                    })
+                if let Some(entry) =
+                    state
+                        .conversation
+                        .history()
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            ConversationEntry::ToolResult(result)
+                                if !result.content.trim().is_empty() =>
+                            {
+                                Some(result.content.clone())
+                            }
+                            _ => None,
+                        })
                 {
                     lines.push(entry);
                 }
@@ -9350,17 +9349,18 @@ fn auto_write_content(
                 let _ = trigger;
             }
             MemoryContentCategory::ArtifactReferences => {
-                if let Some(entry) = state
-                    .conversation
-                    .history()
-                    .iter()
-                    .rev()
-                    .find_map(|entry| match entry {
-                        ConversationEntry::ArtifactReference(entry) => {
-                            Some(format!("artifact {}: {}", entry.artifact_id, entry.label))
-                        }
-                        _ => None,
-                    })
+                if let Some(entry) =
+                    state
+                        .conversation
+                        .history()
+                        .iter()
+                        .rev()
+                        .find_map(|entry| match entry {
+                            ConversationEntry::ArtifactReference(entry) => {
+                                Some(format!("artifact {}: {}", entry.artifact_id, entry.label))
+                            }
+                            _ => None,
+                        })
                 {
                     lines.push(entry);
                 }
@@ -9369,7 +9369,7 @@ fn auto_write_content(
     }
     let mut content = lines.join("\n");
     content.truncate(256 * 1024);
-    Ok(content)
+    content
 }
 
 fn memory_write_action_digest(
@@ -9397,7 +9397,9 @@ fn uuid_from_hash(hash: &ContentHash) -> uuid::Uuid {
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| i64::try_from(duration.as_millis()).unwrap_or(0))
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(0)
+        })
 }
 
 fn construct_memory_query(

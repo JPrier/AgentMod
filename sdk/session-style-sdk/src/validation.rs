@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ApprovalDefaults, BuiltInStyle, ChildAgentLimits, ChildWorkspaceMode, CompactionSelection,
     CompactionStrategy, DecisionCapability, ExecutionBudgets, GraphSource, InterceptorDeclaration,
-    MemoryAutoWriteSelection, MemoryAutoWriteTrigger, MemoryInjectionLocation, MemoryRetrievalTiming,
-    MemoryScope, MemorySelection, MemoryWritePolicy, RetryPolicy,
+    MemoryAutoWriteSelection, MemoryAutoWriteTrigger, MemoryInjectionLocation,
+    MemoryRetrievalTiming, MemoryScope, MemorySelection, MemoryWritePolicy, RetryPolicy,
     SessionStyleManifest, StyleKind, TerminationOutcome, TerminationPolicy, TopLevelSelection,
 };
 
@@ -872,7 +872,6 @@ fn validate_auto_write(
         diagnostics,
     );
 }
-
 
 fn validate_compaction(
     compaction: &CompactionSelection,

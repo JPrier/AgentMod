@@ -31,10 +31,7 @@ fn context() -> CompileContext {
             String::from("filesystem"),
             BTreeSet::from([String::from("filesystem.read")]),
         )]),
-        providers: BTreeSet::from([
-            String::from("mock"),
-            String::from("deterministic-mock"),
-        ]),
+        providers: BTreeSet::from([String::from("mock"), String::from("deterministic-mock")]),
         plugins: BTreeSet::from([String::from("runtime.security")]),
         memory_providers: ["none", "file", "sqlite-fts"]
             .into_iter()
@@ -68,14 +65,15 @@ fn task05_context_fixtures_compile() {
         "persistent-file-auto-write.toml",
     ] {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let source = std::fs::read_to_string(
-            root.join("../../tests/fixtures/styles").join(name),
-        )
-        .expect("fixture exists");
+        let source = std::fs::read_to_string(root.join("../../tests/fixtures/styles").join(name))
+            .expect("fixture exists");
         let manifest = parse_toml(&source).unwrap_or_else(|error| panic!("{name}: {error}"));
         let compiled = compile_style(&manifest, &context(), StyleCompilerLimits::default())
             .unwrap_or_else(|error| panic!("{name} failed to compile: {error}"));
-        assert_eq!(compiled.compaction.strategy == agentmod_session_style_sdk::CompactionStrategy::Summary, name.contains("summary"));
+        assert_eq!(
+            compiled.compaction.strategy == agentmod_session_style_sdk::CompactionStrategy::Summary,
+            name.contains("summary")
+        );
         assert!(!compiled.memory.provider.is_empty());
     }
 }

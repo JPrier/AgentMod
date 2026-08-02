@@ -259,7 +259,9 @@ pub trait PluginCompactionPort: Send + Sync {
     /// # Errors
     ///
     /// Returns [`PluginContextError`] when no compacted range is active.
-    fn report_source_range_hash(&self) -> Result<Option<(u64, u64, ContentHash)>, PluginContextError>;
+    fn report_source_range_hash(
+        &self,
+    ) -> Result<Option<(u64, u64, ContentHash)>, PluginContextError>;
 
     /// Provides immutable artifacts for an optional source range.
     ///
@@ -291,6 +293,10 @@ pub struct ContextTransformResult {
 /// Plugins cannot mutate canonical history, change session/style/workspace
 /// identity, expose undeclared secrets, remove required pending state,
 /// exceed context limits, or fabricate roles.
+///
+/// # Errors
+///
+/// Returns [`PluginContextError`] for any of those violations.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_plugin_context_effect(
     session_id: &str,
@@ -332,7 +338,9 @@ pub fn validate_plugin_context_effect(
     for requirement in preservation_requirements {
         let missing = state.provider_projection().iter().any(|entry| {
             required_entry_for(entry, requirement)
-                && !proposed.iter().any(|candidate| candidate.id() == entry.id())
+                && !proposed
+                    .iter()
+                    .any(|candidate| candidate.id() == entry.id())
         });
         if missing {
             return Err(PluginContextError::RequiredStateRemoved(
@@ -357,6 +365,11 @@ pub fn validate_plugin_context_effect(
 }
 
 /// Validates one proposed plugin memory write before policy evaluation.
+///
+/// # Errors
+///
+/// Returns [`PluginContextError`] when the write is invalid, oversized, or
+/// exposes an undeclared secret.
 #[allow(clippy::too_many_arguments)]
 pub fn validate_plugin_memory_write(
     request: &PluginMemoryWriteProposal,
@@ -397,8 +410,6 @@ fn entry_contains_declared_secret(entry: &ConversationEntry, secrets: &[String])
         ConversationEntry::ToolResult(result) => &result.content,
         ConversationEntry::RetrievedMemory(memory) => &memory.content,
         ConversationEntry::ContextSummary(summary) => &summary.text,
-        ConversationEntry::ToolCallRequest(_)
-        | ConversationEntry::ToolResult { .. } => return false,
         _ => return false,
     };
     secrets
@@ -487,9 +498,7 @@ pub enum PluginContextError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::{
-        ConversationEntryId, PendingTaskEntry, ProjectionProvenance, TextEntry,
-    };
+    use crate::conversation::{ConversationEntryId, PendingTaskEntry, TextEntry};
     use agentmod_primitives::Sequence;
 
     fn sequence(value: u64) -> Sequence {

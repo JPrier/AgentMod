@@ -325,8 +325,9 @@ pub fn build_summary_request_material(
     let mut entries = Vec::new();
     let mut bytes = 0_u64;
     for (index, entry) in source.iter().enumerate() {
-        let required = projection_entry_is_required(entry, current_input, preservation_requirements)
-            || index >= recent_start;
+        let required =
+            projection_entry_is_required(entry, current_input, preservation_requirements)
+                || index >= recent_start;
         if required {
             let contribution = serialized_entry_bytes(entry)?;
             if bytes.saturating_add(contribution) > max_bytes {
@@ -359,9 +360,7 @@ fn projection_entry_is_required(
         ConversationEntry::SystemInstruction(_)
         | ConversationEntry::ProjectInstruction(_)
         | ConversationEntry::UserInstruction(_) => requirement("system_instructions"),
-        ConversationEntry::UserMessage(_) => {
-            current_input.is_some_and(|id| id == entry.id())
-        }
+        ConversationEntry::UserMessage(_) => current_input.is_some_and(|id| id == entry.id()),
         ConversationEntry::PendingTask(_)
         | ConversationEntry::ActiveProcessSummary(_)
         | ConversationEntry::ChildAgentHandoff(_) => requirement("pending_control_state"),
@@ -438,7 +437,8 @@ pub fn serialize_context_artifact(
             "entry_count": source.len(),
         }),
     };
-    let bytes = serde_json::to_vec(&payload).map_err(|_| CompactionError::InvalidContextArtifact)?;
+    let bytes =
+        serde_json::to_vec(&payload).map_err(|_| CompactionError::InvalidContextArtifact)?;
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > max_bytes {
         return Err(CompactionError::ContextArtifactTooLarge);
     }
@@ -669,14 +669,14 @@ mod tests {
             String::from("current_input"),
             String::from("pending_control_state"),
         ];
-        let material = build_summary_request_material(
-            &state,
-            64 * 1024,
-            &requirements,
-            2,
-        )
-        .expect("material");
-        assert!(material.entries.iter().any(|entry| entry.id().0 == "system"));
+        let material =
+            build_summary_request_material(&state, 64 * 1024, &requirements, 2).expect("material");
+        assert!(
+            material
+                .entries
+                .iter()
+                .any(|entry| entry.id().0 == "system")
+        );
         assert!(material.entries.iter().any(|entry| entry.id().0 == "task"));
         assert!(material.entries.iter().any(|entry| entry.id().0 == "u3"));
         assert!(material.entries.iter().any(|entry| entry.id().0 == "u4"));
@@ -720,12 +720,21 @@ mod tests {
         assert_eq!(payload.source_start, 1);
         assert_eq!(payload.source_end, 3);
         assert_eq!(payload.entries.len(), 3);
-        assert!(payload.preserved_state.iter().any(|entry| entry.id().0 == "system"));
-        assert!(payload.preserved_state.iter().any(|entry| entry.id().0 == "task"));
+        assert!(
+            payload
+                .preserved_state
+                .iter()
+                .any(|entry| entry.id().0 == "system")
+        );
+        assert!(
+            payload
+                .preserved_state
+                .iter()
+                .any(|entry| entry.id().0 == "task")
+        );
         // The payload round-trips and the source range is exact.
         let bytes = serde_json::to_vec(&payload).expect("serialize");
-        let decoded: ContextArtifactPayload =
-            serde_json::from_slice(&bytes).expect("decode");
+        let decoded: ContextArtifactPayload = serde_json::from_slice(&bytes).expect("decode");
         assert_eq!(decoded, payload);
         assert_eq!(decoded.source_start, 1);
         assert_eq!(decoded.source_end, 3);

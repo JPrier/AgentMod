@@ -17,6 +17,7 @@ use crate::{
     cancellation::{
         RuntimeCancellationControlDataPort, RuntimeCancellationData, RuntimeCancellationDataPort,
     },
+    execution_plan::ExecutionPlanDataPort,
     fixture_file::FixtureFileDataPort,
     identity::EventIdentityDataPort,
     journal::JournalEventDataPort,
@@ -34,6 +35,7 @@ pub trait LocalRuntimeDataPort:
     + Sync
     + ArtifactDataPort
     + EventIdentityDataPort
+    + ExecutionPlanDataPort
     + FixtureFileDataPort
     + JournalEventDataPort
     + NodeExecutorDataPort
@@ -52,6 +54,7 @@ impl<T> LocalRuntimeDataPort for T where
         + Sync
         + ArtifactDataPort
         + EventIdentityDataPort
+        + ExecutionPlanDataPort
         + FixtureFileDataPort
         + JournalEventDataPort
         + NodeExecutorDataPort

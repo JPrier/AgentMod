@@ -15,6 +15,7 @@ pub mod compaction;
 pub mod continuation;
 pub mod conversation;
 pub mod effect_output;
+pub mod execution_plan;
 pub mod harness;
 pub mod harness_registry;
 pub mod history;

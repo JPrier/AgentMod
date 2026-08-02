@@ -178,7 +178,10 @@ pub enum FixtureExecutionError {
 }
 
 /// Dependency-owned catalog record.
-#[allow(clippy::struct_excessive_bools, reason = "capability flags are the catalog contract")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "capability flags are the catalog contract"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FixtureCatalogRecord {
     /// Stable harness ID.
@@ -272,11 +275,7 @@ impl FixtureProviderCatalogDependency {
         }
     }
 
-    fn validate_grant(
-        &self,
-        grant: &str,
-        resumed: bool,
-    ) -> Result<(), FixtureExecutionError> {
+    fn validate_grant(&self, grant: &str, resumed: bool) -> Result<(), FixtureExecutionError> {
         match &self.grant_validation {
             GrantValidation::Development => {
                 if grant == "grant" {
@@ -330,7 +329,10 @@ impl FixtureProviderExecution for FixtureProviderCatalogDependency {
         &self,
         request: FixtureExecutionRequest,
     ) -> Result<FixtureExecutionResponse, FixtureExecutionError> {
-        self.validate_grant(&request.authorization_grant, request.resumed_after_continuation)?;
+        self.validate_grant(
+            &request.authorization_grant,
+            request.resumed_after_continuation,
+        )?;
         if request.provider_key != FIXTURE_PROVIDER
             || request.model_key.trim().is_empty()
             || request.cancellation_reference.trim().is_empty()
@@ -364,9 +366,7 @@ impl FixtureProviderExecution for FixtureProviderCatalogDependency {
         let events = if request.resumed_after_continuation {
             vec![
                 FixtureProviderEvent::Started,
-                FixtureProviderEvent::TextDelta(
-                    "continued after approved runtime decision".into(),
-                ),
+                FixtureProviderEvent::TextDelta("continued after approved runtime decision".into()),
                 FixtureProviderEvent::Completed {
                     finish_reason: "stop".into(),
                     usage: FixtureUsage {
@@ -443,7 +443,10 @@ impl FixtureProviderCancellation for FixtureProviderCatalogDependency {
     }
 }
 
-#[allow(clippy::too_many_lines, reason = "the scenario matrix is intentionally explicit for auditability")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the scenario matrix is intentionally explicit for auditability"
+)]
 fn scenario_events(
     scenario: &str,
     text: &str,
@@ -744,7 +747,12 @@ mod tests {
         let dependency = FixtureProviderCatalogDependency::development();
         let task = tokio::spawn({
             let dependency = dependency.clone();
-            async move { dependency.execute(request("slow_stream")).await.expect("execution") }
+            async move {
+                dependency
+                    .execute(request("slow_stream"))
+                    .await
+                    .expect("execution")
+            }
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(dependency.cancel("fixture-cancel-1").await.expect("cancel"));

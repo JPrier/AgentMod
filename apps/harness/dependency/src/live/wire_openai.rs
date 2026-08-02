@@ -7,9 +7,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::execution::{
-    DependencyConversationEntry, DependencyProviderEvent, DependencyUsage,
-};
+use crate::execution::{DependencyConversationEntry, DependencyProviderEvent, DependencyUsage};
 
 /// Bounded tool-call accumulator for one streamed tool call.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -86,20 +84,18 @@ impl OpenAiStreamNormalizer {
                 continue;
             };
             if let Some(text) = delta.get("content").and_then(Value::as_str)
-                && !text.is_empty() {
-                    self.started = true;
-                    events.push(DependencyProviderEvent::TextDelta(text.to_owned()));
-                }
+                && !text.is_empty()
+            {
+                self.started = true;
+                events.push(DependencyProviderEvent::TextDelta(text.to_owned()));
+            }
             if let Some(deltas) = delta.get("tool_calls").and_then(Value::as_array) {
                 for tool_call in deltas {
                     let index = usize::try_from(
                         tool_call.get("index").and_then(Value::as_u64).unwrap_or(0),
                     )
                     .unwrap_or(0);
-                    let buffer = self
-                        .tool_buffers
-                        .entry(index)
-                        .or_default();
+                    let buffer = self.tool_buffers.entry(index).or_default();
                     if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
                         id.clone_into(&mut buffer.call_id);
                     }
@@ -107,21 +103,21 @@ impl OpenAiStreamNormalizer {
                         if let Some(name) = function.get("name").and_then(Value::as_str) {
                             buffer.name.push_str(name);
                         }
-                        if let Some(arguments) =
-                            function.get("arguments").and_then(Value::as_str)
-                            && !arguments.is_empty() {
-                                self.started = true;
-                                buffer.arguments.push_str(arguments);
-                                events.push(DependencyProviderEvent::ToolCallDelta {
-                                    call_id: if buffer.call_id.is_empty() {
-                                        format!("tool-call-{index}")
-                                    } else {
-                                        buffer.call_id.clone()
-                                    },
-                                    name_fragment: String::new(),
-                                    arguments_fragment: arguments.to_owned(),
-                                });
-                            }
+                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str)
+                            && !arguments.is_empty()
+                        {
+                            self.started = true;
+                            buffer.arguments.push_str(arguments);
+                            events.push(DependencyProviderEvent::ToolCallDelta {
+                                call_id: if buffer.call_id.is_empty() {
+                                    format!("tool-call-{index}")
+                                } else {
+                                    buffer.call_id.clone()
+                                },
+                                name_fragment: String::new(),
+                                arguments_fragment: arguments.to_owned(),
+                            });
+                        }
                     }
                 }
             }
@@ -336,9 +332,8 @@ fn build_messages(
                 ),
             }),
             DependencyConversationEntry::Metadata { key, value_json } => {
-                let parsed = serde_json::from_str::<Value>(value_json).map_err(|error| {
-                    format!("metadata `{key}` is not valid JSON: {error}")
-                })?;
+                let parsed = serde_json::from_str::<Value>(value_json)
+                    .map_err(|error| format!("metadata `{key}` is not valid JSON: {error}"))?;
                 json!({
                     "role": "user",
                     "content": format!("[{key} metadata]\n{parsed}"),
@@ -354,7 +349,8 @@ fn build_messages(
 }
 
 fn parse_json(value: &str, key: &str) -> Result<Value, String> {
-    serde_json::from_str(value).map_err(|error| format!("option `{key}` is not valid JSON: {error}"))
+    serde_json::from_str(value)
+        .map_err(|error| format!("option `{key}` is not valid JSON: {error}"))
 }
 
 fn parse_bool_option(options: &BTreeMap<String, String>, key: &str) -> Option<bool> {
@@ -477,7 +473,10 @@ mod tests {
     #[test]
     fn builds_request_with_images_tools_and_structured_output() {
         let mut options = BTreeMap::new();
-        options.insert("tools".into(), r#"[{"type":"function","function":{"name":"read_file"}}]"#.into());
+        options.insert(
+            "tools".into(),
+            r#"[{"type":"function","function":{"name":"read_file"}}]"#.into(),
+        );
         options.insert("response_format".into(), r#"{"type":"json_object"}"#.into());
         options.insert("reasoning_effort".into(), "medium".into());
         let body = build_request_body(

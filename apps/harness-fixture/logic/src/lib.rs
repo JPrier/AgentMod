@@ -215,7 +215,10 @@ pub struct FixtureHealthResult {
 }
 
 /// Logic-owned catalog result.
-#[allow(clippy::struct_excessive_bools, reason = "capability flags are the catalog contract")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "capability flags are the catalog contract"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FixtureCatalogResult {
     /// Provider ID.
@@ -348,9 +351,10 @@ where
             ));
         }
         let pending = {
-            let mut pending = self.pending.lock().map_err(|_| {
-                FixtureLogicError::StateUnavailable
-            })?;
+            let mut pending = self
+                .pending
+                .lock()
+                .map_err(|_| FixtureLogicError::StateUnavailable)?;
             pending
                 .remove(&command.continuation_reference)
                 .ok_or(FixtureLogicError::UnknownContinuation)?
@@ -362,7 +366,8 @@ where
             FixtureContinuationDecision::Cancel { reason: _ } => Ok(FixtureExecuteResult {
                 events: vec![FixtureLogicEvent::Cancelled],
             }),
-            FixtureContinuationDecision::Continue | FixtureContinuationDecision::ReplaceContext(_) => {
+            FixtureContinuationDecision::Continue
+            | FixtureContinuationDecision::ReplaceContext(_) => {
                 let mut resumed = pending.command;
                 if let FixtureContinuationDecision::ReplaceContext(entries) = command.decision {
                     if entries.is_empty() || entries.len() > 256 {

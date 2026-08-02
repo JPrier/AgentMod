@@ -119,7 +119,9 @@ fn session_id() -> agentmod_primitives::SessionId {
 }
 
 fn cancellation_id(value: u128) -> agentmod_primitives::CancellationId {
-    format!("018f6f83-7b80-7000-8000-{value:012}").parse().expect("cancellation ID")
+    format!("018f6f83-7b80-7000-8000-{value:012}")
+        .parse()
+        .expect("cancellation ID")
 }
 
 fn execute_command(
@@ -185,7 +187,9 @@ fn streams_text_and_normalizes_usage() {
     let mut fixture = FixtureProcess::spawn();
     fixture.send(&execute_command(
         "streaming_text",
-        vec![ProjectedEntry::User { text: "hello".into() }],
+        vec![ProjectedEntry::User {
+            text: "hello".into(),
+        }],
         &[("fixture_text", serde_json::json!("independent"))],
         10,
     ));
@@ -213,7 +217,9 @@ fn explicit_non_streaming_behavior_emits_one_delta() {
     let mut fixture = FixtureProcess::spawn();
     fixture.send(&execute_command(
         "non_streaming",
-        vec![ProjectedEntry::User { text: "hello".into() }],
+        vec![ProjectedEntry::User {
+            text: "hello".into(),
+        }],
         &[("streaming", serde_json::json!(false))],
         11,
     ));
@@ -223,7 +229,10 @@ fn explicit_non_streaming_behavior_emits_one_delta() {
         .filter(|event| matches!(event, HarnessEvent::TextDelta { .. }))
         .collect();
     assert_eq!(deltas.len(), 1);
-    assert!(matches!(events.last(), Some(HarnessEvent::Completed { .. })));
+    assert!(matches!(
+        events.last(),
+        Some(HarnessEvent::Completed { .. })
+    ));
 }
 
 #[test]
@@ -231,12 +240,18 @@ fn tool_call_waits_for_explicit_continuation_and_resolves_once() {
     let mut fixture = FixtureProcess::spawn();
     fixture.send(&execute_command(
         "one_tool_call",
-        vec![ProjectedEntry::User { text: "read".into() }],
+        vec![ProjectedEntry::User {
+            text: "read".into(),
+        }],
         &[],
         12,
     ));
     let events = fixture.read_events();
-    assert!(!events.iter().any(|event| matches!(event, HarnessEvent::Completed { .. })));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, HarnessEvent::Completed { .. }))
+    );
     let continuation_id = events
         .iter()
         .find_map(|event| {
@@ -263,7 +278,9 @@ fn tool_call_waits_for_explicit_continuation_and_resolves_once() {
         continuation_id,
         decision: HarnessContinuationDecision::ReplaceContext {
             entries: vec![
-                ProjectedEntry::User { text: "read".into() },
+                ProjectedEntry::User {
+                    text: "read".into(),
+                },
                 ProjectedEntry::ToolResult {
                     call_id: "fixture-call-1".into(),
                     content: "bounded result".into(),
@@ -274,7 +291,10 @@ fn tool_call_waits_for_explicit_continuation_and_resolves_once() {
     });
     let resumed = fixture.read_events();
     assert!(matches!(resumed.first(), Some(HarnessEvent::Started)));
-    assert!(matches!(resumed.last(), Some(HarnessEvent::Completed { .. })));
+    assert!(matches!(
+        resumed.last(),
+        Some(HarnessEvent::Completed { .. })
+    ));
 
     // Duplicate resolution is rejected.
     fixture.send(&HarnessCommand::Continue {
@@ -292,7 +312,9 @@ fn slow_stream_cancellation_emits_partial_output_then_cancelled() {
     let mut fixture = FixtureProcess::spawn();
     fixture.send(&execute_command(
         "slow_stream",
-        vec![ProjectedEntry::User { text: "wait".into() }],
+        vec![ProjectedEntry::User {
+            text: "wait".into(),
+        }],
         &[],
         13,
     ));
@@ -333,8 +355,13 @@ fn negative_capability_guards_are_enforced() {
 
     fixture.send(&execute_command(
         "text",
-        vec![ProjectedEntry::User { text: "json".into() }],
-        &[("response_format", serde_json::json!({"type": "json_object"}))],
+        vec![ProjectedEntry::User {
+            text: "json".into(),
+        }],
+        &[(
+            "response_format",
+            serde_json::json!({"type": "json_object"}),
+        )],
         15,
     ));
     let events = fixture.read_events();

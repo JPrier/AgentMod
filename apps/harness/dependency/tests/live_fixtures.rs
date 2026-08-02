@@ -9,11 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use agentmod_harness_dependency::execution::{
     DependencyConversationEntry, DependencyProviderEvent, DependencyProviderExecutionRequest,
-    DependencyProviderOption, DependencyProviderFailureKind, DependencyRetryClassification, ProviderCancellationDependency, ProviderExecutionDependency,
+    DependencyProviderFailureKind, DependencyProviderOption, DependencyRetryClassification,
+    ProviderCancellationDependency, ProviderExecutionDependency,
 };
 use agentmod_harness_dependency::live::{
-    LiveProviderCatalogDependency, PROVIDER_ANTHROPIC, PROVIDER_GEMINI, PROVIDER_OPENAI,
-    PROVIDER_OPENROUTER, PROVIDER_LOCAL,
+    LiveProviderCatalogDependency, PROVIDER_ANTHROPIC, PROVIDER_GEMINI, PROVIDER_LOCAL,
+    PROVIDER_OPENAI, PROVIDER_OPENROUTER,
 };
 use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -76,7 +77,8 @@ async fn spawn_server(
                         if hold_open_ms > 0 {
                             // Abort the connection without a terminating chunk
                             // to exercise cancellation and ambiguous disconnects.
-                            tokio::time::sleep(std::time::Duration::from_millis(hold_open_ms)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(hold_open_ms))
+                                .await;
                             drop(socket);
                         } else {
                             let _ = write_chunk_end(&mut socket).await;
@@ -89,9 +91,7 @@ async fn spawn_server(
     address
 }
 
-async fn read_request(
-    socket: &mut tokio::net::TcpStream,
-) -> Option<(String, Vec<u8>)> {
+async fn read_request(socket: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
     let mut buffer = Vec::new();
     let mut tmp = [0_u8; 4096];
     loop {
@@ -129,7 +129,8 @@ async fn read_request(
         }
         buffer.extend_from_slice(&tmp[..read]);
     }
-    let body = buffer[body_start..body_start + content_length.min(buffer.len() - body_start)].to_vec();
+    let body =
+        buffer[body_start..body_start + content_length.min(buffer.len() - body_start)].to_vec();
     Some((headers, body))
 }
 
@@ -170,10 +171,7 @@ async fn write_chunked_start(socket: &mut tokio::net::TcpStream) -> std::io::Res
         .await
 }
 
-async fn write_chunk(
-    socket: &mut tokio::net::TcpStream,
-    chunk: &[u8],
-) -> std::io::Result<()> {
+async fn write_chunk(socket: &mut tokio::net::TcpStream, chunk: &[u8]) -> std::io::Result<()> {
     socket
         .write_all(format!("{:X}\r\n", chunk.len()).as_bytes())
         .await?;
@@ -234,16 +232,17 @@ fn user(text: &str) -> DependencyConversationEntry {
 
 #[tokio::test]
 async fn openai_compatible_streams_text_with_fragmented_utf8_and_usage() {
-    let base = spawn_server(move |_headers, _body| {
-        // Event text is "h\u{e9}llo world"; the multi-byte character is split
-        // across two HTTP chunks.
-        let prefix = b"data: {\"choices\":[{\"delta\":{\"content\":\"h";
-        let mut chunk_a = prefix.to_vec();
-        chunk_a.push(0xC3); // first byte of the two-byte encoding of U+00E9
-        let mut chunk_b = vec![0xA9]; // second byte of the two-byte encoding of U+00E9
-        chunk_b.extend_from_slice(b"llo\"},\"finish_reason\":null}]}\n\n");
-        ResponsePlan::SseChunks {
-            chunks: vec![
+    let base =
+        spawn_server(move |_headers, _body| {
+            // Event text is "h\u{e9}llo world"; the multi-byte character is split
+            // across two HTTP chunks.
+            let prefix = b"data: {\"choices\":[{\"delta\":{\"content\":\"h";
+            let mut chunk_a = prefix.to_vec();
+            chunk_a.push(0xC3); // first byte of the two-byte encoding of U+00E9
+            let mut chunk_b = vec![0xA9]; // second byte of the two-byte encoding of U+00E9
+            chunk_b.extend_from_slice(b"llo\"},\"finish_reason\":null}]}\n\n");
+            ResponsePlan::SseChunks {
+                chunks: vec![
                 chunk_a,
                 chunk_b,
                 sse_keepalive(),
@@ -252,10 +251,10 @@ async fn openai_compatible_streams_text_with_fragmented_utf8_and_usage() {
                                      "prompt_tokens_details": {"cached_tokens": 3}}}).to_string()),
                 sse("[DONE]"),
             ],
-            hold_open_ms: 0,
-        }
-    })
-    .await;
+                hold_open_ms: 0,
+            }
+        })
+        .await;
     let dependency = LiveProviderCatalogDependency::development();
     let response = dependency
         .execute_provider(live_request(
@@ -267,7 +266,10 @@ async fn openai_compatible_streams_text_with_fragmented_utf8_and_usage() {
         ))
         .await
         .expect("live execution");
-    assert!(matches!(response.events.first(), Some(DependencyProviderEvent::Started)));
+    assert!(matches!(
+        response.events.first(),
+        Some(DependencyProviderEvent::Started)
+    ));
     let text: String = response
         .events
         .iter()
@@ -290,27 +292,31 @@ async fn openai_compatible_streams_text_with_fragmented_utf8_and_usage() {
 
 #[tokio::test]
 async fn openai_compatible_streams_tool_call_deltas_and_multiple_proposals() {
-    let base = spawn_server(move |_headers, _body| {
-        ResponsePlan::SseChunks {
-            chunks: vec![
-                sse(&json!({"choices": [{"delta": {"tool_calls": [{
+    let base = spawn_server(move |_headers, _body| ResponsePlan::SseChunks {
+        chunks: vec![
+            sse(&json!({"choices": [{"delta": {"tool_calls": [{
                     "index": 0, "id": "call-1",
                     "function": {"name": "read_file", "arguments": "{\"pa"}
-                }]}, "finish_reason": null}]}).to_string()),
-                sse(&json!({"choices": [{"delta": {"tool_calls": [{
+                }]}, "finish_reason": null}]})
+            .to_string()),
+            sse(&json!({"choices": [{"delta": {"tool_calls": [{
                     "index": 0,
                     "function": {"arguments": "th\":\"a\"}"}
-                }]}, "finish_reason": null}]}).to_string()),
-                sse(&json!({"choices": [{"delta": {"tool_calls": [{
+                }]}, "finish_reason": null}]})
+            .to_string()),
+            sse(&json!({"choices": [{"delta": {"tool_calls": [{
                     "index": 1, "id": "call-2",
                     "function": {"name": "read_file", "arguments": "{\"path\":\"b\"}"}
-                }]}, "finish_reason": null}]}).to_string()),
-                sse(&json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}],
-                           "usage": {"prompt_tokens": 5, "completion_tokens": 9}}).to_string()),
-                sse("[DONE]"),
-            ],
-            hold_open_ms: 0,
-        }
+                }]}, "finish_reason": null}]})
+            .to_string()),
+            sse(
+                &json!({"choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                           "usage": {"prompt_tokens": 5, "completion_tokens": 9}})
+                .to_string(),
+            ),
+            sse("[DONE]"),
+        ],
+        hold_open_ms: 0,
     })
     .await;
     let dependency = LiveProviderCatalogDependency::development();
@@ -350,16 +356,17 @@ async fn openai_compatible_streams_tool_call_deltas_and_multiple_proposals() {
 
 #[tokio::test]
 async fn openrouter_returns_usage_and_computed_cost_metadata() {
-    let base = spawn_server(move |_headers, _body| {
-        ResponsePlan::SseChunks {
-            chunks: vec![
-                sse(&json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
+    let base = spawn_server(move |_headers, _body| ResponsePlan::SseChunks {
+        chunks: vec![
+            sse(
+                &json!({"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}],
                            "usage": {"prompt_tokens": 100, "completion_tokens": 50,
-                                     "prompt_tokens_details": {"cached_tokens": 40}}}).to_string()),
-                sse("[DONE]"),
-            ],
-            hold_open_ms: 0,
-        }
+                                     "prompt_tokens_details": {"cached_tokens": 40}}})
+                .to_string(),
+            ),
+            sse("[DONE]"),
+        ],
+        hold_open_ms: 0,
     })
     .await;
     let dependency = LiveProviderCatalogDependency::development();
@@ -394,21 +401,19 @@ async fn openrouter_returns_usage_and_computed_cost_metadata() {
 
 #[tokio::test]
 async fn openai_non_streaming_response_is_normalized() {
-    let base = spawn_server(move |_headers, _body| {
-        ResponsePlan::Full {
-            status: 200,
-            headers: vec![("Content-Type".into(), "application/json".into())],
-            body: json!({
-                "id": "chatcmpl-fixture",
-                "choices": [{
-                    "message": {"role": "assistant", "content": "non-stream reply"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 3, "completion_tokens": 2}
-            })
-            .to_string()
-            .into_bytes(),
-        }
+    let base = spawn_server(move |_headers, _body| ResponsePlan::Full {
+        status: 200,
+        headers: vec![("Content-Type".into(), "application/json".into())],
+        body: json!({
+            "id": "chatcmpl-fixture",
+            "choices": [{
+                "message": {"role": "assistant", "content": "non-stream reply"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2}
+        })
+        .to_string()
+        .into_bytes(),
     })
     .await;
     let dependency = LiveProviderCatalogDependency::development();
@@ -551,18 +556,19 @@ async fn gemini_streams_text_and_function_calls() {
 async fn image_inputs_are_serialized_into_the_request_body() {
     let received = Arc::new(Mutex::new(Vec::<u8>::new()));
     let captured = received.clone();
-    let base = spawn_server(move |_headers, body| {
-        *captured.lock().expect("capture") = body.to_vec();
-        ResponsePlan::SseChunks {
-            chunks: vec![
+    let base =
+        spawn_server(move |_headers, body| {
+            *captured.lock().expect("capture") = body.to_vec();
+            ResponsePlan::SseChunks {
+                chunks: vec![
                 sse(&json!({"choices": [{"delta": {"content": "seen"}, "finish_reason": "stop"}],
                            "usage": {"prompt_tokens": 9, "completion_tokens": 1}}).to_string()),
                 sse("[DONE]"),
             ],
-            hold_open_ms: 0,
-        }
-    })
-    .await;
+                hold_open_ms: 0,
+            }
+        })
+        .await;
     let dependency = LiveProviderCatalogDependency::development();
     let response = dependency
         .execute_provider(live_request(
@@ -580,7 +586,10 @@ async fn image_inputs_are_serialized_into_the_request_body() {
         ))
         .await
         .expect("live execution");
-    assert!(matches!(response.events.last(), Some(DependencyProviderEvent::Completed { .. })));
+    assert!(matches!(
+        response.events.last(),
+        Some(DependencyProviderEvent::Completed { .. })
+    ));
     let body = String::from_utf8(received.lock().expect("received").clone()).expect("utf8");
     let value: serde_json::Value = serde_json::from_str(&body).expect("request json");
     assert_eq!(
@@ -591,13 +600,12 @@ async fn image_inputs_are_serialized_into_the_request_body() {
 
 #[tokio::test]
 async fn cancellation_during_stream_emits_cancelled_and_stops() {
-    let base = spawn_server(move |_headers, _body| {
-        ResponsePlan::SseChunks {
-            chunks: vec![
-                sse(&json!({"choices": [{"delta": {"content": "partial"}, "finish_reason": null}]}).to_string()),
-            ],
-            hold_open_ms: 60_000,
-        }
+    let base = spawn_server(move |_headers, _body| ResponsePlan::SseChunks {
+        chunks: vec![sse(
+            &json!({"choices": [{"delta": {"content": "partial"}, "finish_reason": null}]})
+                .to_string(),
+        )],
+        hold_open_ms: 60_000,
     })
     .await;
     let dependency = LiveProviderCatalogDependency::development();
@@ -673,7 +681,11 @@ async fn authentication_headers_are_sent_and_never_leaked_in_errors() {
         ))
         .await
         .expect("live execution");
-    let auth = seen_auth.lock().expect("auth").clone().expect("auth header");
+    let auth = seen_auth
+        .lock()
+        .expect("auth")
+        .clone()
+        .expect("auth header");
     assert_eq!(auth, "Bearer sk-secret-value");
     let message = match response.events.last() {
         Some(DependencyProviderEvent::Failed { message, .. }) => message.clone(),
@@ -692,14 +704,46 @@ async fn authentication_headers_are_sent_and_never_leaked_in_errors() {
 
 #[tokio::test]
 async fn http_statuses_are_classified_without_auto_retry_of_ambiguous_cases() {
-    let cases: Vec<(u16, u64, DependencyProviderFailureKind, DependencyRetryClassification)> = vec![
-        (401, 0, DependencyProviderFailureKind::AuthenticationFailed, DependencyRetryClassification::Never),
-        (429, 2, DependencyProviderFailureKind::RateLimited, DependencyRetryClassification::AfterMilliseconds(2_000)),
-        (500, 0, DependencyProviderFailureKind::ProviderOverloaded, DependencyRetryClassification::AfterMilliseconds(1_000)),
-        (400, 0, DependencyProviderFailureKind::InvalidRequest, DependencyRetryClassification::Never),
-        (404, 0, DependencyProviderFailureKind::UnsupportedCapability, DependencyRetryClassification::Never),
+    let cases: Vec<(
+        u16,
+        u64,
+        DependencyProviderFailureKind,
+        DependencyRetryClassification,
+    )> = vec![
+        (
+            401,
+            0,
+            DependencyProviderFailureKind::AuthenticationFailed,
+            DependencyRetryClassification::Never,
+        ),
+        (
+            429,
+            2,
+            DependencyProviderFailureKind::RateLimited,
+            DependencyRetryClassification::AfterMilliseconds(2_000),
+        ),
+        (
+            500,
+            0,
+            DependencyProviderFailureKind::ProviderOverloaded,
+            DependencyRetryClassification::AfterMilliseconds(1_000),
+        ),
+        (
+            400,
+            0,
+            DependencyProviderFailureKind::InvalidRequest,
+            DependencyRetryClassification::Never,
+        ),
+        (
+            404,
+            0,
+            DependencyProviderFailureKind::UnsupportedCapability,
+            DependencyRetryClassification::Never,
+        ),
     ];
-    for (index, (status, retry_after, expected_kind, expected_retry)) in cases.into_iter().enumerate() {
+    for (index, (status, retry_after, expected_kind, expected_retry)) in
+        cases.into_iter().enumerate()
+    {
         let base = spawn_server(move |_headers, _body| {
             let mut headers = vec![("Content-Type".into(), "application/json".into())];
             if retry_after > 0 {
@@ -738,9 +782,10 @@ async fn http_statuses_are_classified_without_auto_retry_of_ambiguous_cases() {
 async fn ambiguous_disconnect_after_partial_output_is_never_retried() {
     let base = spawn_server(move |_headers, _body| {
         ResponsePlan::SseChunks {
-            chunks: vec![
-                sse(&json!({"choices": [{"delta": {"content": "partial"}, "finish_reason": null}]}).to_string()),
-            ],
+            chunks: vec![sse(
+                &json!({"choices": [{"delta": {"content": "partial"}, "finish_reason": null}]})
+                    .to_string(),
+            )],
             // Hold open briefly, then the fixture aborts the connection by
             // dropping the socket without a terminating chunk.
             hold_open_ms: 50,
@@ -760,11 +805,7 @@ async fn ambiguous_disconnect_after_partial_output_is_never_retried() {
         .expect("live execution");
     let last = response.events.last().expect("last event");
     match last {
-        DependencyProviderEvent::Failed {
-            kind,
-            retry,
-            ..
-        } => {
+        DependencyProviderEvent::Failed { kind, retry, .. } => {
             assert_eq!(kind, &DependencyProviderFailureKind::AmbiguousDisconnect);
             assert_eq!(retry, &DependencyRetryClassification::Never);
         }
@@ -774,11 +815,9 @@ async fn ambiguous_disconnect_after_partial_output_is_never_retried() {
 
 #[tokio::test]
 async fn malformed_stream_events_fail_closed_bounded() {
-    let base = spawn_server(move |_headers, _body| {
-        ResponsePlan::SseChunks {
-            chunks: vec![b"data: {not-json}\n\n".to_vec()],
-            hold_open_ms: 0,
-        }
+    let base = spawn_server(move |_headers, _body| ResponsePlan::SseChunks {
+        chunks: vec![b"data: {not-json}\n\n".to_vec()],
+        hold_open_ms: 0,
     })
     .await;
     let dependency = LiveProviderCatalogDependency::development();
@@ -842,13 +881,11 @@ async fn anthropic_keepalives_and_gemini_errors_are_normalized() {
     assert_eq!(text, "pong");
 
     // Gemini overloaded_error is classified without retry ambiguity.
-    let base = spawn_server(move |_headers, _body| {
-        ResponsePlan::SseChunks {
-            chunks: vec![
-                sse(r#"{"error":{"code":503,"message":"overloaded","status":"UNAVAILABLE"}}"#),
-            ],
-            hold_open_ms: 0,
-        }
+    let base = spawn_server(move |_headers, _body| ResponsePlan::SseChunks {
+        chunks: vec![sse(
+            r#"{"error":{"code":503,"message":"overloaded","status":"UNAVAILABLE"}}"#,
+        )],
+        hold_open_ms: 0,
     })
     .await;
     let dependency = LiveProviderCatalogDependency::development();

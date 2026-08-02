@@ -6,9 +6,8 @@ use agentmod_harness_fixture_logic::FixtureLogicManager;
 use agentmod_harness_fixture_service::FixtureService;
 
 /// Fully assembled independent fixture harness service.
-pub type DefaultFixtureHarnessService = FixtureService<FixtureLogicManager<FixtureDataStore<
-    FixtureProviderCatalogDependency,
->>>;
+pub type DefaultFixtureHarnessService =
+    FixtureService<FixtureLogicManager<FixtureDataStore<FixtureProviderCatalogDependency>>>;
 
 /// Assembles dependency → data → logic → service for the fixture.
 #[must_use]
@@ -33,8 +32,8 @@ mod tests {
     use agentmod_harness_fixture_dependency::{
         FIXTURE_HARNESS_ID, FIXTURE_HARNESS_VERSION, FIXTURE_MODEL, FIXTURE_PROVIDER,
     };
-    use agentmod_harness_protocol::{HarnessCommand, HarnessEvent, ProjectedEntry};
     use agentmod_harness_protocol::CatalogProvider;
+    use agentmod_harness_protocol::{HarnessCommand, HarnessEvent, ProjectedEntry};
 
     use super::*;
 
@@ -88,7 +87,10 @@ mod tests {
             .await
             .expect("provider execution");
         assert!(matches!(events.first(), Some(HarnessEvent::Started)));
-        assert!(matches!(events.last(), Some(HarnessEvent::Completed { .. })));
+        assert!(matches!(
+            events.last(),
+            Some(HarnessEvent::Completed { .. })
+        ));
         assert_eq!(
             events
                 .iter()

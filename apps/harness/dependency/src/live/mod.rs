@@ -23,9 +23,9 @@ use crate::execution::{
     ProviderExecutionDependency, ProviderExecutionDependencyError, validate_runtime_grant,
 };
 use crate::{
-    DependencyCatalogRecord, DependencyError, DependencyProviderRecord,
-    ProviderCatalogDetailDependency, ProviderCatalogDetailResponse, ProviderCatalogDependency,
-    ProviderCatalogProbeRequest, ProviderCatalogProbeResponse,
+    DependencyCatalogRecord, DependencyError, DependencyProviderRecord, ProviderCatalogDependency,
+    ProviderCatalogDetailDependency, ProviderCatalogDetailResponse, ProviderCatalogProbeRequest,
+    ProviderCatalogProbeResponse,
 };
 
 /// Stable live provider adapter IDs.
@@ -189,7 +189,8 @@ pub fn resolve_endpoint_config(
             std::env::var(format!("{env_prefix}_TIMEOUT_MS"))
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
-        }).map_or_else(|| Duration::from_secs(120), Duration::from_millis);
+        })
+        .map_or_else(|| Duration::from_secs(120), Duration::from_millis);
     let pricing = if let Some(raw) = options.get("pricing_json") {
         pricing::PricingTable::parse(raw).unwrap_or_default()
     } else {
@@ -217,7 +218,11 @@ fn resolve_api_key(
     }
     let reference = options
         .get("api_key_ref")
-        .or_else(|| options.get("api_key_env")).map_or_else(|| format!("{env_prefix}_API_KEY"), |value| (*value).to_owned());
+        .or_else(|| options.get("api_key_env"))
+        .map_or_else(
+            || format!("{env_prefix}_API_KEY"),
+            |value| (*value).to_owned(),
+        );
     let value = if let Some(path) = reference.strip_prefix("file:") {
         read_secret_file(path)?
     } else {
@@ -231,9 +236,7 @@ fn resolve_api_key(
     Ok(value)
 }
 
-fn read_secret_file(
-    path: &str,
-) -> Result<Option<String>, ProviderExecutionDependencyError> {
+fn read_secret_file(path: &str) -> Result<Option<String>, ProviderExecutionDependencyError> {
     use std::io::Read as _;
     let mut file = std::fs::File::open(path).map_err(|_| {
         ProviderExecutionDependencyError::InvalidRequest(format!(
@@ -272,10 +275,9 @@ fn endpoint_path(
     model: &str,
 ) -> Result<String, ProviderExecutionDependencyError> {
     match provider_key {
-        PROVIDER_OPENAI
-        | PROVIDER_OPENROUTER
-        | PROVIDER_OPENAI_COMPATIBLE
-        | PROVIDER_LOCAL => Ok("/chat/completions".to_owned()),
+        PROVIDER_OPENAI | PROVIDER_OPENROUTER | PROVIDER_OPENAI_COMPATIBLE | PROVIDER_LOCAL => {
+            Ok("/chat/completions".to_owned())
+        }
         PROVIDER_ANTHROPIC => Ok("/v1/messages".to_owned()),
         PROVIDER_GEMINI => Ok(format!(
             "/v1beta/models/{model}:streamGenerateContent?alt=sse"
@@ -450,7 +452,10 @@ impl ProviderExecutionDependency for LiveProviderCatalogDependency {
         &self,
         request: DependencyProviderExecutionRequest,
     ) -> Result<DependencyProviderExecutionResponse, ProviderExecutionDependencyError> {
-        self.validate_grant(&request.authorization_grant, request.resumed_after_continuation)?;
+        self.validate_grant(
+            &request.authorization_grant,
+            request.resumed_after_continuation,
+        )?;
         if !LIVE_PROVIDER_IDS.contains(&request.provider_key.as_str()) {
             return Err(ProviderExecutionDependencyError::ProviderNotConfigured);
         }
@@ -580,7 +585,8 @@ async fn execute_live(
     config: &ProviderEndpointConfig,
     request: &DependencyProviderExecutionRequest,
     cancellation: CancellationToken,
-) -> Result<DependencyProviderExecutionResponse, ProviderExecutionDependencyError> {    let options: BTreeMap<_, _> = request
+) -> Result<DependencyProviderExecutionResponse, ProviderExecutionDependencyError> {
+    let options: BTreeMap<_, _> = request
         .options
         .iter()
         .map(|option| (option.key.clone(), option.value.clone()))
@@ -666,15 +672,13 @@ async fn execute_live(
             )],
         });
     }
-    let mut events: Vec<DependencyProviderEvent> =
-        vec![DependencyProviderEvent::Started];
+    let mut events: Vec<DependencyProviderEvent> = vec![DependencyProviderEvent::Started];
 
     if !streaming {
         return execute_non_streaming(config, request, response, &options, events).await;
     }
-    let mut normalizer = StreamNormalizer::new(&config.provider_key).map_err(|message| {
-        ProviderExecutionDependencyError::InvalidRequest(message)
-    })?;
+    let mut normalizer = StreamNormalizer::new(&config.provider_key)
+        .map_err(ProviderExecutionDependencyError::InvalidRequest)?;
     let mut event_bytes: usize = 0;
     let mut received_any = false;
     let mut stream_parser = sse::SseParser::new();
@@ -720,12 +724,21 @@ async fn execute_live(
         for sse_event in parsed {
             if sse_event.data == "[DONE]" {
                 // OpenAI-compatible terminal marker; the stream ended normally.
-                return Ok(finish_live_stream(config, request, normalizer, events, event_bytes));
+                return Ok(finish_live_stream(
+                    config,
+                    request,
+                    normalizer,
+                    events,
+                    event_bytes,
+                ));
             }
             if sse_event.data.trim().is_empty() {
                 continue;
             }
-            let value: serde_json::Value = if let Ok(value) = serde_json::from_str(&sse_event.data) { value } else {
+            let value: serde_json::Value = if let Ok(value) = serde_json::from_str(&sse_event.data)
+            {
+                value
+            } else {
                 events.push(failed_event(
                     if received_any {
                         DependencyProviderFailureKind::PartialOutputFailure
@@ -788,7 +801,13 @@ async fn execute_live(
             return Ok(DependencyProviderExecutionResponse { events });
         }
     }
-    Ok(finish_live_stream(config, request, normalizer, events, event_bytes))
+    Ok(finish_live_stream(
+        config,
+        request,
+        normalizer,
+        events,
+        event_bytes,
+    ))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -853,9 +872,8 @@ async fn execute_non_streaming(
             });
         }
     };
-    let mut normalizer = StreamNormalizer::new(&config.provider_key).map_err(|message| {
-        ProviderExecutionDependencyError::InvalidRequest(message)
-    })?;
+    let mut normalizer = StreamNormalizer::new(&config.provider_key)
+        .map_err(ProviderExecutionDependencyError::InvalidRequest)?;
     match config.provider_key.as_str() {
         PROVIDER_OPENAI | PROVIDER_OPENROUTER | PROVIDER_OPENAI_COMPATIBLE | PROVIDER_LOCAL => {
             // Non-stream chat completion: map choices[].message into chunks.
@@ -903,7 +921,9 @@ async fn execute_non_streaming(
     Ok(DependencyProviderExecutionResponse { events })
 }
 
-fn synthesize_openai_non_stream(value: &serde_json::Value) -> Result<Vec<serde_json::Value>, String> {
+fn synthesize_openai_non_stream(
+    value: &serde_json::Value,
+) -> Result<Vec<serde_json::Value>, String> {
     let mut chunks = Vec::new();
     if let Some(usage) = value.get("usage") {
         chunks.push(serde_json::json!({"usage": usage}));
@@ -921,9 +941,13 @@ fn synthesize_openai_non_stream(value: &serde_json::Value) -> Result<Vec<serde_j
         });
         if let Some(message) = choice.get("message") {
             if let Some(content) = message.get("content").and_then(serde_json::Value::as_str) {
-                chunk["choices"][0]["delta"]["content"] = serde_json::Value::String(content.to_owned());
+                chunk["choices"][0]["delta"]["content"] =
+                    serde_json::Value::String(content.to_owned());
             }
-            if let Some(tool_calls) = message.get("tool_calls").and_then(serde_json::Value::as_array) {
+            if let Some(tool_calls) = message
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_array)
+            {
                 let mapped: Vec<serde_json::Value> = tool_calls
                     .iter()
                     .enumerate()
@@ -958,9 +982,15 @@ fn synthesize_anthropic_non_stream(
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| "provider response has no content".to_owned())?;
     for (index, block) in content.iter().enumerate() {
-        let block_type = block.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+        let block_type = block
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
         if block_type == "text" {
-            let text = block.get("text").and_then(serde_json::Value::as_str).unwrap_or("");
+            let text = block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
             events.push((
                 "content_block_start".into(),
                 serde_json::json!({"index": index, "content_block": {"type": "text", "text": ""}}),
@@ -969,7 +999,10 @@ fn synthesize_anthropic_non_stream(
                 "content_block_delta".into(),
                 serde_json::json!({"index": index, "delta": {"type": "text_delta", "text": text}}),
             ));
-            events.push(("content_block_stop".into(), serde_json::json!({"index": index})));
+            events.push((
+                "content_block_stop".into(),
+                serde_json::json!({"index": index}),
+            ));
         } else if block_type == "tool_use" {
             events.push((
                 "content_block_start".into(),
@@ -982,7 +1015,10 @@ fn synthesize_anthropic_non_stream(
                     serde_json::json!({"index": index, "delta": {"type": "input_json_delta", "partial_json": fragment}}),
                 ));
             }
-            events.push(("content_block_stop".into(), serde_json::json!({"index": index})));
+            events.push((
+                "content_block_stop".into(),
+                serde_json::json!({"index": index}),
+            ));
         }
     }
     if let Some(reason) = value.get("stop_reason") {
@@ -1030,7 +1066,10 @@ mod tests {
     fn literal_secret_options_are_rejected() {
         let result = resolve_endpoint_config(
             PROVIDER_OPENAI,
-            &[option("base_url", "http://127.0.0.1:9000/v1"), option("api_key", "sk-literal")],
+            &[
+                option("base_url", "http://127.0.0.1:9000/v1"),
+                option("api_key", "sk-literal"),
+            ],
         );
         assert!(result.is_err());
     }

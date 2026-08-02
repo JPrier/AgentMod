@@ -39,7 +39,10 @@ pub struct ProviderCatalogProbeResponse {
 }
 
 /// Dependency-owned detailed provider/model catalog entry.
-#[allow(clippy::struct_excessive_bools, reason = "capability flags are the record's contract")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "capability flags are the record's contract"
+)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyCatalogRecord {
     /// Adapter-local provider key.
@@ -250,11 +253,7 @@ impl ProviderCatalogDependency for CompositeProviderCatalogDependency {
         request: ProviderCatalogProbeRequest,
     ) -> Result<ProviderCatalogProbeResponse, DependencyError> {
         let mut providers = Vec::new();
-        providers.extend(
-            self.deterministic
-                .probe_catalog(request.clone())?
-                .providers,
-        );
+        providers.extend(self.deterministic.probe_catalog(request.clone())?.providers);
         providers.extend(self.live.probe_catalog(request)?.providers);
         providers.sort_by(|left, right| left.provider_key.cmp(&right.provider_key));
         Ok(ProviderCatalogProbeResponse { providers })
@@ -283,8 +282,10 @@ impl ProviderExecutionDependency for CompositeProviderCatalogDependency {
     async fn execute_provider(
         &self,
         request: crate::execution::DependencyProviderExecutionRequest,
-    ) -> Result<crate::execution::DependencyProviderExecutionResponse, crate::execution::ProviderExecutionDependencyError>
-    {
+    ) -> Result<
+        crate::execution::DependencyProviderExecutionResponse,
+        crate::execution::ProviderExecutionDependencyError,
+    > {
         if request.provider_key == "deterministic-mock" {
             self.deterministic.execute_provider(request).await
         } else {
@@ -341,13 +342,9 @@ impl ProviderCatalogDetailDependency for StaticProviderCatalogDependency {
                 model_ids: vec![String::from("mock-model")],
                 capabilities: provider.capabilities.clone(),
                 context_limit: Some(16_384),
-                tool_support: provider
-                    .capabilities
-                    .contains("tool_calls"),
+                tool_support: provider.capabilities.contains("tool_calls"),
                 image_support: provider.capabilities.contains("images"),
-                structured_output_support: provider
-                    .capabilities
-                    .contains("structured_output"),
+                structured_output_support: provider.capabilities.contains("structured_output"),
                 streaming_support: provider.capabilities.contains("streaming"),
                 pricing_source: String::from("deterministic-fixture"),
                 ready: provider.ready,

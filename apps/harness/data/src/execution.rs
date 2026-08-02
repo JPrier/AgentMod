@@ -267,10 +267,8 @@ pub trait HarnessCancellationData: Send + Sync {
     /// # Errors
     ///
     /// Returns a translated data error without dependency-owned types.
-    async fn cancel(
-        &self,
-        cancellation_reference: &str,
-    ) -> Result<bool, HarnessExecutionDataError>;
+    async fn cancel(&self, cancellation_reference: &str)
+    -> Result<bool, HarnessExecutionDataError>;
 }
 
 #[async_trait]
@@ -431,7 +429,9 @@ const fn map_usage(usage: DependencyUsage) -> DataUsageRecord {
     }
 }
 
-fn map_cost(cost: agentmod_harness_dependency::execution::DependencyCostMetadata) -> DataCostRecord {
+fn map_cost(
+    cost: agentmod_harness_dependency::execution::DependencyCostMetadata,
+) -> DataCostRecord {
     DataCostRecord {
         source: cost.source,
         version: cost.version,
@@ -464,11 +464,15 @@ const fn map_failure_kind(kind: DependencyProviderFailureKind) -> DataProviderFa
         DependencyProviderFailureKind::UnsupportedCapability => {
             DataProviderFailureKind::UnsupportedCapability
         }
-        DependencyProviderFailureKind::TransportFailure => DataProviderFailureKind::TransportFailure,
+        DependencyProviderFailureKind::TransportFailure => {
+            DataProviderFailureKind::TransportFailure
+        }
         DependencyProviderFailureKind::AmbiguousDisconnect => {
             DataProviderFailureKind::AmbiguousDisconnect
         }
-        DependencyProviderFailureKind::UserCancellation => DataProviderFailureKind::UserCancellation,
+        DependencyProviderFailureKind::UserCancellation => {
+            DataProviderFailureKind::UserCancellation
+        }
     }
 }
 

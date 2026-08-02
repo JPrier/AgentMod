@@ -223,7 +223,10 @@ pub struct CostMetadata {
 }
 
 /// Bounded provider/model catalog entry returned by the harness.
-#[allow(clippy::struct_excessive_bools, reason = "capability flags are the catalog contract")]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "capability flags are the catalog contract"
+)]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CatalogProvider {
     /// Stable provider adapter ID.

@@ -6,9 +6,9 @@ use agentmod_harness_logic::HarnessHealthManager;
 use agentmod_harness_service::HarnessService;
 
 /// Fully assembled first-party harness service.
-pub type DefaultHarnessService = HarnessService<HarnessHealthManager<HarnessHealthDataStore<
-    CompositeProviderCatalogDependency,
->>>;
+pub type DefaultHarnessService = HarnessService<
+    HarnessHealthManager<HarnessHealthDataStore<CompositeProviderCatalogDependency>>,
+>;
 
 /// Assembles dependency → data → logic → service for the harness.
 #[must_use]

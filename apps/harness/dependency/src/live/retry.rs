@@ -4,9 +4,7 @@ use std::time::Duration;
 
 use reqwest::header::HeaderMap;
 
-use crate::execution::{
-    DependencyProviderFailureKind, DependencyRetryClassification,
-};
+use crate::execution::{DependencyProviderFailureKind, DependencyRetryClassification};
 
 /// One classified provider failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -235,7 +233,10 @@ mod tests {
     fn classifies_http_statuses_without_leaking_headers() {
         let headers = HeaderMap::new();
         let auth = classify_http_status(reqwest::StatusCode::UNAUTHORIZED, &headers, "");
-        assert_eq!(auth.kind, DependencyProviderFailureKind::AuthenticationFailed);
+        assert_eq!(
+            auth.kind,
+            DependencyProviderFailureKind::AuthenticationFailed
+        );
         assert_eq!(auth.retry, DependencyRetryClassification::Never);
         assert!(!auth.message.contains("Bearer"));
 
@@ -251,9 +252,11 @@ mod tests {
             DependencyRetryClassification::AfterMilliseconds(2_000)
         );
 
-        let overload =
-            classify_http_status(reqwest::StatusCode::SERVICE_UNAVAILABLE, &headers, "");
-        assert_eq!(overload.kind, DependencyProviderFailureKind::ProviderOverloaded);
+        let overload = classify_http_status(reqwest::StatusCode::SERVICE_UNAVAILABLE, &headers, "");
+        assert_eq!(
+            overload.kind,
+            DependencyProviderFailureKind::ProviderOverloaded
+        );
 
         let invalid = classify_http_status(reqwest::StatusCode::BAD_REQUEST, &headers, "");
         assert_eq!(invalid.kind, DependencyProviderFailureKind::InvalidRequest);

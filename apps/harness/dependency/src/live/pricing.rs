@@ -108,12 +108,7 @@ impl PricingTable {
         let models = value.get("models")?.as_object()?;
         let mut records = std::collections::BTreeMap::new();
         for (model, entry) in models {
-            let number = |key: &str| {
-                entry
-                    .get(key)
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-            };
+            let number = |key: &str| entry.get(key).and_then(Value::as_u64).unwrap_or(0);
             records.insert(
                 model.clone(),
                 PricingRecord {

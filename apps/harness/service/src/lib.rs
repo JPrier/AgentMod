@@ -114,12 +114,8 @@ where
                 let request = to_service_request(command)?;
                 self.health(request).map(ServiceResponse::Health)
             }
-            HarnessCommand::Catalog => self
-                .catalog(true)
-                .map(ServiceResponse::Catalog),
-            _ => Err(ServiceError::UnsupportedCommand {
-                command: "execute",
-            }),
+            HarnessCommand::Catalog => self.catalog(true).map(ServiceResponse::Catalog),
+            _ => Err(ServiceError::UnsupportedCommand { command: "execute" }),
         }
     }
 
@@ -146,9 +142,7 @@ fn to_service_request(command: &HarnessCommand) -> Result<ServiceHealthRequest, 
         HarnessCommand::Health => Ok(ServiceHealthRequest {
             required_capabilities: Vec::new(),
         }),
-        _ => Err(ServiceError::UnsupportedCommand {
-            command: "execute",
-        }),
+        _ => Err(ServiceError::UnsupportedCommand { command: "execute" }),
     }
 }
 

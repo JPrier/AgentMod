@@ -3,7 +3,7 @@
 use std::str::FromStr;
 
 use agentmod_harness_fixture_logic::{
-    FixtureCatalogLogic, FixtureCatalogResult, FixtureContinueCommand, FixtureContinuationDecision,
+    FixtureCatalogLogic, FixtureCatalogResult, FixtureContinuationDecision, FixtureContinueCommand,
     FixtureExecuteCommand, FixtureExecutionLogic, FixtureHealthLogic, FixtureLogicEntry,
     FixtureLogicError, FixtureLogicEvent, FixtureLogicOption,
 };
@@ -212,7 +212,10 @@ where
     /// # Errors
     ///
     /// Returns a service-owned error for unsupported commands or failures.
-    #[allow(clippy::unused_async, reason = "the endpoint contract is uniformly async")]
+    #[allow(
+        clippy::unused_async,
+        reason = "the endpoint contract is uniformly async"
+    )]
     pub async fn handle_wire_command(
         &self,
         command: &HarnessCommand,
@@ -288,12 +291,12 @@ where
                         .collect(),
                 )
             }
-            HarnessContinuationDecision::Reject { reason } => {
-                FixtureContinuationDecision::Reject { reason: reason.clone() }
-            }
-            HarnessContinuationDecision::Cancel { reason } => {
-                FixtureContinuationDecision::Cancel { reason: reason.clone() }
-            }
+            HarnessContinuationDecision::Reject { reason } => FixtureContinuationDecision::Reject {
+                reason: reason.clone(),
+            },
+            HarnessContinuationDecision::Cancel { reason } => FixtureContinuationDecision::Cancel {
+                reason: reason.clone(),
+            },
         };
         let result = self
             .logic
@@ -311,10 +314,7 @@ where
     /// # Errors
     ///
     /// Returns a service-owned error for failures.
-    pub async fn cancel_wire(
-        &self,
-        command: &HarnessCommand,
-    ) -> Result<bool, FixtureServiceError> {
+    pub async fn cancel_wire(&self, command: &HarnessCommand) -> Result<bool, FixtureServiceError> {
         let HarnessCommand::Cancel { cancellation_id } = command else {
             return Err(FixtureServiceError::WrongCommand("cancel"));
         };
@@ -369,9 +369,7 @@ fn from_wire_command(
     })
 }
 
-fn from_wire_entry(
-    entry: &ProjectedEntry,
-) -> Result<FixtureServiceEntry, FixtureServiceError> {
+fn from_wire_entry(entry: &ProjectedEntry) -> Result<FixtureServiceEntry, FixtureServiceError> {
     Ok(match entry {
         ProjectedEntry::System { text } => FixtureServiceEntry::System(text.clone()),
         ProjectedEntry::User { text } => FixtureServiceEntry::User(text.clone()),
@@ -574,7 +572,9 @@ fn map_logic_error(error: &FixtureLogicError) -> FixtureServiceError {
 mod tests {
     use std::sync::Mutex;
 
-    use agentmod_harness_fixture_logic::{FixtureExecuteResult, FixtureHealthResult, FixtureLogicUsage};
+    use agentmod_harness_fixture_logic::{
+        FixtureExecuteResult, FixtureHealthResult, FixtureLogicUsage,
+    };
 
     use super::*;
 
@@ -615,10 +615,7 @@ mod tests {
             })
         }
 
-        async fn cancel_provider(
-            &self,
-            _reference: &str,
-        ) -> Result<bool, FixtureLogicError> {
+        async fn cancel_provider(&self, _reference: &str) -> Result<bool, FixtureLogicError> {
             Ok(false)
         }
     }

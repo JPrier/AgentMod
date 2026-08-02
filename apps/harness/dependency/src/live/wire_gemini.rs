@@ -4,9 +4,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::execution::{
-    DependencyConversationEntry, DependencyProviderEvent, DependencyUsage,
-};
+use crate::execution::{DependencyConversationEntry, DependencyProviderEvent, DependencyUsage};
 
 /// Normalizes Gemini `streamGenerateContent` chunks into provider events.
 #[derive(Clone, Debug, Default)]
@@ -52,10 +50,11 @@ impl GeminiStreamNormalizer {
             };
             for part in parts {
                 if let Some(text) = part.get("text").and_then(Value::as_str)
-                    && !text.is_empty() {
-                        self.started = true;
-                        events.push(DependencyProviderEvent::TextDelta(text.to_owned()));
-                    }
+                    && !text.is_empty()
+                {
+                    self.started = true;
+                    events.push(DependencyProviderEvent::TextDelta(text.to_owned()));
+                }
                 if let Some(call) = part.get("functionCall") {
                     let name = call.get("name").and_then(Value::as_str).unwrap_or("");
                     let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
@@ -156,16 +155,10 @@ pub fn build_request_body(
     }
     let mut generation = serde_json::Map::new();
     if let Some(value) = options.get("temperature") {
-        generation.insert(
-            "temperature".into(),
-            parse_f64(value, "temperature")?,
-        );
+        generation.insert("temperature".into(), parse_f64(value, "temperature")?);
     }
     if let Some(value) = options.get("max_tokens") {
-        generation.insert(
-            "maxOutputTokens".into(),
-            parse_u64(value, "max_tokens")?,
-        );
+        generation.insert("maxOutputTokens".into(), parse_u64(value, "max_tokens")?);
     }
     if let Some(value) = options.get("top_p") {
         generation.insert("topP".into(), parse_f64(value, "top_p")?);
@@ -177,20 +170,24 @@ pub fn build_request_body(
         let parsed = parse_json(value, "response_format")?;
         if parsed.get("type").and_then(Value::as_str) == Some("json_schema") {
             if let Some(schema) = parsed.get("json_schema") {
-                generation.insert("responseMimeType".into(), Value::String("application/json".into()));
+                generation.insert(
+                    "responseMimeType".into(),
+                    Value::String("application/json".into()),
+                );
                 generation.insert("responseSchema".into(), schema.clone());
             }
         } else if parsed.get("type").and_then(Value::as_str) == Some("json_object") {
-            generation.insert("responseMimeType".into(), Value::String("application/json".into()));
+            generation.insert(
+                "responseMimeType".into(),
+                Value::String("application/json".into()),
+            );
         }
     }
     if let Some(value) = options.get("thinking")
-        && value == "enabled" {
-            generation.insert(
-                "thinkingConfig".into(),
-                json!({"includeThoughts": false}),
-            );
-        }
+        && value == "enabled"
+    {
+        generation.insert("thinkingConfig".into(), json!({"includeThoughts": false}));
+    }
     if !generation.is_empty() {
         body["generationConfig"] = Value::Object(generation);
     }
@@ -227,9 +224,7 @@ fn build_contents(entries: &[DependencyConversationEntry]) -> Result<Vec<Value>,
     for entry in entries {
         let (role, part) = match entry {
             DependencyConversationEntry::System(_) => continue,
-            DependencyConversationEntry::User(text) => {
-                ("user", json!({"text": text}))
-            }
+            DependencyConversationEntry::User(text) => ("user", json!({"text": text})),
             DependencyConversationEntry::Image {
                 media_type,
                 data_base64,
@@ -237,9 +232,7 @@ fn build_contents(entries: &[DependencyConversationEntry]) -> Result<Vec<Value>,
                 "user",
                 json!({"inline_data": {"mime_type": media_type, "data": data_base64}}),
             ),
-            DependencyConversationEntry::Assistant(text) => {
-                ("model", json!({"text": text}))
-            }
+            DependencyConversationEntry::Assistant(text) => ("model", json!({"text": text})),
             DependencyConversationEntry::ToolCall {
                 call_id: _,
                 tool,
@@ -291,15 +284,15 @@ fn build_contents(entries: &[DependencyConversationEntry]) -> Result<Vec<Value>,
         };
         if let Some(previous) = contents.last_mut()
             && previous.get("role").and_then(Value::as_str) == Some(role)
-                && role != "function"
-                && previous.get("role").and_then(Value::as_str) != Some("function")
-            {
-                previous["parts"]
-                    .as_array_mut()
-                    .expect("parts are an array")
-                    .push(part);
-                continue;
-            }
+            && role != "function"
+            && previous.get("role").and_then(Value::as_str) != Some("function")
+        {
+            previous["parts"]
+                .as_array_mut()
+                .expect("parts are an array")
+                .push(part);
+            continue;
+        }
         contents.push(json!({"role": role, "parts": [part]}));
     }
     if contents.is_empty() || contents.len() > 256 {
@@ -309,7 +302,8 @@ fn build_contents(entries: &[DependencyConversationEntry]) -> Result<Vec<Value>,
 }
 
 fn parse_json(value: &str, key: &str) -> Result<Value, String> {
-    serde_json::from_str(value).map_err(|error| format!("option `{key}` is not valid JSON: {error}"))
+    serde_json::from_str(value)
+        .map_err(|error| format!("option `{key}` is not valid JSON: {error}"))
 }
 
 fn parse_f64(value: &str, key: &str) -> Result<Value, String> {
@@ -355,7 +349,10 @@ mod tests {
                 }))
                 .expect("chunk"),
         );
-        assert_eq!(events[0], DependencyProviderEvent::TextDelta("hello".into()));
+        assert_eq!(
+            events[0],
+            DependencyProviderEvent::TextDelta("hello".into())
+        );
         assert!(matches!(
             events.last(),
             Some(DependencyProviderEvent::ToolCallProposed {
@@ -379,20 +376,30 @@ mod tests {
             "tools".into(),
             r#"[{"function":{"name":"read_file","parameters":{"type":"object"}}}]"#.into(),
         );
-        options.insert("response_format".into(), r#"{"type":"json_schema","json_schema":{"type":"object"}}"#.into());
+        options.insert(
+            "response_format".into(),
+            r#"{"type":"json_schema","json_schema":{"type":"object"}}"#.into(),
+        );
         let body = build_request_body(
             "gemini-2.0-flash",
-            &[
-                DependencyConversationEntry::Image {
-                    media_type: "image/png".into(),
-                    data_base64: "aGVsbG8=".into(),
-                },
-            ],
+            &[DependencyConversationEntry::Image {
+                media_type: "image/png".into(),
+                data_base64: "aGVsbG8=".into(),
+            }],
             &options,
         )
         .expect("request body");
-        assert_eq!(body["contents"][0]["parts"][0]["inline_data"]["data"], "aGVsbG8=");
-        assert_eq!(body["tools"][0]["functionDeclarations"][0]["name"], "read_file");
-        assert_eq!(body["generationConfig"]["responseMimeType"], "application/json");
+        assert_eq!(
+            body["contents"][0]["parts"][0]["inline_data"]["data"],
+            "aGVsbG8="
+        );
+        assert_eq!(
+            body["tools"][0]["functionDeclarations"][0]["name"],
+            "read_file"
+        );
+        assert_eq!(
+            body["generationConfig"]["responseMimeType"],
+            "application/json"
+        );
     }
 }

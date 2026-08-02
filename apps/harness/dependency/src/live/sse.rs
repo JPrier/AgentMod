@@ -119,7 +119,10 @@ impl SseParser {
             return Ok(());
         }
         let Some((field, value)) = line.iter().position(|&byte| byte == b':').map(|index| {
-            (&line[..index], value_with_optional_space(&line[index + 1..]))
+            (
+                &line[..index],
+                value_with_optional_space(&line[index + 1..]),
+            )
         }) else {
             // Unknown field without a colon; tolerated as malformed.
             return Ok(());
@@ -196,9 +199,7 @@ mod tests {
     fn parses_multiline_data_and_events() {
         let mut parser = SseParser::new();
         let events = parser
-            .push(
-                b": keepalive\nid: 7\nevent: delta\ndata: {\"a\":\ndata: 1}\n\n",
-            )
+            .push(b": keepalive\nid: 7\nevent: delta\ndata: {\"a\":\ndata: 1}\n\n")
             .expect("parse");
         assert_eq!(
             events,
@@ -259,7 +260,9 @@ mod tests {
     fn oversized_line_fails_closed() {
         let mut parser = SseParser::with_bounds(8, 64);
         assert_eq!(
-            parser.push(b"data: way-too-long-line").expect_err("oversized"),
+            parser
+                .push(b"data: way-too-long-line")
+                .expect_err("oversized"),
             SseParseError::Oversized
         );
     }

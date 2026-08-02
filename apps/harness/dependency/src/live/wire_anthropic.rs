@@ -4,9 +4,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use crate::execution::{
-    DependencyConversationEntry, DependencyProviderEvent, DependencyUsage,
-};
+use crate::execution::{DependencyConversationEntry, DependencyProviderEvent, DependencyUsage};
 
 /// Accumulated Anthropic content-block tool call.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -53,8 +51,15 @@ impl AnthropicStreamNormalizer {
     /// # Errors
     ///
     /// Returns a redacted diagnostic when an event cannot be normalized.
-    #[allow(clippy::too_many_lines, reason = "the event matrix is intentionally explicit for auditability")]
-    pub fn handle(&mut self, event_type: &str, payload: &Value) -> Result<Vec<DependencyProviderEvent>, String> {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the event matrix is intentionally explicit for auditability"
+    )]
+    pub fn handle(
+        &mut self,
+        event_type: &str,
+        payload: &Value,
+    ) -> Result<Vec<DependencyProviderEvent>, String> {
         let mut events = Vec::new();
         match event_type {
             "message_start" => {
@@ -66,80 +71,81 @@ impl AnthropicStreamNormalizer {
                 }
             }
             "content_block_start" => {
-                let index = usize::try_from(payload.get("index").and_then(Value::as_u64).unwrap_or(0))
-                    .unwrap_or(0);
+                let index =
+                    usize::try_from(payload.get("index").and_then(Value::as_u64).unwrap_or(0))
+                        .unwrap_or(0);
                 if let Some(block) = payload.get("content_block")
-                    && block.get("type").and_then(Value::as_str) == Some("tool_use") {
-                        let buffer = self
-                            .tool_blocks
-                            .entry(index)
-                            .or_default();
-                        if let Some(id) = block.get("id").and_then(Value::as_str) {
-                            id.clone_into(&mut buffer.call_id);
-                        }
-                        if let Some(name) = block.get("name").and_then(Value::as_str) {
-                            name.clone_into(&mut buffer.name);
-                        }
+                    && block.get("type").and_then(Value::as_str) == Some("tool_use")
+                {
+                    let buffer = self.tool_blocks.entry(index).or_default();
+                    if let Some(id) = block.get("id").and_then(Value::as_str) {
+                        id.clone_into(&mut buffer.call_id);
                     }
+                    if let Some(name) = block.get("name").and_then(Value::as_str) {
+                        name.clone_into(&mut buffer.name);
+                    }
+                }
             }
             "content_block_delta" => {
-                let index = usize::try_from(payload.get("index").and_then(Value::as_u64).unwrap_or(0))
-                    .unwrap_or(0);
+                let index =
+                    usize::try_from(payload.get("index").and_then(Value::as_u64).unwrap_or(0))
+                        .unwrap_or(0);
                 if let Some(delta) = payload.get("delta") {
                     // Reasoning deltas are never surfaced as visible text.
                     match delta.get("type").and_then(Value::as_str) {
                         Some("text_delta") => {
                             if let Some(text) = delta.get("text").and_then(Value::as_str)
-                                && !text.is_empty() {
-                                    self.started = true;
-                                    events.push(DependencyProviderEvent::TextDelta(text.to_owned()));
-                                }
+                                && !text.is_empty()
+                            {
+                                self.started = true;
+                                events.push(DependencyProviderEvent::TextDelta(text.to_owned()));
+                            }
                         }
                         Some("input_json_delta") => {
                             if let Some(fragment) =
                                 delta.get("partial_json").and_then(Value::as_str)
-                                && !fragment.is_empty() {
-                                    self.started = true;
-                                    let buffer = self
-                                        .tool_blocks
-                                        .entry(index)
-                                        .or_default();
-                                    buffer.arguments.push_str(fragment);
-                                    events.push(DependencyProviderEvent::ToolCallDelta {
-                                        call_id: if buffer.call_id.is_empty() {
-                                            format!("tool-call-{index}")
-                                        } else {
-                                            buffer.call_id.clone()
-                                        },
-                                        name_fragment: String::new(),
-                                        arguments_fragment: fragment.to_owned(),
-                                    });
-                                }
+                                && !fragment.is_empty()
+                            {
+                                self.started = true;
+                                let buffer = self.tool_blocks.entry(index).or_default();
+                                buffer.arguments.push_str(fragment);
+                                events.push(DependencyProviderEvent::ToolCallDelta {
+                                    call_id: if buffer.call_id.is_empty() {
+                                        format!("tool-call-{index}")
+                                    } else {
+                                        buffer.call_id.clone()
+                                    },
+                                    name_fragment: String::new(),
+                                    arguments_fragment: fragment.to_owned(),
+                                });
+                            }
                         }
                         _ => {}
                     }
                 }
             }
             "content_block_stop" => {
-                let index = usize::try_from(payload.get("index").and_then(Value::as_u64).unwrap_or(0))
-                    .unwrap_or(0);
+                let index =
+                    usize::try_from(payload.get("index").and_then(Value::as_u64).unwrap_or(0))
+                        .unwrap_or(0);
                 if let Some(buffer) = self.tool_blocks.get(&index)
-                    && (!buffer.name.is_empty() || !buffer.arguments.is_empty()) {
-                        events.push(DependencyProviderEvent::ToolCallProposed {
-                            continuation_reference: buffer.call_id.clone(),
-                            call_id: if buffer.call_id.is_empty() {
-                                format!("tool-call-{index}")
-                            } else {
-                                buffer.call_id.clone()
-                            },
-                            tool: buffer.name.clone(),
-                            arguments_json: if buffer.arguments.is_empty() {
-                                "{}".to_owned()
-                            } else {
-                                buffer.arguments.clone()
-                            },
-                        });
-                    }
+                    && (!buffer.name.is_empty() || !buffer.arguments.is_empty())
+                {
+                    events.push(DependencyProviderEvent::ToolCallProposed {
+                        continuation_reference: buffer.call_id.clone(),
+                        call_id: if buffer.call_id.is_empty() {
+                            format!("tool-call-{index}")
+                        } else {
+                            buffer.call_id.clone()
+                        },
+                        tool: buffer.name.clone(),
+                        arguments_json: if buffer.arguments.is_empty() {
+                            "{}".to_owned()
+                        } else {
+                            buffer.arguments.clone()
+                        },
+                    });
+                }
             }
             "message_delta" => {
                 if let Some(reason) = payload
@@ -217,7 +223,10 @@ fn merge_usage(current: DependencyUsage, incoming: DependencyUsage) -> Dependenc
 /// # Errors
 ///
 /// Returns a redacted diagnostic when options are malformed or bounds exceeded.
-#[allow(clippy::too_many_lines, reason = "the message builder maps every projection kind explicitly")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the message builder maps every projection kind explicitly"
+)]
 pub fn build_request_body(
     model: &str,
     entries: &[DependencyConversationEntry],
@@ -241,7 +250,12 @@ pub fn build_request_body(
         "stream": true,
     });
     if !system.is_empty() {
-        body["system"] = Value::Array(system.into_iter().map(|text| json!({"type": "text", "text": text})).collect());
+        body["system"] = Value::Array(
+            system
+                .into_iter()
+                .map(|text| json!({"type": "text", "text": text}))
+                .collect(),
+        );
     }
     if let Some(value) = options.get("temperature") {
         body["temperature"] = parse_f64(value, "temperature")?;
@@ -264,7 +278,10 @@ pub fn build_request_body(
     Ok(body)
 }
 
-#[allow(clippy::too_many_lines, reason = "the message builder maps every projection kind explicitly")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the message builder maps every projection kind explicitly"
+)]
 fn build_messages(entries: &[DependencyConversationEntry]) -> Result<Vec<Value>, String> {
     let mut messages: Vec<Value> = Vec::new();
     let mut pending_tool_blocks: Vec<Value> = Vec::new();
@@ -272,9 +289,10 @@ fn build_messages(entries: &[DependencyConversationEntry]) -> Result<Vec<Value>,
     for entry in entries {
         let (role, content) = match entry {
             DependencyConversationEntry::System(_) => continue,
-            DependencyConversationEntry::User(text) => {
-                ("user".to_owned(), vec![json!({"type": "text", "text": text})])
-            }
+            DependencyConversationEntry::User(text) => (
+                "user".to_owned(),
+                vec![json!({"type": "text", "text": text})],
+            ),
             DependencyConversationEntry::Image {
                 media_type,
                 data_base64,
@@ -389,7 +407,8 @@ fn flush_message(
 }
 
 fn parse_json(value: &str, key: &str) -> Result<Value, String> {
-    serde_json::from_str(value).map_err(|error| format!("option `{key}` is not valid JSON: {error}"))
+    serde_json::from_str(value)
+        .map_err(|error| format!("option `{key}` is not valid JSON: {error}"))
 }
 
 fn parse_f64(value: &str, key: &str) -> Result<Value, String> {
@@ -495,13 +514,7 @@ mod tests {
         .expect("request body");
         assert_eq!(body["system"][0]["text"], "you are helpful");
         assert_eq!(body["messages"][0]["content"][0]["type"], "image");
-        assert_eq!(
-            body["messages"][1]["content"][0]["type"],
-            "tool_use"
-        );
-        assert_eq!(
-            body["messages"][2]["content"][0]["type"],
-            "tool_result"
-        );
+        assert_eq!(body["messages"][1]["content"][0]["type"], "tool_use");
+        assert_eq!(body["messages"][2]["content"][0]["type"], "tool_result");
     }
 }

@@ -378,8 +378,7 @@ where
         let HarnessCommand::Cancel { cancellation_id } = command else {
             return Err(ExecutionServiceError::WrongCommand);
         };
-        self.cancel_execution(&cancellation_id.to_string())
-            .await
+        self.cancel_execution(&cancellation_id.to_string()).await
     }
 
     /// Executes a service-owned cancellation request.

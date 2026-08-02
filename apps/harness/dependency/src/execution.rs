@@ -1037,7 +1037,8 @@ mod tests {
             "disconnected",
         ] {
             let response = dependency
-                .execute_provider(request(scenario)).await
+                .execute_provider(request(scenario))
+                .await
                 .expect("documented scenario");
             assert!(matches!(
                 response.events.first(),
@@ -1050,7 +1051,10 @@ mod tests {
     #[tokio::test]
     async fn usage_retry_tool_calls_and_cancellation_are_normalized() {
         let dependency = StaticProviderCatalogDependency::built_in();
-        let text = dependency.execute_provider(request("text")).await.expect("text");
+        let text = dependency
+            .execute_provider(request("text"))
+            .await
+            .expect("text");
         assert!(matches!(
             text.events.last(),
             Some(DependencyProviderEvent::Completed {
@@ -1062,7 +1066,8 @@ mod tests {
             })
         ));
         let tools = dependency
-            .execute_provider(request("multiple_tool_calls")).await
+            .execute_provider(request("multiple_tool_calls"))
+            .await
             .expect("tools");
         assert_eq!(
             tools
@@ -1073,7 +1078,8 @@ mod tests {
             2
         );
         let rate_limit = dependency
-            .execute_provider(request("rate_limit")).await
+            .execute_provider(request("rate_limit"))
+            .await
             .expect("rate limit");
         assert!(matches!(
             rate_limit.events.last(),
@@ -1083,7 +1089,8 @@ mod tests {
             })
         ));
         let cancelled = dependency
-            .execute_provider(request("cancelled")).await
+            .execute_provider(request("cancelled"))
+            .await
             .expect("cancelled");
         assert_eq!(
             cancelled.events.last(),
@@ -1105,7 +1112,10 @@ mod tests {
                 value: String::from("0"),
             },
         ]);
-        let plan = dependency.execute_provider(plan).await.expect("planner response");
+        let plan = dependency
+            .execute_provider(plan)
+            .await
+            .expect("planner response");
         assert!(plan.events.iter().any(|event| matches!(
             event,
             DependencyProviderEvent::TextDelta(text)
@@ -1121,7 +1131,8 @@ mod tests {
             ),
         }];
         let worker = dependency
-            .execute_provider(worker).await
+            .execute_provider(worker)
+            .await
             .expect("worker response");
         assert!(worker.events.iter().any(|event| matches!(
             event,
@@ -1142,7 +1153,8 @@ mod tests {
             },
         ]);
         let rejected = dependency
-            .execute_provider(rejected).await
+            .execute_provider(rejected)
+            .await
             .expect("reject once response");
         assert!(rejected.events.iter().any(|event| matches!(
             event,
@@ -1156,15 +1168,18 @@ mod tests {
     async fn provider_continuations_are_stable_within_and_unique_across_requests() {
         let dependency = StaticProviderCatalogDependency::built_in();
         let first = dependency
-            .execute_provider(request("approval_multi")).await
+            .execute_provider(request("approval_multi"))
+            .await
             .expect("first request");
         let repeated = dependency
-            .execute_provider(request("approval_multi")).await
+            .execute_provider(request("approval_multi"))
+            .await
             .expect("repeated request identity");
         let mut second_request = request("approval_multi");
         second_request.cancellation_reference = "cancel-2".into();
         let second = dependency
-            .execute_provider(second_request).await
+            .execute_provider(second_request)
+            .await
             .expect("second request");
         let continuations = |response: &DependencyProviderExecutionResponse| {
             response
@@ -1219,7 +1234,8 @@ mod tests {
     async fn process_action_fixture_is_constrained_and_normalizes_json_arguments() {
         let dependency = StaticProviderCatalogDependency::built_in();
         let response = dependency
-            .execute_provider(request("process_action")).await
+            .execute_provider(request("process_action"))
+            .await
             .expect("valid process action");
         assert!(response.events.iter().any(|event| matches!(
             event,
@@ -1267,7 +1283,8 @@ mod tests {
             value: STANDARD.encode(br#"{"process_id":"process-1"}"#),
         });
         let response = dependency
-            .execute_provider(value).await
+            .execute_provider(value)
+            .await
             .expect("base64 arguments");
         assert!(response.events.iter().any(|event| matches!(
             event,
@@ -1297,7 +1314,8 @@ mod tests {
         let mut first = request("text");
         first.authorization_grant = signed_grant(&key, uuid::Uuid::from_u128(101));
         dependency
-            .execute_provider(first.clone()).await
+            .execute_provider(first.clone())
+            .await
             .expect("first authorized request");
         assert!(
             dependency.execute_provider(first).await.is_err(),
@@ -1323,13 +1341,15 @@ mod tests {
         let mut initial = request("text");
         initial.authorization_grant = grant.clone();
         dependency
-            .execute_provider(initial).await
+            .execute_provider(initial)
+            .await
             .expect("initial authorized request");
         let mut resumed = request("text");
         resumed.authorization_grant = grant;
         resumed.resumed_after_continuation = true;
         dependency
-            .execute_provider(resumed).await
+            .execute_provider(resumed)
+            .await
             .expect("explicit continuation use");
     }
 }

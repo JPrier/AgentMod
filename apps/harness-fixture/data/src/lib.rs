@@ -178,7 +178,8 @@ pub trait FixtureExecutionData: Send + Sync {
     /// # Errors
     ///
     /// Returns a translated data error.
-    async fn execute(&self, query: FixtureDataQuery) -> Result<FixtureDataRecord, FixtureDataError>;
+    async fn execute(&self, query: FixtureDataQuery)
+    -> Result<FixtureDataRecord, FixtureDataError>;
 }
 
 /// Data-owned cancellation interface.
@@ -231,7 +232,10 @@ impl<D> FixtureExecutionData for FixtureDataStore<D>
 where
     D: FixtureProviderExecution,
 {
-    async fn execute(&self, query: FixtureDataQuery) -> Result<FixtureDataRecord, FixtureDataError> {
+    async fn execute(
+        &self,
+        query: FixtureDataQuery,
+    ) -> Result<FixtureDataRecord, FixtureDataError> {
         let response = self
             .dependency
             .execute(to_dependency_request(query))
@@ -411,8 +415,10 @@ mod tests {
         async fn execute(
             &self,
             request: FixtureExecutionRequest,
-        ) -> Result<FixtureExecutionResponse, agentmod_harness_fixture_dependency::FixtureExecutionError>
-        {
+        ) -> Result<
+            FixtureExecutionResponse,
+            agentmod_harness_fixture_dependency::FixtureExecutionError,
+        > {
             self.requests
                 .lock()
                 .expect("request lock is not poisoned")

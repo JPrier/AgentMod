@@ -37,7 +37,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             Frame::Bytes(bytes) => bytes,
         };
-        let command: HarnessCommand = if let Ok(command) = serde_json::from_slice(&frame) { command } else {
+        let command: HarnessCommand = if let Ok(command) = serde_json::from_slice(&frame) {
+            command
+        } else {
             write_replies(&output, vec![failed("invalid_json")]).await?;
             continue;
         };
@@ -70,8 +72,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         Ok(events) => incremental_replies(events),
                         Err(error) => vec![failed_with("execution_failed", &error.to_string())],
                     };
-                    if write_replies(&output, replies).await.is_err() {
-                    }
+                    if write_replies(&output, replies).await.is_err() {}
                 });
             }
             command @ HarnessCommand::Continue { .. } => {
@@ -82,8 +83,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         Ok(events) => incremental_replies(events),
                         Err(_) => vec![failed("continuation_failed")],
                     };
-                    if write_replies(&output, replies).await.is_err() {
-                    }
+                    if write_replies(&output, replies).await.is_err() {}
                 });
             }
             HarnessCommand::Cancel { cancellation_id } => {

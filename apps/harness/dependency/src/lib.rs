@@ -1,6 +1,7 @@
 //! External dependency contracts and implementations for the native harness.
 
 pub mod execution;
+pub mod live;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -34,6 +35,44 @@ pub struct ProviderCatalogProbeResponse {
     pub providers: Vec<DependencyProviderRecord>,
 }
 
+/// Dependency-owned detailed provider/model catalog entry.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "capability flags are the record's contract"
+)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DependencyCatalogRecord {
+    /// Adapter-local provider key.
+    pub provider_key: String,
+    /// Adapter version.
+    pub version: String,
+    /// Discoverable model IDs in stable order.
+    pub model_ids: Vec<String>,
+    /// Provider features discovered by the adapter.
+    pub capabilities: BTreeSet<String>,
+    /// Known context limit in tokens.
+    pub context_limit: Option<u64>,
+    /// Tool-call support.
+    pub tool_support: bool,
+    /// Image input support.
+    pub image_support: bool,
+    /// Structured-output support.
+    pub structured_output_support: bool,
+    /// Streaming support.
+    pub streaming_support: bool,
+    /// Pricing-record source.
+    pub pricing_source: String,
+    /// Whether the provider adapter can accept work now.
+    pub ready: bool,
+}
+
+/// Dependency-owned response from a detailed provider catalog probe.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderCatalogDetailResponse {
+    /// Detailed entries in deterministic key order.
+    pub providers: Vec<DependencyCatalogRecord>,
+}
+
 /// Failure reported by a provider-catalog adapter.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum DependencyError {
@@ -59,6 +98,19 @@ pub trait ProviderCatalogDependency {
         &self,
         request: ProviderCatalogProbeRequest,
     ) -> Result<ProviderCatalogProbeResponse, DependencyError>;
+}
+
+/// External dependency used to inspect detailed provider/model capability.
+pub trait ProviderCatalogDetailDependency {
+    /// Reads the detailed bounded provider/model catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DependencyError`] when the external catalog cannot be read.
+    fn probe_catalog_details(
+        &self,
+        request: ProviderCatalogProbeRequest,
+    ) -> Result<ProviderCatalogDetailResponse, DependencyError>;
 }
 
 /// Deterministic built-in catalog used for local health checks and tests.
@@ -162,6 +214,137 @@ impl ProviderCatalogDependency for StaticProviderCatalogDependency {
             .collect();
         providers.sort_by(|left, right| left.provider_key.cmp(&right.provider_key));
         Ok(ProviderCatalogProbeResponse { providers })
+    }
+}
+
+impl ProviderCatalogDetailDependency for StaticProviderCatalogDependency {
+    fn probe_catalog_details(
+        &self,
+        request: ProviderCatalogProbeRequest,
+    ) -> Result<ProviderCatalogDetailResponse, DependencyError> {
+        let providers = self
+            .providers
+            .iter()
+            .filter(|provider| request.include_unavailable || provider.ready)
+            .map(|provider| DependencyCatalogRecord {
+                provider_key: provider.provider_key.clone(),
+                version: String::from("1.0.0"),
+                model_ids: vec![String::from("mock-model")],
+                capabilities: provider.capabilities.clone(),
+                context_limit: Some(64_000),
+                tool_support: provider.capabilities.contains("tool_calls"),
+                image_support: false,
+                structured_output_support: false,
+                streaming_support: provider.capabilities.contains("streaming"),
+                pricing_source: String::from("deterministic-mock"),
+                ready: provider.ready,
+            })
+            .collect();
+        Ok(ProviderCatalogDetailResponse { providers })
+    }
+}
+
+/// Composite catalog routing deterministic mock and live adapters.
+///
+/// The deterministic mock remains credential-free and always ready; live
+/// providers are routed to the live adapter catalog and are ready only when
+/// configured through the environment or approved options.
+#[derive(Clone, Debug)]
+pub struct CompositeProviderCatalogDependency {
+    deterministic: StaticProviderCatalogDependency,
+    live: live::LiveProviderCatalogDependency,
+}
+
+impl Default for CompositeProviderCatalogDependency {
+    fn default() -> Self {
+        Self::development()
+    }
+}
+
+impl CompositeProviderCatalogDependency {
+    /// Creates the composite catalog in development grant mode.
+    #[must_use]
+    pub fn development() -> Self {
+        Self {
+            deterministic: StaticProviderCatalogDependency::built_in(),
+            live: live::LiveProviderCatalogDependency::development(),
+        }
+    }
+
+    /// Creates the composite catalog with mandatory keyed grant validation.
+    #[must_use]
+    pub fn secure(authorization_key: [u8; 32]) -> Self {
+        Self {
+            deterministic: StaticProviderCatalogDependency::secure(authorization_key),
+            live: live::LiveProviderCatalogDependency::secure(authorization_key),
+        }
+    }
+
+    /// The deterministic mock provider key.
+    #[must_use]
+    pub const fn deterministic_provider_key(&self) -> &'static str {
+        "deterministic-mock"
+    }
+}
+
+impl ProviderCatalogDependency for CompositeProviderCatalogDependency {
+    fn probe_catalog(
+        &self,
+        request: ProviderCatalogProbeRequest,
+    ) -> Result<ProviderCatalogProbeResponse, DependencyError> {
+        let mut providers = Vec::new();
+        providers.extend(self.deterministic.probe_catalog(request.clone())?.providers);
+        providers.extend(self.live.probe_catalog(request)?.providers);
+        providers.sort_by(|left, right| left.provider_key.cmp(&right.provider_key));
+        Ok(ProviderCatalogProbeResponse { providers })
+    }
+}
+
+impl ProviderCatalogDetailDependency for CompositeProviderCatalogDependency {
+    fn probe_catalog_details(
+        &self,
+        request: ProviderCatalogProbeRequest,
+    ) -> Result<ProviderCatalogDetailResponse, DependencyError> {
+        let mut providers = Vec::new();
+        providers.extend(
+            self.deterministic
+                .probe_catalog_details(request.clone())?
+                .providers,
+        );
+        providers.extend(self.live.probe_catalog_details(request)?.providers);
+        providers.sort_by(|left, right| left.provider_key.cmp(&right.provider_key));
+        Ok(ProviderCatalogDetailResponse { providers })
+    }
+}
+
+impl execution::ProviderExecutionDependency for CompositeProviderCatalogDependency {
+    fn execute_provider(
+        &self,
+        request: execution::DependencyProviderExecutionRequest,
+    ) -> Result<
+        execution::DependencyProviderExecutionResponse,
+        execution::ProviderExecutionDependencyError,
+    > {
+        if request.provider_key == "deterministic-mock" {
+            self.deterministic.execute_provider(request)
+        } else {
+            self.live.execute_provider(request)
+        }
+    }
+}
+
+impl execution::ProviderCancellationDependency for CompositeProviderCatalogDependency {
+    fn cancel_provider(
+        &self,
+        cancellation_reference: &str,
+    ) -> Result<bool, execution::ProviderExecutionDependencyError> {
+        if self
+            .deterministic
+            .cancel_provider(cancellation_reference)?
+        {
+            return Ok(true);
+        }
+        self.live.cancel_provider(cancellation_reference)
     }
 }
 

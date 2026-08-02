@@ -71,6 +71,9 @@ pub enum ServiceProviderEvent {
         reason: String,
         input_tokens: u64,
         output_tokens: u64,
+        reasoning_tokens: u64,
+        estimated: bool,
+        cost_micros: u64,
     },
     Cancelled,
     Failed {
@@ -79,6 +82,8 @@ pub enum ServiceProviderEvent {
         retryable: bool,
     },
 }
+
+/// Harness provider result event carried back through runtime service.
 #[async_trait]
 pub trait ProviderServicePort: Send + Sync {
     async fn execute(
@@ -223,10 +228,16 @@ fn map_event(v: logic::ProviderEvent) -> ServiceProviderEvent {
             reason,
             input_tokens,
             output_tokens,
+            reasoning_tokens,
+            estimated,
+            cost_micros,
         } => ServiceProviderEvent::Completed {
             reason,
             input_tokens,
             output_tokens,
+            reasoning_tokens,
+            estimated,
+            cost_micros,
         },
         logic::ProviderEvent::Cancelled => ServiceProviderEvent::Cancelled,
         logic::ProviderEvent::Failed {
@@ -291,6 +302,9 @@ mod tests {
                     reason: "stop".into(),
                     input_tokens: 2,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 },
             ])
         }
@@ -341,6 +355,9 @@ mod tests {
                     reason: "stop".into(),
                     input_tokens: 2,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 }
             ]
         );

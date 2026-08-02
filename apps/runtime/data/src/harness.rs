@@ -85,6 +85,9 @@ pub enum HarnessDataEvent {
         reason: String,
         input_tokens: u64,
         output_tokens: u64,
+        reasoning_tokens: u64,
+        estimated: bool,
+        cost_micros: u64,
     },
     Cancelled,
     Failed {
@@ -331,6 +334,14 @@ fn map_event(event: dependency::DependencyEvent) -> HarnessDataEvent {
             reason,
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            estimated: usage.estimated,
+            cost_micros: usage.cost.as_ref().map_or(0, |cost| {
+                cost.input_cost_micros
+                    .saturating_add(cost.output_cost_micros)
+                    .saturating_add(cost.cache_read_cost_micros)
+                    .saturating_add(cost.cache_write_cost_micros)
+            }),
         },
         dependency::DependencyEvent::Cancelled => HarnessDataEvent::Cancelled,
         dependency::DependencyEvent::Failed {
@@ -391,6 +402,9 @@ mod tests {
                         output_tokens: 1,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost: None,
                     },
                 },
             ]))
@@ -432,6 +446,9 @@ mod tests {
                     reason: "stop".into(),
                     input_tokens: 3,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 }
             ])
         );

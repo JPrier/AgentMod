@@ -86,6 +86,9 @@ pub enum ProviderEvent {
         reason: String,
         input_tokens: u64,
         output_tokens: u64,
+        reasoning_tokens: u64,
+        estimated: bool,
+        cost_micros: u64,
     },
     Cancelled,
     Failed {
@@ -528,10 +531,16 @@ fn map_event(event: data::HarnessDataEvent) -> ProviderEvent {
             reason,
             input_tokens,
             output_tokens,
+            reasoning_tokens,
+            estimated,
+            cost_micros,
         } => ProviderEvent::Completed {
             reason,
             input_tokens,
             output_tokens,
+            reasoning_tokens,
+            estimated,
+            cost_micros,
         },
         data::HarnessDataEvent::Cancelled => ProviderEvent::Cancelled,
         data::HarnessDataEvent::Failed {
@@ -598,6 +607,9 @@ mod tests {
                     reason: "stop".into(),
                     input_tokens: 2,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 },
             ]))
         }
@@ -613,6 +625,9 @@ mod tests {
                     reason: "stop".into(),
                     input_tokens: 2,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 },
             ]))
         }

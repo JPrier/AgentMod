@@ -24,6 +24,13 @@ pub enum DependencyConversationEntry {
     System(String),
     /// User content.
     User(String),
+    /// Provider-visible image input.
+    Image {
+        /// Image media type.
+        media_type: String,
+        /// Base64-encoded image bytes.
+        data_base64: String,
+    },
     /// Visible assistant content.
     Assistant(String),
     /// Approved tool request serialized as JSON text.
@@ -101,6 +108,29 @@ pub struct DependencyUsage {
     pub cache_read_tokens: u64,
     /// Provider-reported cache-write tokens.
     pub cache_write_tokens: u64,
+    /// Provider-reported reasoning/thinking tokens.
+    pub reasoning_tokens: u64,
+    /// True only when usage is estimated rather than provider-reported.
+    pub estimated: bool,
+}
+
+/// Pricing-record identity and computed cost for one provider exchange.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DependencyCostMetadata {
+    /// Stable pricing-record source.
+    pub source: String,
+    /// Pricing-record version.
+    pub version: String,
+    /// Computed input cost in micro-units of `currency`.
+    pub input_cost_micros: u64,
+    /// Computed output cost in micro-units of `currency`.
+    pub output_cost_micros: u64,
+    /// Computed cache-read cost in micro-units of `currency`.
+    pub cache_read_cost_micros: u64,
+    /// Computed cache-write cost in micro-units of `currency`.
+    pub cache_write_cost_micros: u64,
+    /// ISO-4217 currency code; empty when the pricing record is unknown.
+    pub currency: String,
 }
 
 /// Provider failure classification.
@@ -116,6 +146,20 @@ pub enum DependencyProviderFailureKind {
     PartialOutputFailure,
     /// Provider transport disconnected.
     Disconnected,
+    /// Provider rejected the supplied credentials.
+    AuthenticationFailed,
+    /// Provider reported overload or transient server failure.
+    ProviderOverloaded,
+    /// Provider rejected the request as invalid.
+    InvalidRequest,
+    /// Provider does not support the requested capability or model.
+    UnsupportedCapability,
+    /// Transport failed safely before any provider response.
+    TransportFailure,
+    /// Disconnect after dispatch whose outcome is ambiguous.
+    AmbiguousDisconnect,
+    /// The caller cancelled the request.
+    UserCancellation,
 }
 
 /// Provider-neutral retry classification.
@@ -162,6 +206,8 @@ pub enum DependencyProviderEvent {
         finish_reason: String,
         /// Provider usage.
         usage: DependencyUsage,
+        /// Pricing-record identity and computed cost.
+        cost: Option<DependencyCostMetadata>,
     },
     /// Provider request was cancelled.
     Cancelled,
@@ -222,6 +268,21 @@ pub trait ProviderExecutionDependency {
     ) -> Result<DependencyProviderExecutionResponse, ProviderExecutionDependencyError>;
 }
 
+/// External provider cancellation interface consumed only by harness data.
+pub trait ProviderCancellationDependency: Send + Sync {
+    /// Requests cancellation of an in-flight provider exchange.
+    ///
+    /// Returns whether an active exchange for the reference was found.
+    ///
+    /// # Errors
+    ///
+    /// Returns a dependency error when the request is malformed.
+    fn cancel_provider(
+        &self,
+        cancellation_reference: &str,
+    ) -> Result<bool, ProviderExecutionDependencyError>;
+}
+
 impl ProviderExecutionDependency for StaticProviderCatalogDependency {
     fn execute_provider(
         &self,
@@ -261,7 +322,10 @@ impl ProviderExecutionDependency for StaticProviderCatalogDependency {
                             output_tokens: 6,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
+                            estimated: false,
                         },
+                        None,
                     ),
                 ],
             });
@@ -288,7 +352,10 @@ impl ProviderExecutionDependency for StaticProviderCatalogDependency {
                             output_tokens: 5,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
+                            estimated: false,
                         },
+                        None,
                     ),
                 ],
             });
@@ -314,6 +381,15 @@ impl ProviderExecutionDependency for StaticProviderCatalogDependency {
             return Err(ProviderExecutionDependencyError::EventLimitExceeded);
         }
         Ok(DependencyProviderExecutionResponse { events })
+    }
+}
+
+impl ProviderCancellationDependency for StaticProviderCatalogDependency {
+    fn cancel_provider(
+        &self,
+        _cancellation_reference: &str,
+    ) -> Result<bool, ProviderExecutionDependencyError> {
+        Ok(false)
     }
 }
 
@@ -370,7 +446,10 @@ fn planner_worker_child_events(
                     output_tokens: 8,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                    estimated: false,
                 },
+                None,
             ));
             return Ok(events);
         }
@@ -637,7 +716,10 @@ fn planner_worker_events(
                     output_tokens: 16,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                    estimated: false,
                 },
+                None,
             ),
         ]);
     }
@@ -740,7 +822,10 @@ fn planner_worker_events(
                 output_tokens: 16,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                reasoning_tokens: 0,
+                estimated: false,
             },
+            None,
         ),
     ])
 }
@@ -834,7 +919,10 @@ fn graph_b_review_sequence_events(
                 output_tokens: 16,
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
+                reasoning_tokens: 0,
+                estimated: false,
             },
+            None,
         ),
     ])
 }
@@ -852,19 +940,21 @@ fn scenario_events(
         output_tokens: 7,
         cache_read_tokens: 3,
         cache_write_tokens: 1,
+        reasoning_tokens: 0,
+        estimated: false,
     };
     let events = match scenario {
         "text" => vec![
             DependencyProviderEvent::Started,
             DependencyProviderEvent::TextDelta(text),
-            completed("stop", usage),
+            completed("stop", usage, None),
         ],
         "streaming_text" => vec![
             DependencyProviderEvent::Started,
             DependencyProviderEvent::TextDelta("alpha ".into()),
             DependencyProviderEvent::TextDelta("beta ".into()),
             DependencyProviderEvent::TextDelta(text),
-            completed("stop", usage),
+            completed("stop", usage, None),
         ],
         "one_tool_call" => {
             let mut events = vec![DependencyProviderEvent::Started];
@@ -1206,7 +1296,10 @@ fn coding_task_events(tool_result_count: usize) -> Vec<DependencyProviderEvent> 
                     output_tokens: 9,
                     cache_read_tokens: 0,
                     cache_write_tokens: 0,
+                    reasoning_tokens: 0,
+                    estimated: false,
                 },
+                None,
             ));
         }
     }
@@ -1285,10 +1378,15 @@ fn append_tool_call(
     });
 }
 
-fn completed(reason: &str, usage: DependencyUsage) -> DependencyProviderEvent {
+fn completed(
+    reason: &str,
+    usage: DependencyUsage,
+    cost: Option<DependencyCostMetadata>,
+) -> DependencyProviderEvent {
     DependencyProviderEvent::Completed {
         finish_reason: reason.into(),
         usage,
+        cost,
     }
 }
 

@@ -1653,6 +1653,7 @@ fn map_turn_event(event: RuntimeProviderEvent) -> DependencyTurnEvent {
             reason,
             input_tokens,
             output_tokens,
+            ..
         } => DependencyTurnEvent::Completed {
             reason,
             input_tokens,

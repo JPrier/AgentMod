@@ -18,6 +18,13 @@ pub enum ProjectedEntry {
         /// User-authored text.
         text: String,
     },
+    /// Provider-visible image input.
+    Image {
+        /// Image media type.
+        media_type: String,
+        /// Base64-encoded image bytes.
+        data_base64: String,
+    },
     /// Visible assistant content.
     Assistant {
         /// Visible assistant text.
@@ -94,6 +101,8 @@ pub enum HarnessCommand {
     },
     /// Read harness health/capabilities.
     Health,
+    /// Read the bounded provider/model capability catalog.
+    Catalog,
 }
 
 /// Decision returned only after runtime interception.
@@ -178,9 +187,70 @@ pub struct Usage {
     /// Output tokens reported by provider.
     pub output_tokens: u64,
     /// Provider-reported cache read tokens.
+    #[serde(default)]
     pub cache_read_tokens: u64,
     /// Provider-reported cache write tokens.
+    #[serde(default)]
     pub cache_write_tokens: u64,
+    /// Provider-reported reasoning/thinking tokens.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// True only when usage is estimated rather than provider-reported.
+    #[serde(default)]
+    pub estimated: bool,
+    /// Cost metadata when the adapter has a pricing record for the model.
+    #[serde(default)]
+    pub cost: Option<CostMetadata>,
+}
+
+/// Pricing-record identity and computed cost for one provider exchange.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CostMetadata {
+    /// Stable pricing-record source.
+    pub source: String,
+    /// Pricing-record version.
+    pub version: String,
+    /// Computed input cost in micro-units of `currency`.
+    pub input_cost_micros: u64,
+    /// Computed output cost in micro-units of `currency`.
+    pub output_cost_micros: u64,
+    /// Computed cache-read cost in micro-units of `currency`.
+    pub cache_read_cost_micros: u64,
+    /// Computed cache-write cost in micro-units of `currency`.
+    pub cache_write_cost_micros: u64,
+    /// ISO-4217 currency code; empty when the pricing record is unknown.
+    pub currency: String,
+}
+
+/// Bounded provider/model catalog entry returned by the harness.
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "capability flags are the catalog contract"
+)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CatalogProvider {
+    /// Stable provider adapter ID.
+    pub id: String,
+    /// Adapter version.
+    pub version: String,
+    /// Discoverable model IDs in stable order.
+    pub models: Vec<String>,
+    /// Stable ordered capability names.
+    pub capabilities: Vec<String>,
+    /// Known context limit in tokens.
+    pub context_limit: Option<u64>,
+    /// Tool-call support.
+    pub tool_support: bool,
+    /// Image input support.
+    pub image_support: bool,
+    /// Structured-output support.
+    pub structured_output_support: bool,
+    /// Streaming support.
+    pub streaming_support: bool,
+    /// Pricing-record source.
+    pub pricing_source: String,
+    /// Whether the provider can accept work now.
+    pub available: bool,
 }
 
 /// One bounded harness-process reply frame.
@@ -200,6 +270,11 @@ pub enum HarnessReply {
     Events {
         /// Ordered bounded lifecycle events.
         events: Vec<HarnessEvent>,
+    },
+    /// Bounded provider/model catalog.
+    Catalog {
+        /// Providers in stable ID order.
+        providers: Vec<CatalogProvider>,
     },
     /// One incrementally delivered lifecycle event.
     Event {

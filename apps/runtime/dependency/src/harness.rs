@@ -101,6 +101,28 @@ pub struct DependencyUsage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub estimated: bool,
+    pub cost: Option<CostMetadata>,
+}
+
+/// Provider-neutral cost metadata carried with a completed exchange.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CostMetadata {
+    /// Stable pricing-record source.
+    pub source: String,
+    /// Pricing-record version.
+    pub version: String,
+    /// Computed input cost in micro-units of `currency`.
+    pub input_cost_micros: u64,
+    /// Computed output cost in micro-units of `currency`.
+    pub output_cost_micros: u64,
+    /// Computed cache-read cost in micro-units of `currency`.
+    pub cache_read_cost_micros: u64,
+    /// Computed cache-write cost in micro-units of `currency`.
+    pub cache_write_cost_micros: u64,
+    /// ISO-4217 currency code; empty when the pricing record is unknown.
+    pub currency: String,
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum DependencyEvent {
@@ -459,6 +481,9 @@ impl ProcessHarnessDependency {
                     wire::HarnessReply::Health { .. } => {
                         return Err(HarnessDependencyError::Protocol);
                     }
+                    wire::HarnessReply::Catalog { .. } => {
+                        return Err(HarnessDependencyError::Protocol);
+                    }
                 }
             }
         })
@@ -755,6 +780,7 @@ fn from_wire(v: wire::HarnessReply) -> DependencyReply {
             DependencyReply::Events(events.into_iter().map(map_event).collect())
         }
         wire::HarnessReply::Event { event, .. } => DependencyReply::Events(vec![map_event(event)]),
+        wire::HarnessReply::Catalog { .. } => DependencyReply::Events(Vec::new()),
     }
 }
 fn map_event(v: wire::HarnessEvent) -> DependencyEvent {
@@ -791,6 +817,17 @@ fn map_event(v: wire::HarnessEvent) -> DependencyEvent {
                 output_tokens: usage.output_tokens,
                 cache_read_tokens: usage.cache_read_tokens,
                 cache_write_tokens: usage.cache_write_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                estimated: usage.estimated,
+                cost: usage.cost.map(|cost| CostMetadata {
+                    source: cost.source,
+                    version: cost.version,
+                    input_cost_micros: cost.input_cost_micros,
+                    output_cost_micros: cost.output_cost_micros,
+                    cache_read_cost_micros: cost.cache_read_cost_micros,
+                    cache_write_cost_micros: cost.cache_write_cost_micros,
+                    currency: cost.currency,
+                }),
             },
         },
         wire::HarnessEvent::Cancelled => DependencyEvent::Cancelled,

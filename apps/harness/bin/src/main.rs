@@ -35,7 +35,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             ready_provider_count: v.ready_provider_count,
                             capabilities: v.capabilities,
                         }],
+                        Ok(ServiceResponse::Catalog(_)) => vec![failed("catalog_unexpected")],
                         Err(_) => vec![failed("health_failed")],
+                    }
+                }
+                Ok(HarnessCommand::Catalog) => {
+                    match service.handle_wire_command(&HarnessCommand::Catalog) {
+                        Ok(ServiceResponse::Catalog(providers)) => {
+                            vec![HarnessReply::Catalog { providers }]
+                        }
+                        Ok(ServiceResponse::Health(_)) => vec![failed("health_unexpected")],
+                        Err(_) => vec![failed("catalog_failed")],
                     }
                 }
                 Ok(command @ HarnessCommand::Execute { .. }) => service

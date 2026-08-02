@@ -1,9 +1,9 @@
 //! Provider-neutral harness execution business behavior.
 
 use agentmod_harness_data::execution::{
-    DataConversationEntry, DataProviderEvent, DataProviderFailureKind, DataProviderOption,
-    DataRetryClassification, DataUsageRecord, HarnessExecutionData, HarnessExecutionDataError,
-    HarnessExecutionDataQuery,
+    DataConversationEntry, DataCostMetadata, DataProviderEvent, DataProviderFailureKind,
+    DataProviderOption, DataRetryClassification, DataUsageRecord, HarnessExecutionData,
+    HarnessExecutionDataError, HarnessExecutionDataQuery,
 };
 
 use crate::HarnessHealthManager;
@@ -15,6 +15,13 @@ pub enum LogicConversationEntry {
     System(String),
     /// User content.
     User(String),
+    /// Provider-visible image input.
+    Image {
+        /// Image media type.
+        media_type: String,
+        /// Base64-encoded image bytes.
+        data_base64: String,
+    },
     /// Visible assistant content.
     Assistant(String),
     /// Approved tool request.
@@ -92,6 +99,29 @@ pub struct LogicUsage {
     pub cache_read_tokens: u64,
     /// Cache-write tokens.
     pub cache_write_tokens: u64,
+    /// Provider-reported reasoning/thinking tokens.
+    pub reasoning_tokens: u64,
+    /// True only when usage is estimated rather than provider-reported.
+    pub estimated: bool,
+}
+
+/// Logic-owned pricing-record identity and computed cost.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct LogicCostMetadata {
+    /// Stable pricing-record source.
+    pub source: String,
+    /// Pricing-record version.
+    pub version: String,
+    /// Computed input cost in micro-units of `currency`.
+    pub input_cost_micros: u64,
+    /// Computed output cost in micro-units of `currency`.
+    pub output_cost_micros: u64,
+    /// Computed cache-read cost in micro-units of `currency`.
+    pub cache_read_cost_micros: u64,
+    /// Computed cache-write cost in micro-units of `currency`.
+    pub cache_write_cost_micros: u64,
+    /// ISO-4217 currency code; empty when the pricing record is unknown.
+    pub currency: String,
 }
 
 /// Logic-owned provider failure kind.
@@ -107,6 +137,20 @@ pub enum LogicProviderFailureKind {
     PartialOutputFailure,
     /// Disconnection.
     Disconnected,
+    /// Provider rejected the supplied credentials.
+    AuthenticationFailed,
+    /// Provider reported overload or transient server failure.
+    ProviderOverloaded,
+    /// Provider rejected the request as invalid.
+    InvalidRequest,
+    /// Provider does not support the requested capability or model.
+    UnsupportedCapability,
+    /// Transport failed safely before any provider response.
+    TransportFailure,
+    /// Disconnect after dispatch whose outcome is ambiguous.
+    AmbiguousDisconnect,
+    /// The caller cancelled the request.
+    UserCancellation,
 }
 
 /// Logic-owned retry classification.
@@ -153,6 +197,8 @@ pub enum LogicProviderEvent {
         finish_reason: String,
         /// Usage.
         usage: LogicUsage,
+        /// Pricing-record identity and computed cost.
+        cost: Option<LogicCostMetadata>,
     },
     /// Provider cancelled.
     Cancelled,
@@ -454,6 +500,13 @@ fn map_entry(entry: LogicConversationEntry) -> DataConversationEntry {
     match entry {
         LogicConversationEntry::System(text) => DataConversationEntry::System(text),
         LogicConversationEntry::User(text) => DataConversationEntry::User(text),
+        LogicConversationEntry::Image {
+            media_type,
+            data_base64,
+        } => DataConversationEntry::Image {
+            media_type,
+            data_base64,
+        },
         LogicConversationEntry::Assistant(text) => DataConversationEntry::Assistant(text),
         LogicConversationEntry::ToolCall {
             call_id,
@@ -515,9 +568,11 @@ fn map_event(event: DataProviderEvent) -> LogicProviderEvent {
         DataProviderEvent::Completed {
             finish_reason,
             usage,
+            cost,
         } => LogicProviderEvent::Completed {
             finish_reason,
             usage: map_usage(usage),
+            cost: cost.map(map_cost),
         },
         DataProviderEvent::Cancelled => LogicProviderEvent::Cancelled,
         DataProviderEvent::Failed {
@@ -538,6 +593,20 @@ const fn map_usage(usage: DataUsageRecord) -> LogicUsage {
         output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        estimated: usage.estimated,
+    }
+}
+
+fn map_cost(cost: DataCostMetadata) -> LogicCostMetadata {
+    LogicCostMetadata {
+        source: cost.source,
+        version: cost.version,
+        input_cost_micros: cost.input_cost_micros,
+        output_cost_micros: cost.output_cost_micros,
+        cache_read_cost_micros: cost.cache_read_cost_micros,
+        cache_write_cost_micros: cost.cache_write_cost_micros,
+        currency: cost.currency,
     }
 }
 
@@ -552,6 +621,19 @@ const fn map_failure_kind(kind: DataProviderFailureKind) -> LogicProviderFailure
             LogicProviderFailureKind::PartialOutputFailure
         }
         DataProviderFailureKind::Disconnected => LogicProviderFailureKind::Disconnected,
+        DataProviderFailureKind::AuthenticationFailed => {
+            LogicProviderFailureKind::AuthenticationFailed
+        }
+        DataProviderFailureKind::ProviderOverloaded => LogicProviderFailureKind::ProviderOverloaded,
+        DataProviderFailureKind::InvalidRequest => LogicProviderFailureKind::InvalidRequest,
+        DataProviderFailureKind::UnsupportedCapability => {
+            LogicProviderFailureKind::UnsupportedCapability
+        }
+        DataProviderFailureKind::TransportFailure => LogicProviderFailureKind::TransportFailure,
+        DataProviderFailureKind::AmbiguousDisconnect => {
+            LogicProviderFailureKind::AmbiguousDisconnect
+        }
+        DataProviderFailureKind::UserCancellation => LogicProviderFailureKind::UserCancellation,
     }
 }
 

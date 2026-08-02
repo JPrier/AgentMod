@@ -1282,6 +1282,15 @@ pub struct ModelResponseCompletedEvent {
     pub input_tokens: u64,
     /// Provider-reported output tokens.
     pub output_tokens: u64,
+    /// Provider-reported reasoning/thinking tokens.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// True only when usage is estimated rather than provider-reported.
+    #[serde(default)]
+    pub estimated: bool,
+    /// Computed cost micros when the provider adapter has a pricing record.
+    #[serde(default)]
+    pub cost_micros: u64,
 }
 
 /// Provider execution cancellation.
@@ -5510,6 +5519,16 @@ pub struct StyleExecutionState {
     /// Provider-reported output tokens accumulated from canonical completions.
     #[serde(default)]
     pub output_tokens: u64,
+    /// Provider-reported reasoning/thinking tokens accumulated from canonical completions.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// Computed cost micros accumulated from canonical completions; unknown
+    /// until a pricing record exists for the selected model.
+    #[serde(default)]
+    pub cost_micros: u64,
+    /// True once any completed exchange was estimated rather than provider-reported.
+    #[serde(default)]
+    pub cost_estimated: bool,
     /// Cumulative provider tokens observed when compaction last committed.
     #[serde(default)]
     pub tokens_at_last_compaction: u64,
@@ -6575,6 +6594,17 @@ fn apply_payload(
                     .output_tokens
                     .checked_add(completed.output_tokens)
                     .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+                execution.reasoning_tokens = execution
+                    .reasoning_tokens
+                    .checked_add(completed.reasoning_tokens)
+                    .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+                execution.cost_micros = execution
+                    .cost_micros
+                    .checked_add(completed.cost_micros)
+                    .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+                if completed.estimated {
+                    execution.cost_estimated = true;
+                }
             }
             Ok(())
         }
@@ -9766,6 +9796,9 @@ fn apply_style_execution_initialized(
         termination_reason: None,
         input_tokens: 0,
         output_tokens: 0,
+        reasoning_tokens: 0,
+        cost_micros: 0,
+        cost_estimated: false,
         tokens_at_last_compaction: 0,
         context_boundaries: Vec::new(),
         latest_model_execution: None,
@@ -17208,14 +17241,112 @@ fn generic_context_effect_evidence_complete(
     else {
         return false;
     };
-    execution.context_boundaries.iter().rev().any(|boundary| {
+    let matches = execution.context_boundaries.iter().rev().any(|boundary| {
         boundary.identity.node_id == completed.node_id
             && boundary.identity.boundary == "context_node"
             && boundary.identity.run_id == run_id
             && boundary
                 .completed_at
                 .is_some_and(|sequence| sequence <= journal_head)
-    })
+    });
+    matches
+}
+
+/// Validates the memory-provenance security constraint for a generic
+/// fresh-context node completion.
+///
+/// The generic dispatch path binds the exact context invocation through
+/// [`generic_context_effect_evidence_complete`]; this additional check retains
+/// the legacy path's guarantee that every non-user entry in the provider
+/// projection was injected by this exact context phase. Stale, mis-attributed,
+/// wrong-provider, or fabricated memory can therefore never complete a
+/// fresh-context node.
+fn generic_fresh_context_memory_evidence_complete(
+    execution: &StyleExecutionState,
+    conversation: &ConversationState,
+    binding: Option<&SessionStyleBinding>,
+    completed: &StyleNodeCompletedEvent,
+    journal_head: Sequence,
+) -> bool {
+    let Some(boundary) = execution.context_boundaries.iter().rev().find(|boundary| {
+        boundary.identity.node_id == completed.node_id
+            && boundary.identity.boundary == "context_node"
+    }) else {
+        return false;
+    };
+    let Some(provenance) = conversation.projection_provenance() else {
+        return false;
+    };
+    // Only fresh-context graphs bind the projection to an exact memory
+    // injection. Other context strategies (memory normalization, plugin
+    // transforms, compaction) are validated by their own dedicated paths.
+    if provenance.method != "generic_fresh_context" {
+        return true;
+    }
+    if provenance.artifact_id.is_some()
+        || provenance.committed_at.checked_next().ok() != Some(journal_head)
+    {
+        return false;
+    }
+    let inputs = conversation
+        .provider_projection()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                ConversationEntry::UserMessage(_) | ConversationEntry::PendingTask(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    let [input] = inputs.as_slice() else {
+        return false;
+    };
+    let (expected_origin, exact_input) = match input {
+        ConversationEntry::UserMessage(user) => {
+            let canonical_user =
+                conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        ConversationEntry::UserMessage(candidate)
+                            if candidate.source_sequence <= boundary.identity.source_head =>
+                        {
+                            Some(candidate)
+                        }
+                        _ => None,
+                    });
+            (ContextBoundaryOrigin::UserTurn, canonical_user == Some(user))
+        }
+        ConversationEntry::PendingTask(_) => (ContextBoundaryOrigin::ChildTask, true),
+        _ => return false,
+    };
+    if !exact_input || boundary.identity.origin != expected_origin {
+        return false;
+    }
+    let Some(replacement_event) = boundary.phase_replacement_event else {
+        return false;
+    };
+    let Some(selected_memory_provider) = binding.map(|binding| binding.memory.provider.as_str())
+    else {
+        return false;
+    };
+    if conversation.provider_projection().iter().any(|entry| {
+        !matches!(
+            entry,
+            ConversationEntry::UserMessage(_) | ConversationEntry::PendingTask(_)
+        ) && !matches!(
+            entry,
+            ConversationEntry::RetrievedMemory(memory)
+                if memory.injection_sequence == provenance.committed_at
+                    && memory.injection_event == Some(replacement_event)
+                    && memory.provider == selected_memory_provider
+                    && selected_memory_provider != "none"
+        )
+    }) {
+        return false;
+    }
+    true
 }
 
 fn generic_model_effect_evidence_complete(
@@ -17610,11 +17741,35 @@ fn style_node_effect_evidence_complete(
     {
         match executor {
             NativeExecutorKey::ContextConstruction => {
-                return generic_context_effect_evidence_complete(
+                // The generic boundary check binds the exact context invocation
+                // identity. Fresh-context graphs additionally retain the
+                // memory-provenance security validation from the legacy path so
+                // stale, mis-attributed, or wrong-provider memory can never
+                // complete a fresh-context node. The node configuration (not
+                // the graph topology) is the discriminator: distinct styles may
+                // intentionally share a built-in node shape.
+                if !generic_context_effect_evidence_complete(
                     execution,
                     completed,
                     journal_head,
-                );
+                ) {
+                    return false;
+                }
+                if matches!(
+                    graph_node_configuration(&execution.graph, &completed.node_id),
+                    Some(agentmod_graph_engine::NodeConfiguration::ContextTransform {
+                        strategy: agentmod_graph_engine::ContextTransformStrategy::Fresh,
+                    })
+                ) {
+                    return generic_fresh_context_memory_evidence_complete(
+                        execution,
+                        conversation,
+                        binding,
+                        completed,
+                        journal_head,
+                    );
+                }
+                return true;
             }
             NativeExecutorKey::ModelRequest => {
                 return generic_model_effect_evidence_complete(execution, completed, journal_head);
@@ -18192,6 +18347,7 @@ fn fresh_context_effect_evidence_complete(
     };
     let Some(selected_memory_provider) = binding.map(|binding| binding.memory.provider.as_str())
     else {
+        eprintln!("fresh-context: no binding memory provider");
         return false;
     };
     if conversation.provider_projection().iter().any(|entry| {
@@ -21755,6 +21911,9 @@ to = "done"
                     finish_reason: String::from("stop"),
                     input_tokens: 1,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 }),
             ),
             envelope(
@@ -24915,6 +25074,9 @@ to = "done"
                         finish_reason: String::from("stop"),
                         input_tokens: 1,
                         output_tokens: 1,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },),
                 ),
             ),
@@ -25397,7 +25559,7 @@ to = "done"
                     provenance: ProjectionProvenance {
                         projection_id: String::from("fresh"),
                         source_range: Some((source_sequence, source_sequence)),
-                        method: String::from("ephemeral_fresh_context"),
+                        method: String::from("generic_fresh_context"),
                         committed_at: Sequence::new(8).expect("sequence"),
                         artifact_id: None,
                     },
@@ -25488,7 +25650,7 @@ to = "done"
                             attempt: 1,
                             loop_iteration: 0,
                             step: 1,
-                            result_reference: None,
+                            result_reference: Some(String::from("context:run-current")),
                             artifact_reference: None,
                         }),
                     ),
@@ -25509,7 +25671,7 @@ to = "done"
                     attempt: 1,
                     loop_iteration: 0,
                     step: 1,
-                    result_reference: None,
+                    result_reference: Some(String::from("context:run-current")),
                     artifact_reference: None,
                 }),
             ),
@@ -26400,6 +26562,9 @@ to = "done"
                 finish_reason: String::from("stop"),
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
+                estimated: false,
+                cost_micros: 0,
             }),
         ] {
             assert!(matches!(
@@ -26542,6 +26707,9 @@ to = "done"
                     finish_reason: String::from("tool_calls"),
                     input_tokens: 3,
                     output_tokens: 5,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 }),
             ),
         )
@@ -26599,6 +26767,9 @@ to = "done"
                 finish_reason: String::from("stop"),
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
+                estimated: false,
+                cost_micros: 0,
             }),
         ] {
             assert!(matches!(
@@ -26629,6 +26800,9 @@ to = "done"
                         finish_reason: String::from("stop"),
                         input_tokens: 1,
                         output_tokens: 1,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     }),
                 ),
             ),
@@ -27394,6 +27568,9 @@ to = "done"
                     finish_reason: String::from("stop"),
                     input_tokens: 11,
                     output_tokens: 7,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 }),
             ),
             envelope(
@@ -28667,3 +28844,4 @@ to = "done"
         ));
     }
 }
+

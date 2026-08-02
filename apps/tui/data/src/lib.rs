@@ -1203,6 +1203,7 @@ fn map_event(value: DependencyTurnEvent) -> TurnDataEvent {
             reason,
             input_tokens,
             output_tokens,
+            ..
         } => TurnDataEvent::Completed {
             reason,
             input_tokens,

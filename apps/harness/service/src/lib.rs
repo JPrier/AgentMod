@@ -3,10 +3,10 @@
 pub mod execution;
 
 use agentmod_harness_logic::{
-    HarnessHealthLogic, HarnessHealthResult, HarnessHealthStatus, InspectHarnessHealthCommand,
-    LogicError,
+    HarnessCatalogLogic, HarnessHealthLogic, HarnessHealthResult, HarnessHealthStatus,
+    InspectHarnessHealthCommand, LogicCatalogRecord, LogicError,
 };
-use agentmod_harness_protocol::HarnessCommand;
+use agentmod_harness_protocol::{CatalogProvider, HarnessCommand};
 use thiserror::Error;
 
 /// Service-owned health endpoint request.
@@ -61,6 +61,8 @@ pub struct ServiceHealthResponse {
 pub enum ServiceResponse {
     /// Harness health response.
     Health(ServiceHealthResponse),
+    /// Bounded provider/model catalog.
+    Catalog(Vec<CatalogProvider>),
 }
 
 /// Endpoint-facing harness service failure.
@@ -96,7 +98,7 @@ impl<L> HarnessService<L> {
 
 impl<L> HarnessService<L>
 where
-    L: HarnessHealthLogic,
+    L: HarnessHealthLogic + HarnessCatalogLogic,
 {
     /// Maps one harness wire command and invokes only the logic layer.
     ///
@@ -107,8 +109,16 @@ where
         &self,
         command: &HarnessCommand,
     ) -> Result<ServiceResponse, ServiceError> {
-        let request = to_service_request(command)?;
-        self.health(request).map(ServiceResponse::Health)
+        match command {
+            HarnessCommand::Health => {
+                let request = to_service_request(command)?;
+                self.health(request).map(ServiceResponse::Health)
+            }
+            HarnessCommand::Catalog => self.catalog(true).map(ServiceResponse::Catalog),
+            _ => Err(ServiceError::UnsupportedCommand {
+                command: "execute",
+            }),
+        }
     }
 
     /// Executes the health endpoint using service-owned types.
@@ -134,15 +144,7 @@ fn to_service_request(command: &HarnessCommand) -> Result<ServiceHealthRequest, 
         HarnessCommand::Health => Ok(ServiceHealthRequest {
             required_capabilities: Vec::new(),
         }),
-        HarnessCommand::Execute { .. } => {
-            Err(ServiceError::UnsupportedCommand { command: "execute" })
-        }
-        HarnessCommand::Continue { .. } => Err(ServiceError::UnsupportedCommand {
-            command: "continue",
-        }),
-        HarnessCommand::Cancel { .. } => {
-            Err(ServiceError::UnsupportedCommand { command: "cancel" })
-        }
+        _ => Err(ServiceError::UnsupportedCommand { command: "execute" }),
     }
 }
 
@@ -180,6 +182,40 @@ fn map_logic_error(error: LogicError) -> ServiceError {
     ServiceError::HealthFailed { message }
 }
 
+impl<L> HarnessService<L>
+where
+    L: HarnessCatalogLogic,
+{
+    /// Reads the bounded provider/model catalog using service-owned records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceError`] when harness logic cannot read the catalog.
+    pub fn catalog(&self, include_unavailable: bool) -> Result<Vec<CatalogProvider>, ServiceError> {
+        let records = self
+            .logic
+            .inspect_catalog(include_unavailable)
+            .map_err(map_logic_error)?;
+        Ok(records.into_iter().map(to_wire_catalog).collect())
+    }
+}
+
+fn to_wire_catalog(record: LogicCatalogRecord) -> CatalogProvider {
+    CatalogProvider {
+        id: record.provider_key,
+        version: record.version,
+        models: record.model_ids,
+        capabilities: record.capabilities,
+        context_limit: record.context_limit,
+        tool_support: record.tool_support,
+        image_support: record.image_support,
+        structured_output_support: record.structured_output_support,
+        streaming_support: record.streaming_support,
+        pricing_source: record.pricing_source,
+        available: record.ready,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -201,6 +237,15 @@ mod tests {
                 .expect("command lock is not poisoned")
                 .push(command);
             self.response.clone()
+        }
+    }
+
+    impl HarnessCatalogLogic for MockHealthLogic {
+        fn inspect_catalog(
+            &self,
+            _include_unavailable: bool,
+        ) -> Result<Vec<LogicCatalogRecord>, LogicError> {
+            Ok(Vec::new())
         }
     }
 

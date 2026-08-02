@@ -1444,6 +1444,7 @@ fn map_turn_event(event: TurnDataEvent) -> TurnEvent {
             reason,
             input_tokens,
             output_tokens,
+            ..
         } => TurnEvent::Completed {
             reason,
             input_tokens,

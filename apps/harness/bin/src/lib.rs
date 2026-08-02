@@ -42,7 +42,10 @@ mod tests {
 
         let ServiceResponse::Health(response) = service
             .handle_wire_command(&HarnessCommand::Health)
-            .expect("built-in service reports health");
+            .expect("built-in service reports health")
+        else {
+            panic!("health command returned a catalog response")
+        };
 
         assert_eq!(response.status, ServiceHealthStatus::Ok);
         assert_eq!(response.configured_provider_count, 1);

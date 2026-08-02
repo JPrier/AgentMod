@@ -904,6 +904,15 @@ pub enum RuntimeProviderEvent {
         input_tokens: u64,
         /// Provider-reported output tokens.
         output_tokens: u64,
+        /// Provider-reported reasoning/thinking tokens.
+        #[serde(default)]
+        reasoning_tokens: u64,
+        /// True only when usage is estimated rather than provider-reported.
+        #[serde(default)]
+        estimated: bool,
+        /// Computed cost micros when the provider adapter has a pricing record.
+        #[serde(default)]
+        cost_micros: u64,
     },
     /// Provider request was cancelled after any visible partial output.
     Cancelled,

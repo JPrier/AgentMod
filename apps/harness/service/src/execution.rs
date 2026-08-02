@@ -5,8 +5,8 @@ use std::str::FromStr;
 use agentmod_harness_logic::execution::{
     ContinueProviderCommand, ExecuteProviderCommand, ExecuteProviderResult, ExecutionLogicError,
     HarnessContinuationLogic, HarnessExecutionLogic, LogicContinuationDecision,
-    LogicConversationEntry, LogicProviderEvent, LogicProviderFailureKind, LogicProviderOption,
-    LogicRetryClassification, LogicUsage,
+    LogicConversationEntry, LogicCostMetadata, LogicProviderEvent, LogicProviderFailureKind,
+    LogicProviderOption, LogicRetryClassification, LogicUsage,
 };
 use agentmod_harness_protocol::{
     HarnessCommand, HarnessContinuationDecision, HarnessEvent, ProjectedEntry, Usage,
@@ -22,6 +22,13 @@ pub enum ServiceConversationEntry {
     System(String),
     /// User content.
     User(String),
+    /// Provider-visible image input.
+    Image {
+        /// Image media type.
+        media_type: String,
+        /// Base64-encoded image bytes.
+        data_base64: String,
+    },
     /// Assistant content.
     Assistant(String),
     /// Tool call.
@@ -89,7 +96,7 @@ pub struct ServiceExecuteRequest {
 }
 
 /// Service-owned provider usage.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ServiceUsage {
     /// Input tokens.
     pub input_tokens: u64,
@@ -99,6 +106,12 @@ pub struct ServiceUsage {
     pub cache_read_tokens: u64,
     /// Cache-write tokens.
     pub cache_write_tokens: u64,
+    /// Provider-reported reasoning/thinking tokens.
+    pub reasoning_tokens: u64,
+    /// True only when usage is estimated rather than provider-reported.
+    pub estimated: bool,
+    /// Pricing-record identity and computed cost.
+    pub cost: Option<agentmod_harness_protocol::CostMetadata>,
 }
 
 /// Service-owned provider event.
@@ -374,6 +387,13 @@ fn from_wire_entry(
     Ok(match entry {
         ProjectedEntry::System { text } => ServiceConversationEntry::System(text.clone()),
         ProjectedEntry::User { text } => ServiceConversationEntry::User(text.clone()),
+        ProjectedEntry::Image {
+            media_type,
+            data_base64,
+        } => ServiceConversationEntry::Image {
+            media_type: media_type.clone(),
+            data_base64: data_base64.clone(),
+        },
         ProjectedEntry::Assistant { text } => ServiceConversationEntry::Assistant(text.clone()),
         ProjectedEntry::ToolCall {
             call_id,
@@ -436,6 +456,13 @@ fn to_logic_entry(entry: ServiceConversationEntry) -> LogicConversationEntry {
     match entry {
         ServiceConversationEntry::System(text) => LogicConversationEntry::System(text),
         ServiceConversationEntry::User(text) => LogicConversationEntry::User(text),
+        ServiceConversationEntry::Image {
+            media_type,
+            data_base64,
+        } => LogicConversationEntry::Image {
+            media_type,
+            data_base64,
+        },
         ServiceConversationEntry::Assistant(text) => LogicConversationEntry::Assistant(text),
         ServiceConversationEntry::ToolCall {
             call_id,
@@ -503,9 +530,10 @@ fn map_logic_event(event: LogicProviderEvent) -> ServiceProviderEvent {
         LogicProviderEvent::Completed {
             finish_reason,
             usage,
+            cost,
         } => ServiceProviderEvent::Completed {
             finish_reason,
-            usage: map_usage(usage),
+            usage: map_usage(usage, cost),
         },
         LogicProviderEvent::Cancelled => ServiceProviderEvent::Cancelled,
         LogicProviderEvent::RuntimeRejected { reason } => ServiceProviderEvent::Failed {
@@ -525,12 +553,26 @@ fn map_logic_event(event: LogicProviderEvent) -> ServiceProviderEvent {
     }
 }
 
-const fn map_usage(usage: LogicUsage) -> ServiceUsage {
+fn map_usage(
+    usage: LogicUsage,
+    cost: Option<LogicCostMetadata>,
+) -> ServiceUsage {
     ServiceUsage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cache_read_tokens,
         cache_write_tokens: usage.cache_write_tokens,
+        reasoning_tokens: usage.reasoning_tokens,
+        estimated: usage.estimated,
+        cost: cost.map(|cost| agentmod_harness_protocol::CostMetadata {
+            source: cost.source,
+            version: cost.version,
+            input_cost_micros: cost.input_cost_micros,
+            output_cost_micros: cost.output_cost_micros,
+            cache_read_cost_micros: cost.cache_read_cost_micros,
+            cache_write_cost_micros: cost.cache_write_cost_micros,
+            currency: cost.currency,
+        }),
     }
 }
 
@@ -541,6 +583,13 @@ const fn failure_code(kind: LogicProviderFailureKind) -> &'static str {
         LogicProviderFailureKind::RateLimited => "rate_limited",
         LogicProviderFailureKind::PartialOutputFailure => "partial_output_failure",
         LogicProviderFailureKind::Disconnected => "disconnected",
+        LogicProviderFailureKind::AuthenticationFailed => "authentication_failed",
+        LogicProviderFailureKind::ProviderOverloaded => "provider_overloaded",
+        LogicProviderFailureKind::InvalidRequest => "invalid_request",
+        LogicProviderFailureKind::UnsupportedCapability => "unsupported_capability",
+        LogicProviderFailureKind::TransportFailure => "transport_failure",
+        LogicProviderFailureKind::AmbiguousDisconnect => "ambiguous_disconnect",
+        LogicProviderFailureKind::UserCancellation => "user_cancellation",
     }
 }
 
@@ -586,6 +635,9 @@ fn to_wire_event(event: ServiceProviderEvent) -> Result<HarnessEvent, ExecutionS
                 output_tokens: usage.output_tokens,
                 cache_read_tokens: usage.cache_read_tokens,
                 cache_write_tokens: usage.cache_write_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                estimated: usage.estimated,
+                cost: usage.cost,
             },
         },
         ServiceProviderEvent::Cancelled => HarnessEvent::Cancelled,
@@ -636,7 +688,10 @@ mod tests {
                             output_tokens: 1,
                             cache_read_tokens: 0,
                             cache_write_tokens: 0,
+                            reasoning_tokens: 0,
+                            estimated: false,
                         },
+                        cost: None,
                     },
                 ],
             })
@@ -664,6 +719,9 @@ mod tests {
                         output_tokens: 1,
                         cache_read_tokens: 0,
                         cache_write_tokens: 0,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost: None,
                     },
                 }
             ]

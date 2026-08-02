@@ -10,7 +10,9 @@ repository.workspace = true
 [dependencies]
 agentmod-event-model = { path = "../../../core/event-model" }
 agentmod-event-pipeline = { path = "../../../core/event-pipeline" }
+agentmod-expression-engine = { path = "../../../core/expression-engine" }
 agentmod-graph-engine = { path = "../../../core/graph-engine" }
+agentmod-graph-state = { path = "../../../core/graph-state" }
 agentmod-primitives = { path = "../../../core/primitives" }
 agentmod-runtime-data = { path = "../data" }
 agentmod-session-style-sdk = { path = "../../../sdk/session-style-sdk" }

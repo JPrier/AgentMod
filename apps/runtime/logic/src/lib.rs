@@ -6,6 +6,7 @@ pub mod child_session;
 pub mod compaction;
 pub mod continuation;
 pub mod conversation;
+pub mod graph_state;
 pub mod harness;
 pub mod harness_registry;
 pub mod history;

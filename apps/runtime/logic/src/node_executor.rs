@@ -248,17 +248,6 @@ fn resolve_node(
             Some(&node_kind),
             format!("registered node executors for `{node_kind}` are unavailable or incompatible"),
         ))),
-        [registration] if registration.boundary == NodeExecutorBoundary::PluginHost => {
-            Ok(Err(diagnostic(
-                "NODEX005",
-                Some(&node.id),
-                Some(&node_kind),
-                format!(
-                    "plugin node executor `{}` is registered but plugin-node dispatch is not enabled",
-                    registration.id
-                ),
-            )))
-        }
         [registration] => Ok(Ok(ResolvedNodeExecutor {
             node_id: node.id.clone(),
             node_kind,

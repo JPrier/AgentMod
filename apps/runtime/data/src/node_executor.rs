@@ -144,6 +144,32 @@ impl RuntimeNodeExecutorData {
     /// Returns [`NodeExecutorDataError`] only if the checked-in first-party
     /// declarations are internally inconsistent.
     pub fn native() -> Result<Self, NodeExecutorDataError> {
+        Self::native_registrations().and_then(Self::new)
+    }
+
+    /// Merges additional composition-root registrations (for example
+    /// plugin-provided graph node executors) with the first-party set.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeExecutorDataError`] when the merged set is invalid or
+    /// duplicates an existing identity.
+    pub fn native_with(
+        additional: Vec<RegisterNodeExecutorDataRecord>,
+    ) -> Result<Self, NodeExecutorDataError> {
+        let mut registrations = Self::native_registrations()?;
+        registrations.extend(additional);
+        Self::new(registrations)
+    }
+
+    /// First-party registration declarations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeExecutorDataError`] only if the checked-in first-party
+    /// declarations are internally inconsistent.
+    fn native_registrations() -> Result<Vec<RegisterNodeExecutorDataRecord>, NodeExecutorDataError>
+    {
         const IMPLEMENTATIONS: &[(&str, &str, &[&str], bool)] = &[
             (
                 "context_transform",
@@ -190,26 +216,24 @@ impl RuntimeNodeExecutorData {
             ("complete_session", "runtime.session-completion", &[], true),
             ("fail", "runtime.structured-failure", &[], true),
         ];
-        Self::new(
-            IMPLEMENTATIONS
-                .iter()
-                .map(
-                    |(node_kind, id, capabilities, available)| RegisterNodeExecutorDataRecord {
-                        id: (*id).to_owned(),
-                        version: String::from("1.0.0"),
-                        runtime_api: String::from("^1.0"),
-                        node_kind: (*node_kind).to_owned(),
-                        capabilities: capabilities
-                            .iter()
-                            .map(|capability| (*capability).to_owned())
-                            .collect(),
-                        source: NodeExecutorSourceData::Runtime,
-                        boundary: NodeExecutorBoundaryData::RuntimeLogic,
-                        available: *available,
-                    },
-                )
-                .collect(),
-        )
+        Ok(IMPLEMENTATIONS
+            .iter()
+            .map(
+                |(node_kind, id, capabilities, available)| RegisterNodeExecutorDataRecord {
+                    id: (*id).to_owned(),
+                    version: String::from("1.0.0"),
+                    runtime_api: String::from("^1.0"),
+                    node_kind: (*node_kind).to_owned(),
+                    capabilities: capabilities
+                        .iter()
+                        .map(|capability| (*capability).to_owned())
+                        .collect(),
+                    source: NodeExecutorSourceData::Runtime,
+                    boundary: NodeExecutorBoundaryData::RuntimeLogic,
+                    available: *available,
+                },
+            )
+            .collect())
     }
 }
 

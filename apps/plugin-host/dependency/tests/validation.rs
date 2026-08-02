@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use agentmod_plugin_host_dependency::{
-    DependencyConfigurationSchema, DependencyContextTransform, DependencyEntrypoint,
-    DependencyManifest, DependencyNodeExecutor, DependencyObserverDelivery, DependencyPluginClass,
+    DependencyConfigurationSchema, DependencyEntrypoint,
+    DependencyManifest, DependencyObserverDelivery, DependencyPluginClass,
     IsolatedPluginDependency, PluginDependencyConfig, PluginDependencyError, PluginDependencyPort,
 };
 

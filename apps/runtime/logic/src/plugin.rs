@@ -218,6 +218,8 @@ where
                             "event_type": event.event_type,
                             "payload": event.payload,
                         }),
+                        event_range_start: event.sequence,
+                        event_range_end: event.sequence,
                         cancellation_id: command.cancellation_id.clone(),
                     })
                     .await
@@ -446,6 +448,60 @@ mod tests {
                 queue_depth: 0,
                 dropped: 0,
             })
+        }
+
+        async fn execute_plugin_node(
+            &self,
+            _request: agentmod_runtime_data::plugin::ExecutePluginNodeDataRequest,
+        ) -> Result<(serde_json::Value, u8), PluginDataError> {
+            Err(PluginDataError::Unavailable)
+        }
+
+        async fn plugin_memory(
+            &self,
+            _operation: String,
+            _request: agentmod_runtime_data::plugin::PluginMemoryDataRequest,
+        ) -> Result<(agentmod_runtime_data::plugin::PluginMemoryDataResult, u8), PluginDataError>
+        {
+            Err(PluginDataError::Unavailable)
+        }
+
+        async fn plugin_compaction_propose(
+            &self,
+            _request: agentmod_runtime_data::plugin::PluginCompactionDataRequest,
+        ) -> Result<(serde_json::Value, u64, u8), PluginDataError> {
+            Err(PluginDataError::Unavailable)
+        }
+
+        async fn plugin_context_transform(
+            &self,
+            _request: agentmod_runtime_data::plugin::PluginContextTransformDataRequest,
+        ) -> Result<(serde_json::Value, u8), PluginDataError> {
+            Err(PluginDataError::Unavailable)
+        }
+
+        async fn plugin_state_change(
+            &self,
+            _operation: &str,
+            _request: agentmod_runtime_data::plugin::PluginStateChangeDataRequest,
+        ) -> Result<agentmod_runtime_data::plugin::PluginAuditDataRecord, PluginDataError> {
+            Err(PluginDataError::Unavailable)
+        }
+
+        async fn plugin_audits(
+            &self,
+            _session_id: String,
+        ) -> Result<Vec<agentmod_runtime_data::plugin::PluginAuditDataRecord>, PluginDataError>
+        {
+            Err(PluginDataError::Unavailable)
+        }
+
+        async fn plugin_health(
+            &self,
+            _session_id: String,
+        ) -> Result<agentmod_runtime_data::plugin::PluginHealthDataRecord, PluginDataError>
+        {
+            Err(PluginDataError::Unavailable)
         }
     }
 

@@ -16,6 +16,7 @@ pub mod node_executor;
 pub mod permission;
 pub mod persistence;
 pub mod plugin;
+pub mod plugin_management;
 pub(crate) mod projection;
 pub mod registry;
 pub mod scheduler;

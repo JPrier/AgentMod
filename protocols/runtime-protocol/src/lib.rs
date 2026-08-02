@@ -207,6 +207,58 @@ pub enum RuntimeRequest {
         /// Highest contiguous stream sequence already accepted.
         last_received_sequence: u64,
     },
+    /// List activated plugin lifecycle projections for a session.
+    PluginList {
+        /// Runtime session ID.
+        session_id: String,
+    },
+    /// Inspect one activated plugin.
+    PluginInspect {
+        /// Runtime session ID.
+        session_id: String,
+        /// Plugin ID.
+        plugin_id: String,
+    },
+    /// Disable a plugin under policy.
+    PluginDisable {
+        /// Runtime session ID.
+        session_id: String,
+        /// Plugin ID.
+        plugin_id: String,
+    },
+    /// Quarantine a plugin under policy.
+    PluginQuarantine {
+        /// Runtime session ID.
+        session_id: String,
+        /// Plugin ID.
+        plugin_id: String,
+        /// Redacted reason code.
+        reason: String,
+    },
+    /// Return a quarantined plugin to active service under policy.
+    PluginUnquarantine {
+        /// Runtime session ID.
+        session_id: String,
+        /// Plugin ID.
+        plugin_id: String,
+    },
+    /// Reload a plugin after an upgrade.
+    PluginReload {
+        /// Runtime session ID.
+        session_id: String,
+        /// Plugin ID.
+        plugin_id: String,
+    },
+    /// Plugin-host health for a session.
+    PluginHealth {
+        /// Runtime session ID.
+        session_id: String,
+    },
+    /// Plugin-host audit slice for a session.
+    PluginAudits {
+        /// Runtime session ID.
+        session_id: String,
+    },
 }
 
 /// Wire-owned optional hard execution-budget overrides.
@@ -427,6 +479,41 @@ pub enum RuntimeResponse {
     },
     /// Operation cancellation was accepted.
     Cancelled,
+    /// Plugin lifecycle projections for a session.
+    PluginListed {
+        /// Plugin projections.
+        plugins: Vec<RuntimePluginProjection>,
+    },
+    /// One plugin lifecycle projection.
+    PluginInspected {
+        /// Plugin projection.
+        plugin: RuntimePluginProjection,
+    },
+    /// One consequential lifecycle action completed.
+    PluginLifecycleChanged {
+        /// Plugin ID.
+        plugin_id: String,
+        /// New state.
+        state: String,
+        /// Audit outcome.
+        outcome: String,
+    },
+    /// Plugin-host health for a session.
+    PluginHealthResult {
+        /// Loaded plugins.
+        loaded: usize,
+        /// Running invocations.
+        running: usize,
+        /// Observer drops.
+        observer_dropped: u64,
+        /// Pending durable deliveries.
+        pending_deliveries: usize,
+    },
+    /// Plugin-host audit slice for a session.
+    PluginAuditsResult {
+        /// Audits in append order.
+        audits: Vec<RuntimePluginAudit>,
+    },
 }
 
 /// Harness adapter descriptor exposed at the runtime protocol boundary.
@@ -442,6 +529,50 @@ pub struct RuntimeHarnessDescriptor {
     pub capability_set_hash: String,
     /// `available` or `disabled`.
     pub availability: String,
+}
+
+/// Wire projection of one activated plugin's lifecycle state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePluginProjection {
+    /// Plugin ID.
+    pub plugin_id: String,
+    /// Blocking/observer/tool/graph_node/memory/compaction/context_transform class.
+    pub class: String,
+    /// Category.
+    pub category: String,
+    /// Semantic version.
+    pub version: String,
+    /// `active`, `disabled`, or `quarantined`.
+    pub status: String,
+    /// Declared node executor IDs.
+    pub node_executors: Vec<String>,
+    /// Declared memory scopes.
+    pub memory_scopes: Vec<String>,
+    /// Declared compaction strategy ID.
+    pub compaction_strategy: Option<String>,
+    /// Declared context transform IDs.
+    pub context_transforms: Vec<String>,
+    /// Observer delivery mode.
+    pub observer_delivery: String,
+    /// Handler timeout.
+    pub timeout_ms: u64,
+}
+
+/// Wire form of one canonical plugin audit entry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimePluginAudit {
+    /// Plugin ID.
+    pub plugin_id: String,
+    /// Invocation/delivery ID when scoped.
+    pub invocation_id: Option<String>,
+    /// Stable operation.
+    pub operation: String,
+    /// Stable outcome code.
+    pub outcome: String,
+    /// Attempt count.
+    pub attempts: u8,
 }
 
 /// Serialization format supplied for a style manifest.

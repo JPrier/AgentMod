@@ -147,6 +147,85 @@ impl<D: Send + Sync> plugin::PluginDataPort for RuntimeData<D> {
             .observe_event(request)
             .await
     }
+
+    async fn execute_plugin_node(
+        &self,
+        request: plugin::ExecutePluginNodeDataRequest,
+    ) -> Result<(serde_json::Value, u8), plugin::PluginDataError> {
+        self.plugins
+            .as_ref()
+            .ok_or(plugin::PluginDataError::Unavailable)?
+            .execute_plugin_node(request)
+            .await
+    }
+
+    async fn plugin_memory(
+        &self,
+        operation: String,
+        request: plugin::PluginMemoryDataRequest,
+    ) -> Result<(plugin::PluginMemoryDataResult, u8), plugin::PluginDataError> {
+        self.plugins
+            .as_ref()
+            .ok_or(plugin::PluginDataError::Unavailable)?
+            .plugin_memory(operation, request)
+            .await
+    }
+
+    async fn plugin_compaction_propose(
+        &self,
+        request: plugin::PluginCompactionDataRequest,
+    ) -> Result<(serde_json::Value, u64, u8), plugin::PluginDataError> {
+        self.plugins
+            .as_ref()
+            .ok_or(plugin::PluginDataError::Unavailable)?
+            .plugin_compaction_propose(request)
+            .await
+    }
+
+    async fn plugin_context_transform(
+        &self,
+        request: plugin::PluginContextTransformDataRequest,
+    ) -> Result<(serde_json::Value, u8), plugin::PluginDataError> {
+        self.plugins
+            .as_ref()
+            .ok_or(plugin::PluginDataError::Unavailable)?
+            .plugin_context_transform(request)
+            .await
+    }
+
+    async fn plugin_state_change(
+        &self,
+        operation: &str,
+        request: plugin::PluginStateChangeDataRequest,
+    ) -> Result<plugin::PluginAuditDataRecord, plugin::PluginDataError> {
+        self.plugins
+            .as_ref()
+            .ok_or(plugin::PluginDataError::Unavailable)?
+            .plugin_state_change(operation, request)
+            .await
+    }
+
+    async fn plugin_audits(
+        &self,
+        session_id: String,
+    ) -> Result<Vec<plugin::PluginAuditDataRecord>, plugin::PluginDataError> {
+        self.plugins
+            .as_ref()
+            .ok_or(plugin::PluginDataError::Unavailable)?
+            .plugin_audits(session_id)
+            .await
+    }
+
+    async fn plugin_health(
+        &self,
+        session_id: String,
+    ) -> Result<plugin::PluginHealthDataRecord, plugin::PluginDataError> {
+        self.plugins
+            .as_ref()
+            .ok_or(plugin::PluginDataError::Unavailable)?
+            .plugin_health(session_id)
+            .await
+    }
 }
 
 impl<D> artifact::ArtifactDataPort for RuntimeData<D> {

@@ -20,6 +20,24 @@ use crate::{
 
 const MAX_REPLAY_VISIBLE_MODEL_BYTES: usize = 16 * 1024 * 1024;
 
+/// Canonical plugin audit outcome codes accepted by the reducer.
+const KNOWN_PLUGIN_AUDIT_OUTCOMES: &[&str] = &[
+    "proposed",
+    "started",
+    "completed",
+    "rejected_by_plugin",
+    "rejected_by_runtime",
+    "timed_out",
+    "cancelled",
+    "crashed",
+    "invalid_response",
+    "quarantined",
+    "observer_delivery_attempted",
+    "observer_delivery_completed",
+    "observer_delivery_failed",
+    "observer_delivery_dropped",
+];
+
 /// Durable session lifecycle reconstructed by replay.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -519,6 +537,23 @@ pub struct PluginInvocationCompletedEvent {
     pub outcome: String,
 }
 
+/// Canonical audit of one plugin invocation, delivery, or lifecycle action.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginAuditRecordedEvent {
+    /// Plugin identity.
+    pub plugin_id: String,
+    /// Invocation/delivery ID when the audit is invocation-scoped.
+    pub invocation_id: Option<String>,
+    /// Stable operation name.
+    pub operation: String,
+    /// Stable outcome code (proposed/started/completed/rejected_by_plugin/
+    /// rejected_by_runtime/timed_out/cancelled/crashed/invalid_response/
+    /// quarantined/observer_delivery_*).
+    pub outcome: String,
+    /// Attempt count.
+    pub attempts: u8,
+}
+
 /// Isolated tool-host execution began.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ToolExecutionStartedEvent {
@@ -1011,6 +1046,8 @@ pub enum RuntimeCommittedEvent {
     PluginSetActivated(PluginSetActivatedEvent),
     /// Records one completed blocking plugin invocation.
     PluginInvocationCompleted(PluginInvocationCompletedEvent),
+    /// Records one canonical plugin invocation/delivery/lifecycle audit.
+    PluginAuditRecorded(PluginAuditRecordedEvent),
     /// Records durable dispatch intent before the external call.
     ToolExecutionDispatched(ToolExecutionDispatchedEvent),
     /// Records isolated host dispatch.
@@ -1098,6 +1135,7 @@ impl RuntimeCommittedEvent {
             Self::ToolCallApproved(_) => "tool.call_approved",
             Self::PluginSetActivated(_) => "plugin.set_activated",
             Self::PluginInvocationCompleted(_) => "plugin.invocation_completed",
+            Self::PluginAuditRecorded(_) => "plugin.audit_recorded",
             Self::ToolExecutionDispatched(_) => "tool.execution_dispatched",
             Self::ToolExecutionStarted(_) => "tool.execution_started",
             Self::ToolOutputObserved(_) => "tool.output_observed",
@@ -1358,6 +1396,26 @@ pub struct PluginExecutionState {
     pub activated_at: Option<Sequence>,
     /// Canonical blocking invocation records in execution order.
     pub invocations: Vec<PluginInvocationRecord>,
+    /// Canonical plugin invocation/delivery/lifecycle audits.
+    #[serde(default)]
+    pub audits: Vec<PluginAuditRecord>,
+}
+
+/// Canonical plugin audit entry reconstructed during replay.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PluginAuditRecord {
+    /// Plugin identity.
+    pub plugin_id: String,
+    /// Invocation/delivery ID when scoped.
+    pub invocation_id: Option<String>,
+    /// Stable operation name.
+    pub operation: String,
+    /// Stable outcome code.
+    pub outcome: String,
+    /// Attempt count.
+    pub attempts: u8,
+    /// Canonical event sequence.
+    pub committed_at: Sequence,
 }
 
 /// Replay-owned blocking plugin invocation.
@@ -1816,6 +1874,27 @@ fn apply_payload(
                 action_kind: completed.action_kind.clone(),
                 proposal_id: completed.proposal_id.clone(),
                 outcome: completed.outcome.clone(),
+                committed_at: event.metadata.sequence,
+            });
+            Ok(())
+        }
+        RuntimeCommittedEvent::PluginAuditRecorded(audit) => {
+            if !state
+                .plugins
+                .activated_plugin_ids
+                .contains(&audit.plugin_id)
+                || audit.operation.trim().is_empty()
+                || audit.outcome.trim().is_empty()
+                || !KNOWN_PLUGIN_AUDIT_OUTCOMES.contains(&audit.outcome.as_str())
+            {
+                return Err(SessionReducerError::InvalidPluginAudit);
+            }
+            state.plugins.audits.push(PluginAuditRecord {
+                plugin_id: audit.plugin_id.clone(),
+                invocation_id: audit.invocation_id.clone(),
+                operation: audit.operation.clone(),
+                outcome: audit.outcome.clone(),
+                attempts: audit.attempts,
                 committed_at: event.metadata.sequence,
             });
             Ok(())
@@ -4003,6 +4082,9 @@ pub enum SessionReducerError {
     /// A plugin invocation did not match the active plugin set or typed boundary.
     #[error("plugin invocation state is invalid")]
     InvalidPluginInvocation,
+    /// A plugin audit event did not match the active plugin set or known outcomes.
+    #[error("plugin audit state is invalid")]
+    InvalidPluginAudit,
     /// Context composition did not follow start, phase, completion ordering.
     #[error("context boundary state transition is invalid")]
     InvalidContextBoundaryTransition,
@@ -4180,6 +4262,85 @@ mod tests {
         );
         assert_eq!(state.plugins.invocations.len(), 1);
         assert_eq!(state.plugins.invocations[0].outcome, "replace");
+    }
+
+    #[test]
+    fn plugin_audit_recorded_replays_into_canonical_audit_state_and_rejects_unknown_outcomes() {
+        let style_binding = binding(BuiltInStyle::PersistentChat);
+        let plugin_set_hash = style_binding.plugin_set_hash;
+        let events = vec![
+            envelope(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture"),
+                    style: style_binding.id.clone(),
+                    style_binding: Some(Box::new(style_binding)),
+                }),
+            ),
+            envelope(
+                2,
+                RuntimeCommittedEvent::PluginSetActivated(PluginSetActivatedEvent {
+                    plugin_ids: vec![String::from("fixture.rewriter")],
+                    plugin_set_hash,
+                }),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::PluginAuditRecorded(PluginAuditRecordedEvent {
+                    plugin_id: String::from("fixture.rewriter"),
+                    invocation_id: Some(String::from("node:graph-node-1:fixture.node")),
+                    operation: String::from("execute_node"),
+                    outcome: String::from("completed"),
+                    attempts: 1,
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::PluginAuditRecorded(PluginAuditRecordedEvent {
+                    plugin_id: String::from("fixture.rewriter"),
+                    invocation_id: Some(String::from("observer-delivery-1")),
+                    operation: String::from("observe"),
+                    outcome: String::from("observer_delivery_completed"),
+                    attempts: 1,
+                }),
+            ),
+        ];
+        let state = replay(&events).expect("plugin audit replay");
+        assert_eq!(state.plugins.audits.len(), 2);
+        assert_eq!(state.plugins.audits[0].operation, "execute_node");
+        assert_eq!(
+            state.plugins.audits[1].outcome,
+            "observer_delivery_completed"
+        );
+        assert_eq!(
+            state.plugins.audits[0].committed_at,
+            Sequence::new(3).expect("seq")
+        );
+
+        let invalid = vec![
+            envelope(
+                1,
+                RuntimeCommittedEvent::SessionCreated(SessionCreatedEvent {
+                    workspace: String::from("fixture"),
+                    style: String::from("persistent-chat"),
+                    style_binding: None,
+                }),
+            ),
+            envelope(
+                2,
+                RuntimeCommittedEvent::PluginAuditRecorded(PluginAuditRecordedEvent {
+                    plugin_id: String::from("fixture.rewriter"),
+                    invocation_id: None,
+                    operation: String::from("execute_node"),
+                    outcome: String::from("not_a_real_outcome"),
+                    attempts: 1,
+                }),
+            ),
+        ];
+        assert!(matches!(
+            replay(&invalid),
+            Err(SessionReducerError::InvalidPluginAudit)
+        ));
     }
 
     #[allow(

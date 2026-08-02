@@ -4,11 +4,12 @@
     reason = "service-local turn records are intentionally boundary-specific"
 )]
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use agentmod_runtime_logic::{
     continuation::{ContinuationWakeCondition, ContinuationWakeProof},
     harness::ProviderEvent,
+    plugin_management::{PluginAuditRecord, PluginLifecycleProjection, PluginManagementLogicPort},
     turn::{
         ApprovalTurnLogicPort, CancelTurnCommand, CancelTurnLogicPort,
         CommittedEventObserverLogicPort, CreateDeferredTurnCommand, DeferredTurnLogicPort,
@@ -540,6 +541,7 @@ pub struct RuntimeDaemonService<C, T> {
     core: RuntimeService<C>,
     turns: TurnService<T>,
     scheduler_completion_delay: std::time::Duration,
+    plugin_management: Option<Arc<dyn PluginManagementLogicPort>>,
 }
 
 enum ScheduledRecoveryState {
@@ -562,6 +564,7 @@ impl<C, T> RuntimeDaemonService<C, T> {
             core,
             turns,
             scheduler_completion_delay: std::time::Duration::ZERO,
+            plugin_management: None,
         }
     }
 
@@ -570,6 +573,168 @@ impl<C, T> RuntimeDaemonService<C, T> {
     pub const fn with_scheduler_completion_delay(mut self, delay: std::time::Duration) -> Self {
         self.scheduler_completion_delay = delay;
         self
+    }
+
+    /// Adds the plugin lifecycle management adapter below the frontend layer.
+    #[must_use]
+    pub fn with_plugin_management(
+        mut self,
+        plugin_management: Arc<dyn PluginManagementLogicPort>,
+    ) -> Self {
+        self.plugin_management = Some(plugin_management);
+        self
+    }
+
+    async fn handle_plugin_management(
+        &self,
+        plugin_management: &dyn PluginManagementLogicPort,
+        request: &RuntimeRequest,
+    ) -> Result<RuntimeResponse, String> {
+        match request {
+            RuntimeRequest::PluginList { session_id } => {
+                let plugins = plugin_management
+                    .list_plugins(session_id.clone())
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(to_wire_plugin_projection)
+                    .collect();
+                Ok(RuntimeResponse::PluginListed { plugins })
+            }
+            RuntimeRequest::PluginInspect {
+                session_id,
+                plugin_id,
+            } => {
+                let plugin = plugin_management
+                    .inspect_plugin(session_id.clone(), plugin_id.clone())
+                    .await
+                    .map_err(|error| error.to_string())
+                    .map(to_wire_plugin_projection)?;
+                Ok(RuntimeResponse::PluginInspected { plugin })
+            }
+            RuntimeRequest::PluginDisable {
+                session_id,
+                plugin_id,
+            } => {
+                let audit = plugin_management
+                    .disable_plugin(session_id.clone(), plugin_id.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(RuntimeResponse::PluginLifecycleChanged {
+                    plugin_id: plugin_id.clone(),
+                    state: "disabled".into(),
+                    outcome: audit.outcome,
+                })
+            }
+            RuntimeRequest::PluginQuarantine {
+                session_id,
+                plugin_id,
+                reason,
+            } => {
+                let audit = plugin_management
+                    .quarantine_plugin(session_id.clone(), plugin_id.clone(), reason.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(RuntimeResponse::PluginLifecycleChanged {
+                    plugin_id: plugin_id.clone(),
+                    state: "quarantined".into(),
+                    outcome: audit.outcome,
+                })
+            }
+            RuntimeRequest::PluginUnquarantine {
+                session_id,
+                plugin_id,
+            } => {
+                let audit = plugin_management
+                    .unquarantine_plugin(session_id.clone(), plugin_id.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(RuntimeResponse::PluginLifecycleChanged {
+                    plugin_id: plugin_id.clone(),
+                    state: "active".into(),
+                    outcome: audit.outcome,
+                })
+            }
+            RuntimeRequest::PluginReload {
+                session_id,
+                plugin_id,
+            } => {
+                let audit = plugin_management
+                    .reload_plugin(session_id.clone(), plugin_id.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(RuntimeResponse::PluginLifecycleChanged {
+                    plugin_id: plugin_id.clone(),
+                    state: "reloaded".into(),
+                    outcome: audit.outcome,
+                })
+            }
+            RuntimeRequest::PluginHealth { session_id } => {
+                let health = plugin_management
+                    .host_health(session_id.clone())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(RuntimeResponse::PluginHealthResult {
+                    loaded: health.loaded,
+                    running: health.running,
+                    observer_dropped: health.observer_dropped,
+                    pending_deliveries: health.pending_deliveries,
+                })
+            }
+            RuntimeRequest::PluginAudits { session_id } => {
+                let audits = plugin_management
+                    .host_audits(session_id.clone())
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(to_wire_plugin_audit)
+                    .collect();
+                Ok(RuntimeResponse::PluginAuditsResult { audits })
+            }
+            _ => Err(String::from("unsupported plugin management request")),
+        }
+    }
+}
+
+fn is_plugin_management_request(request: &RuntimeRequest) -> bool {
+    matches!(
+        request,
+        RuntimeRequest::PluginList { .. }
+            | RuntimeRequest::PluginInspect { .. }
+            | RuntimeRequest::PluginDisable { .. }
+            | RuntimeRequest::PluginQuarantine { .. }
+            | RuntimeRequest::PluginUnquarantine { .. }
+            | RuntimeRequest::PluginReload { .. }
+            | RuntimeRequest::PluginHealth { .. }
+            | RuntimeRequest::PluginAudits { .. }
+    )
+}
+
+fn to_wire_plugin_projection(
+    projection: PluginLifecycleProjection,
+) -> agentmod_runtime_protocol::RuntimePluginProjection {
+    agentmod_runtime_protocol::RuntimePluginProjection {
+        plugin_id: projection.plugin_id,
+        class: projection.class,
+        category: projection.category,
+        version: projection.version,
+        status: projection.status,
+        node_executors: projection.node_executors,
+        memory_scopes: projection.memory_scopes.into_iter().collect(),
+        compaction_strategy: projection.compaction_strategy,
+        context_transforms: projection.context_transforms,
+        observer_delivery: projection.observer_delivery,
+        timeout_ms: projection.timeout_ms,
+    }
+}
+
+fn to_wire_plugin_audit(audit: PluginAuditRecord) -> agentmod_runtime_protocol::RuntimePluginAudit {
+    agentmod_runtime_protocol::RuntimePluginAudit {
+        plugin_id: audit.plugin_id,
+        invocation_id: audit.invocation_id,
+        operation: audit.operation,
+        outcome: audit.outcome,
+        attempts: audit.attempts,
     }
 }
 
@@ -1252,6 +1417,13 @@ where
                 .collect();
             let runs = self.execute_scheduled_claims(executions, false).await;
             return Ok(RuntimeResponse::ScheduledRuns { runs });
+        }
+        if let Some(plugin_management) = &self.plugin_management
+            && is_plugin_management_request(request)
+        {
+            return self
+                .handle_plugin_management(plugin_management.as_ref(), request)
+                .await;
         }
         let RuntimeRequest::RunTurn {
             session_id,

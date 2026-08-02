@@ -103,6 +103,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ),
                     maximum_frame_bytes: 1024 * 1024,
                     request_timeout: std::time::Duration::from_secs(30),
+                    runtime_api_version: String::from("0.1.0"),
+                    available_capabilities: BTreeSet::from([
+                        String::from("events"),
+                        String::from("plugin_state"),
+                        String::from("tools"),
+                        String::from("memory"),
+                        String::from("compaction"),
+                        String::from("context"),
+                        String::from("graph_nodes"),
+                    ]),
+                    idle_shutdown: std::env::var("AGENTMOD_PLUGIN_IDLE_TIMEOUT_MS")
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .filter(|value| *value > 0)
+                        .map(std::time::Duration::from_millis),
                 },
             )?))
         } else {
@@ -327,7 +342,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             FileContinuationDependency::new(sessions_root.clone()),
             scheduler,
         ))
-        .with_node_executors(RuntimeNodeExecutorData::native()?)
         .with_memory(RuntimeMemoryData::first_party(
             &sessions_root
                 .parent()
@@ -335,11 +349,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .join("memory"),
         ))
         .with_artifacts(agentmod_runtime_data::artifact::RuntimeArtifactData::first_party());
+        let mut plugin_data = None;
         if let (Some(dependency), Some(catalog)) = (&plugin_dependency, &plugin_catalog) {
-            data = data.with_plugins(RuntimePluginData::new(
-                dependency.clone(),
-                catalog.manifests.clone(),
-            ));
+            let plugin_data_value =
+                RuntimePluginData::new(dependency.clone(), catalog.manifests.clone());
+            data = data
+                .with_node_executors(RuntimeNodeExecutorData::native_with(
+                    plugin_data_value.node_executor_registrations(),
+                )?)
+                .with_plugins(plugin_data_value.clone());
+            plugin_data = Some(plugin_data_value);
+        } else {
+            data = data.with_node_executors(RuntimeNodeExecutorData::native()?);
         }
         let mut style_config = RuntimeStyleServiceConfig::native(&sessions_root);
         if let Some(catalog) = &plugin_catalog {
@@ -379,7 +400,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "orphaned_count": recovery.orphaned_count,
             })
         );
-        let service = RuntimeDaemonService::new(core, turns).with_scheduler_completion_delay(
+        let mut service = RuntimeDaemonService::new(core, turns).with_scheduler_completion_delay(
             std::time::Duration::from_millis(
                 std::env::var("AGENTMOD_SCHEDULER_COMPLETION_DELAY_MS")
                     .ok()
@@ -387,6 +408,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(0),
             ),
         );
+        if plugin_data.is_some() {
+            service = service.with_plugin_management(std::sync::Arc::new(
+                agentmod_runtime_logic::plugin_management::PluginManagementLogic::new(
+                    data.clone(),
+                    agentmod_runtime_logic::plugin_management::AllowAllLifecyclePolicyGate,
+                ),
+            ));
+        }
         prepare_local_endpoint(&endpoint)?;
         let poll_interval_ms = std::env::var("AGENTMOD_SCHEDULER_POLL_MS")
             .ok()

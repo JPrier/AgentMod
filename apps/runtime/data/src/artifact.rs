@@ -295,13 +295,14 @@ impl ArtifactDataPort for RuntimeArtifactData {
             })?;
         let mut offset = 0_u64;
         let mut bytes = Vec::new();
-        loop {
+        while offset < metadata.byte_size {
+            let length = metadata.byte_size.min(offset.saturating_add(DEFAULT_MAX_ARTIFACT_BYTES_U64));
             let range = self
                 .store(&request.store_root)?
                 .read_range(DependencyReadArtifactRangeRequest {
                     artifact_reference: reference.clone(),
                     offset,
-                    length: DEFAULT_MAX_ARTIFACT_BYTES_U64,
+                    length,
                 })
                 .map_err(ArtifactDataError::Dependency)?;
             if range.bytes.is_empty() {
@@ -309,9 +310,6 @@ impl ArtifactDataPort for RuntimeArtifactData {
             }
             offset = offset.saturating_add(u64::try_from(range.bytes.len()).unwrap_or_default());
             bytes.extend_from_slice(&range.bytes);
-            if offset >= metadata.byte_size {
-                break;
-            }
         }
         if u64::try_from(bytes.len()).unwrap_or_default() != metadata.byte_size {
             return Err(ArtifactDataError::InvalidDependencyRecord);

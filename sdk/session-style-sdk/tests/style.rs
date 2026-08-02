@@ -316,10 +316,10 @@ fn ephemeral_turn_version_selection_and_cache_identity_are_exact_and_determinist
         .expect("exact current version");
     assert_eq!(manifest, built_in_manifest(BuiltInStyle::EphemeralTurn));
 
-    for semantic in [BuiltInStyle::PersistentChat, BuiltInStyle::PlannerWorker] {
-        assert!(built_in_manifest_for_version(semantic, "1.0.0").is_none());
-        assert!(built_in_manifest_for_version(semantic, "1.1.0").is_some());
-    }
+    assert!(built_in_manifest_for_version(BuiltInStyle::PersistentChat, "1.0.0").is_none());
+    assert!(built_in_manifest_for_version(BuiltInStyle::PersistentChat, "1.1.0").is_some());
+    assert!(built_in_manifest_for_version(BuiltInStyle::PlannerWorker, "1.1.0").is_none());
+    assert!(built_in_manifest_for_version(BuiltInStyle::PlannerWorker, "1.2.0").is_some());
 
     let first = compile_style(&manifest, &context(), StyleCompilerLimits::default())
         .expect("first deterministic compile");
@@ -352,9 +352,9 @@ fn ephemeral_turn_version_selection_and_cache_identity_are_exact_and_determinist
 }
 
 #[test]
-fn planner_worker_1_1_compiles_complete_child_execution_policy() {
+fn planner_worker_1_2_compiles_complete_child_execution_policy() {
     let manifest = built_in_manifest(BuiltInStyle::PlannerWorker);
-    assert_eq!(manifest.identity.version, "1.1.0");
+    assert_eq!(manifest.identity.version, "1.2.0");
     let compiled = compile_style(&manifest, &context(), StyleCompilerLimits::default())
         .expect("planner worker compile");
 

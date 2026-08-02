@@ -74,8 +74,8 @@ try {
         if (@($inspection.state.planner_worker.joins).Count -ne 2) {
             throw "expected one exact join per planner iteration"
         }
-        if (@($inspection.state.planner_worker.result_packages).Count -ne 2) {
-            throw "expected one immutable result package per iteration"
+        if (@($inspection.state.planner_worker.result_packages).Count -ne 3) {
+            throw "expected one immutable result package per completed child"
         }
         if (@($inspection.state.planner_worker.integration_results).Count -ne 2) {
             throw "expected one integration result per iteration"
@@ -110,7 +110,7 @@ try {
         if (@($journal | Select-String '"child_agent.created"').Count -ne 3 -or
             @($journal | Select-String '"child_agent.join_completed"').Count -ne 2 -or
             @($journal | Select-String '"style.reviewer_findings_committed"').Count -ne 2 -or
-            @($journal | Select-String '"worker.result_package_committed"').Count -ne 2 -or
+            @($journal | Select-String '"worker.result_package_committed"').Count -ne 3 -or
             @($journal | Select-String '"integration.result_committed"').Count -ne 2) {
             throw "planner canonical orchestration events are incomplete"
         }

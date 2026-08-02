@@ -1134,6 +1134,8 @@ where
                 return Ok(None);
             };
             let workspace_mode = task_workspace_mode(&task.workspace_mode, &default_mode);
+            let task_token_budget = task.token_budget.min(policy.per_child_token_budget);
+            let task_context_budget = context_budget_tokens.min(task_token_budget);
             let identity = ChildAgentExecutionIdentity {
                 execution_id: format!(
                     "child:{}:{}:{}:{}",
@@ -1166,7 +1168,7 @@ where
                             task: task.description.clone(),
                             child_style: child_style.clone(),
                             workspace_mode: workspace_mode.clone(),
-                            token_budget: task.token_budget.min(policy.per_child_token_budget),
+                            token_budget: task_token_budget,
                         },
                     ),
                 )?;
@@ -1189,7 +1191,7 @@ where
                     action: ConsequentialAction::ChildAgentCreation {
                         style: child_style.clone(),
                         workspace_mode: workspace_mode.clone(),
-                        token_budget: task.token_budget.min(policy.per_child_token_budget),
+                        token_budget: task_token_budget,
                     },
                     style: state.style.clone(),
                     workspace: state.workspace.clone(),
@@ -1273,8 +1275,8 @@ where
                         revision: execution.loop_iteration,
                         depth,
                         task: task.description,
-                        token_budget: task.token_budget.min(policy.per_child_token_budget),
-                        context_budget_tokens,
+                        token_budget: task_token_budget,
+                        context_budget_tokens: task_context_budget,
                         tool_groups: task.tool_groups.clone(),
                         memory_access,
                         workspace_mode: workspace_mode.clone(),

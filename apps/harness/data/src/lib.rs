@@ -55,6 +55,7 @@ pub trait HarnessHealthData {
 }
 
 /// Data-owned detailed provider/model catalog entry.
+#[allow(clippy::struct_excessive_bools, reason = "capability flags are the catalog contract")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HarnessCatalogRecord {
     /// Stable provider key.

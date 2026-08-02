@@ -31,9 +31,9 @@ use crate::{
 /// Stable live provider adapter IDs.
 /// Generic OpenAI-compatible HTTP endpoint.
 pub const PROVIDER_OPENAI_COMPATIBLE: &str = "openai-compatible";
-/// OpenRouter endpoint.
+/// `OpenRouter` endpoint.
 pub const PROVIDER_OPENROUTER: &str = "openrouter";
-/// OpenAI official endpoint.
+/// `OpenAI` official endpoint.
 pub const PROVIDER_OPENAI: &str = "openai";
 /// Anthropic official endpoint.
 pub const PROVIDER_ANTHROPIC: &str = "anthropic";
@@ -179,10 +179,7 @@ pub fn resolve_endpoint_config(
         .or_else(|| {
             std::env::var(format!("{env_prefix}_TLS_VERIFY"))
                 .ok()
-                .and_then(|value| match value.as_str() {
-                    "false" | "0" => Some(false),
-                    _ => Some(true),
-                })
+                .map(|value| !matches!(value.as_str(), "false" | "0"))
         })
         .unwrap_or(true);
     let timeout = options
@@ -192,10 +189,12 @@ pub fn resolve_endpoint_config(
             std::env::var(format!("{env_prefix}_TIMEOUT_MS"))
                 .ok()
                 .and_then(|value| value.parse::<u64>().ok())
-        })
-        .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_secs(120));
-    let pricing = pricing::PricingTable::from_env(&env_prefix);
+        }).map_or_else(|| Duration::from_secs(120), Duration::from_millis);
+    let pricing = if let Some(raw) = options.get("pricing_json") {
+        pricing::PricingTable::parse(raw).unwrap_or_default()
+    } else {
+        pricing::PricingTable::from_env(&env_prefix)
+    };
     Ok(ProviderEndpointConfig {
         provider_key: provider_key.to_owned(),
         base_url,
@@ -218,16 +217,44 @@ fn resolve_api_key(
     }
     let reference = options
         .get("api_key_ref")
-        .or_else(|| options.get("api_key_env"))
-        .map(|value| (*value).to_owned())
-        .unwrap_or_else(|| format!("{env_prefix}_API_KEY"));
-    let value = std::env::var(&reference).ok();
+        .or_else(|| options.get("api_key_env")).map_or_else(|| format!("{env_prefix}_API_KEY"), |value| (*value).to_owned());
+    let value = if let Some(path) = reference.strip_prefix("file:") {
+        read_secret_file(path)?
+    } else {
+        std::env::var(&reference).ok()
+    };
     if value.is_none() && std::env::var(format!("{env_prefix}_REQUIRE_KEY")).is_ok() {
         return Err(ProviderExecutionDependencyError::InvalidRequest(format!(
-            "provider `{provider_key}` requires API key environment variable {reference}"
+            "provider `{provider_key}` requires API key reference {reference}"
         )));
     }
     Ok(value)
+}
+
+fn read_secret_file(
+    path: &str,
+) -> Result<Option<String>, ProviderExecutionDependencyError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).map_err(|_| {
+        ProviderExecutionDependencyError::InvalidRequest(format!(
+            "provider secret file `{path}` cannot be opened"
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() || bytes.len() > 64 * 1024 {
+        return Err(ProviderExecutionDependencyError::InvalidRequest(
+            "provider secret file is unreadable or exceeds 64 KiB".into(),
+        ));
+    }
+    let mut value = String::from_utf8(bytes).map_err(|_| {
+        ProviderExecutionDependencyError::InvalidRequest(
+            "provider secret file is not valid UTF-8".into(),
+        )
+    })?;
+    while value.ends_with(['\r', '\n']) {
+        value.pop();
+    }
+    Ok(Some(value))
 }
 
 fn default_base_url(provider_key: &str) -> Option<&'static str> {
@@ -262,20 +289,22 @@ fn configured_models(provider_key: &str) -> Vec<String> {
     let env_prefix = format!("AGENTMOD_PROVIDER_{}", provider_key.to_ascii_uppercase());
     std::env::var(format!("{env_prefix}_MODELS"))
         .ok()
-        .map(|value| {
-            value
-                .split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_else(|| {
-            default_models(provider_key)
-                .iter()
-                .map(|value| (*value).to_owned())
-                .collect()
-        })
+        .map_or_else(
+            || {
+                default_models(provider_key)
+                    .iter()
+                    .map(|value| (*value).to_owned())
+                    .collect()
+            },
+            |value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            },
+        )
 }
 
 fn default_models(provider_key: &str) -> &'static [&'static str] {
@@ -365,7 +394,6 @@ impl ProviderCatalogDetailDependency for LiveProviderCatalogDependency {
                 capabilities: capabilities.clone(),
                 context_limit: match provider_key {
                     PROVIDER_OPENAI => Some(128_000),
-                    PROVIDER_OPENROUTER => None,
                     PROVIDER_ANTHROPIC => Some(200_000),
                     PROVIDER_GEMINI => Some(1_000_000),
                     _ => None,
@@ -544,19 +572,22 @@ fn failed_event(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "the live execution matrix keeps connect, stream, and normalize steps together for auditability"
+)]
 async fn execute_live(
     config: &ProviderEndpointConfig,
     request: &DependencyProviderExecutionRequest,
     cancellation: CancellationToken,
-) -> Result<DependencyProviderExecutionResponse, ProviderExecutionDependencyError> {
-    let options: BTreeMap<_, _> = request
+) -> Result<DependencyProviderExecutionResponse, ProviderExecutionDependencyError> {    let options: BTreeMap<_, _> = request
         .options
         .iter()
         .map(|option| (option.key.clone(), option.value.clone()))
         .collect();
     let streaming = options
         .get("streaming")
-        .map_or(true, |value| value != "false" && value != "0");
+        .is_none_or(|value| value != "false" && value != "0");
     let body = match config.provider_key.as_str() {
         PROVIDER_OPENAI | PROVIDER_OPENROUTER | PROVIDER_OPENAI_COMPATIBLE | PROVIDER_LOCAL => {
             wire_openai::build_request_body(&request.model_key, &request.entries, &options)
@@ -602,7 +633,7 @@ async fn execute_live(
         }
     }
     let response = tokio::select! {
-        _ = cancellation.cancelled() => {
+        () = cancellation.cancelled() => {
             return Ok(DependencyProviderExecutionResponse {
                 events: vec![DependencyProviderEvent::Cancelled],
             });
@@ -635,14 +666,15 @@ async fn execute_live(
             )],
         });
     }
+    let mut events: Vec<DependencyProviderEvent> =
+        vec![DependencyProviderEvent::Started];
 
     if !streaming {
-        return execute_non_streaming(config, request, response, &options).await;
+        return execute_non_streaming(config, request, response, &options, events).await;
     }
     let mut normalizer = StreamNormalizer::new(&config.provider_key).map_err(|message| {
         ProviderExecutionDependencyError::InvalidRequest(message)
     })?;
-    let mut events: Vec<DependencyProviderEvent> = Vec::new();
     let mut event_bytes: usize = 0;
     let mut received_any = false;
     let mut stream_parser = sse::SseParser::new();
@@ -650,7 +682,7 @@ async fn execute_live(
     let mut saw_stream_error = false;
     loop {
         let chunk = tokio::select! {
-            _ = cancellation.cancelled() => {
+            () = cancellation.cancelled() => {
                 events.push(DependencyProviderEvent::Cancelled);
                 return Ok(DependencyProviderExecutionResponse { events });
             }
@@ -687,26 +719,23 @@ async fn execute_live(
         };
         for sse_event in parsed {
             if sse_event.data == "[DONE]" {
-                saw_stream_error = true;
-                break;
+                // OpenAI-compatible terminal marker; the stream ended normally.
+                return Ok(finish_live_stream(config, request, normalizer, events, event_bytes));
             }
             if sse_event.data.trim().is_empty() {
                 continue;
             }
-            let value: serde_json::Value = match serde_json::from_str(&sse_event.data) {
-                Ok(value) => value,
-                Err(_) => {
-                    events.push(failed_event(
-                        if received_any {
-                            DependencyProviderFailureKind::PartialOutputFailure
-                        } else {
-                            DependencyProviderFailureKind::InvalidRequest
-                        },
-                        "provider emitted a malformed stream event",
-                        DependencyRetryClassification::Never,
-                    ));
-                    return Ok(DependencyProviderExecutionResponse { events });
-                }
+            let value: serde_json::Value = if let Ok(value) = serde_json::from_str(&sse_event.data) { value } else {
+                events.push(failed_event(
+                    if received_any {
+                        DependencyProviderFailureKind::PartialOutputFailure
+                    } else {
+                        DependencyProviderFailureKind::InvalidRequest
+                    },
+                    "provider emitted a malformed stream event",
+                    DependencyRetryClassification::Never,
+                ));
+                return Ok(DependencyProviderExecutionResponse { events });
             };
             if let Some(error) = value.get("error") {
                 let kind = error
@@ -759,13 +788,24 @@ async fn execute_live(
             return Ok(DependencyProviderExecutionResponse { events });
         }
     }
+    Ok(finish_live_stream(config, request, normalizer, events, event_bytes))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn finish_live_stream(
+    config: &ProviderEndpointConfig,
+    request: &DependencyProviderExecutionRequest,
+    mut normalizer: StreamNormalizer,
+    mut events: Vec<DependencyProviderEvent>,
+    event_bytes: usize,
+) -> DependencyProviderExecutionResponse {
     if events.len() > MAX_STREAM_EVENTS || event_bytes > MAX_EVENT_DELTAS_BYTES {
         events.push(failed_event(
             DependencyProviderFailureKind::PartialOutputFailure,
             "provider stream exceeded the bounded output budget",
             DependencyRetryClassification::Never,
         ));
-        return Ok(DependencyProviderExecutionResponse { events });
+        return DependencyProviderExecutionResponse { events };
     }
     let finish_reason = normalizer.finish_reason().unwrap_or("stop").to_owned();
     let usage = normalizer.usage().unwrap_or_default();
@@ -777,7 +817,7 @@ async fn execute_live(
                 message,
                 DependencyRetryClassification::Never,
             ));
-            return Ok(DependencyProviderExecutionResponse { events });
+            return DependencyProviderExecutionResponse { events };
         }
     };
     events.extend(tool_proposals);
@@ -787,7 +827,7 @@ async fn execute_live(
         usage,
         cost,
     });
-    Ok(DependencyProviderExecutionResponse { events })
+    DependencyProviderExecutionResponse { events }
 }
 
 async fn execute_non_streaming(
@@ -795,6 +835,7 @@ async fn execute_non_streaming(
     request: &DependencyProviderExecutionRequest,
     response: reqwest::Response,
     _options: &BTreeMap<String, String>,
+    mut events: Vec<DependencyProviderEvent>,
 ) -> Result<DependencyProviderExecutionResponse, ProviderExecutionDependencyError> {
     let mut body = response.text().await.unwrap_or_default();
     if body.len() > 32 * 1024 * 1024 {
@@ -815,7 +856,6 @@ async fn execute_non_streaming(
     let mut normalizer = StreamNormalizer::new(&config.provider_key).map_err(|message| {
         ProviderExecutionDependencyError::InvalidRequest(message)
     })?;
-    let mut events: Vec<DependencyProviderEvent> = Vec::new();
     match config.provider_key.as_str() {
         PROVIDER_OPENAI | PROVIDER_OPENROUTER | PROVIDER_OPENAI_COMPATIBLE | PROVIDER_LOCAL => {
             // Non-stream chat completion: map choices[].message into chunks.

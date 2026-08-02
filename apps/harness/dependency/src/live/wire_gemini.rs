@@ -24,11 +24,18 @@ impl GeminiStreamNormalizer {
         Self::default()
     }
 
-    /// Consumes one Gemini response chunk.
+    /// Consumes one Gemini response chunk and returns normalized events.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted diagnostic when a chunk cannot be normalized.
     pub fn handle(&mut self, chunk: &Value) -> Result<Vec<DependencyProviderEvent>, String> {
         let mut events = Vec::new();
         if let Some(metadata) = chunk.get("usageMetadata") {
-            self.usage = Some(parse_usage(metadata));
+            self.usage = Some(merge_usage(
+                self.usage.unwrap_or_default(),
+                parse_usage(metadata),
+            ));
         }
         let Some(candidates) = chunk.get("candidates").and_then(Value::as_array) else {
             return Ok(events);
@@ -44,26 +51,26 @@ impl GeminiStreamNormalizer {
                 continue;
             };
             for part in parts {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    if !text.is_empty() {
+                if let Some(text) = part.get("text").and_then(Value::as_str)
+                    && !text.is_empty() {
                         self.started = true;
                         events.push(DependencyProviderEvent::TextDelta(text.to_owned()));
                     }
-                }
                 if let Some(call) = part.get("functionCall") {
                     let name = call.get("name").and_then(Value::as_str).unwrap_or("");
                     let arguments = call.get("args").cloned().unwrap_or_else(|| json!({}));
                     if !name.is_empty() {
                         self.started = true;
                         let arguments_json = arguments.to_string();
+                        let call_id = format!("gemini-call-{}", events.len());
                         events.push(DependencyProviderEvent::ToolCallDelta {
-                            call_id: format!("gemini-call-{}", events.len()),
+                            call_id: call_id.clone(),
                             name_fragment: String::new(),
                             arguments_fragment: arguments_json.clone(),
                         });
                         events.push(DependencyProviderEvent::ToolCallProposed {
-                            continuation_reference: format!("gemini-call-{}", events.len()),
-                            call_id: format!("gemini-call-{}", events.len()),
+                            continuation_reference: call_id.clone(),
+                            call_id,
                             tool: name.to_owned(),
                             arguments_json,
                         });
@@ -107,6 +114,17 @@ fn parse_usage(metadata: &Value) -> DependencyUsage {
             .and_then(Value::as_u64)
             .unwrap_or(0),
         estimated: false,
+    }
+}
+
+fn merge_usage(current: DependencyUsage, incoming: DependencyUsage) -> DependencyUsage {
+    DependencyUsage {
+        input_tokens: current.input_tokens.max(incoming.input_tokens),
+        output_tokens: current.output_tokens.max(incoming.output_tokens),
+        cache_read_tokens: current.cache_read_tokens.max(incoming.cache_read_tokens),
+        cache_write_tokens: current.cache_write_tokens.max(incoming.cache_write_tokens),
+        reasoning_tokens: current.reasoning_tokens.max(incoming.reasoning_tokens),
+        estimated: current.estimated || incoming.estimated,
     }
 }
 
@@ -166,14 +184,13 @@ pub fn build_request_body(
             generation.insert("responseMimeType".into(), Value::String("application/json".into()));
         }
     }
-    if let Some(value) = options.get("thinking") {
-        if value == "enabled" {
+    if let Some(value) = options.get("thinking")
+        && value == "enabled" {
             generation.insert(
                 "thinkingConfig".into(),
                 json!({"includeThoughts": false}),
             );
         }
-    }
     if !generation.is_empty() {
         body["generationConfig"] = Value::Object(generation);
     }
@@ -187,7 +204,7 @@ pub fn build_request_body(
                     .filter_map(|tool| {
                         let function = tool
                             .get("function")
-                            .or_else(|| Some(tool))?;
+                            .or(Some(tool))?;
                         let name = function.get("name").and_then(Value::as_str)?;
                         Some(json!({
                             "name": name,
@@ -272,8 +289,8 @@ fn build_contents(entries: &[DependencyConversationEntry]) -> Result<Vec<Value>,
                 )
             }
         };
-        if let Some(previous) = contents.last_mut() {
-            if previous.get("role").and_then(Value::as_str) == Some(role)
+        if let Some(previous) = contents.last_mut()
+            && previous.get("role").and_then(Value::as_str) == Some(role)
                 && role != "function"
                 && previous.get("role").and_then(Value::as_str) != Some("function")
             {
@@ -283,7 +300,6 @@ fn build_contents(entries: &[DependencyConversationEntry]) -> Result<Vec<Value>,
                     .push(part);
                 continue;
             }
-        }
         contents.push(json!({"role": role, "parts": [part]}));
     }
     if contents.is_empty() || contents.len() > 256 {

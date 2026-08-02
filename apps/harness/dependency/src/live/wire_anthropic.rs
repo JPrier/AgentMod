@@ -47,54 +47,63 @@ impl AnthropicStreamNormalizer {
         }
     }
 
-    /// Consumes one Anthropic SSE event payload and returns normalized events.
+    /// Consumes one Anthropic SSE event payload and returns normalized
+    /// events.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted diagnostic when an event cannot be normalized.
+    #[allow(clippy::too_many_lines, reason = "the event matrix is intentionally explicit for auditability")]
     pub fn handle(&mut self, event_type: &str, payload: &Value) -> Result<Vec<DependencyProviderEvent>, String> {
         let mut events = Vec::new();
         match event_type {
             "message_start" => {
                 if let Some(usage) = payload.pointer("/message/usage") {
-                    self.usage = Some(parse_usage(usage));
+                    self.usage = Some(merge_usage(
+                        self.usage.unwrap_or_default(),
+                        parse_usage(usage),
+                    ));
                 }
             }
             "content_block_start" => {
-                let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                if let Some(block) = payload.get("content_block") {
-                    if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                let index = usize::try_from(payload.get("index").and_then(Value::as_u64).unwrap_or(0))
+                    .unwrap_or(0);
+                if let Some(block) = payload.get("content_block")
+                    && block.get("type").and_then(Value::as_str) == Some("tool_use") {
                         let buffer = self
                             .tool_blocks
                             .entry(index)
-                            .or_insert_with(AnthropicToolBlock::default);
+                            .or_default();
                         if let Some(id) = block.get("id").and_then(Value::as_str) {
-                            buffer.call_id = id.to_owned();
+                            id.clone_into(&mut buffer.call_id);
                         }
                         if let Some(name) = block.get("name").and_then(Value::as_str) {
-                            buffer.name = name.to_owned();
+                            name.clone_into(&mut buffer.name);
                         }
                     }
-                }
             }
             "content_block_delta" => {
-                let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let index = usize::try_from(payload.get("index").and_then(Value::as_u64).unwrap_or(0))
+                    .unwrap_or(0);
                 if let Some(delta) = payload.get("delta") {
+                    // Reasoning deltas are never surfaced as visible text.
                     match delta.get("type").and_then(Value::as_str) {
                         Some("text_delta") => {
-                            if let Some(text) = delta.get("text").and_then(Value::as_str) {
-                                if !text.is_empty() {
+                            if let Some(text) = delta.get("text").and_then(Value::as_str)
+                                && !text.is_empty() {
                                     self.started = true;
                                     events.push(DependencyProviderEvent::TextDelta(text.to_owned()));
                                 }
-                            }
                         }
                         Some("input_json_delta") => {
                             if let Some(fragment) =
                                 delta.get("partial_json").and_then(Value::as_str)
-                            {
-                                if !fragment.is_empty() {
+                                && !fragment.is_empty() {
                                     self.started = true;
                                     let buffer = self
                                         .tool_blocks
                                         .entry(index)
-                                        .or_insert_with(AnthropicToolBlock::default);
+                                        .or_default();
                                     buffer.arguments.push_str(fragment);
                                     events.push(DependencyProviderEvent::ToolCallDelta {
                                         call_id: if buffer.call_id.is_empty() {
@@ -106,19 +115,16 @@ impl AnthropicStreamNormalizer {
                                         arguments_fragment: fragment.to_owned(),
                                     });
                                 }
-                            }
-                        }
-                        Some("thinking_delta") => {
-                            // Reasoning deltas are never surfaced as visible text.
                         }
                         _ => {}
                     }
                 }
             }
             "content_block_stop" => {
-                let index = payload.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                if let Some(buffer) = self.tool_blocks.get(&index) {
-                    if !buffer.name.is_empty() || !buffer.arguments.is_empty() {
+                let index = usize::try_from(payload.get("index").and_then(Value::as_u64).unwrap_or(0))
+                    .unwrap_or(0);
+                if let Some(buffer) = self.tool_blocks.get(&index)
+                    && (!buffer.name.is_empty() || !buffer.arguments.is_empty()) {
                         events.push(DependencyProviderEvent::ToolCallProposed {
                             continuation_reference: buffer.call_id.clone(),
                             call_id: if buffer.call_id.is_empty() {
@@ -134,7 +140,6 @@ impl AnthropicStreamNormalizer {
                             },
                         });
                     }
-                }
             }
             "message_delta" => {
                 if let Some(reason) = payload
@@ -144,15 +149,14 @@ impl AnthropicStreamNormalizer {
                     self.finish_reason = Some(reason.to_owned());
                 }
                 if let Some(usage) = payload.get("usage") {
-                    self.usage = Some(parse_usage(usage));
+                    self.usage = Some(merge_usage(
+                        self.usage.unwrap_or_default(),
+                        parse_usage(usage),
+                    ));
                 }
             }
-            "message_stop" => {
-                // Terminal; usage and stop reason already captured.
-            }
-            "ping" => {
-                // Keepalive; ignored.
-            }
+            // Terminal (`message_stop`) and keepalive (`ping`) events need no
+            // further normalization; usage and stop reason are already captured.
             _ => {}
         }
         Ok(events)
@@ -194,11 +198,26 @@ fn parse_usage(usage: &Value) -> DependencyUsage {
     }
 }
 
+/// Merges a later usage observation into the accumulated one. Anthropic splits
+/// input/output usage across events, so fields are merged by maximum rather
+/// than replaced.
+fn merge_usage(current: DependencyUsage, incoming: DependencyUsage) -> DependencyUsage {
+    DependencyUsage {
+        input_tokens: current.input_tokens.max(incoming.input_tokens),
+        output_tokens: current.output_tokens.max(incoming.output_tokens),
+        cache_read_tokens: current.cache_read_tokens.max(incoming.cache_read_tokens),
+        cache_write_tokens: current.cache_write_tokens.max(incoming.cache_write_tokens),
+        reasoning_tokens: current.reasoning_tokens.max(incoming.reasoning_tokens),
+        estimated: current.estimated || incoming.estimated,
+    }
+}
+
 /// Builds the Anthropic Messages request body.
 ///
 /// # Errors
 ///
 /// Returns a redacted diagnostic when options are malformed or bounds exceeded.
+#[allow(clippy::too_many_lines, reason = "the message builder maps every projection kind explicitly")]
 pub fn build_request_body(
     model: &str,
     entries: &[DependencyConversationEntry],
@@ -245,6 +264,7 @@ pub fn build_request_body(
     Ok(body)
 }
 
+#[allow(clippy::too_many_lines, reason = "the message builder maps every projection kind explicitly")]
 fn build_messages(entries: &[DependencyConversationEntry]) -> Result<Vec<Value>, String> {
     let mut messages: Vec<Value> = Vec::new();
     let mut pending_tool_blocks: Vec<Value> = Vec::new();

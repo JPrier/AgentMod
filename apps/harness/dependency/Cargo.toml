@@ -27,3 +27,6 @@ workspace = true
 kind = "process-layer"
 process = "harness"
 layer = "dependency"
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -62,21 +62,18 @@ impl SseParser {
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, SseParseError> {
         let mut events = Vec::new();
         for &byte in chunk {
-            match byte {
-                b'\n' => {
-                    let line = std::mem::take(&mut self.pending);
-                    if line.len() > self.max_line_bytes {
-                        self.reset();
-                        return Err(SseParseError::Oversized);
-                    }
-                    self.dispatch_line(&line, &mut events)?;
+            if byte == b'\n' {
+                let line = std::mem::take(&mut self.pending);
+                if line.len() > self.max_line_bytes {
+                    self.reset();
+                    return Err(SseParseError::Oversized);
                 }
-                _ => {
-                    self.pending.push(byte);
-                    if self.pending.len() > self.max_line_bytes {
-                        self.reset();
-                        return Err(SseParseError::Oversized);
-                    }
+                self.dispatch_line(&line, &mut events)?;
+            } else {
+                self.pending.push(byte);
+                if self.pending.len() > self.max_line_bytes {
+                    self.reset();
+                    return Err(SseParseError::Oversized);
                 }
             }
         }
@@ -138,7 +135,6 @@ impl SseParser {
                 self.data_lines.push(value.to_vec());
             }
             b"event" => self.event_name = value.to_vec(),
-            b"id" | b"retry" => {}
             _ => {}
         }
         Ok(())

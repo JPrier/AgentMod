@@ -39,6 +39,7 @@ pub struct ProviderCatalogProbeResponse {
 }
 
 /// Dependency-owned detailed provider/model catalog entry.
+#[allow(clippy::struct_excessive_bools, reason = "capability flags are the record's contract")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DependencyCatalogRecord {
     /// Adapter-local provider key.

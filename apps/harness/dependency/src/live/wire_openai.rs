@@ -1,6 +1,6 @@
 //! OpenAI-compatible Chat Completions wire adapter.
 //!
-//! Shared by the generic OpenAI-compatible, OpenRouter, OpenAI, and local
+//! Shared by the generic OpenAI-compatible, `OpenRouter`, `OpenAI`, and local
 //! endpoints. Provider-specific serialization stays in dependency.
 
 use std::collections::BTreeMap;
@@ -61,11 +61,19 @@ impl OpenAiStreamNormalizer {
         }
     }
 
-    /// Consumes one chunk and returns normalized events.
+    /// Consumes one OpenAI-compatible stream chunk and returns normalized
+    /// events.
+    ///
+    /// # Errors
+    ///
+    /// Returns a redacted diagnostic when a chunk cannot be normalized.
     pub fn handle(&mut self, chunk: &Value) -> Result<Vec<DependencyProviderEvent>, String> {
         let mut events = Vec::new();
         if let Some(usage) = chunk.get("usage") {
-            self.usage = Some(parse_usage(usage));
+            self.usage = Some(merge_usage(
+                self.usage.unwrap_or_default(),
+                parse_usage(usage),
+            ));
         }
         let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
             return Ok(events);
@@ -77,24 +85,23 @@ impl OpenAiStreamNormalizer {
             let Some(delta) = choice.get("delta") else {
                 continue;
             };
-            if let Some(text) = delta.get("content").and_then(Value::as_str) {
-                if !text.is_empty() {
+            if let Some(text) = delta.get("content").and_then(Value::as_str)
+                && !text.is_empty() {
                     self.started = true;
                     events.push(DependencyProviderEvent::TextDelta(text.to_owned()));
                 }
-            }
             if let Some(deltas) = delta.get("tool_calls").and_then(Value::as_array) {
                 for tool_call in deltas {
-                    let index = tool_call
-                        .get("index")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0) as usize;
+                    let index = usize::try_from(
+                        tool_call.get("index").and_then(Value::as_u64).unwrap_or(0),
+                    )
+                    .unwrap_or(0);
                     let buffer = self
                         .tool_buffers
                         .entry(index)
-                        .or_insert_with(ToolCallBuffer::default);
+                        .or_default();
                     if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
-                        buffer.call_id = id.to_owned();
+                        id.clone_into(&mut buffer.call_id);
                     }
                     if let Some(function) = tool_call.get("function") {
                         if let Some(name) = function.get("name").and_then(Value::as_str) {
@@ -102,8 +109,7 @@ impl OpenAiStreamNormalizer {
                         }
                         if let Some(arguments) =
                             function.get("arguments").and_then(Value::as_str)
-                        {
-                            if !arguments.is_empty() {
+                            && !arguments.is_empty() {
                                 self.started = true;
                                 buffer.arguments.push_str(arguments);
                                 events.push(DependencyProviderEvent::ToolCallDelta {
@@ -116,7 +122,6 @@ impl OpenAiStreamNormalizer {
                                     arguments_fragment: arguments.to_owned(),
                                 });
                             }
-                        }
                     }
                 }
             }
@@ -194,6 +199,17 @@ fn parse_usage(usage: &Value) -> DependencyUsage {
         cache_write_tokens: 0,
         reasoning_tokens,
         estimated: false,
+    }
+}
+
+fn merge_usage(current: DependencyUsage, incoming: DependencyUsage) -> DependencyUsage {
+    DependencyUsage {
+        input_tokens: current.input_tokens.max(incoming.input_tokens),
+        output_tokens: current.output_tokens.max(incoming.output_tokens),
+        cache_read_tokens: current.cache_read_tokens.max(incoming.cache_read_tokens),
+        cache_write_tokens: current.cache_write_tokens.max(incoming.cache_write_tokens),
+        reasoning_tokens: current.reasoning_tokens.max(incoming.reasoning_tokens),
+        estimated: current.estimated || incoming.estimated,
     }
 }
 

@@ -57,7 +57,7 @@ pub fn classify_http_status(
             message: format!("provider request timed out before dispatch (HTTP {code})"),
             retry: DependencyRetryClassification::Immediate,
         },
-        429..=499 => ClassifiedFailure {
+        430..=499 => ClassifiedFailure {
             kind: DependencyProviderFailureKind::InvalidRequest,
             message: format!("provider rejected the request (HTTP {code})"),
             retry: DependencyRetryClassification::Never,
@@ -218,8 +218,7 @@ fn retry_after_millis(headers: &HeaderMap) -> u64 {
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|seconds| seconds.saturating_mul(1_000))
-        .unwrap_or(1_000)
+        .map_or(1_000, |seconds| seconds.saturating_mul(1_000))
 }
 
 /// Returns the configured per-request timeout as a duration.

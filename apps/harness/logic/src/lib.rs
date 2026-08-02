@@ -77,6 +77,7 @@ pub trait HarnessHealthLogic {
 }
 
 /// Logic-owned detailed provider/model catalog entry.
+#[allow(clippy::struct_excessive_bools, reason = "capability flags are the catalog contract")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogicCatalogRecord {
     /// Stable provider key.

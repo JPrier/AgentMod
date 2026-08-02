@@ -1576,7 +1576,17 @@ where
                 cancellation_id: cancellation_id.to_string(),
             })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "runtime.turn_stream_start_failed",
+                        "session_id": session_id,
+                        "reason": error.to_string(),
+                    })
+                );
+                error.to_string()
+            })?;
         let observer = self.clone();
         let observed_session = *session_id;
         let (sender, receiver) = mpsc::channel(16);
@@ -1585,6 +1595,14 @@ where
                 let item = match item {
                     Ok(item) => item,
                     Err(error) => {
+                        eprintln!(
+                            "{}",
+                            serde_json::json!({
+                                "event": "runtime.turn_stream_item_failed",
+                                "session_id": observed_session,
+                                "reason": error.to_string(),
+                            })
+                        );
                         let _ = sender.send(Err(error.to_string())).await;
                         break;
                     }

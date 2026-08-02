@@ -388,6 +388,10 @@ pub enum PluginCommand {
         event_type: String,
         /// Bounded committed event projection.
         event: Value,
+        /// First canonical sequence in the delivered range.
+        event_range_start: u64,
+        /// Last canonical sequence in the delivered range.
+        event_range_end: u64,
         /// Authorization.
         authorization: PluginAuthorization,
     },

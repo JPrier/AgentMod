@@ -422,6 +422,8 @@ impl<L: logic::PluginLogicPort> PluginHostService<L> {
                 handler,
                 event_type,
                 event,
+                event_range_start,
+                event_range_end,
                 authorization,
             } => {
                 let v = self
@@ -432,8 +434,8 @@ impl<L: logic::PluginLogicPort> PluginHostService<L> {
                         handler,
                         event_type,
                         event,
-                        event_range_start: 0,
-                        event_range_end: 0,
+                        event_range_start,
+                        event_range_end,
                         authorization: map_auth(authorization),
                     })
                     .await

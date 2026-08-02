@@ -87,17 +87,17 @@ use crate::{
         ConversationEntryCommittedEvent, ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent,
         ModelRequestCancelledEvent, ModelRequestFailedEvent, ModelRequestProposedEvent,
         ModelRequestStartedEvent, ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent,
-        ModelToolCallProposedEvent, PlannedTask, PluginInvocationCompletedEvent,
-        PluginSetActivatedEvent, ProcessReconciliationCompletedEvent,
-        ProcessReconciliationStartedEvent, ProcessReconciliationStatus,
-        ReviewerFindingsCommittedEvent, RuntimeCommittedEvent, SchedulerDeliveryReconciledEvent,
-        SchedulerFiredEvent, SessionReducerError, StyleExecutionControlState,
-        StyleExecutionInitializedEvent, StyleExecutionTerminatedEvent, StyleNodeCompletedEvent,
-        StyleNodeEnteredEvent, StyleNodeFailedEvent, StyleTransitionSelectedEvent,
-        TaskPlanCommittedEvent, ToolCallApprovedEvent, ToolCallProposedEvent,
-        ToolExecutionCompletedEvent, ToolExecutionDispatchedEvent, ToolExecutionFailedEvent,
-        ToolExecutionStartedEvent, ToolExecutionState, ToolExecutionTerminalOutcome,
-        ToolOutputObservedEvent, reduce,
+        ModelToolCallProposedEvent, PlannedTask, PluginAuditRecordedEvent,
+        PluginInvocationCompletedEvent, PluginSetActivatedEvent,
+        ProcessReconciliationCompletedEvent, ProcessReconciliationStartedEvent,
+        ProcessReconciliationStatus, ReviewerFindingsCommittedEvent, RuntimeCommittedEvent,
+        SchedulerDeliveryReconciledEvent, SchedulerFiredEvent, SessionReducerError,
+        StyleExecutionControlState, StyleExecutionInitializedEvent, StyleExecutionTerminatedEvent,
+        StyleNodeCompletedEvent, StyleNodeEnteredEvent, StyleNodeFailedEvent,
+        StyleTransitionSelectedEvent, TaskPlanCommittedEvent, ToolCallApprovedEvent,
+        ToolCallProposedEvent, ToolExecutionCompletedEvent, ToolExecutionDispatchedEvent,
+        ToolExecutionFailedEvent, ToolExecutionStartedEvent, ToolExecutionState,
+        ToolExecutionTerminalOutcome, ToolOutputObservedEvent, reduce,
     },
     style_executor::{
         CompiledStyleExecutor, StyleAdapterKind, StyleExecutorError, StyleNodeCursor,
@@ -1510,11 +1510,8 @@ where
         let session_id =
             SessionId::from_str(&command.session_id).map_err(|_| RunTurnError::InvalidSession)?;
         let session_directory = command.sessions_root.join(session_id.to_string());
-        let state = Self::load_state(
-            &SessionPersistenceLogic::new(self.data.clone()),
-            session_id,
-            &session_directory,
-        )?;
+        let persistence = SessionPersistenceLogic::new(self.data.clone());
+        let state = Self::load_state(&persistence, session_id, &session_directory)?;
         let binding = state
             .style_binding
             .ok_or(RunTurnError::StyleMigrationRequired)?;
@@ -1533,7 +1530,7 @@ where
             .as_ref()
             .ok_or(RunTurnError::PluginCompositionUnavailable)?;
         let last_sequence = command.events.last().map_or(0, |event| event.sequence);
-        plugins
+        let summary = plugins
             .observe_committed_events(ObserveCommittedPluginEventsCommand {
                 session_id: command.session_id,
                 cancellation_id: format!("observer-range-{last_sequence}"),
@@ -1542,7 +1539,39 @@ where
                 events: command.events,
             })
             .await
-            .map_err(RunTurnError::PluginComposition)
+            .map_err(RunTurnError::PluginComposition)?;
+        // Deliveries are canonically auditable: commit attempted/dropped
+        // outcomes as plugin.audit_recorded events. The audit events are never
+        // re-delivered to observers, preventing canonical audit recursion.
+        if !summary.audits.is_empty() {
+            let loaded = persistence
+                .load_session(LoadSessionCommand {
+                    session_directory: session_directory.clone(),
+                    expected_session_id: session_id,
+                })
+                .map_err(RunTurnError::Persistence)?;
+            let mut position = JournalPosition {
+                sequence: loaded.state.last_sequence,
+                event_id: loaded.last_event_id,
+            };
+            for audit in &summary.audits {
+                (position.sequence, position.event_id) = self.commit_next(
+                    &persistence,
+                    session_id,
+                    &session_directory,
+                    position.sequence,
+                    position.event_id,
+                    RuntimeCommittedEvent::PluginAuditRecorded(PluginAuditRecordedEvent {
+                        plugin_id: audit.plugin_id.clone(),
+                        invocation_id: audit.invocation_id.clone(),
+                        operation: audit.operation.clone(),
+                        outcome: audit.outcome.clone(),
+                        attempts: audit.attempts,
+                    }),
+                )?;
+            }
+        }
+        Ok(summary)
     }
 }
 

@@ -817,6 +817,8 @@ impl RuntimePluginDependencyPort for ProcessPluginDependency {
                     handler: request.handler,
                     event_type: request.event_type,
                     event: request.event,
+                    event_range_start: request.event_range_start,
+                    event_range_end: request.event_range_end,
                     authorization,
                 },
             )

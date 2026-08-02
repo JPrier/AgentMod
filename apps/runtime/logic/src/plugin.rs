@@ -58,6 +58,26 @@ pub struct ObserveCommittedPluginEventsCommand {
 pub struct PluginObservationSummary {
     pub enqueued: u64,
     pub dropped: u64,
+    /// Per-delivery canonical audit records (attempted/dropped).
+    pub audits: Vec<PluginAuditRecord>,
+}
+
+/// Canonical plugin delivery audit record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PluginAuditRecord {
+    pub plugin_id: String,
+    pub invocation_id: Option<String>,
+    pub operation: String,
+    pub outcome: String,
+    pub attempts: u8,
+}
+
+/// Event types that are never deliverable to observers (prevents canonical
+/// audit recursion).
+const NON_DELIVERABLE_EVENT_TYPES: &[&str] = &["plugin.audit_recorded"];
+
+fn deliverable(event_type: &str) -> bool {
+    !NON_DELIVERABLE_EVENT_TYPES.contains(&event_type)
 }
 
 #[async_trait]
@@ -200,10 +220,10 @@ where
             .collect::<Vec<_>>();
         let mut summary = PluginObservationSummary::default();
         for event in command.events {
-            for observer in observers
-                .iter()
-                .filter(|plugin| plugin.subscribed_events.contains(&event.event_type))
-            {
+            for observer in observers.iter().filter(|plugin| {
+                deliverable(&event.event_type)
+                    && plugin.subscribed_events.contains(&event.event_type)
+            }) {
                 let result = self
                     .data
                     .observe_event(ObservePluginDataRequest {
@@ -224,10 +244,22 @@ where
                     })
                     .await
                     .map_err(PluginCompositionError::Data)?;
+                summary.audits.push(PluginAuditRecord {
+                    plugin_id: observer.id.clone(),
+                    invocation_id: Some(format!("observer-{}-{}", event.event_id, observer.id)),
+                    operation: String::from("observe"),
+                    outcome: if result.accepted {
+                        String::from("observer_delivery_attempted")
+                    } else {
+                        String::from("observer_delivery_dropped")
+                    },
+                    attempts: 1,
+                });
                 if result.accepted {
                     summary.enqueued = summary.enqueued.saturating_add(1);
+                } else {
+                    summary.dropped = summary.dropped.saturating_add(result.dropped);
                 }
-                summary.dropped = summary.dropped.saturating_add(result.dropped);
             }
         }
         Ok(summary)

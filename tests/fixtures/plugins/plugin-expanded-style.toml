@@ -1,0 +1,134 @@
+schema_version = 1
+kind = "custom"
+required_capabilities = ["events", "model", "tools"]
+allowed_tool_groups = ["filesystem"]
+allowed_providers = ["mock"]
+allowed_plugins = [
+    "fixture.rewriter",
+    "fixture.durable-observer",
+    "fixture.graph-node",
+    "fixture.memory",
+    "fixture.compaction",
+    "fixture.context-transform",
+]
+
+[identity]
+id = "plugin-expanded"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[graph]
+kind = "inline"
+source = '''
+format_version = 1
+entry = "respond"
+
+[budget]
+max_steps = 20
+max_tokens = 10000
+max_cost_micros = 100000
+max_duration_ms = 60000
+
+[declarations]
+capabilities = ["model", "tools"]
+tools = ["filesystem.read"]
+providers = ["mock"]
+
+[[nodes]]
+id = "respond"
+kind = "model_call"
+provider = "mock"
+retry_limit = 1
+
+[[nodes]]
+id = "tool"
+kind = "tool_execution_gate"
+tool = "filesystem.read"
+read_scopes = ["workspace"]
+
+[[nodes]]
+id = "done"
+kind = "complete_turn"
+
+[[edges]]
+from = "respond"
+to = "tool"
+
+[[edges]]
+from = "tool"
+to = "done"
+'''
+
+[[interceptors]]
+id = "rewrite-tool"
+owner = "fixture.rewriter"
+event = "action.proposed"
+stage = 20
+priority = 100
+before = []
+after = []
+supported_decisions = ["continue", "replace", "reject"]
+required_capabilities = ["events"]
+
+[memory]
+provider = "none"
+scopes = []
+retrieval_timing = "never"
+max_items = 0
+max_injected_bytes = 0
+write_policy = "never"
+injection_location = "none"
+
+[memory.query]
+source = "current_input"
+include_active_artifacts = false
+include_style_context = false
+max_query_bytes = 16384
+
+[compaction]
+strategy = "none"
+reserved_context_tokens = 0
+max_provider_projection_tokens = 0
+preserve_unresolved_tasks = true
+preserve_active_processes = true
+preservation_requirements = [
+    "system_instructions",
+    "current_input",
+    "pending_control_state",
+    "artifact_references",
+    "memory_provenance",
+    "active_graph_state",
+    "tool_call_correlation",
+]
+
+[approvals]
+default = "allow"
+groups = {}
+
+[budgets]
+max_iterations = 1
+max_steps = 20
+max_tokens = 10000
+max_cost_micros = 100000
+max_duration_ms = 60000
+
+[child_agents]
+max_children = 0
+max_concurrent = 0
+max_depth = 0
+per_child_token_budget = 0
+
+[retry]
+max_attempts = 2
+initial_backoff_ms = 100
+max_backoff_ms = 1000
+retryable_failures = ["provider.unavailable"]
+
+[termination]
+allowed_outcomes = ["complete_turn", "fail"]
+on_hard_limit = "fail"
+require_explicit_terminal_node = true
+
+[selection]
+requires_explicit_selection = true
+model_may_select = false

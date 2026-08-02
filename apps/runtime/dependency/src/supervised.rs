@@ -276,6 +276,28 @@ impl RuntimeDependencyPort for SupervisedRuntimeDependencies {
     }
 }
 
+impl crate::execution_plan::ExecutionPlanDependencyPort for SupervisedRuntimeDependencies {
+    fn store_execution_plan(
+        &self,
+        request: crate::execution_plan::DependencyStoreExecutionPlanRequest,
+    ) -> Result<
+        crate::execution_plan::DependencyStoreExecutionPlanResponse,
+        crate::execution_plan::ExecutionPlanDependencyError,
+    > {
+        crate::execution_plan::LocalExecutionPlanDependency.store_execution_plan(request)
+    }
+
+    fn load_execution_plan(
+        &self,
+        request: crate::execution_plan::DependencyLoadExecutionPlanRequest,
+    ) -> Result<
+        crate::execution_plan::DependencyLoadExecutionPlanResult,
+        crate::execution_plan::ExecutionPlanDependencyError,
+    > {
+        crate::execution_plan::LocalExecutionPlanDependency.load_execution_plan(request)
+    }
+}
+
 impl WorkspaceLeaseDependencyPort for SupervisedRuntimeDependencies {
     fn ensure_workspace_lease(
         &self,

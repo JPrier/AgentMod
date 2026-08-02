@@ -12,6 +12,8 @@ use agentmod_runtime_dependency::registry::{
 };
 use thiserror::Error;
 
+use crate::execution_plan::ExecutionPlanDataError;
+
 /// Data request to normalize a workspace and allocate stable primitives.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrepareSessionDataRequest {
@@ -55,6 +57,8 @@ pub struct CreateSessionDataRequest {
     pub initial_event_json: Vec<u8>,
     /// Exact transient MCP configuration; diagnostics are always redacted.
     pub mcp_configuration: Option<SensitiveMcpConfigurationData>,
+    /// Immutable checksummed node-execution plan staged with the session.
+    pub execution_plan: Option<crate::execution_plan::ExecutionPlanFileData>,
 }
 
 /// Data-owned sensitive MCP configuration wrapper.
@@ -131,6 +135,8 @@ pub struct CreateBranchDataRequest {
     pub events: Vec<BranchEventDataRecord>,
     /// Immutable artifacts atomically staged with the child.
     pub artifacts: Vec<BranchArtifactDataRecord>,
+    /// Immutable checksummed node-execution plan staged with the child.
+    pub execution_plan: Option<crate::execution_plan::ExecutionPlanFileData>,
 }
 
 /// Data-owned MCP bootstrap disposition for an atomic branch.
@@ -172,6 +178,8 @@ pub struct CreateChildSessionDataRequest {
     pub mcp_bootstrap: BranchMcpBootstrapData,
     /// Complete sealed child journal.
     pub events: Vec<BranchEventDataRecord>,
+    /// Immutable checksummed node-execution plan staged with the child.
+    pub execution_plan: Option<crate::execution_plan::ExecutionPlanFileData>,
 }
 
 /// Listing request.
@@ -311,6 +319,10 @@ where
                 compiled_style_json: request.compiled_style_json,
                 initial_event_json: request.initial_event_json,
                 mcp_configuration: request.mcp_configuration.map(|value| value.0.into()),
+                execution_plan: request
+                    .execution_plan
+                    .map(crate::execution_plan::to_dependency_file)
+                    .transpose()?,
             })
             .map(|created| CreatedSessionDataRecord {
                 session_directory: created.session_directory,
@@ -323,7 +335,7 @@ where
         request: CreateBranchDataRequest,
     ) -> Result<CreatedSessionDataRecord, SessionRegistryDataError> {
         self.dependency
-            .create_branch(to_dependency_branch(request))
+            .create_branch(to_dependency_branch(request)?)
             .map(|created| CreatedSessionDataRecord {
                 session_directory: created.session_directory,
             })
@@ -335,7 +347,7 @@ where
         request: CreateChildSessionDataRequest,
     ) -> Result<CreatedSessionDataRecord, SessionRegistryDataError> {
         self.dependency
-            .create_child_session(to_dependency_child(request))
+            .create_child_session(to_dependency_child(request)?)
             .map(|created| CreatedSessionDataRecord {
                 session_directory: created.session_directory,
             })
@@ -417,6 +429,10 @@ where
                 compiled_style_json: request.compiled_style_json,
                 initial_event_json: request.initial_event_json,
                 mcp_configuration: request.mcp_configuration.map(|value| value.0.into()),
+                execution_plan: request
+                    .execution_plan
+                    .map(crate::execution_plan::to_dependency_file)
+                    .transpose()?,
             })
             .map(|created| CreatedSessionDataRecord {
                 session_directory: created.session_directory,
@@ -429,7 +445,7 @@ where
         request: CreateBranchDataRequest,
     ) -> Result<CreatedSessionDataRecord, SessionRegistryDataError> {
         self.dependency
-            .create_branch(to_dependency_branch(request))
+            .create_branch(to_dependency_branch(request)?)
             .map(|created| CreatedSessionDataRecord {
                 session_directory: created.session_directory,
             })
@@ -441,7 +457,7 @@ where
         request: CreateChildSessionDataRequest,
     ) -> Result<CreatedSessionDataRecord, SessionRegistryDataError> {
         self.dependency
-            .create_child_session(to_dependency_child(request))
+            .create_child_session(to_dependency_child(request)?)
             .map(|created| CreatedSessionDataRecord {
                 session_directory: created.session_directory,
             })
@@ -504,8 +520,10 @@ fn from_dependency_prepared(value: DependencyPreparedSession) -> PreparedSession
     }
 }
 
-fn to_dependency_branch(request: CreateBranchDataRequest) -> DependencyCreateBranchRequest {
-    DependencyCreateBranchRequest {
+fn to_dependency_branch(
+    request: CreateBranchDataRequest,
+) -> Result<DependencyCreateBranchRequest, SessionRegistryDataError> {
+    Ok(DependencyCreateBranchRequest {
         sessions_root: request.sessions_root,
         prepared: to_dependency_prepared(request.prepared),
         style: request.style,
@@ -544,13 +562,17 @@ fn to_dependency_branch(request: CreateBranchDataRequest) -> DependencyCreateBra
                 bytes: artifact.bytes,
             })
             .collect(),
-    }
+        execution_plan: request
+            .execution_plan
+            .map(crate::execution_plan::to_dependency_file)
+            .transpose()?,
+    })
 }
 
 fn to_dependency_child(
     request: CreateChildSessionDataRequest,
-) -> DependencyCreateChildSessionRequest {
-    DependencyCreateChildSessionRequest {
+) -> Result<DependencyCreateChildSessionRequest, SessionRegistryDataError> {
+    Ok(DependencyCreateChildSessionRequest {
         sessions_root: request.sessions_root,
         prepared: to_dependency_prepared(request.prepared),
         style: request.style,
@@ -578,7 +600,11 @@ fn to_dependency_child(
                 event_json: event.event_json,
             })
             .collect(),
-    }
+        execution_plan: request
+            .execution_plan
+            .map(crate::execution_plan::to_dependency_file)
+            .transpose()?,
+    })
 }
 
 fn to_dependency_prepared(value: PreparedSessionDataRecord) -> DependencyPreparedSession {
@@ -604,6 +630,15 @@ pub enum SessionRegistryDataError {
     /// Dependency returned sequence zero.
     #[error("session catalog returned an invalid sequence")]
     InvalidSequence,
+    /// The immutable node-execution plan file could not be normalized.
+    #[error("session execution plan data failed: {0}")]
+    ExecutionPlan(ExecutionPlanDataError),
+}
+
+impl From<ExecutionPlanDataError> for SessionRegistryDataError {
+    fn from(error: ExecutionPlanDataError) -> Self {
+        Self::ExecutionPlan(error)
+    }
 }
 
 /// Constructs the first-party file-backed session data router.

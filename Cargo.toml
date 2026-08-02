@@ -5,6 +5,7 @@ members = [
     "protocols/*",
     "apps/runtime/*",
     "apps/harness/*",
+    "apps/harness-fixture/*",
     "apps/cli/*",
     "apps/acp/*",
     "apps/plugin-host/*",

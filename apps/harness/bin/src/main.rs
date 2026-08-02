@@ -119,29 +119,31 @@ enum Frame {
 async fn read_frame<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> io::Result<Frame> {
     let mut bytes = Vec::new();
     let mut oversized = false;
+    let mut buffer = [0_u8; 8192];
     loop {
-        match reader.read_u8().await {
-            Ok(b'\n') => {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(if bytes.is_empty() && !oversized {
+                Frame::Eof
+            } else if oversized {
+                Frame::Oversized
+            } else {
+                Frame::Bytes(bytes)
+            });
+        }
+        for &byte in &buffer[..read] {
+            if byte == b'\n' {
                 return Ok(if oversized {
                     Frame::Oversized
                 } else {
                     Frame::Bytes(bytes)
                 });
             }
-            Ok(byte) if bytes.len() < MAX_FRAME => bytes.push(byte),
-            Ok(_) => oversized = true,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                return if bytes.is_empty() && !oversized {
-                    Ok(Frame::Eof)
-                } else {
-                    Ok(if oversized {
-                        Frame::Oversized
-                    } else {
-                        Frame::Bytes(bytes)
-                    })
-                };
+            if bytes.len() < MAX_FRAME {
+                bytes.push(byte);
+            } else {
+                oversized = true;
             }
-            Err(e) => return Err(e),
         }
     }
 }

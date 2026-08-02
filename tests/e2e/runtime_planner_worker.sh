@@ -41,7 +41,7 @@ start_runtime() {
 
 start_runtime
 session_id=$("$cli" session create --workspace "$repository" \
-    --style planner-worker@1.1.0 --json |
+    --style planner-worker@1.2.0 --json |
     python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
 "$cli" run "verify modular child orchestration" --session "$session_id" \
     --option 'mock_scenario="planner_worker"' --json >/dev/null

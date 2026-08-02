@@ -13823,6 +13823,176 @@ mod tests {
         assert_ne!(plan, base);
     }
 
+    fn planner_task(id: &str, dependencies: &[&str]) -> PlannedTask {
+        PlannedTask {
+            task_id: id.to_owned(),
+            description: format!("task {id}"),
+            goal: format!("task {id}"),
+            scope: Vec::new(),
+            dependencies: dependencies.iter().map(|value| (*value).to_owned()).collect(),
+            expected_artifacts: Vec::new(),
+            workspace_mode: String::from("shared_read_only"),
+            tool_groups: Vec::new(),
+            validation_commands: Vec::new(),
+            completion_criteria: vec![String::from("complete")],
+            review_criteria: Vec::new(),
+            token_budget: 5_000,
+            cost_budget_micros: 100_000,
+            max_steps: 8,
+            retry_policy: TaskRetryPolicy::default(),
+            risk: TaskRisk::Low,
+        }
+    }
+
+    fn planner_state_with(
+        tasks: Vec<PlannedTask>,
+        records: Vec<crate::session::ChildAgentRecord>,
+    ) -> crate::session::SessionState {
+        let mut state = crate::session::SessionState {
+            id: SessionId::from_uuid(Uuid::from_u128(1)),
+            workspace: String::from("workspace"),
+            style: String::from("planner-worker"),
+            style_binding: None,
+            style_execution: None,
+            ancestry: None,
+            child_origin: None,
+            lifecycle: crate::session::SessionLifecycle::Active,
+            conversation: crate::conversation::ConversationState::new(),
+            approvals: BTreeMap::new(),
+            tool_executions: BTreeMap::new(),
+            artifact_persistences: BTreeMap::new(),
+            child_agents: BTreeMap::new(),
+            planner_worker: crate::session::PlannerWorkerState::default(),
+            plugins: crate::session::PluginExecutionState::default(),
+            process_reconciliations: BTreeMap::new(),
+            last_sequence: agentmod_primitives::Sequence::new(10).expect("sequence"),
+            last_event_checksum: agentmod_primitives::ContentHash::digest(b"fixture"),
+        };
+        for task in tasks {
+            state
+                .planner_worker
+                .tasks
+                .insert(task.task_id.clone(), task);
+        }
+        for record in records {
+            state
+                .child_agents
+                .insert(record.identity.execution_id.clone(), record);
+        }
+        state
+    }
+
+    fn planner_record(
+        execution_id: &str,
+        task_id: &str,
+        loop_iteration: u32,
+        state: ChildAgentState,
+    ) -> crate::session::ChildAgentRecord {
+        crate::session::ChildAgentRecord {
+            identity: ChildAgentExecutionIdentity {
+                execution_id: execution_id.to_owned(),
+                node_id: String::from("spawn-workers"),
+                attempt: 1,
+                loop_iteration,
+                step: 2,
+                task_id: task_id.to_owned(),
+            },
+            task: String::from("task"),
+            child_style: String::from("ephemeral-turn@1.1.0"),
+            workspace_mode: String::from("shared_read_only"),
+            token_budget: 5_000,
+            state,
+            proposed_at: agentmod_primitives::Sequence::new(3).expect("sequence"),
+            action_digest: None,
+            approved_at: None,
+            child_session_id: None,
+            created_at: None,
+            child_head_sequence: None,
+            completed_at: None,
+            summary: None,
+            result_package_reference: None,
+            result_package_mime_type: None,
+            result_package_byte_size: None,
+        }
+    }
+
+    #[test]
+    fn planner_ready_tasks_are_deterministic_bounded_and_dependency_aware() {
+        let state = planner_state_with(
+            vec![
+                planner_task("task-c", &["task-a"]),
+                planner_task("task-b", &[]),
+                planner_task("task-a", &[]),
+            ],
+            Vec::new(),
+        );
+        let ready = planner_ready_tasks(&state, 0, 4, "shared_read_only").expect("ready");
+        assert_eq!(
+            ready.iter().map(|task| task.task_id.as_str()).collect::<Vec<_>>(),
+            ["task-a", "task-b"],
+            "independent tasks dispatch in deterministic ID order"
+        );
+
+        let capacity_one = planner_ready_tasks(&state, 0, 1, "shared_read_only").expect("ready");
+        assert_eq!(capacity_one.len(), 1);
+        assert_eq!(capacity_one[0].task_id, "task-a");
+    }
+
+    #[test]
+    fn planner_dependencies_are_satisfied_only_after_completion() {
+        let state = planner_state_with(
+            vec![
+                planner_task("task-a", &[]),
+                planner_task("task-b", &["task-a"]),
+            ],
+            vec![planner_record(
+                "child:spawn-workers:0:task-a:2",
+                "task-a",
+                0,
+                ChildAgentState::Completed,
+            )],
+        );
+        let ready = planner_ready_tasks(&state, 0, 4, "shared_read_only").expect("ready");
+        assert_eq!(
+            ready.iter().map(|task| task.task_id.as_str()).collect::<Vec<_>>(),
+            ["task-b"]
+        );
+
+        let active = planner_state_with(
+            vec![
+                planner_task("task-a", &[]),
+                planner_task("task-b", &["task-a"]),
+            ],
+            vec![planner_record(
+                "child:spawn-workers:0:task-a:2",
+                "task-a",
+                0,
+                ChildAgentState::Active,
+            )],
+        );
+        assert!(planner_ready_tasks(&active, 0, 4, "shared_read_only")
+            .expect("ready")
+            .is_empty());
+        assert!(planner_undispatched_tasks(&active, 0).expect("remaining"));
+    }
+
+    #[test]
+    fn planner_concurrency_capacity_never_exceeds_the_bound() {
+        let state = planner_state_with(
+            (0..6)
+                .map(|index| planner_task(&format!("task-{index}"), &[]))
+                .collect(),
+            vec![planner_record(
+                "child:spawn-workers:0:task-0:2",
+                "task-0",
+                0,
+                ChildAgentState::Active,
+            )],
+        );
+        let ready = planner_ready_tasks(&state, 0, 2, "shared_read_only").expect("ready");
+        assert_eq!(ready.len(), 1, "capacity is max_concurrent minus active");
+    }
+
     #[test]
     fn planner_child_cancellation_ids_are_typed_and_task_scoped() {
         let base = Uuid::from_u128(42).hyphenated().to_string();

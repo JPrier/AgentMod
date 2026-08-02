@@ -5112,6 +5112,544 @@ mod tests {
         ));
     }
 
+    /// Planner crash-cut coverage: every canonical cut must replay to a
+    /// consistent state and reject the next illegal transition so restart can
+    /// never duplicate a committed child, package, join, integration, review,
+    /// lease, or approval.
+    #[test]
+    fn planner_crash_cut_plan_commitment_never_replays_a_second_plan() {
+        let (_, _, mut events) = proposed_child_creation_fixture();
+        events.truncate(7);
+        assert!(replay(&events).is_ok(), "plan commitment cut replays");
+        let RuntimeCommittedEvent::TaskPlanCommitted(plan) =
+            &events[6].payload
+        else {
+            panic!("expected plan");
+        };
+        events.push(envelope(
+            8,
+            RuntimeCommittedEvent::TaskPlanCommitted(plan.clone()),
+        ));
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+    }
+
+    #[test]
+    fn planner_crash_cut_child_preparation_requires_policy_before_catalog() {
+        let (identity, _, mut events) = proposed_child_creation_fixture();
+        assert!(replay(&events).is_ok(), "child preparation cut replays");
+        events.push(envelope(
+            12,
+            RuntimeCommittedEvent::ChildAgentCreated(ChildAgentCreatedEvent {
+                identity: identity.clone(),
+                child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                parent_action_sequence: Sequence::new(11).expect("proposal"),
+                child_style: String::from("ephemeral-turn@1.1.0"),
+            }),
+        ));
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidChildAgentTransition)
+        ));
+    }
+
+    #[test]
+    fn planner_crash_cut_child_catalog_write_never_creates_twice() {
+        let (identity, digest, mut events) = proposed_child_creation_fixture();
+        events.push(envelope(
+            12,
+            RuntimeCommittedEvent::ChildAgentCreationApproved(ChildAgentCreationApprovedEvent {
+                identity: identity.clone(),
+                action_digest: digest,
+            }),
+        ));
+        let created = envelope(
+            13,
+            RuntimeCommittedEvent::ChildAgentCreated(ChildAgentCreatedEvent {
+                identity: identity.clone(),
+                child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                parent_action_sequence: Sequence::new(11).expect("proposal"),
+                child_style: String::from("ephemeral-turn@1.1.0"),
+            }),
+        );
+        events.push(created.clone());
+        let state = replay(&events).expect("catalog write cut replays");
+        assert_eq!(
+            state
+                .child_agents
+                .get(&identity.execution_id)
+                .expect("child")
+                .state,
+            ChildAgentState::Active
+        );
+        events.push(envelope(
+            14,
+            RuntimeCommittedEvent::ChildAgentCreated(ChildAgentCreatedEvent {
+                identity: identity.clone(),
+                child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                parent_action_sequence: Sequence::new(11).expect("proposal"),
+                child_style: String::from("ephemeral-turn@1.1.0"),
+            }),
+        ));
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidChildAgentTransition)
+        ));
+    }
+
+    #[test]
+    fn planner_crash_cut_terminal_events_are_exact_and_single() {
+        let mut events = planner_events_through_completed();
+        let (identity, _, _) = proposed_child_creation_fixture();
+        let state = replay(&events).expect("terminal cut replays");
+        assert_eq!(
+            state
+                .child_agents
+                .get(&identity.execution_id)
+                .expect("child")
+                .state,
+            ChildAgentState::Completed
+        );
+        events.push(envelope(
+            22,
+            RuntimeCommittedEvent::ChildAgentCompleted(ChildAgentCompletedEvent {
+                identity: identity.clone(),
+                child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                child_head_sequence: Sequence::new(40).expect("head"),
+                summary: String::from("duplicate"),
+            }),
+        ));
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidChildAgentTransition)
+        ));
+    }
+
+    #[test]
+    fn planner_crash_cut_result_package_requires_terminal_child_and_is_immutable() {
+        let (identity, _, _) = proposed_child_creation_fixture();
+        let package = envelope(
+            22,
+            RuntimeCommittedEvent::WorkerResultPackageCommitted(
+                WorkerResultPackageCommittedEvent {
+                    identity: identity.clone(),
+                    child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                    package_reference: String::from("artifact:blake3:result"),
+                    mime_type: String::from("application/vnd.agentmod.worker-result-package+json"),
+                    byte_size: 128,
+                    summary: String::from("task completed"),
+                },
+            ),
+        );
+        let (_, _, mut early) = proposed_child_creation_fixture();
+        early.push(envelope(
+            12,
+            RuntimeCommittedEvent::WorkerResultPackageCommitted(
+                WorkerResultPackageCommittedEvent {
+                    identity: identity.clone(),
+                    child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                    package_reference: String::from("artifact:blake3:result"),
+                    mime_type: String::from("application/vnd.agentmod.worker-result-package+json"),
+                    byte_size: 128,
+                    summary: String::from("task completed"),
+                },
+            ),
+        ));
+        assert!(matches!(
+            replay(&early),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+
+        let mut events = planner_events_through_completed();
+        events.push(package.clone());
+        assert!(replay(&events).is_ok(), "result package cut replays");
+        events.push(envelope(
+            23,
+            RuntimeCommittedEvent::WorkerResultPackageCommitted(
+                WorkerResultPackageCommittedEvent {
+                    identity: identity.clone(),
+                    child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                    package_reference: String::from("artifact:blake3:result"),
+                    mime_type: String::from("application/vnd.agentmod.worker-result-package+json"),
+                    byte_size: 128,
+                    summary: String::from("task completed"),
+                },
+            ),
+        ));
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+    }
+
+    #[test]
+    fn planner_crash_cut_join_is_exact_and_single_per_iteration() {
+        let (identity, _, _) = proposed_child_creation_fixture();
+        let second_identity = ChildAgentExecutionIdentity {
+            execution_id: String::from("child:spawn-workers:task-2:0"),
+            node_id: String::from("spawn-workers"),
+            attempt: 1,
+            loop_iteration: 0,
+            step: 2,
+            task_id: String::from("task-2"),
+        };
+        let mut events = planner_events_through_completed();
+        let join = envelope(
+            22,
+            RuntimeCommittedEvent::ChildJoinCompleted(ChildJoinCompletedEvent {
+                node_id: String::from("wait-workers"),
+                loop_iteration: 0,
+                child_execution_ids: vec![
+                    identity.execution_id.clone(),
+                    second_identity.execution_id.clone(),
+                ],
+            }),
+        );
+        events.push(join.clone());
+        assert!(replay(&events).is_ok(), "join readiness cut replays");
+        events.push(envelope(
+            23,
+            RuntimeCommittedEvent::ChildJoinCompleted(ChildJoinCompletedEvent {
+                node_id: String::from("wait-workers"),
+                loop_iteration: 0,
+                child_execution_ids: vec![
+                    identity.execution_id.clone(),
+                    second_identity.execution_id.clone(),
+                ],
+            }),
+        ));
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+
+        let (_, _, mut early) = proposed_child_creation_fixture();
+        early.push(envelope(
+            12,
+            RuntimeCommittedEvent::ChildJoinCompleted(ChildJoinCompletedEvent {
+                node_id: String::from("wait-workers"),
+                loop_iteration: 0,
+                child_execution_ids: vec![String::from("child:spawn-workers:task-2:0")],
+            }),
+        ));
+        assert!(matches!(
+            replay(&early),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+    }
+
+    #[test]
+    fn planner_crash_cut_integration_requires_applied_packages() {
+        let (_, _, mut events) = proposed_child_creation_fixture();
+        events.truncate(7);
+        events.push(envelope(
+            8,
+            RuntimeCommittedEvent::IntegrationResultCommitted(
+                IntegrationResultCommittedEvent::default(),
+            ),
+        ));
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+    }
+
+    #[test]
+    fn planner_crash_cut_review_is_out_of_order_safe_and_single() {
+        // A review committed while the wait node is active is rejected.
+        let mut events = planner_events_through_completed();
+        events.push(envelope(
+            22,
+            RuntimeCommittedEvent::ReviewerFindingsCommitted(ReviewerFindingsCommittedEvent {
+                node_id: String::from("review"),
+                attempt: 1,
+                loop_iteration: 0,
+                step: 5,
+                approved: false,
+                rejected_task_ids: vec![String::from("task-2")],
+                findings: vec![String::from("F-1|warning|revise|package:task-2")],
+            }),
+        ));
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+        // A second review for the same iteration is rejected after one commit.
+        let mut approved = planner_events_through_completed();
+        approved.push(envelope(
+            22,
+            RuntimeCommittedEvent::ReviewerFindingsCommitted(ReviewerFindingsCommittedEvent {
+                node_id: String::from("review"),
+                attempt: 1,
+                loop_iteration: 0,
+                step: 5,
+                approved: false,
+                rejected_task_ids: vec![String::from("task-2")],
+                findings: vec![String::from("F-1|warning|revise|package:task-2")],
+            }),
+        ));
+        approved.push(envelope(
+            23,
+            RuntimeCommittedEvent::ReviewerFindingsCommitted(ReviewerFindingsCommittedEvent {
+                node_id: String::from("review"),
+                attempt: 1,
+                loop_iteration: 0,
+                step: 5,
+                approved: true,
+                rejected_task_ids: Vec::new(),
+                findings: vec![String::from("F-2|info|none|package:task-1")],
+            }),
+        ));
+        assert!(matches!(
+            replay(&approved),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+    }
+
+    #[test]
+    fn workspace_lease_cuts_acquire_release_reconcile_once() {
+        let (_, _, mut events) = proposed_child_creation_fixture();
+        events.truncate(7);
+        let acquire = envelope(
+            8,
+            RuntimeCommittedEvent::WorkspaceLeaseAcquired(WorkspaceLeaseAcquiredEvent {
+                node_id: String::from("spawn-workers"),
+                loop_iteration: 0,
+                workspace: String::from("fixture"),
+                mode: String::from("shared_serialized_writes"),
+                owner_execution_id: String::from("child:spawn-workers:task-1:0"),
+                task_id: String::from("task-1"),
+                expires_at_ms: 1_000_000,
+            }),
+        );
+        events.push(acquire.clone());
+        assert!(replay(&events).is_ok(), "lease acquisition cut replays");
+        events.push(envelope(
+            9,
+            RuntimeCommittedEvent::WorkspaceLeaseAcquired(WorkspaceLeaseAcquiredEvent {
+                node_id: String::from("spawn-workers"),
+                loop_iteration: 0,
+                workspace: String::from("fixture"),
+                mode: String::from("shared_serialized_writes"),
+                owner_execution_id: String::from("child:spawn-workers:task-1:0"),
+                task_id: String::from("task-1"),
+                expires_at_ms: 1_000_000,
+            }),
+        ));
+        assert!(matches!(
+            replay(&events),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+
+        let mut released = planner_events_through_completed();
+        released.push(envelope(
+            22,
+            RuntimeCommittedEvent::WorkspaceLeaseReleased(WorkspaceLeaseReleasedEvent {
+                owner_execution_id: String::from("unknown-owner"),
+                task_id: String::from("task-1"),
+            }),
+        ));
+        assert!(matches!(
+            replay(&released),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+    }
+
+    #[test]
+    fn child_approval_cuts_resolve_once_with_exact_identity() {
+        let (identity, _, mut events) = proposed_child_creation_fixture();
+        events.truncate(7);
+        let requested = envelope(
+            8,
+            RuntimeCommittedEvent::ChildCreationApprovalRequested(
+                ChildCreationApprovalRequestedEvent {
+                    identity: identity.clone(),
+                    continuation_id: String::from("continuation-1"),
+                    child_style: String::from("ephemeral-turn@1.1.0"),
+                    workspace_mode: String::from("shared_read_only"),
+                    workspace: String::from("fixture"),
+                    tool_groups: Vec::new(),
+                    token_budget: 10_000,
+                    expires_at_ms: 1_000_000,
+                },
+            ),
+        );
+        let mut wrong = events.clone();
+        wrong.push(requested.clone());
+        assert!(replay(&wrong).is_ok(), "approval request cut replays");
+
+        let resolved = envelope(
+            9,
+            RuntimeCommittedEvent::ChildCreationApprovalResolved(
+                ChildCreationApprovalResolvedEvent {
+                    identity: identity.clone(),
+                    continuation_id: String::from("not-the-stored-continuation"),
+                    approved: true,
+                    transitioned: true,
+                },
+            ),
+        );
+        wrong.push(resolved);
+        assert!(matches!(
+            replay(&wrong),
+            Err(SessionReducerError::InvalidPlannerWorkerTransition)
+        ));
+
+        let mut exact = proposed_child_creation_fixture().2;
+        exact.truncate(7);
+        exact.push(envelope(
+            8,
+            RuntimeCommittedEvent::ChildCreationApprovalRequested(
+                ChildCreationApprovalRequestedEvent {
+                    identity: identity.clone(),
+                    continuation_id: String::from("continuation-1"),
+                    child_style: String::from("ephemeral-turn@1.1.0"),
+                    workspace_mode: String::from("shared_read_only"),
+                    workspace: String::from("fixture"),
+                    tool_groups: Vec::new(),
+                    token_budget: 10_000,
+                    expires_at_ms: 1_000_000,
+                },
+            ),
+        ));
+        exact.push(envelope(
+            9,
+            RuntimeCommittedEvent::ChildCreationApprovalResolved(
+                ChildCreationApprovalResolvedEvent {
+                    identity: identity.clone(),
+                    continuation_id: String::from("continuation-1"),
+                    approved: true,
+                    transitioned: true,
+                },
+            ),
+        ));
+        assert!(replay(&exact).is_ok(), "approval resolution cut replays");
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the crash-cut fixture builds the full canonical planner lifecycle so every cut is exact"
+    )]
+    fn planner_events_through_completed() -> Vec<EventEnvelope<RuntimeCommittedEvent>> {
+        let (identity, digest, mut events) = proposed_child_creation_fixture();
+        let second_identity = ChildAgentExecutionIdentity {
+            execution_id: String::from("child:spawn-workers:task-2:0"),
+            node_id: String::from("spawn-workers"),
+            attempt: 1,
+            loop_iteration: 0,
+            step: 2,
+            task_id: String::from("task-2"),
+        };
+        let second_digest = ActionProposal {
+            id: ProposalId(second_identity.execution_id.clone()),
+            action: ConsequentialAction::ChildAgentCreation {
+                style: String::from("ephemeral-turn@1.1.0"),
+                workspace_mode: String::from("shared_read_only"),
+                token_budget: 5_000,
+            },
+            style: String::from("planner-worker"),
+            workspace: String::from("fixture"),
+            origin: String::from("runtime"),
+        }
+        .digest()
+        .expect("digest");
+        events.push(envelope(
+            12,
+            RuntimeCommittedEvent::ChildAgentCreationApproved(ChildAgentCreationApprovedEvent {
+                identity: identity.clone(),
+                action_digest: digest,
+            }),
+        ));
+        events.push(envelope(
+            13,
+            RuntimeCommittedEvent::ChildAgentCreated(ChildAgentCreatedEvent {
+                identity: identity.clone(),
+                child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                parent_action_sequence: Sequence::new(11).expect("proposal"),
+                child_style: String::from("ephemeral-turn@1.1.0"),
+            }),
+        ));
+        events.push(envelope(
+            14,
+            RuntimeCommittedEvent::ChildAgentCreationProposed(
+                ChildAgentCreationProposedEvent {
+                    identity: second_identity.clone(),
+                    task: String::from("inspect tool recovery"),
+                    child_style: String::from("ephemeral-turn@1.1.0"),
+                    workspace_mode: String::from("shared_read_only"),
+                    token_budget: 5_000,
+                },
+            ),
+        ));
+        events.push(envelope(
+            15,
+            RuntimeCommittedEvent::ChildAgentCreationApproved(ChildAgentCreationApprovedEvent {
+                identity: second_identity.clone(),
+                action_digest: second_digest,
+            }),
+        ));
+        events.push(envelope(
+            16,
+            RuntimeCommittedEvent::ChildAgentCreated(ChildAgentCreatedEvent {
+                identity: second_identity.clone(),
+                child_session_id: SessionId::from_uuid(Uuid::from_u128(1000)),
+                parent_action_sequence: Sequence::new(14).expect("proposal"),
+                child_style: String::from("ephemeral-turn@1.1.0"),
+            }),
+        ));
+        events.push(envelope(
+            17,
+            RuntimeCommittedEvent::StyleNodeCompleted(StyleNodeCompletedEvent {
+                node_id: String::from("spawn-workers"),
+                attempt: 1,
+                loop_iteration: 0,
+                step: 2,
+                result_reference: Some(String::from("children:2")),
+                artifact_reference: None,
+            }),
+        ));
+        events.push(envelope(
+            18,
+            RuntimeCommittedEvent::StyleTransitionSelected(StyleTransitionSelectedEvent {
+                from_node_id: String::from("spawn-workers"),
+                to_node_id: String::from("wait-workers"),
+                attempt: 1,
+                loop_iteration: 0,
+                step: 2,
+            }),
+        ));
+        events.push(envelope(
+            19,
+            RuntimeCommittedEvent::StyleNodeEntered(StyleNodeEnteredEvent {
+                node_id: String::from("wait-workers"),
+                attempt: 1,
+                loop_iteration: 0,
+                step: 3,
+            }),
+        ));
+        events.push(envelope(
+            20,
+            RuntimeCommittedEvent::ChildAgentCompleted(ChildAgentCompletedEvent {
+                identity: identity.clone(),
+                child_session_id: SessionId::from_uuid(Uuid::from_u128(999)),
+                child_head_sequence: Sequence::new(40).expect("head"),
+                summary: String::from("done"),
+            }),
+        ));
+        events.push(envelope(
+            21,
+            RuntimeCommittedEvent::ChildAgentCompleted(ChildAgentCompletedEvent {
+                identity: second_identity.clone(),
+                child_session_id: SessionId::from_uuid(Uuid::from_u128(1000)),
+                child_head_sequence: Sequence::new(41).expect("head"),
+                summary: String::from("done"),
+            }),
+        ));
+        events
+    }
+
     fn compiled_graph() -> ExecutableGraph {
         compile_graph(
             r#"

@@ -47,7 +47,7 @@ try {
 
     function Assert-PlannerState($inspection) {
         if ($inspection.state.style_binding.id -ne "planner-worker" -or
-            $inspection.state.style_binding.version -ne "1.1.0") {
+            $inspection.state.style_binding.version -ne "1.2.0") {
             throw "planner style binding mismatch"
         }
         if ($inspection.state.lifecycle -ne "completed" -or
@@ -57,6 +57,11 @@ try {
         }
         if (@($inspection.state.planner_worker.tasks.PSObject.Properties).Count -ne 2) {
             throw "planner did not retain two runtime-owned tasks"
+        }
+        $taskOne = $inspection.state.planner_worker.tasks."task-1"
+        if ($null -eq $taskOne -or $taskOne.workspace_mode -ne "shared_read_only" -or
+            $taskOne.token_budget -le 0 -or $taskOne.completion_criteria.Count -eq 0) {
+            throw "planner tasks are not fully validated structured records"
         }
         if (@($inspection.state.planner_worker.reviews).Count -ne 2 -or
             $inspection.state.planner_worker.reviews[0].approved -ne $false -or
@@ -69,12 +74,23 @@ try {
         if (@($inspection.state.planner_worker.joins).Count -ne 2) {
             throw "expected one exact join per planner iteration"
         }
+        if (@($inspection.state.planner_worker.result_packages).Count -ne 2) {
+            throw "expected one immutable result package per iteration"
+        }
+        if (@($inspection.state.planner_worker.integration_results).Count -ne 2) {
+            throw "expected one integration result per iteration"
+        }
+        $packageRefs = @($inspection.state.planner_worker.result_packages |
+            ForEach-Object { $_.package_reference })
+        if ($packageRefs -contains $null -or $packageRefs -contains "") {
+            throw "result packages must carry content-addressed references"
+        }
     }
 
     $daemon = Start-TestRuntime
     try {
         $session = & $cli session create --workspace $repository `
-            --style planner-worker@1.1.0 --json | ConvertFrom-Json
+            --style planner-worker@1.2.0 --json | ConvertFrom-Json
         $result = & $cli run "verify modular child orchestration" `
             --session $session.session_id `
             --option 'mock_scenario="planner_worker"' --json | ConvertFrom-Json
@@ -93,11 +109,23 @@ try {
         $journal = Get-Content -LiteralPath $journalPath
         if (@($journal | Select-String '"child_agent.created"').Count -ne 3 -or
             @($journal | Select-String '"child_agent.join_completed"').Count -ne 2 -or
-            @($journal | Select-String '"style.reviewer_findings_committed"').Count -ne 2) {
+            @($journal | Select-String '"style.reviewer_findings_committed"').Count -ne 2 -or
+            @($journal | Select-String '"worker.result_package_committed"').Count -ne 2 -or
+            @($journal | Select-String '"integration.result_committed"').Count -ne 2) {
             throw "planner canonical orchestration events are incomplete"
         }
         if ($result.last_committed_sequence -ne @($journal).Count) {
             throw "planner result does not match journal head"
+        }
+        $artifactsRoot = Join-Path $runRoot (
+            "sessions\" + $session.session_id + "\artifacts"
+        )
+        $workerArtifacts = @(Get-ChildItem -LiteralPath (Join-Path $artifactsRoot "workers") `
+            -Recurse -File -ErrorAction SilentlyContinue)
+        $integrationArtifacts = @(Get-ChildItem -LiteralPath (Join-Path $artifactsRoot "integration") `
+            -Recurse -File -ErrorAction SilentlyContinue)
+        if ($workerArtifacts.Count -eq 0 -or $integrationArtifacts.Count -eq 0) {
+            throw "planner artifacts were not persisted immutably"
         }
 
         Stop-TestRuntime $daemon

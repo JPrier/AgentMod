@@ -86,7 +86,7 @@ use crate::{
     child_session::{ChildSessionLogicPort, EnsureChildSessionCommand},
     compaction::{
         CompactionContext, CompactionError, CompactionStrategy, bounded_typed_summary,
-        compact_projection,
+        build_summary_request_material, compact_projection,
     },
     continuation::{
         ApprovalDisposition, ChildGraphApprovalContinuation, ChildGraphApprovalOperation,
@@ -204,7 +204,10 @@ use crate::{
         ChildMessageState, ContextBoundaryCompletedEvent, ContextBoundaryIdentity,
         ContextBoundaryOrigin, ContextBoundaryStartedEvent, ContextPhaseCompletedEvent,
         ContextPhaseIdentity, ContextPhaseStartedEvent, ContextProjectionReplacedEvent,
-        ContextProjectionReplacementApprovedEvent, ConversationEntryCommittedEvent,
+        ContextProjectionReplacementApprovedEvent, ContextSummaryApprovedEvent,
+        ContextSummaryCompletedEvent, ContextSummaryFailedEvent, ContextSummaryIdentity,
+        ContextSummaryProposedEvent, ContextSummaryStartedEvent, ContextSummaryState,
+        ConversationEntryCommittedEvent,
         GenericModelInvocationBoundEvent, GenericModelToolBatchSuspendedEvent,
         GenericProviderToolBatchBoundEvent, GraphNodeWaitDisposition, GraphNodeWaitResolvedEvent,
         GraphScheduleApprovedEvent, GraphScheduleCancellationCompletedEvent,
@@ -19160,6 +19163,218 @@ where
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
+        reason = "live summary keeps the normal proposal chain, canonical outbox, harness dispatch, and terminal-evidence reuse adjacent"
+    )]
+    async fn execute_live_summary(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        state: &crate::session::SessionState,
+        binding: &crate::session::SessionStyleBinding,
+        command: &RunTurnCommand,
+        committed_at: Sequence,
+        mut position: JournalPosition,
+    ) -> Result<(String, String, String, String, JournalPosition), RunTurnError> {
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle =
+            serde_json::from_str(&binding.compiled_style_json)
+                .map_err(|_| RunTurnError::StyleBindingInvalid)?;
+        let summary_config = compiled.compaction.summary.clone();
+        let summary_provider = summary_config.as_ref().map_or_else(
+            || command.provider.clone(),
+            |config| config.provider.clone(),
+        );
+        let summary_model = summary_config
+            .as_ref()
+            .map_or_else(|| command.model.clone(), |config| config.model.clone());
+        let max_summary_bytes = compiled.compaction.summary_max_bytes.max(1);
+        let max_request_bytes = summary_config.as_ref().map_or(1024 * 1024, |config| {
+            config.max_request_tokens.saturating_mul(4).max(1024)
+        });
+        let material = build_summary_request_material(
+            &state.conversation,
+            max_request_bytes,
+            &binding.compaction.preservation_requirements,
+            DEFAULT_SLIDING_WINDOW_ENTRIES,
+        )
+        .map_err(RunTurnError::Compaction)?;
+        let summary_options = command.options.clone();
+        let request_hash = summary_request_hash(
+            &summary_provider,
+            &summary_model,
+            &summary_options,
+            &material.entries,
+        )?;
+        let summary_id = format!("summary:{}:{}", committed_at.get(), request_hash.to_hex());
+        let identity = ContextSummaryIdentity {
+            summary_id: summary_id.clone(),
+            request_hash,
+            provider: summary_provider.clone(),
+            model: summary_model.clone(),
+            schema_version: compiled.compaction.summary_schema_version,
+            max_summary_bytes,
+            source_range: material.source_range,
+        };
+        let existing = state.context_summaries.get(&summary_id).cloned();
+        if let Some(record) = existing.as_ref() {
+            match record.state {
+                ContextSummaryState::Completed => {
+                    let text = record
+                        .text
+                        .clone()
+                        .ok_or(RunTurnError::SummaryEvidenceIncomplete)?;
+                    return Ok((text, summary_id, summary_provider, summary_model, position));
+                }
+                ContextSummaryState::Started => {
+                    return Err(RunTurnError::AmbiguousSummaryProvider);
+                }
+                ContextSummaryState::Proposed
+                | ContextSummaryState::Approved
+                | ContextSummaryState::Failed => {}
+            }
+        }
+        let session_policy = self
+            .policy_for_state(state, &command.cancellation_id)
+            .await?;
+        let provider = ProviderExecutionLogic::new(self.data.clone(), session_policy.execution);
+        let summary_cancellation = uuid::Uuid::now_v7().to_string();
+        let prepared = provider
+            .prepare(ExecuteProviderCommand {
+                harness: binding.harness.clone(),
+                session_id: command.session_id.clone(),
+                provider: summary_provider.clone(),
+                model: summary_model.clone(),
+                entries: project(&material.entries),
+                options: summary_options.clone(),
+                cancellation_id: summary_cancellation,
+                style: state.style.clone(),
+                workspace: state.workspace.clone(),
+            })
+            .map_err(RunTurnError::Provider)?;
+        if existing.is_none() {
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ContextSummaryProposed(ContextSummaryProposedEvent {
+                    identity: identity.clone(),
+                }),
+            )?;
+        }
+        let authorized = provider
+            .authorize_prepared(prepared)
+            .await
+            .map_err(RunTurnError::Provider)?;
+        let action_digest = authorized
+            .executable
+            .digest()
+            .map_err(|_| RunTurnError::Event)?;
+        if !existing
+            .as_ref()
+            .is_some_and(|record| record.state == ContextSummaryState::Approved)
+        {
+            let invocation_position = self.commit_plugin_invocations(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                state,
+                &authorized.interceptor_audit,
+            )?;
+            position = invocation_position;
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ContextSummaryApproved(ContextSummaryApprovedEvent {
+                    identity: identity.clone(),
+                    action_digest,
+                }),
+            )?;
+        }
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextSummaryStarted(ContextSummaryStartedEvent {
+                identity: identity.clone(),
+            }),
+        )?;
+        let mut stream = provider
+            .execute_authorized_stream(authorized)
+            .await
+            .map_err(RunTurnError::Provider)?;
+        let mut text = String::new();
+        let mut usage = (0_u64, 0_u64);
+        let mut failed = None;
+        while let Some(event) = stream.next().await {
+            match event.map_err(RunTurnError::Provider)? {
+                ProviderEvent::Text(delta) => text.push_str(&delta),
+                ProviderEvent::Completed {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => usage = (input_tokens, output_tokens),
+                ProviderEvent::Failed { code, message, .. } => {
+                    failed = Some((code, message));
+                }
+                ProviderEvent::ToolProposed { .. }
+                | ProviderEvent::ToolDelta { .. }
+                | ProviderEvent::Cancelled => {
+                    failed = Some((
+                        String::from("summary_tool_or_cancel"),
+                        String::from("summary provider must return bounded text only"),
+                    ));
+                }
+                ProviderEvent::Started => {}
+            }
+        }
+        if let Some((code, message)) = failed {
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ContextSummaryFailed(ContextSummaryFailedEvent {
+                    identity: identity.clone(),
+                    code,
+                    message,
+                }),
+            )?;
+            return Err(RunTurnError::SummaryProviderFailed);
+        }
+        truncate_owned_utf8(
+            &mut text,
+            usize::try_from(max_summary_bytes).unwrap_or(usize::MAX),
+        );
+        let content_hash = ContentHash::digest(text.as_bytes());
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                identity: identity.clone(),
+                content_hash,
+                text: text.clone(),
+                input_tokens: usage.0,
+                output_tokens: usage.1,
+            }),
+        )?;
+        Ok((text, summary_id, summary_provider, summary_model, position))
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
         reason = "context composition keeps proposal authorization, bounded retrieval, canonical replacement, and compaction ordering explicit"
     )]
     async fn compose_style_context(
@@ -20000,15 +20215,53 @@ where
                         .map_err(RunTurnError::Compaction)?,
                         Vec::new(),
                     ),
-                    "summary" => (
-                        compact_typed_summary_to_bound(
-                            &state.conversation,
-                            &binding.compaction.preservation_requirements,
-                            projection_limit,
-                            &context,
-                        )?,
-                        Vec::new(),
-                    ),
+                    "summary" => {
+                        // The immutable style may select a live model-generated
+                        // summary (an explicit provider/model request) instead
+                        // of the deterministic runtime generator.
+                        if binding.compaction.summary.is_some() {
+                            let (summary_text, summary_id, _provider, _model, next_position) =
+                                self
+                                    .execute_live_summary(
+                                        persistence,
+                                        session_id,
+                                        session_directory,
+                                        &state,
+                                        &binding,
+                                        command,
+                                        initial_committed_at,
+                                        position,
+                                    )
+                                    .await?;
+                            position = next_position;
+                            let mut plan = compact_projection(
+                                &state.conversation,
+                                CompactionStrategy::Summary {
+                                    summary_id,
+                                    summary: summary_text,
+                                    artifact_id: None,
+                                },
+                                context,
+                            )
+                            .map_err(RunTurnError::Compaction)?;
+                            plan.replacement = restore_required_projection_entries(
+                                state.conversation.provider_projection(),
+                                &plan.replacement,
+                                &binding.compaction.preservation_requirements,
+                            );
+                            (plan, Vec::new())
+                        } else {
+                            (
+                                compact_typed_summary_to_bound(
+                                    &state.conversation,
+                                    &binding.compaction.preservation_requirements,
+                                    projection_limit,
+                                    &context,
+                                )?,
+                                Vec::new(),
+                            )
+                        }
+                    },
                     "artifact_handoff" => {
                         let bytes = canonical_json_bytes(&json!({
                             "schema": "agentmod.context-artifact.v1",
@@ -25988,6 +26241,22 @@ fn compact_typed_summary_to_bound(
     }
 }
 
+fn summary_request_hash(
+    provider: &str,
+    model: &str,
+    options: &Value,
+    entries: &[ConversationEntry],
+) -> Result<ContentHash, RunTurnError> {
+    let canonical_options = canonical_json_bytes(options).map_err(map_projection_measure_error)?;
+    let mut identity = Vec::from(b"agentmod.summary-request.v1".as_slice());
+    append_identity_field(&mut identity, provider.as_bytes())?;
+    append_identity_field(&mut identity, model.as_bytes())?;
+    append_identity_field(&mut identity, &canonical_options)?;
+    let entries_bytes = serde_json::to_vec(entries).map_err(|_| RunTurnError::Event)?;
+    append_identity_field(&mut identity, &entries_bytes)?;
+    Ok(ContentHash::digest(&identity))
+}
+
 fn restore_required_projection_entries(
     source: &[ConversationEntry],
     candidate: &[ConversationEntry],
@@ -28276,6 +28545,12 @@ pub enum RunTurnError {
     AmbiguousContextPhase(String),
     #[error("provider resume may have crossed the proposal or dispatch boundary")]
     AmbiguousProviderResume,
+    #[error("live summary provider evidence is incomplete")]
+    SummaryEvidenceIncomplete,
+    #[error("live summary provider dispatch is ambiguous and fails closed")]
+    AmbiguousSummaryProvider,
+    #[error("live summary provider failed")]
+    SummaryProviderFailed,
     #[error("provider terminal receipt is unavailable, corrupt, or conflicting")]
     ProviderReceipt,
     #[error("context-artifact memory injection requires an approved immutable artifact")]

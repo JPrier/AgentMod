@@ -274,6 +274,29 @@ pub struct SessionCompactionConfiguration {
     /// Typed records that the selected compactor must retain.
     #[serde(default)]
     pub preservation_requirements: Vec<String>,
+    /// Explicit provider/model selection for a live model-generated summary,
+    /// when the strategy is `summary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SessionSummaryCompactionSelection>,
+    /// Maximum provider-visible summary content bytes for a live
+    /// model-generated summary.
+    #[serde(default)]
+    pub summary_max_bytes: u32,
+    /// Canonical bounded summary schema version written by the runtime.
+    #[serde(default)]
+    pub summary_schema_version: u16,
+}
+
+/// Session-owned explicit selection for a live model-generated summary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSummaryCompactionSelection {
+    /// Provider used for the summary model request.
+    pub provider: String,
+    /// Model used for the summary model request.
+    pub model: String,
+    /// Maximum provider tokens consumed by one summary call.
+    pub max_request_tokens: u64,
 }
 
 /// Session-owned exact plugin compactor implementation selection.
@@ -3948,6 +3971,16 @@ pub enum RuntimeCommittedEvent {
     AutomaticMemoryWriteFailed(Box<AutomaticMemoryWriteFailedEvent>),
     /// Records a permanently ambiguous non-idempotent plugin write.
     AutomaticMemoryWriteAmbiguous(Box<AutomaticMemoryWriteAmbiguousEvent>),
+    /// Records a live model-generated summary proposal.
+    ContextSummaryProposed(ContextSummaryProposedEvent),
+    /// Records final authorization of a live summary request.
+    ContextSummaryApproved(ContextSummaryApprovedEvent),
+    /// Records provider dispatch of a live summary request.
+    ContextSummaryStarted(ContextSummaryStartedEvent),
+    /// Records terminal provider evidence for a live summary request.
+    ContextSummaryCompleted(ContextSummaryCompletedEvent),
+    /// Records a definite terminal failure without provider evidence.
+    ContextSummaryFailed(ContextSummaryFailedEvent),
     /// Records child-session creation intent before policy and branching.
     ChildAgentCreationProposed(ChildAgentCreationProposedEvent),
     /// Records the final approved child-session creation action.
@@ -4140,6 +4173,11 @@ impl RuntimeCommittedEvent {
             Self::AutomaticMemoryWriteCompleted(_) => "memory.write_completed",
             Self::AutomaticMemoryWriteFailed(_) => "memory.write_failed",
             Self::AutomaticMemoryWriteAmbiguous(_) => "memory.write_ambiguous",
+            Self::ContextSummaryProposed(_) => "context.summary_proposed",
+            Self::ContextSummaryApproved(_) => "context.summary_approved",
+            Self::ContextSummaryStarted(_) => "context.summary_started",
+            Self::ContextSummaryCompleted(_) => "context.summary_completed",
+            Self::ContextSummaryFailed(_) => "context.summary_failed",
             Self::ChildAgentCreationProposed(_) => "child_agent.creation_proposed",
             Self::ChildAgentCreationApproved(_) => "child_agent.creation_approved",
             Self::GenericChildCreationProposed(_) => "child_agent.generic_creation_proposed",
@@ -4568,6 +4606,136 @@ impl AutomaticMemoryWriteRecord {
     }
 }
 
+/// Stable identity for one live model-generated summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryIdentity {
+    /// Projection-local summary execution ID.
+    pub summary_id: String,
+    /// Hash of the exact provider/model/options/entries request.
+    pub request_hash: ContentHash,
+    /// Provider used for the summary model request.
+    pub provider: String,
+    /// Model used for the summary model request.
+    pub model: String,
+    /// Bounded summary schema version.
+    pub schema_version: u16,
+    /// Maximum provider-visible summary bytes.
+    pub max_summary_bytes: u32,
+    /// Inclusive source projection range being summarized.
+    pub source_range: Option<(Sequence, Sequence)>,
+}
+
+/// Canonical intent to begin a live model-generated summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryProposedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+}
+
+/// Records the final policy-approved summary action before dispatch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryApprovedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Digest bound into the short-lived harness grant.
+    pub action_digest: ContentHash,
+}
+
+/// Records provider dispatch of one summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryStartedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+}
+
+/// Terminal provider evidence for one summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryCompletedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Hash of the exact bounded summary text.
+    pub content_hash: ContentHash,
+    /// Bounded provider-visible summary text.
+    pub text: String,
+    /// Provider-reported input tokens.
+    pub input_tokens: u64,
+    /// Provider-reported output tokens.
+    pub output_tokens: u64,
+}
+
+/// Terminal failure for one summary request without provider evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryFailedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Stable failure code.
+    pub code: String,
+    /// Bounded failure detail.
+    pub message: String,
+}
+
+/// Canonical outbox phase for one live summary request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSummaryState {
+    /// Proposal is canonical; no policy outcome is canonical yet.
+    Proposed,
+    /// Policy approved the exact request; no provider call is canonical yet.
+    Approved,
+    /// Provider dispatch is canonical; recovery must reuse exact evidence.
+    Started,
+    /// Terminal provider evidence is canonical.
+    Completed,
+    /// Terminal failure without provider evidence is canonical.
+    Failed,
+}
+
+/// Replay-owned live model-generated summary outbox record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryRecord {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Latest durable outbox state.
+    pub state: ContextSummaryState,
+    /// Digest of the approved action, once policy succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<ContentHash>,
+    /// Canonical proposal sequence.
+    pub proposed_at: Sequence,
+    /// Canonical approval sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<Sequence>,
+    /// Canonical dispatch sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Sequence>,
+    /// Canonical terminal sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Sequence>,
+    /// Hash of the exact bounded summary text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<ContentHash>,
+    /// Bounded provider-visible summary text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Provider-reported input tokens.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Provider-reported output tokens.
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+impl ContextSummaryRecord {
+    /// Returns whether terminal provider evidence already exists.
+    #[must_use]
+    pub const fn has_terminal_evidence(&self) -> bool {
+        matches!(
+            self.state,
+            ContextSummaryState::Completed | ContextSummaryState::Failed
+        )
+    }
+}
+
 /// Replay-owned plugin context-operation lifecycle.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -4700,6 +4868,9 @@ pub struct SessionState {
     pub successful_iteration_completions: Vec<SuccessfulIterationCompletionBoundary>,
     /// Canonical content and provider projection.
     pub conversation: ConversationState,
+    /// Canonical live model-generated summary outbox keyed by summary ID.
+    #[serde(default)]
+    pub context_summaries: BTreeMap<String, ContextSummaryRecord>,
     /// Durable approval continuations.
     pub approvals: BTreeMap<ContinuationId, ApprovalRecord>,
     /// Durable tool-dispatch outbox projection keyed by provider call ID.
@@ -5800,6 +5971,7 @@ fn initialize(
         tool_executions: BTreeMap::new(),
         artifact_persistences: BTreeMap::new(),
         automatic_memory_writes: BTreeMap::new(),
+        context_summaries: BTreeMap::new(),
         child_agents: BTreeMap::new(),
         received_child_messages: Vec::new(),
         planner_worker: PlannerWorkerState::default(),
@@ -6816,6 +6988,21 @@ fn apply_payload(
         }
         RuntimeCommittedEvent::AutomaticMemoryWriteAmbiguous(ambiguous) => {
             apply_automatic_memory_write_ambiguous(state, ambiguous, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryProposed(proposed) => {
+            apply_context_summary_proposed(state, proposed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryApproved(approved) => {
+            apply_context_summary_approved(state, approved, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryStarted(started) => {
+            apply_context_summary_started(state, started, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryCompleted(completed) => {
+            apply_context_summary_completed(state, completed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryFailed(failed) => {
+            apply_context_summary_failed(state, failed, event.metadata.sequence)
         }
         RuntimeCommittedEvent::ChildAgentCreationProposed(proposed) => {
             apply_child_agent_creation_proposed(state, proposed, event.metadata.sequence)
@@ -15016,6 +15203,182 @@ fn valid_automatic_memory_identity(
             == Some(identity.write_id.as_str())
 }
 
+fn advance_open_boundary(
+    state: &mut SessionState,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if let Some(execution) = state.style_execution.as_mut()
+        && let Some(boundary) = execution.context_boundaries.last_mut()
+        && boundary.completed_at.is_none()
+    {
+        if boundary.last_sequence.checked_next() != Ok(sequence) {
+            return Err(SessionReducerError::InvalidContextBoundaryTransition);
+        }
+        boundary.last_sequence = sequence;
+    }
+    Ok(())
+}
+
+fn valid_summary_identity(identity: &ContextSummaryIdentity) -> bool {
+    !identity.summary_id.trim().is_empty()
+        && !identity.provider.trim().is_empty()
+        && !identity.model.trim().is_empty()
+        && identity.schema_version == 1
+        && identity.max_summary_bytes > 0
+        && identity.max_summary_bytes <= 1024 * 1024
+}
+
+fn apply_context_summary_proposed(
+    state: &mut SessionState,
+    proposed: &ContextSummaryProposedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let identity = &proposed.identity;
+    if !valid_summary_identity(identity)
+        || identity
+            .source_range
+            .is_some_and(|(start, end)| start > end)
+        || state.context_summaries.contains_key(&identity.summary_id)
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    state.context_summaries.insert(
+        identity.summary_id.clone(),
+        ContextSummaryRecord {
+            identity: identity.clone(),
+            state: ContextSummaryState::Proposed,
+            action_digest: None,
+            proposed_at: sequence,
+            approved_at: None,
+            started_at: None,
+            completed_at: None,
+            content_hash: None,
+            text: None,
+            input_tokens: 0,
+            output_tokens: 0,
+        },
+    );
+    advance_open_boundary(state, sequence)?;
+    Ok(())
+}
+
+fn summary_record_mut<'a>(
+    state: &'a mut SessionState,
+    identity: &ContextSummaryIdentity,
+) -> Result<&'a mut ContextSummaryRecord, SessionReducerError> {
+    let record = state
+        .context_summaries
+        .get_mut(&identity.summary_id)
+        .ok_or(SessionReducerError::InvalidSummaryTransition)?;
+    if record.identity != *identity {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    Ok(record)
+}
+
+fn apply_context_summary_approved(
+    state: &mut SessionState,
+    approved: &ContextSummaryApprovedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = summary_record_mut(state, &approved.identity)?;
+    if record.state != ContextSummaryState::Proposed
+        || record.action_digest.is_some()
+        || record.approved_at.is_some()
+        || record.started_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Approved;
+    record.action_digest = Some(approved.action_digest);
+    record.approved_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
+    Ok(())
+}
+
+fn apply_context_summary_started(
+    state: &mut SessionState,
+    started: &ContextSummaryStartedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = summary_record_mut(state, &started.identity)?;
+    if record.state != ContextSummaryState::Approved
+        || record.approved_at.is_none()
+        || record.started_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Started;
+    record.started_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
+    Ok(())
+}
+
+fn apply_context_summary_completed(
+    state: &mut SessionState,
+    completed: &ContextSummaryCompletedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let identity = &completed.identity;
+    if completed.text.trim().is_empty()
+        || u64::try_from(completed.text.len())
+            .map_or(true, |len| len > u64::from(identity.max_summary_bytes))
+        || completed.content_hash != ContentHash::digest(completed.text.as_bytes())
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    let record = summary_record_mut(state, identity)?;
+    if record.state != ContextSummaryState::Started
+        || record.started_at.is_none()
+        || record.completed_at.is_some()
+        || record.content_hash.is_some()
+        || record.text.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Completed;
+    record.completed_at = Some(sequence);
+    record.content_hash = Some(completed.content_hash);
+    record.text = Some(completed.text.clone());
+    record.input_tokens = completed.input_tokens;
+    record.output_tokens = completed.output_tokens;
+    if let Some(execution) = state.style_execution.as_mut() {
+        execution.input_tokens = execution
+            .input_tokens
+            .checked_add(completed.input_tokens)
+            .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+        execution.output_tokens = execution
+            .output_tokens
+            .checked_add(completed.output_tokens)
+            .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+    }
+    advance_open_boundary(state, sequence)?;
+    Ok(())
+}
+
+fn apply_context_summary_failed(
+    state: &mut SessionState,
+    failed: &ContextSummaryFailedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if failed.code.trim().is_empty() {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    let record = summary_record_mut(state, &failed.identity)?;
+    if record.state != ContextSummaryState::Started
+        || record.started_at.is_none()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Failed;
+    record.completed_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
+    Ok(())
+}
+
 fn apply_automatic_memory_write_proposed(
     state: &mut SessionState,
     proposed: &AutomaticMemoryWriteProposedEvent,
@@ -18807,6 +19170,9 @@ pub enum SessionReducerError {
     /// Automatic memory persistence did not follow exact outbox ordering.
     #[error("automatic memory write state transition is invalid")]
     InvalidAutomaticMemoryWrite,
+    /// Live model-generated summary did not follow exact outbox ordering.
+    #[error("live summary state transition is invalid")]
+    InvalidSummaryTransition,
     /// Child sessions did not follow proposal, atomic creation, and terminal ordering.
     #[error("child-agent state transition is invalid")]
     InvalidChildAgentTransition,

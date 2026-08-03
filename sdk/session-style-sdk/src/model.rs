@@ -390,6 +390,47 @@ pub struct CompactionSelection {
     /// Typed provider-projection records a compactor must retain.
     #[serde(default = "default_compaction_preservation_requirements")]
     pub preservation_requirements: Vec<CompactionPreservationRequirement>,
+    /// Explicit provider/model selection for a live model-generated summary,
+    /// when the strategy is `summary` and the runtime should ask a model to
+    /// produce the bounded summary text instead of the deterministic runtime
+    /// generator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SummaryCompactionSelection>,
+    /// Maximum provider-visible summary content bytes for a live
+    /// model-generated summary.
+    #[serde(default = "default_summary_max_bytes", skip_serializing_if = "is_default_summary_max_bytes")]
+    pub summary_max_bytes: u32,
+    /// Canonical bounded summary schema version written by the runtime.
+    #[serde(default = "default_summary_schema_version", skip_serializing_if = "is_default_summary_schema_version")]
+    pub summary_schema_version: u16,
+}
+
+fn default_summary_max_bytes() -> u32 {
+    64 * 1024
+}
+
+fn default_summary_schema_version() -> u16 {
+    1
+}
+
+fn is_default_summary_max_bytes(value: &u32) -> bool {
+    *value == default_summary_max_bytes()
+}
+
+fn is_default_summary_schema_version(value: &u16) -> bool {
+    *value == default_summary_schema_version()
+}
+
+/// Explicit provider/model selection for one live model-generated summary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SummaryCompactionSelection {
+    /// Provider used for the summary model request.
+    pub provider: String,
+    /// Model used for the summary model request.
+    pub model: String,
+    /// Maximum provider tokens consumed by one summary call.
+    pub max_request_tokens: u64,
 }
 
 /// Immutable selection of one plugin-provided compactor implementation.

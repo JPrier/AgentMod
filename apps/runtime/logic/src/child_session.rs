@@ -733,6 +733,9 @@ mod tests {
                 preserve_unresolved_tasks: true,
                 preserve_active_processes: true,
                 preservation_requirements: Vec::new(),
+                summary: None,
+                summary_max_bytes: 64 * 1024,
+                summary_schema_version: 1,
             },
             tool_groups: vec![
                 String::from("filesystem.read"),

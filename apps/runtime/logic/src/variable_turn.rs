@@ -1034,6 +1034,7 @@ mod tests {
             tool_executions: BTreeMap::new(),
             artifact_persistences: BTreeMap::new(),
             automatic_memory_writes: BTreeMap::new(),
+            context_summaries: BTreeMap::new(),
             child_agents: BTreeMap::new(),
             received_child_messages: Vec::new(),
             planner_worker: PlannerWorkerState::default(),

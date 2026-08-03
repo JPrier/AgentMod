@@ -30,7 +30,7 @@ use crate::{
     session::{
         SessionCompactionConfiguration, SessionMemoryConfiguration, SessionPermissionDefaults,
         SessionPluginCompactorConfiguration, SessionPluginMemoryConfiguration, SessionStyleBinding,
-        SessionStyleBudgets, SessionStyleSource,
+        SessionStyleBudgets, SessionStyleSource, SessionSummaryCompactionSelection,
     },
 };
 
@@ -1172,6 +1172,29 @@ fn binding(
             preserve_unresolved_tasks: value_bool(compaction, "preserve_unresolved_tasks")?,
             preserve_active_processes: value_bool(compaction, "preserve_active_processes")?,
             preservation_requirements: string_array(Some(compaction), "preservation_requirements"),
+            summary: match compaction.get("summary").and_then(Value::as_object) {
+                Some(selection) => Some(SessionSummaryCompactionSelection {
+                    provider: required_string(
+                        selection.get("provider").and_then(Value::as_str),
+                    )?,
+                    model: required_string(selection.get("model").and_then(Value::as_str))?,
+                    max_request_tokens: selection
+                        .get("max_request_tokens")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                }),
+                None => None,
+            },
+            summary_max_bytes: compaction
+                .get("summary_max_bytes")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or(64 * 1024),
+            summary_schema_version: compaction
+                .get("summary_schema_version")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(1),
         },
         tool_groups: string_array(Some(&compiled), "allowed_tool_groups"),
         harness: harness_id.clone(),

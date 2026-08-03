@@ -507,3 +507,51 @@ the converged tree is `abbf97b…`.
 
 All temporary commits are squashed into a single final reconciliation commit
 before updating `main`.
+
+## 10. Validation status
+
+Linux (Ubuntu/WSL2) process E2Es executed against the reconciled tree:
+
+- Arbitrary graph A, B, B-cancellation, C (plugin node), schedule: **passed**
+- Planner-worker v1.4: **passed**
+- Typed summary, artifact handoff, artifact-handoff finalize: **passed**
+- Automatic memory, session-completion memory: **passed**
+- Plugin context, plugin automatic memory, plugin node executor, MCP OAuth,
+  ACP/MCP branch, TUI rich attachments, scheduler, scheduler recovery: **passed**
+- Harness selection (independent harness), runtime-supervised live-provider
+  fixture: **passed**
+- `runtime_plugin_lifecycle`: **pre-existing converged-base failure** in the
+  startup lifecycle-recovery phase (plugin post-receipt cut marker is never
+  reached after daemon restart). Reproduces identically on the unmodified
+  `5274b83` tree and was recorded as failing in the July 31 validation log
+  (`all_scripts_passed: False`). Not caused by this reconciliation.
+
+Two stale E2E scripts were corrected to match the converged generic contract:
+- `runtime_typed_summary.sh`: the converged generic executor legitimately
+  retains the user input plus the canonical tool-call request/result pair as
+  conversation entries (count 2 -> 3); the summary-specific assertions
+  (schema, projection method, restart, replay) were already correct.
+- `runtime_automatic_memory.sh`/`.ps1`: replaced the sed-rewritten legacy
+  fixture with a dedicated `automatic-memory-file.toml` that uses the generic
+  `model_request`/`complete_turn` configuration contract and configures the
+  filesystem host for the fixed `filesystem.read` gate.
+
+Static validation gates against the reconciled tree:
+
+- `cargo fmt --all -- --check`: **passed**
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`:
+  **passed**
+- `cargo test --workspace --all-targets --all-features --locked`: **passed**
+  (124 test binaries, 0 failures; includes the two ported property tests and
+  the summary outbox/material tests)
+- `cargo test --workspace --doc --all-features --locked`: **passed**
+- `cargo run --locked -p xtask -- architecture`: **passed** (95 packages)
+- `cargo test --locked -p xtask --test architecture`: **passed**
+- `cargo deny check`: **passed** (advisories, bans, licenses, sources)
+- `cargo audit`: **passed** (1 pre-existing allowed warning: `fxhash`
+  unmaintained)
+
+Windows: the named-pipe daemon startup ("local runtime endpoint is invalid")
+reproduces identically on the unmodified base in this environment and is
+pre-existing; the Windows E2E variants are provided and the Linux/WSL2 matrix
+above is the executed cross-platform evidence for this reconciliation.

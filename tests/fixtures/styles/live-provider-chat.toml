@@ -1,0 +1,115 @@
+schema_version = 1
+kind = "custom"
+required_capabilities = ["model"]
+allowed_tool_groups = []
+allowed_providers = ["local"]
+allowed_plugins = ["runtime.security"]
+
+[identity]
+id = "live-provider-chat"
+version = "1.0.0"
+runtime_api = "^1.0"
+
+[harness]
+id = "native"
+required_capabilities = [
+  "cancellation",
+  "streaming",
+  "structured_context_replacement",
+  "token_usage",
+  "tool_calls",
+]
+
+[graph]
+kind = "inline"
+source = '''
+format_version = 1
+entry = "respond"
+
+[budget]
+max_steps = 10
+max_tokens = 10000
+max_cost_micros = 1000000
+max_duration_ms = 60000
+
+[declarations]
+capabilities = ["model"]
+providers = ["local"]
+
+[[nodes]]
+id = "respond"
+kind = "model_call"
+provider = "local"
+retry_limit = 1
+
+[[nodes]]
+id = "done"
+kind = "complete_turn"
+
+[[edges]]
+from = "respond"
+to = "done"
+'''
+
+[memory]
+provider = "none"
+scopes = []
+retrieval_timing = "never"
+max_items = 0
+max_injected_bytes = 0
+write_policy = "never"
+injection_location = "none"
+
+[memory.query]
+source = "current_input"
+include_active_artifacts = false
+include_style_context = false
+max_query_bytes = 16384
+
+[compaction]
+strategy = "none"
+reserved_context_tokens = 0
+max_provider_projection_tokens = 0
+preserve_unresolved_tasks = true
+preserve_active_processes = true
+preservation_requirements = [
+  "system_instructions",
+  "current_input",
+  "pending_control_state",
+  "artifact_references",
+  "memory_provenance",
+  "active_graph_state",
+  "tool_call_correlation",
+]
+
+[approvals]
+default = "allow"
+groups = {}
+
+[budgets]
+max_iterations = 1
+max_steps = 10
+max_tokens = 10000
+max_cost_micros = 1000000
+max_duration_ms = 60000
+
+[child_agents]
+max_children = 0
+max_concurrent = 0
+max_depth = 0
+per_child_token_budget = 0
+
+[retry]
+max_attempts = 2
+initial_backoff_ms = 10
+max_backoff_ms = 100
+retryable_failures = ["provider.unavailable"]
+
+[termination]
+allowed_outcomes = ["complete_turn", "fail"]
+on_hard_limit = "fail"
+require_explicit_terminal_node = true
+
+[selection]
+requires_explicit_selection = true
+model_may_select = false

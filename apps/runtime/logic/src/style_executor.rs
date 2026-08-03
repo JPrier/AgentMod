@@ -1038,6 +1038,9 @@ pub(crate) mod tests {
                 preserve_unresolved_tasks: true,
                 preserve_active_processes: true,
                 preservation_requirements: Vec::new(),
+                summary: None,
+                summary_max_bytes: 64 * 1024,
+                summary_schema_version: 1,
             },
             tool_groups: Vec::new(),
             harness: String::from("native"),
@@ -1505,6 +1508,33 @@ pub(crate) mod tests {
                 StyleAdapterKind::PersistentTurn
             ))
         );
+    }
+
+    /// Ported from `audit/task-02`: repeated transition selection never
+    /// diverges on any built-in graph, independent of node position.
+    #[test]
+    fn repeated_selection_never_diverges_on_built_in_graphs() {
+        for style in [
+            BuiltInStyle::PersistentChat,
+            BuiltInStyle::EphemeralTurn,
+            BuiltInStyle::ResearchLoop,
+            BuiltInStyle::PlannerWorker,
+            BuiltInStyle::DeclarativeGraph,
+        ] {
+            let executor = CompiledStyleExecutor::from_binding(&binding(style)).expect("executor");
+            let graph = &executor.compiled().graph;
+            for node in &graph.nodes {
+                let first = executor.transition(node.index, &json!({}));
+                for _ in 0..5 {
+                    assert_eq!(
+                        first,
+                        executor.transition(node.index, &json!({})),
+                        "{style:?}: {} diverged",
+                        node.id
+                    );
+                }
+            }
+        }
     }
 
     #[test]

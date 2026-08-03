@@ -502,6 +502,9 @@ fn summary_compaction() -> CompactionSelection {
         preserve_unresolved_tasks: true,
         preserve_active_processes: true,
         preservation_requirements: required_projection_records(),
+        summary: None,
+        summary_max_bytes: 64 * 1024,
+        summary_schema_version: 1,
     }
 }
 
@@ -515,6 +518,9 @@ fn no_compaction() -> CompactionSelection {
         preserve_unresolved_tasks: true,
         preserve_active_processes: true,
         preservation_requirements: required_projection_records(),
+        summary: None,
+        summary_max_bytes: 64 * 1024,
+        summary_schema_version: 1,
     }
 }
 

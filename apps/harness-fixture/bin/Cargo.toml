@@ -1,0 +1,29 @@
+[package]
+name = "agentmod-harness-fixture"
+description = "Independent deterministic harness fixture process for AgentMod"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-harness-fixture-data = { version = "0.1.0", path = "../data" }
+agentmod-harness-fixture-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-harness-fixture-logic = { version = "0.1.0", path = "../logic" }
+agentmod-harness-fixture-service = { version = "0.1.0", path = "../service" }
+agentmod-harness-protocol = { version = "0.1.0", path = "../../../protocols/harness-protocol" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["io-std"] }
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "composition-root"
+process = "harness-fixture"
+
+[dev-dependencies]
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
+blake3.workspace = true
+uuid.workspace = true

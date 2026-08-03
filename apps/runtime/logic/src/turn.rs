@@ -30,6 +30,7 @@ use agentmod_runtime_data::{
         ChildMessageParentLinkData,
     },
     continuation::ContinuationDataPort,
+    execution_plan::ExecutionPlanDataPort,
     harness::HarnessDataPort,
     identity::{
         AllocateEventIdentityDataRequest, EventIdentityDataError, EventIdentityDataPort,
@@ -85,7 +86,7 @@ use crate::{
     child_session::{ChildSessionLogicPort, EnsureChildSessionCommand},
     compaction::{
         CompactionContext, CompactionError, CompactionStrategy, bounded_typed_summary,
-        compact_projection,
+        build_summary_request_material, compact_projection,
     },
     continuation::{
         ApprovalDisposition, ChildGraphApprovalContinuation, ChildGraphApprovalOperation,
@@ -133,7 +134,7 @@ use crate::{
         NodeWorkIdentity, SessionTermination, canonical_initial_variables_json,
         canonical_user_event_artifacts, execute_native_node, native_executor_key,
     },
-    node_executor::{RuntimeExecutabilityError, revalidate_runtime_execution_plan},
+    node_executor::RuntimeExecutabilityError,
     parallel_driver::{BranchEffectDispatchClass, BranchEffectKind, NativePureBranchExecutor},
     parallel_turn::{
         ApplyParallelBranchEffectOutputCommand, ApplyParallelJoinMergesCommand,
@@ -203,22 +204,25 @@ use crate::{
         ChildMessageState, ContextBoundaryCompletedEvent, ContextBoundaryIdentity,
         ContextBoundaryOrigin, ContextBoundaryStartedEvent, ContextPhaseCompletedEvent,
         ContextPhaseIdentity, ContextPhaseStartedEvent, ContextProjectionReplacedEvent,
-        ContextProjectionReplacementApprovedEvent, ConversationEntryCommittedEvent,
-        GenericModelInvocationBoundEvent, GenericModelToolBatchSuspendedEvent,
-        GenericProviderToolBatchBoundEvent, GraphNodeWaitDisposition, GraphNodeWaitResolvedEvent,
-        GraphScheduleApprovedEvent, GraphScheduleCancellationCompletedEvent,
-        GraphScheduleCancellationRequestedEvent, GraphScheduleDispatchedEvent,
-        GraphScheduleIdentity, GraphScheduleResolvedEvent, GraphScheduleState,
-        GraphScheduleStoredEvent, GraphScheduleTriggeredEvent, ModelOutputDeltaObservedEvent,
-        ModelRequestApprovedEvent, ModelRequestCancelledEvent, ModelRequestFailedEvent,
-        ModelRequestProposedEvent, ModelRequestStartedEvent, ModelResponseCompletedEvent,
-        ModelToolCallDeltaObservedEvent, ModelToolCallProposedEvent, PlannedTask,
-        PluginContextApprovalStage, PluginContextOperationProposal, PluginContextOperationRequest,
-        PluginInvocationCompletedEvent, PluginNodeActionAmbiguousEvent,
-        PluginNodeActionAppliedEvent, PluginNodeActionFailedEvent, PluginNodeActionProposedEvent,
-        PluginNodeActionTerminalRecord, PluginNodeBudgetChargedEvent, PluginNodeBudgetUsage,
-        PluginNodeInvocationFailedEvent, PluginNodeOutcomeRejectionDisposition,
-        PluginNodeOutcomeValidatedEvent, PluginNodeRuntimeActionProposal, PluginSetActivatedEvent,
+        ContextProjectionReplacementApprovedEvent, ContextSummaryApprovedEvent,
+        ContextSummaryCompletedEvent, ContextSummaryFailedEvent, ContextSummaryIdentity,
+        ContextSummaryProposedEvent, ContextSummaryStartedEvent, ContextSummaryState,
+        ConversationEntryCommittedEvent, GenericModelInvocationBoundEvent,
+        GenericModelToolBatchSuspendedEvent, GenericProviderToolBatchBoundEvent,
+        GraphNodeWaitDisposition, GraphNodeWaitResolvedEvent, GraphScheduleApprovedEvent,
+        GraphScheduleCancellationCompletedEvent, GraphScheduleCancellationRequestedEvent,
+        GraphScheduleDispatchedEvent, GraphScheduleIdentity, GraphScheduleResolvedEvent,
+        GraphScheduleState, GraphScheduleStoredEvent, GraphScheduleTriggeredEvent,
+        ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent, ModelRequestCancelledEvent,
+        ModelRequestFailedEvent, ModelRequestProposedEvent, ModelRequestStartedEvent,
+        ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent, ModelToolCallProposedEvent,
+        PlannedTask, PluginContextApprovalStage, PluginContextOperationProposal,
+        PluginContextOperationRequest, PluginInvocationCompletedEvent,
+        PluginNodeActionAmbiguousEvent, PluginNodeActionAppliedEvent, PluginNodeActionFailedEvent,
+        PluginNodeActionProposedEvent, PluginNodeActionTerminalRecord,
+        PluginNodeBudgetChargedEvent, PluginNodeBudgetUsage, PluginNodeInvocationFailedEvent,
+        PluginNodeOutcomeRejectionDisposition, PluginNodeOutcomeValidatedEvent,
+        PluginNodeRuntimeActionProposal, PluginSetActivatedEvent,
         ProcessReconciliationCompletedEvent, ProcessReconciliationStartedEvent,
         ProcessReconciliationStatus, ReviewerFindingsCommittedEvent, RuntimeCommittedEvent,
         SchedulerDeliveryReconciledEvent, SchedulerFiredEvent, SchedulerTriggerObservation,
@@ -805,6 +809,12 @@ struct ProviderCompletionReceipt {
     reason: String,
     input_tokens: u64,
     output_tokens: u64,
+    #[serde(default)]
+    reasoning_tokens: u64,
+    #[serde(default)]
+    estimated: bool,
+    #[serde(default)]
+    cost_micros: u64,
 }
 
 impl GenericModelPhase {
@@ -1083,6 +1093,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -1496,6 +1507,7 @@ where
         + ContinuationDataPort
         + MemoryDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -2893,6 +2905,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -5641,6 +5654,9 @@ where
                 finish_reason: receipt.reason,
                 input_tokens: receipt.input_tokens,
                 output_tokens: receipt.output_tokens,
+                reasoning_tokens: receipt.reasoning_tokens,
+                estimated: receipt.estimated,
+                cost_micros: receipt.cost_micros,
             }),
         )?;
         Ok(true)
@@ -5789,7 +5805,9 @@ where
     /// with the same invocation identity and bytes.
     #[allow(
         clippy::too_many_arguments,
-        reason = "generic completion binds the canonical graph cursor, provider phase, conversation projection, and journal position"
+        clippy::too_many_lines,
+        dead_code,
+        reason = "generic completion binds the canonical graph cursor, provider phase, conversation projection, and journal position; retained for the typed-summary completion path"
     )]
     fn commit_generic_complete_turn_assistant(
         &self,
@@ -7893,6 +7911,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -7981,6 +8000,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -8318,6 +8338,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -8423,8 +8444,12 @@ where
             .map_err(RunTurnError::Persistence)?;
         validate_child_execution_defaults(&loaded.state, command)?;
         if let Some(binding) = loaded.state.style_binding.as_ref() {
-            revalidate_runtime_execution_plan(&self.data, binding)
-                .map_err(RunTurnError::RuntimeExecutability)?;
+            crate::execution_plan::validate_session_resume_plan(
+                &self.data,
+                &session_directory,
+                binding,
+            )
+            .map_err(execution_plan_resume_error)?;
         }
         if !loaded
             .state
@@ -9464,8 +9489,12 @@ where
             .map_err(RunTurnError::Persistence)?;
         validate_child_execution_defaults(&preflight.state, &command)?;
         if let Some(binding) = preflight.state.style_binding.as_ref() {
-            revalidate_runtime_execution_plan(&self.data, binding)
-                .map_err(RunTurnError::RuntimeExecutability)?;
+            crate::execution_plan::validate_session_resume_plan(
+                &self.data,
+                &session_directory,
+                binding,
+            )
+            .map_err(execution_plan_resume_error)?;
         }
         validate_generic_request_contract_before_recovery(&preflight.state, &command)?;
         let preflight = self.recover_style_control_gaps(
@@ -15591,8 +15620,12 @@ where
             .style_binding
             .as_ref()
             .ok_or(RunTurnError::StyleMigrationRequired)?;
-        revalidate_runtime_execution_plan(&self.data, style_binding)
-            .map_err(RunTurnError::RuntimeExecutability)?;
+        crate::execution_plan::validate_session_resume_plan(
+            &self.data,
+            &binding.session_directory,
+            style_binding,
+        )
+        .map_err(execution_plan_resume_error)?;
         let canonical_contract = loaded
             .state
             .style_execution
@@ -15649,6 +15682,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -15713,8 +15747,12 @@ where
                 .style_binding
                 .as_ref()
                 .ok_or(RunTurnError::StyleMigrationRequired)?;
-            revalidate_runtime_execution_plan(&self.data, binding)
-                .map_err(RunTurnError::RuntimeExecutability)?;
+            crate::execution_plan::validate_session_resume_plan(
+                &self.data,
+                &session_directory,
+                binding,
+            )
+            .map_err(execution_plan_resume_error)?;
             let execution = loaded
                 .state
                 .style_execution
@@ -15980,6 +16018,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -16090,6 +16129,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -18162,6 +18202,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -18223,8 +18264,12 @@ where
                 .style_binding
                 .as_ref()
                 .ok_or(RunTurnError::StyleMigrationRequired)?;
-            revalidate_runtime_execution_plan(&self.data, binding)
-                .map_err(RunTurnError::RuntimeExecutability)?;
+            crate::execution_plan::validate_session_resume_plan(
+                &self.data,
+                &session_directory,
+                binding,
+            )
+            .map_err(execution_plan_resume_error)?;
             let execution = state
                 .state
                 .style_execution
@@ -18513,6 +18558,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -18575,6 +18621,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -18618,8 +18665,12 @@ where
             .style_binding
             .as_ref()
             .ok_or(RunTurnError::StyleMigrationRequired)?;
-        revalidate_runtime_execution_plan(&self.data, binding)
-            .map_err(RunTurnError::RuntimeExecutability)?;
+        crate::execution_plan::validate_session_resume_plan(
+            &self.data,
+            &session_directory,
+            binding,
+        )
+        .map_err(execution_plan_resume_error)?;
         let execution = loaded
             .state
             .style_execution
@@ -18738,6 +18789,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -18881,6 +18933,7 @@ where
         + MemoryDataPort
         + ArtifactDataPort
         + NodeExecutorDataPort
+        + ExecutionPlanDataPort
         + RuntimeScheduleDataPort
         + ChildMessageDataPort
         + ProviderCompletionReceiptDataPort
@@ -19105,6 +19158,218 @@ where
             &cancellation_id,
         )?
         .ok_or(RunTurnError::GenericReviewReceiptUnavailable)
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "live summary keeps the normal proposal chain, canonical outbox, harness dispatch, and terminal-evidence reuse adjacent"
+    )]
+    async fn execute_live_summary(
+        &self,
+        persistence: &SessionPersistenceLogic<D>,
+        session_id: SessionId,
+        session_directory: &std::path::Path,
+        state: &crate::session::SessionState,
+        binding: &crate::session::SessionStyleBinding,
+        command: &RunTurnCommand,
+        committed_at: Sequence,
+        mut position: JournalPosition,
+    ) -> Result<(String, String, String, String, JournalPosition), RunTurnError> {
+        let compiled: agentmod_session_style_sdk::CompiledSessionStyle =
+            serde_json::from_str(&binding.compiled_style_json)
+                .map_err(|_| RunTurnError::StyleBindingInvalid)?;
+        let summary_config = compiled.compaction.summary.clone();
+        let summary_provider = summary_config.as_ref().map_or_else(
+            || command.provider.clone(),
+            |config| config.provider.clone(),
+        );
+        let summary_model = summary_config
+            .as_ref()
+            .map_or_else(|| command.model.clone(), |config| config.model.clone());
+        let max_summary_bytes = compiled.compaction.summary_max_bytes.max(1);
+        let max_request_bytes = summary_config.as_ref().map_or(1024 * 1024, |config| {
+            config.max_request_tokens.saturating_mul(4).max(1024)
+        });
+        let material = build_summary_request_material(
+            &state.conversation,
+            max_request_bytes,
+            &binding.compaction.preservation_requirements,
+            DEFAULT_SLIDING_WINDOW_ENTRIES,
+        )
+        .map_err(RunTurnError::Compaction)?;
+        let summary_options = command.options.clone();
+        let request_hash = summary_request_hash(
+            &summary_provider,
+            &summary_model,
+            &summary_options,
+            &material.entries,
+        )?;
+        let summary_id = format!("summary:{}:{}", committed_at.get(), request_hash.to_hex());
+        let identity = ContextSummaryIdentity {
+            summary_id: summary_id.clone(),
+            request_hash,
+            provider: summary_provider.clone(),
+            model: summary_model.clone(),
+            schema_version: compiled.compaction.summary_schema_version,
+            max_summary_bytes,
+            source_range: material.source_range,
+        };
+        let existing = state.context_summaries.get(&summary_id).cloned();
+        if let Some(record) = existing.as_ref() {
+            match record.state {
+                ContextSummaryState::Completed => {
+                    let text = record
+                        .text
+                        .clone()
+                        .ok_or(RunTurnError::SummaryEvidenceIncomplete)?;
+                    return Ok((text, summary_id, summary_provider, summary_model, position));
+                }
+                ContextSummaryState::Started => {
+                    return Err(RunTurnError::AmbiguousSummaryProvider);
+                }
+                ContextSummaryState::Proposed
+                | ContextSummaryState::Approved
+                | ContextSummaryState::Failed => {}
+            }
+        }
+        let session_policy = self
+            .policy_for_state(state, &command.cancellation_id)
+            .await?;
+        let provider = ProviderExecutionLogic::new(self.data.clone(), session_policy.execution);
+        let summary_cancellation = uuid::Uuid::now_v7().to_string();
+        let prepared = provider
+            .prepare(ExecuteProviderCommand {
+                harness: binding.harness.clone(),
+                session_id: command.session_id.clone(),
+                provider: summary_provider.clone(),
+                model: summary_model.clone(),
+                entries: project(&material.entries),
+                options: summary_options.clone(),
+                cancellation_id: summary_cancellation,
+                style: state.style.clone(),
+                workspace: state.workspace.clone(),
+            })
+            .map_err(RunTurnError::Provider)?;
+        if existing.is_none() {
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ContextSummaryProposed(ContextSummaryProposedEvent {
+                    identity: identity.clone(),
+                }),
+            )?;
+        }
+        let authorized = provider
+            .authorize_prepared(prepared)
+            .await
+            .map_err(RunTurnError::Provider)?;
+        let action_digest = authorized
+            .executable
+            .digest()
+            .map_err(|_| RunTurnError::Event)?;
+        if !existing
+            .as_ref()
+            .is_some_and(|record| record.state == ContextSummaryState::Approved)
+        {
+            let invocation_position = self.commit_plugin_invocations(
+                persistence,
+                session_id,
+                session_directory,
+                position,
+                state,
+                &authorized.interceptor_audit,
+            )?;
+            position = invocation_position;
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ContextSummaryApproved(ContextSummaryApprovedEvent {
+                    identity: identity.clone(),
+                    action_digest,
+                }),
+            )?;
+        }
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextSummaryStarted(ContextSummaryStartedEvent {
+                identity: identity.clone(),
+            }),
+        )?;
+        let mut stream = provider
+            .execute_authorized_stream(authorized)
+            .await
+            .map_err(RunTurnError::Provider)?;
+        let mut text = String::new();
+        let mut usage = (0_u64, 0_u64);
+        let mut failed = None;
+        while let Some(event) = stream.next().await {
+            match event.map_err(RunTurnError::Provider)? {
+                ProviderEvent::Text(delta) => text.push_str(&delta),
+                ProviderEvent::Completed {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => usage = (input_tokens, output_tokens),
+                ProviderEvent::Failed { code, message, .. } => {
+                    failed = Some((code, message));
+                }
+                ProviderEvent::ToolProposed { .. }
+                | ProviderEvent::ToolDelta { .. }
+                | ProviderEvent::Cancelled => {
+                    failed = Some((
+                        String::from("summary_tool_or_cancel"),
+                        String::from("summary provider must return bounded text only"),
+                    ));
+                }
+                ProviderEvent::Started => {}
+            }
+        }
+        if let Some((code, message)) = failed {
+            (position.sequence, position.event_id) = self.commit_next(
+                persistence,
+                session_id,
+                session_directory,
+                position.sequence,
+                position.event_id,
+                RuntimeCommittedEvent::ContextSummaryFailed(ContextSummaryFailedEvent {
+                    identity: identity.clone(),
+                    code,
+                    message,
+                }),
+            )?;
+            return Err(RunTurnError::SummaryProviderFailed);
+        }
+        truncate_owned_utf8(
+            &mut text,
+            usize::try_from(max_summary_bytes).unwrap_or(usize::MAX),
+        );
+        let content_hash = ContentHash::digest(text.as_bytes());
+        (position.sequence, position.event_id) = self.commit_next(
+            persistence,
+            session_id,
+            session_directory,
+            position.sequence,
+            position.event_id,
+            RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                identity: identity.clone(),
+                content_hash,
+                text: text.clone(),
+                input_tokens: usage.0,
+                output_tokens: usage.1,
+            }),
+        )?;
+        Ok((text, summary_id, summary_provider, summary_model, position))
     }
 
     #[allow(
@@ -19950,15 +20215,52 @@ where
                         .map_err(RunTurnError::Compaction)?,
                         Vec::new(),
                     ),
-                    "summary" => (
-                        compact_typed_summary_to_bound(
-                            &state.conversation,
-                            &binding.compaction.preservation_requirements,
-                            projection_limit,
-                            &context,
-                        )?,
-                        Vec::new(),
-                    ),
+                    "summary" => {
+                        // The immutable style may select a live model-generated
+                        // summary (an explicit provider/model request) instead
+                        // of the deterministic runtime generator.
+                        if binding.compaction.summary.is_some() {
+                            let (summary_text, summary_id, _provider, _model, next_position) = self
+                                .execute_live_summary(
+                                    persistence,
+                                    session_id,
+                                    session_directory,
+                                    &state,
+                                    &binding,
+                                    command,
+                                    initial_committed_at,
+                                    position,
+                                )
+                                .await?;
+                            position = next_position;
+                            let mut plan = compact_projection(
+                                &state.conversation,
+                                CompactionStrategy::Summary {
+                                    summary_id,
+                                    summary: summary_text,
+                                    artifact_id: None,
+                                },
+                                context,
+                            )
+                            .map_err(RunTurnError::Compaction)?;
+                            plan.replacement = restore_required_projection_entries(
+                                state.conversation.provider_projection(),
+                                &plan.replacement,
+                                &binding.compaction.preservation_requirements,
+                            );
+                            (plan, Vec::new())
+                        } else {
+                            (
+                                compact_typed_summary_to_bound(
+                                    &state.conversation,
+                                    &binding.compaction.preservation_requirements,
+                                    projection_limit,
+                                    &context,
+                                )?,
+                                Vec::new(),
+                            )
+                        }
+                    }
                     "artifact_handoff" => {
                         let bytes = canonical_json_bytes(&json!({
                             "schema": "agentmod.context-artifact.v1",
@@ -21431,6 +21733,9 @@ where
                 reason,
                 input_tokens,
                 output_tokens,
+                reasoning_tokens,
+                estimated,
+                cost_micros,
             } = &event
             {
                 let loaded = Self::load_state(persistence, session_id, session_directory)?;
@@ -21462,6 +21767,9 @@ where
                         reason: reason.clone(),
                         input_tokens: *input_tokens,
                         output_tokens: *output_tokens,
+                        reasoning_tokens: *reasoning_tokens,
+                        estimated: *estimated,
+                        cost_micros: *cost_micros,
                     };
                     self.data
                         .store_provider_completion_receipt(
@@ -23321,11 +23629,17 @@ where
                     reason,
                     input_tokens,
                     output_tokens,
+                    reasoning_tokens,
+                    estimated,
+                    cost_micros,
                 } => RuntimeCommittedEvent::ModelResponseCompleted(ModelResponseCompletedEvent {
                     cancellation_id: cancellation_id.to_owned(),
                     finish_reason: reason.clone(),
                     input_tokens: *input_tokens,
                     output_tokens: *output_tokens,
+                    reasoning_tokens: *reasoning_tokens,
+                    estimated: *estimated,
+                    cost_micros: *cost_micros,
                 }),
                 ProviderEvent::Cancelled => {
                     RuntimeCommittedEvent::ModelRequestCancelled(ModelRequestCancelledEvent {
@@ -25926,6 +26240,22 @@ fn compact_typed_summary_to_bound(
     }
 }
 
+fn summary_request_hash(
+    provider: &str,
+    model: &str,
+    options: &Value,
+    entries: &[ConversationEntry],
+) -> Result<ContentHash, RunTurnError> {
+    let canonical_options = canonical_json_bytes(options).map_err(map_projection_measure_error)?;
+    let mut identity = Vec::from(b"agentmod.summary-request.v1".as_slice());
+    append_identity_field(&mut identity, provider.as_bytes())?;
+    append_identity_field(&mut identity, model.as_bytes())?;
+    append_identity_field(&mut identity, &canonical_options)?;
+    let entries_bytes = serde_json::to_vec(entries).map_err(|_| RunTurnError::Event)?;
+    append_identity_field(&mut identity, &entries_bytes)?;
+    Ok(ContentHash::digest(&identity))
+}
+
 fn restore_required_projection_entries(
     source: &[ConversationEntry],
     candidate: &[ConversationEntry],
@@ -27973,6 +28303,40 @@ fn generic_node_declares_recorded_time(execution: &ActiveStyleTurn) -> bool {
         })
 }
 
+/// Maps an execution-plan validation failure into a stable turn error.
+fn execution_plan_resume_error(
+    error: crate::execution_plan::ExecutionPlanLogicError,
+) -> RunTurnError {
+    let diagnostic =
+        |code: &str, message: String| crate::node_executor::RuntimeExecutabilityDiagnostic {
+            code: String::from(code),
+            node_id: None,
+            node_kind: None,
+            message,
+        };
+    match error {
+        crate::execution_plan::ExecutionPlanLogicError::MigrationRequired(_) => {
+            RunTurnError::StyleMigrationRequired
+        }
+        crate::execution_plan::ExecutionPlanLogicError::Revalidate(error) => {
+            RunTurnError::RuntimeExecutability(error)
+        }
+        crate::execution_plan::ExecutionPlanLogicError::IdentityDrift(drift) => {
+            RunTurnError::RuntimeExecutability(RuntimeExecutabilityError::Unsupported {
+                diagnostics: vec![diagnostic(&drift.code, drift.message)],
+            })
+        }
+        crate::execution_plan::ExecutionPlanLogicError::Data(error) => {
+            RunTurnError::RuntimeExecutability(RuntimeExecutabilityError::Unsupported {
+                diagnostics: vec![diagnostic("EPLAN-401", error.to_string())],
+            })
+        }
+        other => RunTurnError::RuntimeExecutability(RuntimeExecutabilityError::Unsupported {
+            diagnostics: vec![diagnostic("EPLAN-400", other.to_string())],
+        }),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RunTurnError {
     #[error("turn request is invalid")]
@@ -28180,6 +28544,12 @@ pub enum RunTurnError {
     AmbiguousContextPhase(String),
     #[error("provider resume may have crossed the proposal or dispatch boundary")]
     AmbiguousProviderResume,
+    #[error("live summary provider evidence is incomplete")]
+    SummaryEvidenceIncomplete,
+    #[error("live summary provider dispatch is ambiguous and fails closed")]
+    AmbiguousSummaryProvider,
+    #[error("live summary provider failed")]
+    SummaryProviderFailed,
     #[error("provider terminal receipt is unavailable, corrupt, or conflicting")]
     ProviderReceipt,
     #[error("context-artifact memory injection requires an approved immutable artifact")]
@@ -29667,6 +30037,30 @@ mod tests {
             _succeeded: bool,
         ) -> Result<bool, RuntimeScheduleDataError> {
             Ok(true)
+        }
+    }
+
+    impl ExecutionPlanDataPort for MockTurnData {
+        fn store_execution_plan(
+            &self,
+            _request: agentmod_runtime_data::execution_plan::StoreExecutionPlanDataRequest,
+        ) -> Result<
+            agentmod_runtime_data::execution_plan::StoreExecutionPlanDataRecord,
+            agentmod_runtime_data::execution_plan::ExecutionPlanDataError,
+        > {
+            Err(agentmod_runtime_data::execution_plan::ExecutionPlanDataError::InvalidPayload)
+        }
+
+        fn load_execution_plan(
+            &self,
+            _request: agentmod_runtime_data::execution_plan::LoadExecutionPlanDataRequest,
+        ) -> Result<
+            agentmod_runtime_data::execution_plan::LoadExecutionPlanDataResult,
+            agentmod_runtime_data::execution_plan::ExecutionPlanDataError,
+        > {
+            // Mock turn sessions replay canonical events without a durable
+            // plan file; resume falls back to binding revalidation.
+            Ok(agentmod_runtime_data::execution_plan::LoadExecutionPlanDataResult::Missing)
         }
     }
 
@@ -32658,6 +33052,9 @@ to = "finish"
                 reason: String::from("stop"),
                 input_tokens: 4,
                 output_tokens: 1,
+                reasoning_tokens: 0,
+                estimated: false,
+                cost_micros: 0,
             },
         ])
     }
@@ -33664,6 +34061,9 @@ to = "finish"
                 reason: String::from("tool_calls"),
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
+                estimated: false,
+                cost_micros: 0,
             },
         ]);
         let final_reply = successful_harness_reply("repository");
@@ -33788,6 +34188,9 @@ to = "finish"
                         reason: String::from("tool_calls"),
                         input_tokens: 1,
                         output_tokens: 1,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },
                 ])),
                 Ok(successful_harness_reply("approved")),
@@ -34304,6 +34707,9 @@ to = "finish"
                     reason: String::from("stop"),
                     input_tokens: 1,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 },
             ])),
             context_recovery_events(true),
@@ -34570,6 +34976,9 @@ to = "finish"
                         reason: String::from("tool_calls"),
                         input_tokens: 1,
                         output_tokens: 1,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },
                 ])),
                 Ok(successful_harness_reply("must-not-be-dispatched")),
@@ -34595,6 +35004,9 @@ to = "finish"
                         reason: String::from("tool_calls"),
                         input_tokens: 1,
                         output_tokens: 1,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },
                 ])),
                 Ok(successful_harness_reply("continued after tool failure")),
@@ -36986,6 +37398,9 @@ to = "finish"
                         reason: String::from("tool_calls"),
                         input_tokens: 2,
                         output_tokens: 2,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },
                 ])),
                 Ok(successful_harness_reply("final")),
@@ -37495,6 +37910,9 @@ to = "finish"
                     reason: String::from("stop"),
                     input_tokens: 1,
                     output_tokens: 0,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 },
             ]))],
             Err(ToolDataError::Unavailable),
@@ -37577,6 +37995,9 @@ to = "finish"
                         reason: String::from("tool_calls"),
                         input_tokens: 2,
                         output_tokens: 2,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },
                 ])),
                 Ok(HarnessDataReply::Events(vec![
@@ -37586,6 +38007,9 @@ to = "finish"
                         reason: String::from("stop"),
                         input_tokens: 2,
                         output_tokens: 2,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },
                 ])),
             ],
@@ -37657,6 +38081,9 @@ to = "finish"
                         reason: String::from("tool_calls"),
                         input_tokens: 2,
                         output_tokens: 2,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },
                 ])),
                 Ok(HarnessDataReply::Events(vec![
@@ -37666,6 +38093,9 @@ to = "finish"
                         reason: String::from("stop"),
                         input_tokens: 2,
                         output_tokens: 2,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },
                 ])),
             ],
@@ -37856,6 +38286,9 @@ to = "finish"
                     reason: String::from("stop"),
                     input_tokens: 1,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 },
             ]),
             None
@@ -39054,6 +39487,9 @@ to = "finish"
                     reason: String::from("stop"),
                     input_tokens: 1_001,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 },
             ])),
             vec![data_event(
@@ -42851,6 +43287,9 @@ configuration = {{ type = "send_child_agent_message", child = {{ kind = "exact",
                     reason: String::from("stop"),
                     input_tokens: 1,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 },
             ])),
             vec![data_event(
@@ -42891,6 +43330,9 @@ configuration = {{ type = "send_child_agent_message", child = {{ kind = "exact",
                     reason: String::from("stop"),
                     input_tokens: 1,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 },
             ])),
             vec![data_event(
@@ -42957,6 +43399,9 @@ configuration = {{ type = "send_child_agent_message", child = {{ kind = "exact",
                             reason: String::from("tool_calls"),
                             input_tokens: 1,
                             output_tokens: 1,
+                            reasoning_tokens: 0,
+                            estimated: false,
+                            cost_micros: 0,
                         },
                     ])),
                     Ok(HarnessDataReply::Events(vec![
@@ -43322,6 +43767,9 @@ configuration = {{ type = "send_child_agent_message", child = {{ kind = "exact",
                         reason: String::from("stop"),
                         input_tokens: 4,
                         output_tokens: 1,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },
                 ])),
                 events,
@@ -43431,6 +43879,9 @@ configuration = {{ type = "send_child_agent_message", child = {{ kind = "exact",
                     reason: String::from("stop"),
                     input_tokens: 4,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 },
             ])),
             events,
@@ -43768,6 +44219,9 @@ configuration = {{ type = "send_child_agent_message", child = {{ kind = "exact",
                 reason: "stop".into(),
                 input_tokens: 4,
                 output_tokens: 1,
+                reasoning_tokens: 0,
+                estimated: false,
+                cost_micros: 0,
             },
         ])));
         let logic = TurnLogic::new(data.clone(), policy(PermissionEffect::Allow));
@@ -43819,6 +44273,9 @@ configuration = {{ type = "send_child_agent_message", child = {{ kind = "exact",
                 reason: "stop".into(),
                 input_tokens: 4,
                 output_tokens: 1,
+                reasoning_tokens: 0,
+                estimated: false,
+                cost_micros: 0,
             },
         ])));
         let logic = TurnLogic::new(data, policy(PermissionEffect::Allow));
@@ -43868,6 +44325,9 @@ configuration = {{ type = "send_child_agent_message", child = {{ kind = "exact",
                 reason: String::from("stop"),
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
+                estimated: false,
+                cost_micros: 0,
             },
         ])))
         .with_blocked_harness();

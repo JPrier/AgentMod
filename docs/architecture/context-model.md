@@ -13,6 +13,17 @@ Runtime compaction logic implements no-op, sliding-window, typed summary,
 artifact-handoff, and tool-output-eviction strategies while preserving canonical
 history, unresolved tasks, active processes, and artifact references.
 
+When the immutable style selects `compaction.summary` (an explicit
+provider/model pair), runtime logic executes a **live model-generated summary**
+as a separate strategy instead of the deterministic runtime generator: it
+builds bounded provider-visible request material, binds an exact request hash,
+runs the normal proposal → interceptor → user policy → mandatory policy →
+dispatch → terminal-evidence path, commits canonical `context.summary_*`
+outbox events, and records durable terminal provider evidence so a restart
+never issues a duplicate summary call. Ambiguous completion fails closed; the
+summary text is bounded and schema-typed. The deterministic typed summary
+remains the default.
+
 Branch materialization preserves exact structured history inline while it is at
 most 32 entries and 64 KiB. Above either bound, logic serializes complete parent
 history, provider projection, projection provenance, ancestry, and fork sequence

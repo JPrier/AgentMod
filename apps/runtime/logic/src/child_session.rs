@@ -420,6 +420,8 @@ where
                     BranchMcpBootstrapData::None
                 },
                 events,
+                execution_plan: crate::execution_plan::to_plan_file_data(&style)
+                    .map_err(ChildSessionLogicError::ExecutionPlan)?,
             })
             .map_err(ChildSessionLogicError::Registry)?;
         Ok(ChildSessionResult {
@@ -651,6 +653,9 @@ pub enum ChildSessionLogicError {
     /// A canonical child event could not be sealed.
     #[error("child session event mapping failed")]
     Event,
+    /// The immutable node-execution plan file could not be prepared.
+    #[error("child session execution plan logic failed: {0}")]
+    ExecutionPlan(crate::execution_plan::ExecutionPlanLogicError),
 }
 
 #[cfg(test)]
@@ -728,6 +733,9 @@ mod tests {
                 preserve_unresolved_tasks: true,
                 preserve_active_processes: true,
                 preservation_requirements: Vec::new(),
+                summary: None,
+                summary_max_bytes: 64 * 1024,
+                summary_schema_version: 1,
             },
             tool_groups: vec![
                 String::from("filesystem.read"),

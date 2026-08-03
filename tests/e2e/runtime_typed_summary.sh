@@ -79,7 +79,10 @@ printf '%s' "$turn" | grep -F '"text":"beta "' >/dev/null
 printf '%s' "$turn" | grep -F '"text":"summary-output"' >/dev/null
 
 journal="$run_root/sessions/$session_id/events.jsonl"
-test "$(grep -c -F '"event_type":"conversation.entry_committed"' "$journal")" -eq 2
+# The converged generic executor retains the user input plus the
+# canonical tool-call request/result pair as conversation entries; the
+# summary projection itself never fabricates a user message.
+test "$(grep -c -F '"event_type":"conversation.entry_committed"' "$journal")" -eq 3
 test "$(grep -F '"event_type":"conversation.entry_committed"' "$journal" |
     grep -c -F '"kind":"context_summary"' || true)" -eq 0
 test "$(grep -F '"event_type":"context.projection_replaced"' "$journal" |

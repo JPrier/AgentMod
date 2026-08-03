@@ -274,6 +274,29 @@ pub struct SessionCompactionConfiguration {
     /// Typed records that the selected compactor must retain.
     #[serde(default)]
     pub preservation_requirements: Vec<String>,
+    /// Explicit provider/model selection for a live model-generated summary,
+    /// when the strategy is `summary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<SessionSummaryCompactionSelection>,
+    /// Maximum provider-visible summary content bytes for a live
+    /// model-generated summary.
+    #[serde(default)]
+    pub summary_max_bytes: u32,
+    /// Canonical bounded summary schema version written by the runtime.
+    #[serde(default)]
+    pub summary_schema_version: u16,
+}
+
+/// Session-owned explicit selection for a live model-generated summary.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionSummaryCompactionSelection {
+    /// Provider used for the summary model request.
+    pub provider: String,
+    /// Model used for the summary model request.
+    pub model: String,
+    /// Maximum provider tokens consumed by one summary call.
+    pub max_request_tokens: u64,
 }
 
 /// Session-owned exact plugin compactor implementation selection.
@@ -1282,6 +1305,15 @@ pub struct ModelResponseCompletedEvent {
     pub input_tokens: u64,
     /// Provider-reported output tokens.
     pub output_tokens: u64,
+    /// Provider-reported reasoning/thinking tokens.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// True only when usage is estimated rather than provider-reported.
+    #[serde(default)]
+    pub estimated: bool,
+    /// Computed cost micros when the provider adapter has a pricing record.
+    #[serde(default)]
+    pub cost_micros: u64,
 }
 
 /// Provider execution cancellation.
@@ -3939,6 +3971,16 @@ pub enum RuntimeCommittedEvent {
     AutomaticMemoryWriteFailed(Box<AutomaticMemoryWriteFailedEvent>),
     /// Records a permanently ambiguous non-idempotent plugin write.
     AutomaticMemoryWriteAmbiguous(Box<AutomaticMemoryWriteAmbiguousEvent>),
+    /// Records a live model-generated summary proposal.
+    ContextSummaryProposed(ContextSummaryProposedEvent),
+    /// Records final authorization of a live summary request.
+    ContextSummaryApproved(ContextSummaryApprovedEvent),
+    /// Records provider dispatch of a live summary request.
+    ContextSummaryStarted(ContextSummaryStartedEvent),
+    /// Records terminal provider evidence for a live summary request.
+    ContextSummaryCompleted(ContextSummaryCompletedEvent),
+    /// Records a definite terminal failure without provider evidence.
+    ContextSummaryFailed(ContextSummaryFailedEvent),
     /// Records child-session creation intent before policy and branching.
     ChildAgentCreationProposed(ChildAgentCreationProposedEvent),
     /// Records the final approved child-session creation action.
@@ -4131,6 +4173,11 @@ impl RuntimeCommittedEvent {
             Self::AutomaticMemoryWriteCompleted(_) => "memory.write_completed",
             Self::AutomaticMemoryWriteFailed(_) => "memory.write_failed",
             Self::AutomaticMemoryWriteAmbiguous(_) => "memory.write_ambiguous",
+            Self::ContextSummaryProposed(_) => "context.summary_proposed",
+            Self::ContextSummaryApproved(_) => "context.summary_approved",
+            Self::ContextSummaryStarted(_) => "context.summary_started",
+            Self::ContextSummaryCompleted(_) => "context.summary_completed",
+            Self::ContextSummaryFailed(_) => "context.summary_failed",
             Self::ChildAgentCreationProposed(_) => "child_agent.creation_proposed",
             Self::ChildAgentCreationApproved(_) => "child_agent.creation_approved",
             Self::GenericChildCreationProposed(_) => "child_agent.generic_creation_proposed",
@@ -4559,6 +4606,136 @@ impl AutomaticMemoryWriteRecord {
     }
 }
 
+/// Stable identity for one live model-generated summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryIdentity {
+    /// Projection-local summary execution ID.
+    pub summary_id: String,
+    /// Hash of the exact provider/model/options/entries request.
+    pub request_hash: ContentHash,
+    /// Provider used for the summary model request.
+    pub provider: String,
+    /// Model used for the summary model request.
+    pub model: String,
+    /// Bounded summary schema version.
+    pub schema_version: u16,
+    /// Maximum provider-visible summary bytes.
+    pub max_summary_bytes: u32,
+    /// Inclusive source projection range being summarized.
+    pub source_range: Option<(Sequence, Sequence)>,
+}
+
+/// Canonical intent to begin a live model-generated summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryProposedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+}
+
+/// Records the final policy-approved summary action before dispatch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryApprovedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Digest bound into the short-lived harness grant.
+    pub action_digest: ContentHash,
+}
+
+/// Records provider dispatch of one summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryStartedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+}
+
+/// Terminal provider evidence for one summary request.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryCompletedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Hash of the exact bounded summary text.
+    pub content_hash: ContentHash,
+    /// Bounded provider-visible summary text.
+    pub text: String,
+    /// Provider-reported input tokens.
+    pub input_tokens: u64,
+    /// Provider-reported output tokens.
+    pub output_tokens: u64,
+}
+
+/// Terminal failure for one summary request without provider evidence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryFailedEvent {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Stable failure code.
+    pub code: String,
+    /// Bounded failure detail.
+    pub message: String,
+}
+
+/// Canonical outbox phase for one live summary request.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextSummaryState {
+    /// Proposal is canonical; no policy outcome is canonical yet.
+    Proposed,
+    /// Policy approved the exact request; no provider call is canonical yet.
+    Approved,
+    /// Provider dispatch is canonical; recovery must reuse exact evidence.
+    Started,
+    /// Terminal provider evidence is canonical.
+    Completed,
+    /// Terminal failure without provider evidence is canonical.
+    Failed,
+}
+
+/// Replay-owned live model-generated summary outbox record.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextSummaryRecord {
+    /// Exact summary request identity.
+    pub identity: ContextSummaryIdentity,
+    /// Latest durable outbox state.
+    pub state: ContextSummaryState,
+    /// Digest of the approved action, once policy succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action_digest: Option<ContentHash>,
+    /// Canonical proposal sequence.
+    pub proposed_at: Sequence,
+    /// Canonical approval sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approved_at: Option<Sequence>,
+    /// Canonical dispatch sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Sequence>,
+    /// Canonical terminal sequence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<Sequence>,
+    /// Hash of the exact bounded summary text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<ContentHash>,
+    /// Bounded provider-visible summary text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Provider-reported input tokens.
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// Provider-reported output tokens.
+    #[serde(default)]
+    pub output_tokens: u64,
+}
+
+impl ContextSummaryRecord {
+    /// Returns whether terminal provider evidence already exists.
+    #[must_use]
+    pub const fn has_terminal_evidence(&self) -> bool {
+        matches!(
+            self.state,
+            ContextSummaryState::Completed | ContextSummaryState::Failed
+        )
+    }
+}
+
 /// Replay-owned plugin context-operation lifecycle.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -4691,6 +4868,9 @@ pub struct SessionState {
     pub successful_iteration_completions: Vec<SuccessfulIterationCompletionBoundary>,
     /// Canonical content and provider projection.
     pub conversation: ConversationState,
+    /// Canonical live model-generated summary outbox keyed by summary ID.
+    #[serde(default)]
+    pub context_summaries: BTreeMap<String, ContextSummaryRecord>,
     /// Durable approval continuations.
     pub approvals: BTreeMap<ContinuationId, ApprovalRecord>,
     /// Durable tool-dispatch outbox projection keyed by provider call ID.
@@ -5510,6 +5690,16 @@ pub struct StyleExecutionState {
     /// Provider-reported output tokens accumulated from canonical completions.
     #[serde(default)]
     pub output_tokens: u64,
+    /// Provider-reported reasoning/thinking tokens accumulated from canonical completions.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// Computed cost micros accumulated from canonical completions; unknown
+    /// until a pricing record exists for the selected model.
+    #[serde(default)]
+    pub cost_micros: u64,
+    /// True once any completed exchange was estimated rather than provider-reported.
+    #[serde(default)]
+    pub cost_estimated: bool,
     /// Cumulative provider tokens observed when compaction last committed.
     #[serde(default)]
     pub tokens_at_last_compaction: u64,
@@ -5781,6 +5971,7 @@ fn initialize(
         tool_executions: BTreeMap::new(),
         artifact_persistences: BTreeMap::new(),
         automatic_memory_writes: BTreeMap::new(),
+        context_summaries: BTreeMap::new(),
         child_agents: BTreeMap::new(),
         received_child_messages: Vec::new(),
         planner_worker: PlannerWorkerState::default(),
@@ -6575,6 +6766,17 @@ fn apply_payload(
                     .output_tokens
                     .checked_add(completed.output_tokens)
                     .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+                execution.reasoning_tokens = execution
+                    .reasoning_tokens
+                    .checked_add(completed.reasoning_tokens)
+                    .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+                execution.cost_micros = execution
+                    .cost_micros
+                    .checked_add(completed.cost_micros)
+                    .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+                if completed.estimated {
+                    execution.cost_estimated = true;
+                }
             }
             Ok(())
         }
@@ -6786,6 +6988,21 @@ fn apply_payload(
         }
         RuntimeCommittedEvent::AutomaticMemoryWriteAmbiguous(ambiguous) => {
             apply_automatic_memory_write_ambiguous(state, ambiguous, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryProposed(proposed) => {
+            apply_context_summary_proposed(state, proposed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryApproved(approved) => {
+            apply_context_summary_approved(state, approved, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryStarted(started) => {
+            apply_context_summary_started(state, started, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryCompleted(completed) => {
+            apply_context_summary_completed(state, completed, event.metadata.sequence)
+        }
+        RuntimeCommittedEvent::ContextSummaryFailed(failed) => {
+            apply_context_summary_failed(state, failed, event.metadata.sequence)
         }
         RuntimeCommittedEvent::ChildAgentCreationProposed(proposed) => {
             apply_child_agent_creation_proposed(state, proposed, event.metadata.sequence)
@@ -9766,6 +9983,9 @@ fn apply_style_execution_initialized(
         termination_reason: None,
         input_tokens: 0,
         output_tokens: 0,
+        reasoning_tokens: 0,
+        cost_micros: 0,
+        cost_estimated: false,
         tokens_at_last_compaction: 0,
         context_boundaries: Vec::new(),
         latest_model_execution: None,
@@ -14983,6 +15203,182 @@ fn valid_automatic_memory_identity(
             == Some(identity.write_id.as_str())
 }
 
+fn advance_open_boundary(
+    state: &mut SessionState,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if let Some(execution) = state.style_execution.as_mut()
+        && let Some(boundary) = execution.context_boundaries.last_mut()
+        && boundary.completed_at.is_none()
+    {
+        if boundary.last_sequence.checked_next() != Ok(sequence) {
+            return Err(SessionReducerError::InvalidContextBoundaryTransition);
+        }
+        boundary.last_sequence = sequence;
+    }
+    Ok(())
+}
+
+fn valid_summary_identity(identity: &ContextSummaryIdentity) -> bool {
+    !identity.summary_id.trim().is_empty()
+        && !identity.provider.trim().is_empty()
+        && !identity.model.trim().is_empty()
+        && identity.schema_version == 1
+        && identity.max_summary_bytes > 0
+        && identity.max_summary_bytes <= 1024 * 1024
+}
+
+fn apply_context_summary_proposed(
+    state: &mut SessionState,
+    proposed: &ContextSummaryProposedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let identity = &proposed.identity;
+    if !valid_summary_identity(identity)
+        || identity
+            .source_range
+            .is_some_and(|(start, end)| start > end)
+        || state.context_summaries.contains_key(&identity.summary_id)
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    state.context_summaries.insert(
+        identity.summary_id.clone(),
+        ContextSummaryRecord {
+            identity: identity.clone(),
+            state: ContextSummaryState::Proposed,
+            action_digest: None,
+            proposed_at: sequence,
+            approved_at: None,
+            started_at: None,
+            completed_at: None,
+            content_hash: None,
+            text: None,
+            input_tokens: 0,
+            output_tokens: 0,
+        },
+    );
+    advance_open_boundary(state, sequence)?;
+    Ok(())
+}
+
+fn summary_record_mut<'a>(
+    state: &'a mut SessionState,
+    identity: &ContextSummaryIdentity,
+) -> Result<&'a mut ContextSummaryRecord, SessionReducerError> {
+    let record = state
+        .context_summaries
+        .get_mut(&identity.summary_id)
+        .ok_or(SessionReducerError::InvalidSummaryTransition)?;
+    if record.identity != *identity {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    Ok(record)
+}
+
+fn apply_context_summary_approved(
+    state: &mut SessionState,
+    approved: &ContextSummaryApprovedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = summary_record_mut(state, &approved.identity)?;
+    if record.state != ContextSummaryState::Proposed
+        || record.action_digest.is_some()
+        || record.approved_at.is_some()
+        || record.started_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Approved;
+    record.action_digest = Some(approved.action_digest);
+    record.approved_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
+    Ok(())
+}
+
+fn apply_context_summary_started(
+    state: &mut SessionState,
+    started: &ContextSummaryStartedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let record = summary_record_mut(state, &started.identity)?;
+    if record.state != ContextSummaryState::Approved
+        || record.approved_at.is_none()
+        || record.started_at.is_some()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Started;
+    record.started_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
+    Ok(())
+}
+
+fn apply_context_summary_completed(
+    state: &mut SessionState,
+    completed: &ContextSummaryCompletedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    let identity = &completed.identity;
+    if completed.text.trim().is_empty()
+        || u64::try_from(completed.text.len())
+            .map_or(true, |len| len > u64::from(identity.max_summary_bytes))
+        || completed.content_hash != ContentHash::digest(completed.text.as_bytes())
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    let record = summary_record_mut(state, identity)?;
+    if record.state != ContextSummaryState::Started
+        || record.started_at.is_none()
+        || record.completed_at.is_some()
+        || record.content_hash.is_some()
+        || record.text.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Completed;
+    record.completed_at = Some(sequence);
+    record.content_hash = Some(completed.content_hash);
+    record.text = Some(completed.text.clone());
+    record.input_tokens = completed.input_tokens;
+    record.output_tokens = completed.output_tokens;
+    if let Some(execution) = state.style_execution.as_mut() {
+        execution.input_tokens = execution
+            .input_tokens
+            .checked_add(completed.input_tokens)
+            .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+        execution.output_tokens = execution
+            .output_tokens
+            .checked_add(completed.output_tokens)
+            .ok_or(SessionReducerError::StyleTokenUsageOverflow)?;
+    }
+    advance_open_boundary(state, sequence)?;
+    Ok(())
+}
+
+fn apply_context_summary_failed(
+    state: &mut SessionState,
+    failed: &ContextSummaryFailedEvent,
+    sequence: Sequence,
+) -> Result<(), SessionReducerError> {
+    if failed.code.trim().is_empty() {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    let record = summary_record_mut(state, &failed.identity)?;
+    if record.state != ContextSummaryState::Started
+        || record.started_at.is_none()
+        || record.completed_at.is_some()
+    {
+        return Err(SessionReducerError::InvalidSummaryTransition);
+    }
+    record.state = ContextSummaryState::Failed;
+    record.completed_at = Some(sequence);
+    advance_open_boundary(state, sequence)?;
+    Ok(())
+}
+
 fn apply_automatic_memory_write_proposed(
     state: &mut SessionState,
     proposed: &AutomaticMemoryWriteProposedEvent,
@@ -17218,6 +17614,106 @@ fn generic_context_effect_evidence_complete(
     })
 }
 
+/// Validates the memory-provenance security constraint for a generic
+/// fresh-context node completion.
+///
+/// The generic dispatch path binds the exact context invocation through
+/// [`generic_context_effect_evidence_complete`]; this additional check retains
+/// the legacy path's guarantee that every non-user entry in the provider
+/// projection was injected by this exact context phase. Stale, mis-attributed,
+/// wrong-provider, or fabricated memory can therefore never complete a
+/// fresh-context node.
+fn generic_fresh_context_memory_evidence_complete(
+    execution: &StyleExecutionState,
+    conversation: &ConversationState,
+    binding: Option<&SessionStyleBinding>,
+    completed: &StyleNodeCompletedEvent,
+    journal_head: Sequence,
+) -> bool {
+    let Some(boundary) = execution.context_boundaries.iter().rev().find(|boundary| {
+        boundary.identity.node_id == completed.node_id
+            && boundary.identity.boundary == "context_node"
+    }) else {
+        return false;
+    };
+    let Some(provenance) = conversation.projection_provenance() else {
+        return false;
+    };
+    // Only fresh-context graphs bind the projection to an exact memory
+    // injection. Other context strategies (memory normalization, plugin
+    // transforms, compaction) are validated by their own dedicated paths.
+    if provenance.method != "generic_fresh_context" {
+        return true;
+    }
+    if provenance.artifact_id.is_some()
+        || provenance.committed_at.checked_next().ok() != Some(journal_head)
+    {
+        return false;
+    }
+    let inputs = conversation
+        .provider_projection()
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry,
+                ConversationEntry::UserMessage(_) | ConversationEntry::PendingTask(_)
+            )
+        })
+        .collect::<Vec<_>>();
+    let [input] = inputs.as_slice() else {
+        return false;
+    };
+    let (expected_origin, exact_input) = match input {
+        ConversationEntry::UserMessage(user) => {
+            let canonical_user =
+                conversation
+                    .history()
+                    .iter()
+                    .rev()
+                    .find_map(|entry| match entry {
+                        ConversationEntry::UserMessage(candidate)
+                            if candidate.source_sequence <= boundary.identity.source_head =>
+                        {
+                            Some(candidate)
+                        }
+                        _ => None,
+                    });
+            (
+                ContextBoundaryOrigin::UserTurn,
+                canonical_user == Some(user),
+            )
+        }
+        ConversationEntry::PendingTask(_) => (ContextBoundaryOrigin::ChildTask, true),
+        _ => return false,
+    };
+    if !exact_input || boundary.identity.origin != expected_origin {
+        return false;
+    }
+    let Some(replacement_event) = boundary.phase_replacement_event else {
+        return false;
+    };
+    let Some(selected_memory_provider) = binding.map(|binding| binding.memory.provider.as_str())
+    else {
+        return false;
+    };
+    if conversation.provider_projection().iter().any(|entry| {
+        !matches!(
+            entry,
+            ConversationEntry::UserMessage(_) | ConversationEntry::PendingTask(_)
+        ) && !matches!(
+            entry,
+            ConversationEntry::RetrievedMemory(memory)
+                if memory.injection_sequence == provenance.committed_at
+                    && memory.injection_event == Some(replacement_event)
+                    && memory.provider == selected_memory_provider
+                    && selected_memory_provider != "none"
+        )
+    }) {
+        return false;
+    }
+    true
+}
+
 fn generic_model_effect_evidence_complete(
     execution: &StyleExecutionState,
     completed: &StyleNodeCompletedEvent,
@@ -17610,11 +18106,31 @@ fn style_node_effect_evidence_complete(
     {
         match executor {
             NativeExecutorKey::ContextConstruction => {
-                return generic_context_effect_evidence_complete(
-                    execution,
-                    completed,
-                    journal_head,
-                );
+                // The generic boundary check binds the exact context invocation
+                // identity. Fresh-context graphs additionally retain the
+                // memory-provenance security validation from the legacy path so
+                // stale, mis-attributed, or wrong-provider memory can never
+                // complete a fresh-context node. The node configuration (not
+                // the graph topology) is the discriminator: distinct styles may
+                // intentionally share a built-in node shape.
+                if !generic_context_effect_evidence_complete(execution, completed, journal_head) {
+                    return false;
+                }
+                if matches!(
+                    graph_node_configuration(&execution.graph, &completed.node_id),
+                    Some(agentmod_graph_engine::NodeConfiguration::ContextTransform {
+                        strategy: agentmod_graph_engine::ContextTransformStrategy::Fresh,
+                    })
+                ) {
+                    return generic_fresh_context_memory_evidence_complete(
+                        execution,
+                        conversation,
+                        binding,
+                        completed,
+                        journal_head,
+                    );
+                }
+                return true;
             }
             NativeExecutorKey::ModelRequest => {
                 return generic_model_effect_evidence_complete(execution, completed, journal_head);
@@ -18192,6 +18708,7 @@ fn fresh_context_effect_evidence_complete(
     };
     let Some(selected_memory_provider) = binding.map(|binding| binding.memory.provider.as_str())
     else {
+        eprintln!("fresh-context: no binding memory provider");
         return false;
     };
     if conversation.provider_projection().iter().any(|entry| {
@@ -18651,6 +19168,9 @@ pub enum SessionReducerError {
     /// Automatic memory persistence did not follow exact outbox ordering.
     #[error("automatic memory write state transition is invalid")]
     InvalidAutomaticMemoryWrite,
+    /// Live model-generated summary did not follow exact outbox ordering.
+    #[error("live summary state transition is invalid")]
+    InvalidSummaryTransition,
     /// Child sessions did not follow proposal, atomic creation, and terminal ordering.
     #[error("child-agent state transition is invalid")]
     InvalidChildAgentTransition,
@@ -19272,6 +19792,129 @@ mod tests {
         )
         .expect("dispatched");
         (dispatched, identity, action_digest)
+    }
+
+    fn summary_identity() -> ContextSummaryIdentity {
+        ContextSummaryIdentity {
+            summary_id: String::from("summary:run:1"),
+            request_hash: ContentHash::digest(b"summary-request"),
+            provider: String::from("mock"),
+            model: String::from("mock-model"),
+            schema_version: 1,
+            max_summary_bytes: 64 * 1024,
+            source_range: Some((Sequence::FIRST, Sequence::new(8).expect("sequence"))),
+        }
+    }
+
+    fn reduce_all(events: Vec<EventEnvelope<RuntimeCommittedEvent>>) -> SessionState {
+        let mut state: Option<SessionState> = None;
+        for event in events {
+            state = Some(reduce(state, &event).expect("reduce"));
+        }
+        state.expect("initialized")
+    }
+
+    /// Ported from `audit/task-05`: the live model-generated summary outbox
+    /// follows proposal -> approval -> start -> completion ordering, and
+    /// terminal evidence hash must match the bounded text.
+    #[test]
+    fn summary_outbox_follows_proposal_approval_start_completion_ordering() {
+        let identity = summary_identity();
+        let events = vec![
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::ContextSummaryProposed(ContextSummaryProposedEvent {
+                    identity: identity.clone(),
+                }),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::ContextSummaryApproved(ContextSummaryApprovedEvent {
+                    identity: identity.clone(),
+                    action_digest: ContentHash::digest(b"approved-summary"),
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::ContextSummaryStarted(ContextSummaryStartedEvent {
+                    identity: identity.clone(),
+                }),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                    identity: identity.clone(),
+                    content_hash: ContentHash::digest(b"bounded summary"),
+                    text: String::from("bounded summary"),
+                    input_tokens: 12,
+                    output_tokens: 3,
+                }),
+            ),
+        ];
+        let state = reduce_all(events);
+        let record = state
+            .context_summaries
+            .get(&identity.summary_id)
+            .expect("record");
+        assert_eq!(record.state, ContextSummaryState::Completed);
+        assert!(record.has_terminal_evidence());
+        assert_eq!(record.text.as_deref(), Some("bounded summary"));
+        assert_eq!(record.input_tokens, 12);
+    }
+
+    #[test]
+    fn summary_evidence_hash_must_match_text_and_completion_requires_start() {
+        let identity = summary_identity();
+        let completed_without_start = envelope(
+            2,
+            RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                identity: identity.clone(),
+                content_hash: ContentHash::digest(b"summary"),
+                text: String::from("summary"),
+                input_tokens: 1,
+                output_tokens: 1,
+            }),
+        );
+        assert!(matches!(
+            reduce(Some(reduce_all(vec![created()])), &completed_without_start),
+            Err(SessionReducerError::InvalidSummaryTransition)
+        ));
+
+        let hash_mismatch = envelope(
+            2,
+            RuntimeCommittedEvent::ContextSummaryProposed(ContextSummaryProposedEvent {
+                identity: summary_identity(),
+            }),
+        );
+        let approved = envelope(
+            3,
+            RuntimeCommittedEvent::ContextSummaryApproved(ContextSummaryApprovedEvent {
+                identity: summary_identity(),
+                action_digest: ContentHash::digest(b"approved"),
+            }),
+        );
+        let started = envelope(
+            4,
+            RuntimeCommittedEvent::ContextSummaryStarted(ContextSummaryStartedEvent {
+                identity: summary_identity(),
+            }),
+        );
+        let mismatched = envelope(
+            5,
+            RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                identity: summary_identity(),
+                content_hash: ContentHash::digest(b"different"),
+                text: String::from("summary"),
+                input_tokens: 1,
+                output_tokens: 1,
+            }),
+        );
+        let state = reduce_all(vec![created(), hash_mismatch, approved, started]);
+        assert!(matches!(
+            reduce(Some(state), &mismatched),
+            Err(SessionReducerError::InvalidSummaryTransition)
+        ));
     }
 
     #[test]
@@ -21755,6 +22398,9 @@ to = "done"
                     finish_reason: String::from("stop"),
                     input_tokens: 1,
                     output_tokens: 1,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 }),
             ),
             envelope(
@@ -24915,6 +25561,9 @@ to = "done"
                         finish_reason: String::from("stop"),
                         input_tokens: 1,
                         output_tokens: 1,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     },),
                 ),
             ),
@@ -25397,7 +26046,7 @@ to = "done"
                     provenance: ProjectionProvenance {
                         projection_id: String::from("fresh"),
                         source_range: Some((source_sequence, source_sequence)),
-                        method: String::from("ephemeral_fresh_context"),
+                        method: String::from("generic_fresh_context"),
                         committed_at: Sequence::new(8).expect("sequence"),
                         artifact_id: None,
                     },
@@ -25488,7 +26137,7 @@ to = "done"
                             attempt: 1,
                             loop_iteration: 0,
                             step: 1,
-                            result_reference: None,
+                            result_reference: Some(String::from("context:run-current")),
                             artifact_reference: None,
                         }),
                     ),
@@ -25509,7 +26158,7 @@ to = "done"
                     attempt: 1,
                     loop_iteration: 0,
                     step: 1,
-                    result_reference: None,
+                    result_reference: Some(String::from("context:run-current")),
                     artifact_reference: None,
                 }),
             ),
@@ -26400,6 +27049,9 @@ to = "done"
                 finish_reason: String::from("stop"),
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
+                estimated: false,
+                cost_micros: 0,
             }),
         ] {
             assert!(matches!(
@@ -26542,6 +27194,9 @@ to = "done"
                     finish_reason: String::from("tool_calls"),
                     input_tokens: 3,
                     output_tokens: 5,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 }),
             ),
         )
@@ -26599,6 +27254,9 @@ to = "done"
                 finish_reason: String::from("stop"),
                 input_tokens: 1,
                 output_tokens: 1,
+                reasoning_tokens: 0,
+                estimated: false,
+                cost_micros: 0,
             }),
         ] {
             assert!(matches!(
@@ -26629,6 +27287,9 @@ to = "done"
                         finish_reason: String::from("stop"),
                         input_tokens: 1,
                         output_tokens: 1,
+                        reasoning_tokens: 0,
+                        estimated: false,
+                        cost_micros: 0,
                     }),
                 ),
             ),
@@ -27394,6 +28055,9 @@ to = "done"
                     finish_reason: String::from("stop"),
                     input_tokens: 11,
                     output_tokens: 7,
+                    reasoning_tokens: 0,
+                    estimated: false,
+                    cost_micros: 0,
                 }),
             ),
             envelope(

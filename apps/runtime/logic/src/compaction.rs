@@ -353,6 +353,105 @@ fn ensure_unique_ids(replacement: &[ConversationEntry]) -> Result<(), Compaction
     Ok(())
 }
 
+/// Bounded provider-visible material for a live model-generated summary request.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SummaryRequestMaterial {
+    /// Projection entries sent to the summary provider.
+    pub entries: Vec<ConversationEntry>,
+    /// Inclusive source projection range covered by the material.
+    pub source_range: Option<(Sequence, Sequence)>,
+    /// Exact serialized request bytes.
+    pub serialized_bytes: u64,
+}
+
+/// Builds the bounded provider-visible material for a live model-generated
+/// summary request.
+///
+/// Required protected state always fits; recent window entries may be dropped
+/// instead of failing the request when the byte bound is exceeded.
+///
+/// # Errors
+///
+/// Returns [`CompactionError::MissingSourceRange`] when the projection has no
+/// source range, [`CompactionError::InvalidSummaryMaterial`] for invalid bounds,
+/// or [`CompactionError::SummaryMaterialTooLarge`] when required state exceeds
+/// the bound.
+pub fn build_summary_request_material(
+    conversation: &ConversationState,
+    max_bytes: u64,
+    preservation_requirements: &[String],
+    recent_window: usize,
+) -> Result<SummaryRequestMaterial, CompactionError> {
+    let source = conversation.provider_projection();
+    let source_range = projection_range(source).ok_or(CompactionError::MissingSourceRange)?;
+    if max_bytes == 0 || recent_window == 0 {
+        return Err(CompactionError::InvalidSummaryMaterial);
+    }
+    let recent_start = source.len().saturating_sub(recent_window);
+    let current_input = source
+        .iter()
+        .rfind(|entry| matches!(entry, ConversationEntry::UserMessage(_)))
+        .map(ConversationEntry::id);
+    let mut entries = Vec::new();
+    let mut bytes = 0_u64;
+    for (index, entry) in source.iter().enumerate() {
+        let required = summary_entry_is_required(entry, current_input, preservation_requirements)
+            || index >= recent_start;
+        if required {
+            let contribution = serialized_entry_bytes(entry)?;
+            if bytes.saturating_add(contribution) > max_bytes {
+                // Required protected state must always fit; a window entry may
+                // be dropped instead of failing the summary request.
+                if summary_entry_is_required(entry, current_input, preservation_requirements) {
+                    return Err(CompactionError::SummaryMaterialTooLarge);
+                }
+                continue;
+            }
+            bytes = bytes.saturating_add(contribution);
+            entries.push(entry.clone());
+        }
+    }
+    ensure_unique_ids(&entries)?;
+    Ok(SummaryRequestMaterial {
+        entries,
+        source_range: Some(source_range),
+        serialized_bytes: bytes,
+    })
+}
+
+fn summary_entry_is_required(
+    entry: &ConversationEntry,
+    current_input: Option<&ConversationEntryId>,
+    requirements: &[String],
+) -> bool {
+    let requirement = |name: &str| requirements.iter().any(|value| value == name);
+    match entry {
+        ConversationEntry::SystemInstruction(_)
+        | ConversationEntry::ProjectInstruction(_)
+        | ConversationEntry::UserInstruction(_) => requirement("system_instructions"),
+        ConversationEntry::UserMessage(_) => current_input.is_some_and(|id| id == entry.id()),
+        ConversationEntry::PendingTask(_)
+        | ConversationEntry::ActiveProcessSummary(_)
+        | ConversationEntry::ChildAgentHandoff(_) => requirement("pending_control_state"),
+        ConversationEntry::ArtifactReference(_)
+        | ConversationEntry::Attachment(_)
+        | ConversationEntry::Image(_) => requirement("artifact_references"),
+        ConversationEntry::RetrievedMemory(_) => requirement("memory_provenance"),
+        ConversationEntry::ProviderVisibleMetadata(_) => requirement("active_graph_state"),
+        ConversationEntry::ToolCallRequest(_) | ConversationEntry::ToolResult(_) => {
+            requirement("tool_call_correlation")
+        }
+        ConversationEntry::ContextSummary(_) | ConversationEntry::RuntimeAnnotation(_) => true,
+        ConversationEntry::AssistantMessage(_) => false,
+    }
+}
+
+fn serialized_entry_bytes(entry: &ConversationEntry) -> Result<u64, CompactionError> {
+    serde_json::to_vec(entry)
+        .map(|bytes| u64::try_from(bytes.len()).unwrap_or(u64::MAX))
+        .map_err(|_| CompactionError::SummaryMaterialTooLarge)
+}
+
 /// Deterministic compaction failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum CompactionError {
@@ -374,6 +473,12 @@ pub enum CompactionError {
     /// Summary needs a source event range.
     #[error("summary compaction has no source event range")]
     MissingSourceRange,
+    /// Live summary material bounds are invalid.
+    #[error("live summary material requires positive byte and window bounds")]
+    InvalidSummaryMaterial,
+    /// Required protected state cannot fit in the live summary request bound.
+    #[error("live summary request material exceeds the byte bound")]
+    SummaryMaterialTooLarge,
     /// Artifact handoff metadata is incomplete.
     #[error("artifact handoff requires a non-empty entry ID and label")]
     InvalidArtifactHandoff,
@@ -610,6 +715,56 @@ mod tests {
                 context(),
             ),
             Err(CompactionError::ToolOutputMissingArtifact("missing".into()))
+        );
+    }
+
+    /// Ported from `audit/task-05`: bounded live-summary request material
+    /// preserves required protected state, retains the recent window, and
+    /// fails closed when a required record cannot fit.
+    #[test]
+    fn summary_request_material_is_bounded_and_preserves_required_state() {
+        let entries = vec![
+            ConversationEntry::SystemInstruction(TextEntry {
+                id: ConversationEntryId("system".into()),
+                text: "system policy".into(),
+                source_sequence: sequence(1),
+            }),
+            ConversationEntry::PendingTask(PendingTaskEntry {
+                id: ConversationEntryId("task".into()),
+                task_id: "t1".into(),
+                description: "finish".into(),
+                state: "pending".into(),
+                source_sequence: sequence(2),
+            }),
+            user("u1", 3),
+            user("u2", 4),
+            user("u3", 5),
+            user("u4", 6),
+        ];
+        let state = state(entries.clone());
+        let requirements = vec![
+            String::from("system_instructions"),
+            String::from("current_input"),
+            String::from("pending_control_state"),
+        ];
+        let material =
+            build_summary_request_material(&state, 64 * 1024, &requirements, 2).expect("material");
+        assert!(
+            material
+                .entries
+                .iter()
+                .any(|entry| entry.id().0 == "system")
+        );
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "task"));
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "u3"));
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "u4"));
+        assert!(!material.entries.iter().any(|entry| entry.id().0 == "u1"));
+        assert_eq!(material.source_range, Some((Sequence::FIRST, sequence(6))));
+        assert!(material.serialized_bytes > 0);
+        // A too-small cap on protected state fails closed instead of dropping it.
+        assert_eq!(
+            build_summary_request_material(&state, 4, &requirements, 2),
+            Err(CompactionError::SummaryMaterialTooLarge)
         );
     }
 }

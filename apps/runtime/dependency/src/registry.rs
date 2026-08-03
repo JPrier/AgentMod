@@ -23,9 +23,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::journal::{
-    DependencyAppendJournalRequest, DependencyDurability, DependencyScanJournalRequest,
-    JournalDependencyPort, JsonlJournalDependency,
+use crate::{
+    execution_plan::ExecutionPlanDependencyPort,
+    journal::{
+        DependencyAppendJournalRequest, DependencyDurability, DependencyScanJournalRequest,
+        JournalDependencyPort, JsonlJournalDependency,
+    },
 };
 
 const METADATA_LIMIT_BYTES: usize = 2 * 1024 * 1024;
@@ -164,6 +167,8 @@ pub struct DependencyCreateSessionRequest {
     pub initial_event_json: Vec<u8>,
     /// Exact transient MCP configuration; diagnostics are always redacted.
     pub mcp_configuration: Option<DependencySensitiveMcpConfiguration>,
+    /// Immutable checksummed node-execution plan staged with the session.
+    pub execution_plan: Option<crate::execution_plan::DependencyExecutionPlanFile>,
 }
 
 /// Dependency-owned sensitive MCP configuration wrapper.
@@ -250,6 +255,8 @@ pub struct DependencyCreateBranchRequest {
     pub events: Vec<DependencyBranchEvent>,
     /// Immutable artifacts committed with the child before its atomic rename.
     pub artifacts: Vec<DependencyBranchArtifact>,
+    /// Immutable checksummed node-execution plan staged with the child.
+    pub execution_plan: Option<crate::execution_plan::DependencyExecutionPlanFile>,
 }
 
 /// Dependency-owned MCP bootstrap disposition for an atomic branch.
@@ -291,6 +298,8 @@ pub struct DependencyCreateChildSessionRequest {
     pub mcp_bootstrap: DependencyBranchMcpBootstrap,
     /// Complete child journal, starting at sequence one.
     pub events: Vec<DependencyBranchEvent>,
+    /// Immutable checksummed node-execution plan staged with the child.
+    pub execution_plan: Option<crate::execution_plan::DependencyExecutionPlanFile>,
 }
 
 /// Session listing request.
@@ -631,6 +640,7 @@ fn populate_directory(
     };
     write_session_descriptors(temporary, &metadata, workspace.as_ref(), &descriptors)?;
     write_session_mcp_bootstrap(temporary, request, &descriptors.binding)?;
+    write_session_execution_plan(temporary, request.execution_plan.as_ref())?;
     JsonlJournalDependency
         .append(DependencyAppendJournalRequest {
             session_directory: temporary.to_owned(),
@@ -685,6 +695,22 @@ fn write_session_descriptors(
         }),
     )?;
     Ok(())
+}
+
+fn write_session_execution_plan(
+    temporary: &Path,
+    plan: Option<&crate::execution_plan::DependencyExecutionPlanFile>,
+) -> Result<(), SessionCatalogDependencyError> {
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    crate::execution_plan::LocalExecutionPlanDependency
+        .store_execution_plan(crate::execution_plan::DependencyStoreExecutionPlanRequest {
+            session_directory: temporary.to_owned(),
+            plan: plan.clone(),
+        })
+        .map(|_| ())
+        .map_err(|error| SessionCatalogDependencyError::ExecutionPlan(error.to_string()))
 }
 
 fn write_session_mcp_bootstrap(
@@ -1179,6 +1205,7 @@ fn populate_branch_directory(
     };
     write_session_descriptors(temporary, &metadata, workspace.as_ref(), &descriptors)?;
     write_branch_mcp_bootstrap(temporary, request, &descriptors.binding)?;
+    write_session_execution_plan(temporary, request.execution_plan.as_ref())?;
     for artifact in &request.artifacts {
         let artifact_directory = temporary.join("artifacts");
         let path = artifact_directory.join(format!("{}.json", artifact.artifact_id));
@@ -1250,6 +1277,7 @@ fn populate_child_directory(
     };
     write_session_descriptors(temporary, &metadata, workspace.as_ref(), &descriptors)?;
     write_child_mcp_bootstrap(temporary, request, &descriptors.binding)?;
+    write_session_execution_plan(temporary, request.execution_plan.as_ref())?;
     for event in &request.events {
         JsonlJournalDependency
             .append(DependencyAppendJournalRequest {
@@ -1931,6 +1959,9 @@ pub enum SessionCatalogDependencyError {
     /// Style binding, manifest, or compiled descriptor was inconsistent.
     #[error("session style binding is invalid")]
     InvalidStyleBinding,
+    /// The immutable node-execution plan file could not be persisted.
+    #[error("session execution plan persistence failed: {0}")]
+    ExecutionPlan(String),
 }
 
 /// Stable failure classification for a child-message append-or-replay.
@@ -2109,6 +2140,7 @@ mod tests {
                 compiled_style_json: compiled,
                 initial_event_json: br#"{"fixture":"parent"}"#.to_vec(),
                 mcp_configuration: None,
+                execution_plan: None,
             })
             .expect("parent");
         let (binding, manifest, compiled) = style_documents();
@@ -2170,6 +2202,7 @@ mod tests {
                             .expect("workspace lease json"),
                     },
                 ],
+                execution_plan: None,
             })
             .expect("child");
         (
@@ -2454,6 +2487,7 @@ mod tests {
                 compiled_style_json,
                 initial_event_json: br#"{"fixture":true}"#.to_vec(),
                 mcp_configuration: None,
+                execution_plan: None,
             })
             .expect("create");
         for required in [
@@ -2503,6 +2537,7 @@ mod tests {
                 compiled_style_json: compiled,
                 initial_event_json: br#"{"fixture":true}"#.to_vec(),
                 mcp_configuration: Some(configuration),
+                execution_plan: None,
             })
             .expect("MCP session");
         let encrypted_path = created.session_directory.join(MCP_BOOTSTRAP_FILE);
@@ -2555,6 +2590,7 @@ mod tests {
                 compiled_style_json: compiled,
                 initial_event_json: br#"{"fixture":true}"#.to_vec(),
                 mcp_configuration: Some(configuration),
+                execution_plan: None,
             })
             .expect("MCP session");
         let encrypted_path = created.session_directory.join(MCP_BOOTSTRAP_FILE);
@@ -2626,6 +2662,7 @@ mod tests {
                 compiled_style_json: compiled.clone(),
                 initial_event_json: br#"{"fixture":"parent"}"#.to_vec(),
                 mcp_configuration: Some(configuration),
+                execution_plan: None,
             })
             .expect("parent MCP session");
         let parent_encrypted = fs::read(parent_created.session_directory.join(MCP_BOOTSTRAP_FILE))
@@ -2656,6 +2693,7 @@ mod tests {
                     },
                 ],
                 artifacts: Vec::new(),
+                execution_plan: None,
             })
             .expect("branch with inherited MCP bootstrap");
         let child_encrypted = fs::read(branch.session_directory.join(MCP_BOOTSTRAP_FILE))
@@ -2696,6 +2734,7 @@ mod tests {
                 compiled_style_json: compiled.clone(),
                 initial_event_json: br#"{"fixture":"parent"}"#.to_vec(),
                 mcp_configuration: Some(configuration),
+                execution_plan: None,
             })
             .expect("parent MCP session");
         let parent_encrypted = fs::read(parent_created.session_directory.join(MCP_BOOTSTRAP_FILE))
@@ -2722,6 +2761,7 @@ mod tests {
                         event_json: format!(r#"{{"fixture":{index}}}"#).into_bytes(),
                     })
                     .collect(),
+                execution_plan: None,
             })
             .expect("child with inherited MCP bootstrap");
         let child_encrypted = fs::read(created.session_directory.join(MCP_BOOTSTRAP_FILE))
@@ -2755,6 +2795,7 @@ mod tests {
                 compiled_style_json: compiled.clone(),
                 initial_event_json: br#"{"fixture":"parent"}"#.to_vec(),
                 mcp_configuration: Some(configuration),
+                execution_plan: None,
             })
             .expect("parent MCP session");
         let request = |child: DependencyPreparedSession,
@@ -2785,6 +2826,7 @@ mod tests {
                     },
                 ],
                 artifacts: Vec::new(),
+                execution_plan: None,
             }
         };
         assert!(matches!(
@@ -2839,6 +2881,7 @@ mod tests {
                 compiled_style_json,
                 initial_event_json: br#"{"fixture":true}"#.to_vec(),
                 mcp_configuration: None,
+                execution_plan: None,
             })
             .expect("create");
         JsonlJournalDependency
@@ -2913,6 +2956,7 @@ mod tests {
                 creation_event: Uuid::from_u128(13).to_string(),
                 bytes: bytes.clone(),
             }],
+            execution_plan: None,
         };
         let created = FileSessionCatalogDependency
             .create_branch(request.clone())
@@ -2984,6 +3028,7 @@ mod tests {
                     event_json: br#"{"event":"child_session.workspace_lease_bound"}"#.to_vec(),
                 },
             ],
+            execution_plan: None,
         };
 
         FileSessionCatalogDependency

@@ -482,9 +482,73 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake3",
+ "reqwest",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "uuid",
+]
+
+[[package]]
+name = "agentmod-harness-fixture"
+version = "0.1.0"
+dependencies = [
+ "agentmod-harness-fixture-data",
+ "agentmod-harness-fixture-dependency",
+ "agentmod-harness-fixture-logic",
+ "agentmod-harness-fixture-service",
+ "agentmod-harness-protocol",
+ "agentmod-primitives",
+ "blake3",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "agentmod-harness-fixture-data"
+version = "0.1.0"
+dependencies = [
+ "agentmod-harness-fixture-dependency",
+ "async-trait",
+ "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "agentmod-harness-fixture-dependency"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "blake3",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "agentmod-harness-fixture-logic"
+version = "0.1.0"
+dependencies = [
+ "agentmod-harness-fixture-data",
+ "async-trait",
+ "thiserror 2.0.19",
+]
+
+[[package]]
+name = "agentmod-harness-fixture-service"
+version = "0.1.0"
+dependencies = [
+ "agentmod-harness-fixture-logic",
+ "agentmod-harness-protocol",
+ "agentmod-primitives",
+ "async-trait",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]
@@ -950,6 +1014,7 @@ dependencies = [
  "agentmod-runtime-data",
  "agentmod-session-style-sdk",
  "async-trait",
+ "proptest",
  "semver",
  "serde",
  "serde_json",
@@ -3999,6 +4064,7 @@ dependencies = [
  "base64",
  "bytes",
  "encoding_rs",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "http",

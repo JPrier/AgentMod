@@ -59,6 +59,23 @@ On Windows, `tests/e2e/runtime_cli.ps1`,
 pipe. Matching Unix scripts exist, but `STATUS.md` records which platforms were
 actually executed.
 
+## Live providers and the independent harness
+
+The native harness executes live provider adapters in its dependency layer:
+generic OpenAI-compatible, OpenRouter, OpenAI, Anthropic, Gemini, and local
+endpoints. Secrets are configured through environment references or `file:`
+references (never inline options); TLS verification defaults to enabled. See
+`docs/guides/providers.md` for setup. A separate `agentmod-harness-fixture`
+binary provides a genuinely independent second harness implementation and is
+registered in the runtime harness registry as `independent`.
+
+The immutable style binding may select a live model-generated summary by
+setting `compaction.summary` in the style manifest. This runs through the
+normal proposal/policy/dispatch/terminal-evidence path with canonical
+`context.summary_*` events and durable recovery; the deterministic typed
+summary remains the default. See `docs/architecture/context-model.md` and
+`docs/architecture/execution-plan.md` for the reconciliation record.
+
 ## License
 
 Licensed under either Apache License, Version 2.0 or MIT license at your option.

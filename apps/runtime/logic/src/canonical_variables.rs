@@ -3447,6 +3447,93 @@ mod tests {
         event
     }
 
+    /// Ported concept from `audit/task-04`: deterministic replay under random
+    /// assignment order. The converged reducer is a pure function of its
+    /// canonical events, so replaying the exact same journal from a fresh
+    /// reducer must reconstruct byte-identical state no matter how many
+    /// declarations, assignments, and merges preceded it.
+    fn apply_random_sequence(
+        reducer: &mut CanonicalVariableEventReducer,
+        names: &[String],
+        seed: u64,
+    ) -> Vec<CanonicalVariableEvent> {
+        let mut events = Vec::new();
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = |bound: usize| -> usize {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as usize % bound
+        };
+        for name in names {
+            events.push(apply_attempt(
+                reducer,
+                RUNTIME_PRODUCER,
+                VariableValidationAttempt::Declare {
+                    declaration: declaration(name, VariableValueType::String, RUNTIME_PRODUCER),
+                },
+            ));
+        }
+        let rounds = 3 + next(5);
+        for _ in 0..rounds {
+            let name = &names[next(names.len())];
+            let value = CanonicalVariableValue::String(format!("value-{}-{}", seed, next(1000)));
+            events.push(apply_attempt(
+                reducer,
+                RUNTIME_PRODUCER,
+                VariableValidationAttempt::Assign {
+                    variable: name.clone(),
+                    writer: node_writer(),
+                    expected_version: None,
+                    value,
+                },
+            ));
+        }
+        events
+    }
+
+    #[test]
+    fn replay_reconstructs_identical_state_under_random_assignment_order() {
+        use proptest::prelude::*;
+        proptest!(|(seed in any::<u64>(), names in prop::collection::vec(proptest::string::string_regex("v[0-9]").unwrap(), 1..6))| {
+            let mut names = names;
+            names.sort();
+            names.dedup();
+            let mut live = CanonicalVariableEventReducer::new(
+                "run:variables:prop",
+                VariableEnvironmentLimits::default(),
+            )
+            .expect("live reducer");
+            let events = apply_random_sequence(&mut live, &names, seed);
+
+            let mut replay = CanonicalVariableEventReducer::new(
+                "run:variables:prop",
+                VariableEnvironmentLimits::default(),
+            )
+            .expect("replay reducer");
+            for event in &events {
+                replay.apply(event.clone()).expect("replay event");
+            }
+            let replay_hash = replay.state_hash().expect("replay hash");
+            let live_hash = live.state_hash().expect("live hash");
+            prop_assert!(
+                replay_hash == live_hash,
+                "replay diverged from live state under seed {}",
+                seed
+            );
+
+            // A serialized snapshot survives restart and revalidates.
+            let bytes = serde_json::to_vec(&live).expect("serialize reducer");
+            let recovered: CanonicalVariableEventReducer =
+                serde_json::from_slice(&bytes).expect("deserialize reducer");
+            recovered.validate_replayed().expect("validate recovered");
+            prop_assert_eq!(
+                recovered.state_hash().expect("recovered hash"),
+                live.state_hash().expect("live hash")
+            );
+        });
+    }
+
     #[test]
     fn event_reducer_replays_declaration_assignment_artifacts_and_rejects_tampering() {
         let mut reducer = CanonicalVariableEventReducer::new(

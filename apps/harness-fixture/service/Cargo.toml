@@ -1,0 +1,27 @@
+[package]
+name = "agentmod-harness-fixture-service"
+description = "Endpoint-facing service layer for the independent AgentMod harness fixture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+agentmod-harness-fixture-logic = { version = "0.1.0", path = "../logic" }
+agentmod-harness-protocol = { version = "0.1.0", path = "../../../protocols/harness-protocol" }
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
+async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.agentmod]
+kind = "process-layer"
+process = "harness-fixture"
+layer = "service"
+
+[dev-dependencies]
+tokio.workspace = true

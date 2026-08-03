@@ -274,6 +274,10 @@ pub enum ServiceStyleDecisionCapability {
 impl RuntimeStyleServiceConfig {
     /// Builds the native runtime's explicit first-party capability registry.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the native capability registry keeps every advertised first-party component explicit"
+    )]
     pub fn native(session_root: &std::path::Path) -> Self {
         let parent = session_root.parent().unwrap_or(session_root);
         Self {
@@ -298,7 +302,16 @@ impl RuntimeStyleServiceConfig {
             .map(str::to_owned)
             .collect(),
             tool_groups: canonical_tool_groups(),
-            providers: BTreeSet::from([String::from("deterministic-mock"), String::from("mock")]),
+            providers: BTreeSet::from([
+                String::from("deterministic-mock"),
+                String::from("mock"),
+                String::from("local"),
+                String::from("openai-compatible"),
+                String::from("openrouter"),
+                String::from("openai"),
+                String::from("anthropic"),
+                String::from("gemini"),
+            ]),
             plugins: BTreeSet::from([String::from("runtime.security")]),
             context_transforms: Vec::new(),
             plugin_memory_providers: Vec::new(),

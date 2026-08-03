@@ -369,3 +369,33 @@ platforms = ["windows", "linux", "macos"]
 evidence = ["protocols/scheduler-protocol/src/lib.rs", "protocols/runtime-protocol/src/lib.rs", "apps/scheduler/ARCHITECTURE.md", "apps/scheduler/dependency/src/lib.rs", "apps/scheduler/data/src/lib.rs", "apps/scheduler/logic/src/lib.rs", "apps/scheduler/service/src/lib.rs", "apps/runtime/dependency/src/scheduler.rs", "apps/runtime/data/src/scheduler.rs", "apps/runtime/logic/src/scheduler.rs", "apps/runtime/service/src/turn.rs", "apps/cli/service/src/lib.rs", "tests/fixtures/styles/arbitrary-graph-schedule.toml", "tests/e2e/scheduler_worker.ps1", "tests/e2e/scheduler_worker.sh", "tests/e2e/runtime_scheduler.ps1", "tests/e2e/runtime_scheduler.sh", "tests/e2e/runtime_scheduler_recovery.ps1", "tests/e2e/runtime_scheduler_recovery.sh", "tests/e2e/runtime_process_restart.ps1", "tests/e2e/runtime_process_restart.sh", "tests/e2e/runtime_arbitrary_graph_schedule.ps1", "tests/e2e/runtime_arbitrary_graph_schedule.sh"]
 status = "partial"
 limitation = "Windows and Ubuntu/WSL2 process matrices prove authenticated supervision, complete policy-bearing schedules, automatic bounded polling, TUI create/list/remove, one-time and bounded recurring claims, committed runtime-event delivery, exact process/output-range delivery, corruption rejection, scheduler.fired provenance, normal intercepted prompt execution, idempotent terminal completion, and restart reconciliation without redispatch. A non-built-in arbitrary graph also proves exact persisted schedule executor identity, policy/outbox handling, daemon restart, wake-once continuation, and pure replay. Deferred continuations remain exact-proof and cannot be manually approved. Exhaustive cancellation crash-gap injection across every schedule action and macOS execution remain incomplete."
+
+[[requirement]]
+id = "PROV-01"
+capability = "live-provider-adapters"
+owner = "harness-dependency"
+tests = ["openai_compatible_streams_text_with_fragmented_utf8_and_usage", "openai_compatible_streams_tool_call_deltas_and_multiple_proposals", "openrouter_returns_usage_and_computed_cost_metadata", "openai_non_streaming_response_is_normalized", "anthropic_streams_text_and_tool_use_events", "gemini_streams_text_and_function_calls", "image_inputs_are_serialized_into_the_request_body", "malformed_sse_fails_closed_without_stream_partial_claims", "retryable_rate_limit_is_classified_with_delay", "non_retryable_auth_failure_is_classified_never", "ambiguous_disconnect_fails_closed_without_completion", "cancellation_during_stream_emits_cancelled_and_stops", "authentication_headers_are_sent_and_never_leaked_in_errors"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/harness/dependency/src/live/mod.rs", "apps/harness/dependency/src/live/sse.rs", "apps/harness/dependency/src/live/retry.rs", "apps/harness/dependency/src/live/pricing.rs", "apps/harness/dependency/src/live/wire_openai.rs", "apps/harness/dependency/src/live/wire_anthropic.rs", "apps/harness/dependency/src/live/wire_gemini.rs", "apps/harness/dependency/tests/live_fixtures.rs", "docs/guides/providers.md"]
+status = "partial"
+limitation = "Deterministic local HTTP fixtures drive every live adapter offline and credential-free; the runtime-supervised live-provider fixture E2E passes on Ubuntu/WSL2. Real paid-provider smoke tests remain opt-in and are not executed by the default suite."
+
+[[requirement]]
+id = "PROV-02"
+capability = "independent-harness"
+owner = "harness-fixture/runtime"
+tests = ["composition_root_assembles_a_healthy_vertical_slice", "maps_execute_wire_to_logic_and_protocol_events", "process_conformance"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/harness-fixture/bin/src/main.rs", "apps/harness-fixture/bin/tests/process.rs", "apps/runtime/bin/src/main.rs", "tests/e2e/independent_harness.ps1", "tests/e2e/independent_harness.sh", "tests/e2e/runtime_harness_selection.sh"]
+status = "partial"
+limitation = "The independent fixture process passes protocol negotiation, distinct identity/capabilities, deterministic streaming, negative capability guards, and in-flight cancellation conformance; runtime registry registration is verified by harness selection E2Es on Ubuntu/WSL2."
+
+[[requirement]]
+id = "CTX-08"
+capability = "model-generated-summary"
+owner = "runtime-logic"
+tests = ["summary_outbox_follows_proposal_approval_start_completion_ordering", "summary_evidence_hash_must_match_text_and_completion_requires_start", "summary_request_material_is_bounded_and_preserves_required_state"]
+platforms = ["windows", "linux", "macos"]
+evidence = ["apps/runtime/logic/src/turn.rs", "apps/runtime/logic/src/session.rs", "apps/runtime/logic/src/compaction.rs", "sdk/session-style-sdk/src/model.rs", "docs/architecture/context-model.md"]
+status = "partial"
+limitation = "Canonical outbox ordering, terminal-evidence hashing, bounded material, and fail-closed ambiguity are reducer-tested. A full process E2E with a live summary provider remains to be added."

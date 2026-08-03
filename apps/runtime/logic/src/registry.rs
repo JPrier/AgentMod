@@ -188,6 +188,8 @@ where
             .map_err(|_| SessionRegistryLogicError::InitialEventSerialization)?;
         let style_binding_json = serde_json::to_string(&command.style_binding)
             .map_err(|_| SessionRegistryLogicError::InitialEventSerialization)?;
+        let execution_plan = crate::execution_plan::to_plan_file_data(&command.style_binding)
+            .map_err(SessionRegistryLogicError::ExecutionPlan)?;
         let session_id = prepared.session_id;
         let created = self
             .data
@@ -200,6 +202,7 @@ where
                 compiled_style_json: command.style_binding.compiled_style_json,
                 initial_event_json: event_json,
                 mcp_configuration: mcp_configuration.map(|value| value.0.into()),
+                execution_plan,
             })
             .map_err(SessionRegistryLogicError::Data)?;
         Ok(CreateSessionResult {
@@ -550,6 +553,9 @@ pub enum SessionRegistryLogicError {
     /// Data returned sequence zero.
     #[error("session registry returned an invalid sequence")]
     InvalidSequence,
+    /// The immutable node-execution plan file could not be prepared.
+    #[error("session execution plan logic failed: {0}")]
+    ExecutionPlan(crate::execution_plan::ExecutionPlanLogicError),
 }
 
 #[cfg(test)]

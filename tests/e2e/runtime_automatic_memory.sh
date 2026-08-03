@@ -18,15 +18,18 @@ succeeded=0
 workspace="$run_root/workspace"
 style_root="$run_root/styles/user"
 mkdir -p "$workspace" "$style_root"
-sed \
-    -e 's/id = "e2e-persistent-file"/id = "e2e-automatic-memory"/' \
-    -e 's/write_policy = "explicit_only"/write_policy = "turn_completion"/' \
-    tests/fixtures/styles/persistent-file-none.toml \
-    >"$style_root/automatic-memory.toml"
+cp "$repository/tests/fixtures/styles/automatic-memory-file.toml" \
+    "$style_root/automatic-memory.toml"
+
+# The style graph uses a fixed `filesystem.read` gate; make the read succeed.
+mkdir -p "$workspace/src"
+printf '%s\n' 'pub fn fixture() -> bool { true }' > \
+    "$workspace/src/lib.rs"
 
 export AGENTMOD_RUNTIME_ENDPOINT="$run_root/runtime.sock"
 export AGENTMOD_RUNTIME_AUTH_TOKEN="0123456789abcdef0123456789abcdef0123456789abcdef"
 export AGENTMOD_HARNESS_PROGRAM="$debug_root/agentmod-harness"
+export AGENTMOD_FILESYSTEM_HOST_PROGRAM="$debug_root/agentmod-filesystem-host"
 export AGENTMOD_MEMORY_WRITE_POST_PERSIST_DELAY_MS=10000
 runtime="$debug_root/agentmod-runtime"
 cli="$debug_root/agentmod"

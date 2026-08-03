@@ -91,6 +91,7 @@ impl IndependentHarness {
                 events: vec![HarnessEvent::Cancelled],
             }],
             HarnessCommand::Continue { .. } => vec![failed("continuation_unsupported")],
+            HarnessCommand::Catalog => vec![failed("catalog_unsupported")],
         }
     }
 }

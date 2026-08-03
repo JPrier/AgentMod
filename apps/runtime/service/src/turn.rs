@@ -177,6 +177,9 @@ pub enum ServiceTurnEvent {
         reason: String,
         input_tokens: u64,
         output_tokens: u64,
+        reasoning_tokens: u64,
+        estimated: bool,
+        cost_micros: u64,
     },
     Cancelled,
     Failed {
@@ -2000,10 +2003,16 @@ fn map_event(event: ProviderEvent) -> ServiceTurnEvent {
             reason,
             input_tokens,
             output_tokens,
+            reasoning_tokens,
+            estimated,
+            cost_micros,
         } => ServiceTurnEvent::Completed {
             reason,
             input_tokens,
             output_tokens,
+            reasoning_tokens,
+            estimated,
+            cost_micros,
         },
         ProviderEvent::Cancelled => ServiceTurnEvent::Cancelled,
         ProviderEvent::Failed {
@@ -2057,10 +2066,16 @@ fn to_wire_event(event: ServiceTurnEvent) -> RuntimeProviderEvent {
             reason,
             input_tokens,
             output_tokens,
+            reasoning_tokens,
+            estimated,
+            cost_micros,
         } => RuntimeProviderEvent::Completed {
             reason,
             input_tokens,
             output_tokens,
+            reasoning_tokens,
+            estimated,
+            cost_micros,
         },
         ServiceTurnEvent::Cancelled => RuntimeProviderEvent::Cancelled,
         ServiceTurnEvent::Failed {

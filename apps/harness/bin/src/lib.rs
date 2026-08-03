@@ -1,18 +1,19 @@
 //! Composition root for the `AgentMod` native harness.
 
 use agentmod_harness_data::HarnessHealthDataStore;
-use agentmod_harness_dependency::StaticProviderCatalogDependency;
+use agentmod_harness_dependency::CompositeProviderCatalogDependency;
 use agentmod_harness_logic::HarnessHealthManager;
 use agentmod_harness_service::HarnessService;
 
 /// Fully assembled first-party harness service.
-pub type DefaultHarnessService =
-    HarnessService<HarnessHealthManager<HarnessHealthDataStore<StaticProviderCatalogDependency>>>;
+pub type DefaultHarnessService = HarnessService<
+    HarnessHealthManager<HarnessHealthDataStore<CompositeProviderCatalogDependency>>,
+>;
 
 /// Assembles dependency → data → logic → service for the harness.
 #[must_use]
 pub fn build_service() -> DefaultHarnessService {
-    let dependency = StaticProviderCatalogDependency::built_in();
+    let dependency = CompositeProviderCatalogDependency::development();
     let data = HarnessHealthDataStore::new(dependency);
     let logic = HarnessHealthManager::new(data);
     HarnessService::new(logic)
@@ -21,7 +22,7 @@ pub fn build_service() -> DefaultHarnessService {
 /// Assembles the production harness with keyed runtime grant validation.
 #[must_use]
 pub fn build_secure_service(authorization_key: [u8; 32]) -> DefaultHarnessService {
-    let dependency = StaticProviderCatalogDependency::secure(authorization_key);
+    let dependency = CompositeProviderCatalogDependency::secure(authorization_key);
     let data = HarnessHealthDataStore::new(dependency);
     let logic = HarnessHealthManager::new(data);
     HarnessService::new(logic)
@@ -42,10 +43,15 @@ mod tests {
 
         let ServiceResponse::Health(response) = service
             .handle_wire_command(&HarnessCommand::Health)
-            .expect("built-in service reports health");
+            .expect("built-in service reports health")
+        else {
+            panic!("health command returned a catalog response")
+        };
 
         assert_eq!(response.status, ServiceHealthStatus::Ok);
-        assert_eq!(response.configured_provider_count, 1);
+        // The composite catalog configures the deterministic mock plus the live
+        // provider adapters; only the mock is ready without provider secrets.
+        assert_eq!(response.configured_provider_count, 7);
         assert_eq!(response.ready_provider_count, 1);
         assert_eq!(
             response.capabilities,

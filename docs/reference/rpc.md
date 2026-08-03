@@ -33,7 +33,13 @@ approval resolution, session-scoped plugin disable/quarantine, and bounded
 session event catch-up. Runtime protocol 2.5
 adds optional memory, compaction, and hard execution-budget selections to
 session creation plus the
-component catalog used by frontends. Receiving service types translate runtime
+component catalog used by frontends. Provider completion events carry optional
+reasoning-token, estimated-usage, and cost-micros fields (serde-defaulted for
+backward compatibility). The harness protocol adds a bounded provider/model
+`catalog` command whose entries include model IDs, capabilities, context
+limits, tool/image/structured-output/streaming support, and pricing sources;
+provider `usage` gains serde-defaulted reasoning-token, estimated, and cost
+metadata. Receiving service types translate runtime
 wire contracts before calling logic; logic reaches external state only through
 data and dependency.
 

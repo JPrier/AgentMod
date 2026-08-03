@@ -412,6 +412,8 @@ where
                 mcp_bootstrap,
                 events,
                 artifacts,
+                execution_plan: crate::execution_plan::to_plan_file_data(&style_binding)
+                    .map_err(SessionHistoryLogicError::ExecutionPlan)?,
             })
             .map_err(SessionHistoryLogicError::Registry)?;
         Ok(BranchSessionResult {
@@ -861,6 +863,9 @@ pub enum SessionHistoryLogicError {
     /// Full context exceeds the hard artifact bound.
     #[error("branch context exceeds the artifact size limit")]
     BranchContextTooLarge,
+    /// The immutable node-execution plan file could not be prepared.
+    #[error("branch execution plan logic failed: {0}")]
+    ExecutionPlan(crate::execution_plan::ExecutionPlanLogicError),
 }
 
 impl From<agentmod_primitives::PrimitiveError> for SessionHistoryLogicError {

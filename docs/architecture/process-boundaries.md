@@ -13,9 +13,10 @@ named pipe. The runtime lazily starts the per-session selected harness adapter
 over bounded JSONL stdio, keeps its child alive across requests, kills it on
 desynchronization, and never automatically retries an ambiguous provider
 exchange. Runtime and harness negotiate provider behavior through
-`agentmod-harness-protocol`. The composition root registers the native adapter
-and an independent deterministic fixture adapter; neither adapter is imported
-as a runtime internal.
+`agentmod-harness-protocol`. The composition root registers the native adapter,
+an independent deterministic fixture adapter, and the independent
+`agentmod-harness-fixture` adapter (registry ID `independent`); none of these
+adapters is imported as a runtime internal.
 
 Harness process launch uses a runtime-generated 256-bit key passed only through
 the child environment. Each approved model action receives a short-lived,

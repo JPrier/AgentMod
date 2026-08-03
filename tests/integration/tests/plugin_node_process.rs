@@ -476,6 +476,32 @@ impl RuntimeDependencyPort for ProcessRuntimeDependencies {
     }
 }
 
+impl agentmod_runtime_dependency::execution_plan::ExecutionPlanDependencyPort
+    for ProcessRuntimeDependencies
+{
+    fn store_execution_plan(
+        &self,
+        request: agentmod_runtime_dependency::execution_plan::DependencyStoreExecutionPlanRequest,
+    ) -> Result<
+        agentmod_runtime_dependency::execution_plan::DependencyStoreExecutionPlanResponse,
+        agentmod_runtime_dependency::execution_plan::ExecutionPlanDependencyError,
+    > {
+        agentmod_runtime_dependency::execution_plan::LocalExecutionPlanDependency
+            .store_execution_plan(request)
+    }
+
+    fn load_execution_plan(
+        &self,
+        request: agentmod_runtime_dependency::execution_plan::DependencyLoadExecutionPlanRequest,
+    ) -> Result<
+        agentmod_runtime_dependency::execution_plan::DependencyLoadExecutionPlanResult,
+        agentmod_runtime_dependency::execution_plan::ExecutionPlanDependencyError,
+    > {
+        agentmod_runtime_dependency::execution_plan::LocalExecutionPlanDependency
+            .load_execution_plan(request)
+    }
+}
+
 impl SessionStyleDependencyPort for ProcessRuntimeDependencies {
     fn discover_session_styles(
         &self,

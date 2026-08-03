@@ -35,15 +35,42 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             ready_provider_count: v.ready_provider_count,
                             capabilities: v.capabilities,
                         }],
+                        Ok(ServiceResponse::Catalog(_)) => vec![failed("catalog_unexpected")],
                         Err(_) => vec![failed("health_failed")],
                     }
                 }
-                Ok(command @ HarnessCommand::Execute { .. }) => service
-                    .execute_wire(&command)
-                    .map_or_else(|_| vec![failed("execution_failed")], incremental_replies),
-                Ok(command @ HarnessCommand::Continue { .. }) => service
-                    .continue_wire(&command)
-                    .map_or_else(|_| vec![failed("continuation_failed")], incremental_replies),
+                Ok(HarnessCommand::Catalog) => {
+                    match service.handle_wire_command(&HarnessCommand::Catalog) {
+                        Ok(ServiceResponse::Catalog(providers)) => {
+                            vec![HarnessReply::Catalog { providers }]
+                        }
+                        Ok(ServiceResponse::Health(_)) => vec![failed("health_unexpected")],
+                        Err(_) => vec![failed("catalog_failed")],
+                    }
+                }
+                Ok(command @ HarnessCommand::Execute { .. }) => {
+                    // The live provider adapters use the blocking reqwest
+                    // client, which must run off the tokio worker runtime.
+                    let service = service.clone();
+                    tokio::task::spawn_blocking(move || {
+                        service
+                            .execute_wire(&command)
+                            .map_or_else(|_| vec![failed("execution_failed")], incremental_replies)
+                    })
+                    .await
+                    .unwrap_or_else(|_| vec![failed("execution_failed")])
+                }
+                Ok(command @ HarnessCommand::Continue { .. }) => {
+                    let service = service.clone();
+                    tokio::task::spawn_blocking(move || {
+                        service.continue_wire(&command).map_or_else(
+                            |_| vec![failed("continuation_failed")],
+                            incremental_replies,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|_| vec![failed("continuation_failed")])
+                }
                 Ok(HarnessCommand::Cancel { .. }) => {
                     vec![failed("cancellation_unsupported")]
                 }

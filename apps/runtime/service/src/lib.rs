@@ -298,7 +298,16 @@ impl RuntimeStyleServiceConfig {
             .map(str::to_owned)
             .collect(),
             tool_groups: canonical_tool_groups(),
-            providers: BTreeSet::from([String::from("deterministic-mock"), String::from("mock")]),
+            providers: BTreeSet::from([
+                String::from("deterministic-mock"),
+                String::from("mock"),
+                String::from("local"),
+                String::from("openai-compatible"),
+                String::from("openrouter"),
+                String::from("openai"),
+                String::from("anthropic"),
+                String::from("gemini"),
+            ]),
             plugins: BTreeSet::from([String::from("runtime.security")]),
             context_transforms: Vec::new(),
             plugin_memory_providers: Vec::new(),

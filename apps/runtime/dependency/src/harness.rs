@@ -284,6 +284,16 @@ impl ProcessHarnessDependency {
         if let Some(root) = &self.config.test_gate_root {
             c.env("AGENTMOD_HARNESS_TEST_GATE_ROOT", root);
         }
+        // Provider configuration and secret references are forwarded from the
+        // runtime process environment through the curated `AGENTMOD_PROVIDER_*`
+        // namespace only. The harness resolves secret values itself from
+        // environment references or `file:` references; secrets never cross
+        // protocol frames, events, logs, or request options.
+        for (name, value) in std::env::vars() {
+            if name.starts_with("AGENTMOD_PROVIDER_") {
+                c.env(name, value);
+            }
+        }
         let mut child = c.spawn().map_err(|_| HarnessDependencyError::Unavailable)?;
         let stdin = child
             .stdin

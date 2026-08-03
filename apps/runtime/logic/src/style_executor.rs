@@ -1510,6 +1510,34 @@ pub(crate) mod tests {
         );
     }
 
+    /// Ported from `audit/task-02`: repeated transition selection never
+    /// diverges on any built-in graph, independent of node position.
+    #[test]
+    fn repeated_selection_never_diverges_on_built_in_graphs() {
+        for style in [
+            BuiltInStyle::PersistentChat,
+            BuiltInStyle::EphemeralTurn,
+            BuiltInStyle::ResearchLoop,
+            BuiltInStyle::PlannerWorker,
+            BuiltInStyle::DeclarativeGraph,
+        ] {
+            let executor =
+                CompiledStyleExecutor::from_binding(&binding(style)).expect("executor");
+            let graph = &executor.compiled().graph;
+            for node in &graph.nodes {
+                let first = executor.transition(node.index, &json!({}));
+                for _ in 0..5 {
+                    assert_eq!(
+                        first,
+                        executor.transition(node.index, &json!({})),
+                        "{style:?}: {} diverged",
+                        node.id
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn compiled_descriptor_tampering_fails_before_execution() {
         let mut binding = binding(BuiltInStyle::PersistentChat);

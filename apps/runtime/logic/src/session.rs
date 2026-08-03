@@ -19796,6 +19796,129 @@ mod tests {
         (dispatched, identity, action_digest)
     }
 
+    fn summary_identity() -> ContextSummaryIdentity {
+        ContextSummaryIdentity {
+            summary_id: String::from("summary:run:1"),
+            request_hash: ContentHash::digest(b"summary-request"),
+            provider: String::from("mock"),
+            model: String::from("mock-model"),
+            schema_version: 1,
+            max_summary_bytes: 64 * 1024,
+            source_range: Some((Sequence::FIRST, Sequence::new(8).expect("sequence"))),
+        }
+    }
+
+    fn reduce_all(events: Vec<EventEnvelope<RuntimeCommittedEvent>>) -> SessionState {
+        let mut state: Option<SessionState> = None;
+        for event in events {
+            state = Some(reduce(state, &event).expect("reduce"));
+        }
+        state.expect("initialized")
+    }
+
+    /// Ported from `audit/task-05`: the live model-generated summary outbox
+    /// follows proposal -> approval -> start -> completion ordering, and
+    /// terminal evidence hash must match the bounded text.
+    #[test]
+    fn summary_outbox_follows_proposal_approval_start_completion_ordering() {
+        let identity = summary_identity();
+        let events = vec![
+            created(),
+            envelope(
+                2,
+                RuntimeCommittedEvent::ContextSummaryProposed(ContextSummaryProposedEvent {
+                    identity: identity.clone(),
+                }),
+            ),
+            envelope(
+                3,
+                RuntimeCommittedEvent::ContextSummaryApproved(ContextSummaryApprovedEvent {
+                    identity: identity.clone(),
+                    action_digest: ContentHash::digest(b"approved-summary"),
+                }),
+            ),
+            envelope(
+                4,
+                RuntimeCommittedEvent::ContextSummaryStarted(ContextSummaryStartedEvent {
+                    identity: identity.clone(),
+                }),
+            ),
+            envelope(
+                5,
+                RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                    identity: identity.clone(),
+                    content_hash: ContentHash::digest(b"bounded summary"),
+                    text: String::from("bounded summary"),
+                    input_tokens: 12,
+                    output_tokens: 3,
+                }),
+            ),
+        ];
+        let state = reduce_all(events);
+        let record = state
+            .context_summaries
+            .get(&identity.summary_id)
+            .expect("record");
+        assert_eq!(record.state, ContextSummaryState::Completed);
+        assert!(record.has_terminal_evidence());
+        assert_eq!(record.text.as_deref(), Some("bounded summary"));
+        assert_eq!(record.input_tokens, 12);
+    }
+
+    #[test]
+    fn summary_evidence_hash_must_match_text_and_completion_requires_start() {
+        let identity = summary_identity();
+        let completed_without_start = envelope(
+            2,
+            RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                identity: identity.clone(),
+                content_hash: ContentHash::digest(b"summary"),
+                text: String::from("summary"),
+                input_tokens: 1,
+                output_tokens: 1,
+            }),
+        );
+        assert!(matches!(
+            reduce(Some(reduce_all(vec![created()])), &completed_without_start),
+            Err(SessionReducerError::InvalidSummaryTransition)
+        ));
+
+        let hash_mismatch = envelope(
+            2,
+            RuntimeCommittedEvent::ContextSummaryProposed(ContextSummaryProposedEvent {
+                identity: summary_identity(),
+            }),
+        );
+        let approved = envelope(
+            3,
+            RuntimeCommittedEvent::ContextSummaryApproved(ContextSummaryApprovedEvent {
+                identity: summary_identity(),
+                action_digest: ContentHash::digest(b"approved"),
+            }),
+        );
+        let started = envelope(
+            4,
+            RuntimeCommittedEvent::ContextSummaryStarted(ContextSummaryStartedEvent {
+                identity: summary_identity(),
+            }),
+        );
+        let mismatched = envelope(
+            5,
+            RuntimeCommittedEvent::ContextSummaryCompleted(ContextSummaryCompletedEvent {
+                identity: summary_identity(),
+                content_hash: ContentHash::digest(b"different"),
+                text: String::from("summary"),
+                input_tokens: 1,
+                output_tokens: 1,
+            }),
+        );
+        let state = reduce_all(vec![created(), hash_mismatch, approved, started]);
+        assert!(matches!(
+            reduce(Some(state), &mismatched),
+            Err(SessionReducerError::InvalidSummaryTransition)
+        ));
+    }
+
     #[test]
     fn plugin_automatic_memory_write_uses_v3_and_never_reconciles_ambiguity() {
         let (dispatched, identity, action_digest) = dispatched_plugin_automatic_memory_write();

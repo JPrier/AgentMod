@@ -718,4 +718,49 @@ mod tests {
             Err(CompactionError::ToolOutputMissingArtifact("missing".into()))
         );
     }
+
+    /// Ported from `audit/task-05`: bounded live-summary request material
+    /// preserves required protected state, retains the recent window, and
+    /// fails closed when a required record cannot fit.
+    #[test]
+    fn summary_request_material_is_bounded_and_preserves_required_state() {
+        let entries = vec![
+            ConversationEntry::SystemInstruction(TextEntry {
+                id: ConversationEntryId("system".into()),
+                text: "system policy".into(),
+                source_sequence: sequence(1),
+            }),
+            ConversationEntry::PendingTask(PendingTaskEntry {
+                id: ConversationEntryId("task".into()),
+                task_id: "t1".into(),
+                description: "finish".into(),
+                state: "pending".into(),
+                source_sequence: sequence(2),
+            }),
+            user("u1", 3),
+            user("u2", 4),
+            user("u3", 5),
+            user("u4", 6),
+        ];
+        let state = state(entries.clone());
+        let requirements = vec![
+            String::from("system_instructions"),
+            String::from("current_input"),
+            String::from("pending_control_state"),
+        ];
+        let material =
+            build_summary_request_material(&state, 64 * 1024, &requirements, 2).expect("material");
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "system"));
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "task"));
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "u3"));
+        assert!(material.entries.iter().any(|entry| entry.id().0 == "u4"));
+        assert!(!material.entries.iter().any(|entry| entry.id().0 == "u1"));
+        assert_eq!(material.source_range, Some((Sequence::FIRST, sequence(6))));
+        assert!(material.serialized_bytes > 0);
+        // A too-small cap on protected state fails closed instead of dropping it.
+        assert_eq!(
+            build_summary_request_material(&state, 4, &requirements, 2),
+            Err(CompactionError::SummaryMaterialTooLarge)
+        );
+    }
 }

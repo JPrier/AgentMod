@@ -61,10 +61,15 @@ agentmod-acp
 runtime status as unsuccessful. Session creation defaults to the current
 workspace, `persistent-chat`, and the style-selected `native` harness. Use
 `harness list` and `harness inspect` to view adapter versions, availability,
-capabilities, and the exact capability-set hash. An explicit `--harness`
+capabilities, and the exact capability-set hash. The registry advertises the
+`native`, `fixture`, and independent `agentmod-harness-fixture` (ID
+`independent`) adapters. An explicit `--harness`
 override is accepted only when it satisfies the selected style.
 `--memory` and `--compaction` apply SDK-owned component transforms and compile a
-new immutable per-session binding. Omitting them retains the style defaults;
+new immutable per-session binding. A `summary` compaction strategy may carry an
+explicit `summary` provider/model selection that asks the runtime to generate
+the bounded summary through a live model request instead of the deterministic
+generator. Omitting them retains the style defaults;
 invalid or unavailable selections fail with style diagnostics.
 The five optional budget flags also compile a new binding. The SDK narrows
 subordinate inline-graph, compaction, retry, and child-agent bounds to the

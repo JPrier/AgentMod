@@ -844,5 +844,23 @@ broader host-category crash injection, TUI LSP management, additional plugin
 action classes and nested parallel regions, the complete planner
 workspace-mode/write-denial matrix, transitive/grandchild MCP inheritance, and
 macOS.
-The final mandatory cross-platform
-validation against the converged tree has not yet been run.
+Live provider adapters are now integrated in the native harness dependency
+layer: generic OpenAI-compatible, OpenRouter, OpenAI, Anthropic, Gemini, and
+local endpoints speak their documented wire formats through a bounded SSE
+parser, retry classification, pricing/cost metadata, and a provider catalog
+wire command. Provider secrets are resolved exclusively from environment or
+`file:` references and never cross protocol frames, events, logs, or request
+options; TLS verification defaults to enabled. The runtime forwards only the
+curated `AGENTMOD_PROVIDER_*` environment channel to the supervised harness.
+An independent second harness (`agentmod-harness-fixture`) with its own n-tier
+implementation is registered in the runtime harness registry under `independent`.
+A runtime-supervised live-provider fixture E2E drives a real session through
+the `local` adapter against a deterministic HTTP fixture and passes on
+Ubuntu/WSL2; a Windows named-pipe variant is provided. A model-generated
+summary strategy is available as an explicit `summary` compaction selection:
+it runs the normal proposal -> policy -> dispatch -> terminal-evidence path
+with canonical `context.summary_*` outbox events, exact request hashes, durable
+terminal evidence (no duplicate provider call after restart), fail-closed
+ambiguous completion, and bounded schema/output. The deterministic typed
+summary remains the default. The final mandatory cross-platform validation
+against the converged tree is recorded in `docs/integration/SUBAGENT-RECONCILIATION.md`.

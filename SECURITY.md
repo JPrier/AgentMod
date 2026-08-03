@@ -16,4 +16,12 @@ The intended security invariants are:
 - filesystem, process, and network operations enforce platform-aware boundaries;
 - recovery never silently repeats an externally uncertain side effect.
 
+Live provider secrets follow the reference-only rule: API keys are resolved from
+explicit environment references or `file:` references at harness startup, never
+from inline request options. Passing a plaintext `api_key` option is rejected.
+TLS peer verification defaults to enabled; disabling it requires an explicit
+configuration override. Custom endpoints and proxies require explicit
+configuration, response bodies and SSE streams are bounded, and ambiguous
+provider disconnects fail closed rather than being redispatched.
+
 These are release requirements, not claims that all controls are implemented today.

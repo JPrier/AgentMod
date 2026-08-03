@@ -1,16 +1,24 @@
 # Provider System
 
 The provider-neutral harness protocol carries approved structured projections,
-execute/continue/cancel/health commands, visible text and tool-call deltas,
-tool-call proposals, normalized completion/failure, usage, and structured
-context-replacement decisions.
+execute/continue/cancel/health/catalog commands, visible text and tool-call
+deltas, tool-call proposals, normalized completion/failure, usage, cost
+metadata, and structured context-replacement decisions.
 
 The native harness and deterministic fixture are separately registered bounded
 JSONL process endpoints. The native implementation's complete
-service → logic → data → dependency path currently implements a deterministic
+service → logic → data → dependency path implements a deterministic
 mock provider with text, streaming fragments, one or multiple tool calls,
 malformed arguments, timeout, rate limit, partial failure, cancellation,
-disconnect, usage, and explicit continuation fixtures.
+disconnect, usage, and explicit continuation fixtures. In addition, the live
+provider adapters (generic OpenAI-compatible, OpenRouter, OpenAI, Anthropic,
+Gemini, and local endpoints) speak their documented wire formats through a
+bounded SSE parser, retry classification, pricing/cost metadata, and a
+provider-catalog wire command. Secrets are resolved from environment or
+`file:` references only and never cross protocol frames, events, logs, or
+request options; TLS verification defaults to enabled. A second independent
+harness (`agentmod-harness-fixture`) provides its own n-tier provider
+implementation and is registered as `independent` in the runtime registry.
 
 Runtime provider execution follows this implemented sequence:
 

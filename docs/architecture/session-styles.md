@@ -26,6 +26,14 @@ the exact base style, reapplies only the retained memory/compaction/budget selec
 recompiles, and compares the complete binding. Invalid or unavailable
 components return SDK-derived diagnostics and are never silently replaced.
 
+A `summary` compaction strategy may additionally select an explicit live
+model-generated summary (`compaction.summary` with provider/model and a bounded
+request-token budget). When set, runtime logic executes the summary as a normal
+provider request through proposal/policy/dispatch/terminal-evidence with
+canonical `context.summary_*` outbox events; otherwise it uses the deterministic
+bounded typed-summary generator. The selection is part of the immutable binding,
+so restart and branch validation retain it exactly.
+
 Budget transforms are SDK-owned. They update the style-wide ceilings and narrow
 subordinate inline-graph, compaction, retry, and child-agent declarations before
 normal compilation. Referenced graphs are not rewritten: a selected ceiling

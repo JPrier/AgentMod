@@ -19,4 +19,9 @@ action and therefore fail with an explicit unsupported-schema error.
 
 Provider live compatibility requires supported official APIs and is tested separately
 from the credential-free default suite. Exact validated versions will be recorded in
-release evidence.
+release evidence. The live provider adapters (OpenAI-compatible, OpenRouter, OpenAI,
+Anthropic, Gemini, local) are implemented in the native harness dependency layer;
+official-API smoke tests remain opt-in and are not required by the default offline
+suite. Harness protocol `Usage` and completion events gain serde-defaulted
+reasoning-token, estimated-usage, and cost fields, and the `catalog` command is an
+additive wire variant, so older harnesses and runtime clients remain readable.

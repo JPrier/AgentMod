@@ -127,3 +127,16 @@ identity, duplicate node resolution, an extra live-registry registration that
 must not alter the existing selection, and atomic branch failure are all
 covered by dependency, data, logic, and integration tests. Corrupt files fail
 closed with stable `EPLAN-3xx`/`EPLAN-4xx` diagnostics.
+
+## Mirror authority
+
+The persisted `execution-plan.json` is a **verified immutable mirror** of the
+canonical plan retained in the style binding and canonical `session.created`
+evidence. It is never authoritative: the canonical binding is the only
+single source of truth. A binding/mirror mismatch fails closed (the session is
+not resumed until the mismatch is resolved); a missing legacy mirror produces
+an explicit migration/availability diagnostic rather than silent
+reconstruction. Branches and child sessions stage their own mirrors atomically
+at creation. The mirror exists to expose restart mismatch diagnostics,
+corruption classification, and inspection projections, not to override the
+canonical plan.

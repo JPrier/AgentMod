@@ -63,9 +63,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Ok(command @ HarnessCommand::Continue { .. }) => {
                     let service = service.clone();
                     tokio::task::spawn_blocking(move || {
-                        service
-                            .continue_wire(&command)
-                            .map_or_else(|_| vec![failed("continuation_failed")], incremental_replies)
+                        service.continue_wire(&command).map_or_else(
+                            |_| vec![failed("continuation_failed")],
+                            incremental_replies,
+                        )
                     })
                     .await
                     .unwrap_or_else(|_| vec![failed("continuation_failed")])

@@ -207,22 +207,22 @@ use crate::{
         ContextProjectionReplacementApprovedEvent, ContextSummaryApprovedEvent,
         ContextSummaryCompletedEvent, ContextSummaryFailedEvent, ContextSummaryIdentity,
         ContextSummaryProposedEvent, ContextSummaryStartedEvent, ContextSummaryState,
-        ConversationEntryCommittedEvent,
-        GenericModelInvocationBoundEvent, GenericModelToolBatchSuspendedEvent,
-        GenericProviderToolBatchBoundEvent, GraphNodeWaitDisposition, GraphNodeWaitResolvedEvent,
-        GraphScheduleApprovedEvent, GraphScheduleCancellationCompletedEvent,
-        GraphScheduleCancellationRequestedEvent, GraphScheduleDispatchedEvent,
-        GraphScheduleIdentity, GraphScheduleResolvedEvent, GraphScheduleState,
-        GraphScheduleStoredEvent, GraphScheduleTriggeredEvent, ModelOutputDeltaObservedEvent,
-        ModelRequestApprovedEvent, ModelRequestCancelledEvent, ModelRequestFailedEvent,
-        ModelRequestProposedEvent, ModelRequestStartedEvent, ModelResponseCompletedEvent,
-        ModelToolCallDeltaObservedEvent, ModelToolCallProposedEvent, PlannedTask,
-        PluginContextApprovalStage, PluginContextOperationProposal, PluginContextOperationRequest,
-        PluginInvocationCompletedEvent, PluginNodeActionAmbiguousEvent,
-        PluginNodeActionAppliedEvent, PluginNodeActionFailedEvent, PluginNodeActionProposedEvent,
-        PluginNodeActionTerminalRecord, PluginNodeBudgetChargedEvent, PluginNodeBudgetUsage,
-        PluginNodeInvocationFailedEvent, PluginNodeOutcomeRejectionDisposition,
-        PluginNodeOutcomeValidatedEvent, PluginNodeRuntimeActionProposal, PluginSetActivatedEvent,
+        ConversationEntryCommittedEvent, GenericModelInvocationBoundEvent,
+        GenericModelToolBatchSuspendedEvent, GenericProviderToolBatchBoundEvent,
+        GraphNodeWaitDisposition, GraphNodeWaitResolvedEvent, GraphScheduleApprovedEvent,
+        GraphScheduleCancellationCompletedEvent, GraphScheduleCancellationRequestedEvent,
+        GraphScheduleDispatchedEvent, GraphScheduleIdentity, GraphScheduleResolvedEvent,
+        GraphScheduleState, GraphScheduleStoredEvent, GraphScheduleTriggeredEvent,
+        ModelOutputDeltaObservedEvent, ModelRequestApprovedEvent, ModelRequestCancelledEvent,
+        ModelRequestFailedEvent, ModelRequestProposedEvent, ModelRequestStartedEvent,
+        ModelResponseCompletedEvent, ModelToolCallDeltaObservedEvent, ModelToolCallProposedEvent,
+        PlannedTask, PluginContextApprovalStage, PluginContextOperationProposal,
+        PluginContextOperationRequest, PluginInvocationCompletedEvent,
+        PluginNodeActionAmbiguousEvent, PluginNodeActionAppliedEvent, PluginNodeActionFailedEvent,
+        PluginNodeActionProposedEvent, PluginNodeActionTerminalRecord,
+        PluginNodeBudgetChargedEvent, PluginNodeBudgetUsage, PluginNodeInvocationFailedEvent,
+        PluginNodeOutcomeRejectionDisposition, PluginNodeOutcomeValidatedEvent,
+        PluginNodeRuntimeActionProposal, PluginSetActivatedEvent,
         ProcessReconciliationCompletedEvent, ProcessReconciliationStartedEvent,
         ProcessReconciliationStatus, ReviewerFindingsCommittedEvent, RuntimeCommittedEvent,
         SchedulerDeliveryReconciledEvent, SchedulerFiredEvent, SchedulerTriggerObservation,
@@ -20220,19 +20220,18 @@ where
                         // summary (an explicit provider/model request) instead
                         // of the deterministic runtime generator.
                         if binding.compaction.summary.is_some() {
-                            let (summary_text, summary_id, _provider, _model, next_position) =
-                                self
-                                    .execute_live_summary(
-                                        persistence,
-                                        session_id,
-                                        session_directory,
-                                        &state,
-                                        &binding,
-                                        command,
-                                        initial_committed_at,
-                                        position,
-                                    )
-                                    .await?;
+                            let (summary_text, summary_id, _provider, _model, next_position) = self
+                                .execute_live_summary(
+                                    persistence,
+                                    session_id,
+                                    session_directory,
+                                    &state,
+                                    &binding,
+                                    command,
+                                    initial_committed_at,
+                                    position,
+                                )
+                                .await?;
                             position = next_position;
                             let mut plan = compact_projection(
                                 &state.conversation,
@@ -20261,7 +20260,7 @@ where
                                 Vec::new(),
                             )
                         }
-                    },
+                    }
                     "artifact_handoff" => {
                         let bytes = canonical_json_bytes(&json!({
                             "schema": "agentmod.context-artifact.v1",

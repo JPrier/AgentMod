@@ -398,10 +398,16 @@ pub struct CompactionSelection {
     pub summary: Option<SummaryCompactionSelection>,
     /// Maximum provider-visible summary content bytes for a live
     /// model-generated summary.
-    #[serde(default = "default_summary_max_bytes", skip_serializing_if = "is_default_summary_max_bytes")]
+    #[serde(
+        default = "default_summary_max_bytes",
+        skip_serializing_if = "is_default_summary_max_bytes"
+    )]
     pub summary_max_bytes: u32,
     /// Canonical bounded summary schema version written by the runtime.
-    #[serde(default = "default_summary_schema_version", skip_serializing_if = "is_default_summary_schema_version")]
+    #[serde(
+        default = "default_summary_schema_version",
+        skip_serializing_if = "is_default_summary_schema_version"
+    )]
     pub summary_schema_version: u16,
 }
 
@@ -413,10 +419,12 @@ fn default_summary_schema_version() -> u16 {
     1
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_default_summary_max_bytes(value: &u32) -> bool {
     *value == default_summary_max_bytes()
 }
 
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_default_summary_schema_version(value: &u16) -> bool {
     *value == default_summary_schema_version()
 }

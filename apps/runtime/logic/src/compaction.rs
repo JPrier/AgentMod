@@ -395,9 +395,8 @@ pub fn build_summary_request_material(
     let mut entries = Vec::new();
     let mut bytes = 0_u64;
     for (index, entry) in source.iter().enumerate() {
-        let required =
-            summary_entry_is_required(entry, current_input, preservation_requirements)
-                || index >= recent_start;
+        let required = summary_entry_is_required(entry, current_input, preservation_requirements)
+            || index >= recent_start;
         if required {
             let contribution = serialized_entry_bytes(entry)?;
             if bytes.saturating_add(contribution) > max_bytes {
@@ -750,7 +749,12 @@ mod tests {
         ];
         let material =
             build_summary_request_material(&state, 64 * 1024, &requirements, 2).expect("material");
-        assert!(material.entries.iter().any(|entry| entry.id().0 == "system"));
+        assert!(
+            material
+                .entries
+                .iter()
+                .any(|entry| entry.id().0 == "system")
+        );
         assert!(material.entries.iter().any(|entry| entry.id().0 == "task"));
         assert!(material.entries.iter().any(|entry| entry.id().0 == "u3"));
         assert!(material.entries.iter().any(|entry| entry.id().0 == "u4"));

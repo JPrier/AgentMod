@@ -429,11 +429,15 @@ const fn map_failure_kind(kind: DependencyProviderFailureKind) -> DataProviderFa
         DependencyProviderFailureKind::UnsupportedCapability => {
             DataProviderFailureKind::UnsupportedCapability
         }
-        DependencyProviderFailureKind::TransportFailure => DataProviderFailureKind::TransportFailure,
+        DependencyProviderFailureKind::TransportFailure => {
+            DataProviderFailureKind::TransportFailure
+        }
         DependencyProviderFailureKind::AmbiguousDisconnect => {
             DataProviderFailureKind::AmbiguousDisconnect
         }
-        DependencyProviderFailureKind::UserCancellation => DataProviderFailureKind::UserCancellation,
+        DependencyProviderFailureKind::UserCancellation => {
+            DataProviderFailureKind::UserCancellation
+        }
     }
 }
 

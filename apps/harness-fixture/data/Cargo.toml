@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-harness-fixture-dependency = { path = "../dependency" }
+agentmod-harness-fixture-dependency = { version = "0.1.0", path = "../dependency" }
 async-trait.workspace = true
 thiserror.workspace = true
 

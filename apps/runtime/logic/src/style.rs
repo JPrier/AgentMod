@@ -1174,9 +1174,7 @@ fn binding(
             preservation_requirements: string_array(Some(compaction), "preservation_requirements"),
             summary: match compaction.get("summary").and_then(Value::as_object) {
                 Some(selection) => Some(SessionSummaryCompactionSelection {
-                    provider: required_string(
-                        selection.get("provider").and_then(Value::as_str),
-                    )?,
+                    provider: required_string(selection.get("provider").and_then(Value::as_str))?,
                     model: required_string(selection.get("model").and_then(Value::as_str))?,
                     max_request_tokens: selection
                         .get("max_request_tokens")

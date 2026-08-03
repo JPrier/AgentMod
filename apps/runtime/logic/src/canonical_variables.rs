@@ -3470,19 +3470,14 @@ mod tests {
                 reducer,
                 RUNTIME_PRODUCER,
                 VariableValidationAttempt::Declare {
-                    declaration: declaration(
-                        name,
-                        VariableValueType::String,
-                        RUNTIME_PRODUCER,
-                    ),
+                    declaration: declaration(name, VariableValueType::String, RUNTIME_PRODUCER),
                 },
             ));
         }
         let rounds = 3 + next(5);
         for _ in 0..rounds {
             let name = &names[next(names.len())];
-            let value =
-                CanonicalVariableValue::String(format!("value-{}-{}", seed, next(1000)));
+            let value = CanonicalVariableValue::String(format!("value-{}-{}", seed, next(1000)));
             events.push(apply_attempt(
                 reducer,
                 RUNTIME_PRODUCER,

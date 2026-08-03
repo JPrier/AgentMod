@@ -115,9 +115,7 @@ where
                 self.health(request).map(ServiceResponse::Health)
             }
             HarnessCommand::Catalog => self.catalog(true).map(ServiceResponse::Catalog),
-            _ => Err(ServiceError::UnsupportedCommand {
-                command: "execute",
-            }),
+            _ => Err(ServiceError::UnsupportedCommand { command: "execute" }),
         }
     }
 

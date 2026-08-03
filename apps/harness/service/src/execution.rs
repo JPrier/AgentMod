@@ -553,10 +553,7 @@ fn map_logic_event(event: LogicProviderEvent) -> ServiceProviderEvent {
     }
 }
 
-fn map_usage(
-    usage: LogicUsage,
-    cost: Option<LogicCostMetadata>,
-) -> ServiceUsage {
+fn map_usage(usage: LogicUsage, cost: Option<LogicCostMetadata>) -> ServiceUsage {
     ServiceUsage {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,

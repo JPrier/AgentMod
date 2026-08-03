@@ -17604,15 +17604,14 @@ fn generic_context_effect_evidence_complete(
     else {
         return false;
     };
-    let matches = execution.context_boundaries.iter().rev().any(|boundary| {
+    execution.context_boundaries.iter().rev().any(|boundary| {
         boundary.identity.node_id == completed.node_id
             && boundary.identity.boundary == "context_node"
             && boundary.identity.run_id == run_id
             && boundary
                 .completed_at
                 .is_some_and(|sequence| sequence <= journal_head)
-    });
-    matches
+    })
 }
 
 /// Validates the memory-provenance security constraint for a generic
@@ -17679,7 +17678,10 @@ fn generic_fresh_context_memory_evidence_complete(
                         }
                         _ => None,
                     });
-            (ContextBoundaryOrigin::UserTurn, canonical_user == Some(user))
+            (
+                ContextBoundaryOrigin::UserTurn,
+                canonical_user == Some(user),
+            )
         }
         ConversationEntry::PendingTask(_) => (ContextBoundaryOrigin::ChildTask, true),
         _ => return false,
@@ -18111,11 +18113,7 @@ fn style_node_effect_evidence_complete(
                 // complete a fresh-context node. The node configuration (not
                 // the graph topology) is the discriminator: distinct styles may
                 // intentionally share a built-in node shape.
-                if !generic_context_effect_evidence_complete(
-                    execution,
-                    completed,
-                    journal_head,
-                ) {
+                if !generic_context_effect_evidence_complete(execution, completed, journal_head) {
                     return false;
                 }
                 if matches!(
@@ -29333,4 +29331,3 @@ to = "done"
         ));
     }
 }
-

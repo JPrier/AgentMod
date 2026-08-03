@@ -1521,8 +1521,7 @@ pub(crate) mod tests {
             BuiltInStyle::PlannerWorker,
             BuiltInStyle::DeclarativeGraph,
         ] {
-            let executor =
-                CompiledStyleExecutor::from_binding(&binding(style)).expect("executor");
+            let executor = CompiledStyleExecutor::from_binding(&binding(style)).expect("executor");
             let graph = &executor.compiled().graph;
             for node in &graph.nodes {
                 let first = executor.transition(node.index, &json!({}));

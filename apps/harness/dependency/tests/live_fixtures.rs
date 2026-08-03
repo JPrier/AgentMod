@@ -17,7 +17,7 @@ use std::{
 use agentmod_harness_dependency::execution::{
     DependencyConversationEntry, DependencyProviderEvent, DependencyProviderExecutionRequest,
     DependencyProviderFailureKind, DependencyProviderOption, DependencyRetryClassification,
-    ProviderCancellationDependency, ProviderExecutionDependency,
+    DependencyUsage, ProviderCancellationDependency, ProviderExecutionDependency,
 };
 use agentmod_harness_dependency::live::{
     LiveProviderCatalogDependency, PROVIDER_ANTHROPIC, PROVIDER_GEMINI, PROVIDER_LOCAL,
@@ -181,10 +181,6 @@ fn sse_event(event: &str, data: &str) -> Vec<u8> {
     format!("event: {event}\ndata: {data}\n\n").into_bytes()
 }
 
-fn sse_keepalive() -> Vec<u8> {
-    b": keepalive\n\n".to_vec()
-}
-
 fn option(key: &str, value: &str) -> DependencyProviderOption {
     DependencyProviderOption {
         key: key.into(),
@@ -220,22 +216,24 @@ fn user(text: &str) -> DependencyConversationEntry {
 
 #[test]
 fn openai_compatible_streams_text_with_fragmented_utf8_and_usage() {
-    let base = spawn_server(|_headers, _body| {
-        ResponsePlan::SseChunks {
-            chunks: vec![
-                sse(&json!({"choices": [{"delta": {"content": "hé"}, "finish_reason": null}]}).to_string()),
-                sse(&json!({"choices": [{"delta": {"content": "llo"}, "finish_reason": null}]}).to_string()),
-                sse(
-                    &json!({
-                        "choices": [{"delta": {}, "finish_reason": "stop"}],
-                        "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
-                    })
+    let base = spawn_server(|_headers, _body| ResponsePlan::SseChunks {
+        chunks: vec![
+            sse(
+                &json!({"choices": [{"delta": {"content": "hé"}, "finish_reason": null}]})
                     .to_string(),
-                ),
-                b"data: [DONE]\n\n".to_vec(),
-            ],
-            hold_open_ms: 0,
-        }
+            ),
+            sse(
+                &json!({"choices": [{"delta": {"content": "llo"}, "finish_reason": null}]})
+                    .to_string(),
+            ),
+            sse(&json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+            })
+            .to_string()),
+            b"data: [DONE]\n\n".to_vec(),
+        ],
+        hold_open_ms: 0,
     });
     let dependency = LiveProviderCatalogDependency::development();
     let response = dependency
@@ -332,7 +330,7 @@ fn openai_compatible_streams_tool_call_deltas_and_multiple_proposals() {
         response.events.last(),
         Some(&DependencyProviderEvent::Completed {
             finish_reason: String::from("tool_calls"),
-            usage: Default::default(),
+            usage: DependencyUsage::default(),
             cost: None,
         })
     );
@@ -340,21 +338,20 @@ fn openai_compatible_streams_tool_call_deltas_and_multiple_proposals() {
 
 #[test]
 fn openrouter_returns_usage_and_computed_cost_metadata() {
-    let base = spawn_server(|_headers, _body| {
-        ResponsePlan::SseChunks {
-            chunks: vec![
-                sse(&json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": null}]}).to_string()),
-                sse(
-                    &json!({
-                        "choices": [{"delta": {}, "finish_reason": "stop"}],
-                        "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
-                    })
+    let base = spawn_server(|_headers, _body| ResponsePlan::SseChunks {
+        chunks: vec![
+            sse(
+                &json!({"choices": [{"delta": {"content": "hi"}, "finish_reason": null}]})
                     .to_string(),
-                ),
-                b"data: [DONE]\n\n".to_vec(),
-            ],
-            hold_open_ms: 0,
-        }
+            ),
+            sse(&json!({
+                "choices": [{"delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            })
+            .to_string()),
+            b"data: [DONE]\n\n".to_vec(),
+        ],
+        hold_open_ms: 0,
     });
     let dependency = LiveProviderCatalogDependency::development();
     let mut options = options_with_base(&format!("http://{base}/v1"));
@@ -390,16 +387,14 @@ fn openrouter_returns_usage_and_computed_cost_metadata() {
 
 #[test]
 fn openai_non_streaming_response_is_normalized() {
-    let base = spawn_server(|_headers, _body| {
-        ResponsePlan::Full {
-            status: 200,
-            headers: vec![("Content-Type".into(), "application/json".into())],
-            body: serde_json::to_vec(&json!({
-                "choices": [{"message": {"content": "non-streaming reply"}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
-            }))
-            .expect("response body"),
-        }
+    let base = spawn_server(|_headers, _body| ResponsePlan::Full {
+        status: 200,
+        headers: vec![("Content-Type".into(), "application/json".into())],
+        body: serde_json::to_vec(&json!({
+            "choices": [{"message": {"content": "non-streaming reply"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        }))
+        .expect("response body"),
     });
     let dependency = LiveProviderCatalogDependency::development();
     let mut options = options_with_base(&format!("http://{base}/v1"));
@@ -602,23 +597,26 @@ fn image_inputs_are_serialized_into_the_request_body() {
             "cancel-image",
         ))
         .expect("live execution");
-    assert!(response
-        .events
-        .iter()
-        .any(|event| matches!(event, DependencyProviderEvent::Completed { .. })));
+    assert!(
+        response
+            .events
+            .iter()
+            .any(|event| matches!(event, DependencyProviderEvent::Completed { .. }))
+    );
 }
 
 #[test]
 fn malformed_sse_fails_closed_without_stream_partial_claims() {
-    let base = spawn_server(|_headers, _body| {
-        ResponsePlan::SseChunks {
-            chunks: vec![
-                sse("not-json-{"),
-                sse(&json!({"choices": [{"delta": {"content": "partial"}, "finish_reason": null}]}).to_string()),
-                b"data: [DONE]\n\n".to_vec(),
-            ],
-            hold_open_ms: 0,
-        }
+    let base = spawn_server(|_headers, _body| ResponsePlan::SseChunks {
+        chunks: vec![
+            sse("not-json-{"),
+            sse(
+                &json!({"choices": [{"delta": {"content": "partial"}, "finish_reason": null}]})
+                    .to_string(),
+            ),
+            b"data: [DONE]\n\n".to_vec(),
+        ],
+        hold_open_ms: 0,
     });
     let dependency = LiveProviderCatalogDependency::development();
     let response = dependency
@@ -642,12 +640,10 @@ fn malformed_sse_fails_closed_without_stream_partial_claims() {
 
 #[test]
 fn retryable_rate_limit_is_classified_with_delay() {
-    let base = spawn_server(|_headers, _body| {
-        ResponsePlan::Full {
-            status: 429,
-            headers: vec![("Retry-After".into(), "5".into())],
-            body: br#"{"error":{"message":"rate limited"}}"#.to_vec(),
-        }
+    let base = spawn_server(|_headers, _body| ResponsePlan::Full {
+        status: 429,
+        headers: vec![("Retry-After".into(), "5".into())],
+        body: br#"{"error":{"message":"rate limited"}}"#.to_vec(),
     });
     let dependency = LiveProviderCatalogDependency::development();
     let response = dependency
@@ -671,12 +667,10 @@ fn retryable_rate_limit_is_classified_with_delay() {
 
 #[test]
 fn non_retryable_auth_failure_is_classified_never() {
-    let base = spawn_server(|_headers, _body| {
-        ResponsePlan::Full {
-            status: 401,
-            headers: vec![("Content-Type".into(), "application/json".into())],
-            body: br#"{"error":{"message":"invalid api key"}}"#.to_vec(),
-        }
+    let base = spawn_server(|_headers, _body| ResponsePlan::Full {
+        status: 401,
+        headers: vec![("Content-Type".into(), "application/json".into())],
+        body: br#"{"error":{"message":"invalid api key"}}"#.to_vec(),
     });
     let dependency = LiveProviderCatalogDependency::development();
     let mut options = options_with_base(&format!("http://{base}/v1"));
@@ -702,13 +696,12 @@ fn non_retryable_auth_failure_is_classified_never() {
 
 #[test]
 fn ambiguous_disconnect_fails_closed_without_completion() {
-    let base = spawn_server(|_headers, _body| {
-        ResponsePlan::SseChunks {
-            chunks: vec![
-                sse(&json!({"choices": [{"delta": {"content": "partial"}, "finish_reason": null}]}).to_string()),
-            ],
-            hold_open_ms: 5_000,
-        }
+    let base = spawn_server(|_headers, _body| ResponsePlan::SseChunks {
+        chunks: vec![sse(
+            &json!({"choices": [{"delta": {"content": "partial"}, "finish_reason": null}]})
+                .to_string(),
+        )],
+        hold_open_ms: 5_000,
     });
     let dependency = LiveProviderCatalogDependency::development();
     let response = dependency
@@ -727,10 +720,12 @@ fn ambiguous_disconnect_fails_closed_without_completion() {
             ..
         })
     ));
-    assert!(!response.events.iter().any(|event| matches!(
-        event,
-        DependencyProviderEvent::Completed { .. }
-    )));
+    assert!(
+        !response
+            .events
+            .iter()
+            .any(|event| matches!(event, DependencyProviderEvent::Completed { .. }))
+    );
 }
 
 #[test]

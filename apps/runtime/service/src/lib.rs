@@ -274,6 +274,10 @@ pub enum ServiceStyleDecisionCapability {
 impl RuntimeStyleServiceConfig {
     /// Builds the native runtime's explicit first-party capability registry.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the native capability registry keeps every advertised first-party component explicit"
+    )]
     pub fn native(session_root: &std::path::Path) -> Self {
         let parent = session_root.parent().unwrap_or(session_root);
         Self {

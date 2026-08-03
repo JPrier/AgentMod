@@ -200,7 +200,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let independent_harness = ProcessHarnessDependency::new(HarnessDependencyConfig {
             program: std::env::var("AGENTMOD_INDEPENDENT_HARNESS_PROGRAM")
                 .or_else(|_| std::env::var("AGENTMOD_FIXTURE_HARNESS_PROGRAM"))
-                .map_or_else(|_| sibling_binary("agentmod-harness-fixture"), PathBuf::from)
+                .map_or_else(
+                    |_| sibling_binary("agentmod-harness-fixture"),
+                    PathBuf::from,
+                )
                 .to_string_lossy()
                 .into_owned(),
             arguments: Vec::new(),

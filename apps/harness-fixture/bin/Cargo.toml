@@ -8,11 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-agentmod-harness-fixture-data = { path = "../data" }
-agentmod-harness-fixture-dependency = { path = "../dependency" }
-agentmod-harness-fixture-logic = { path = "../logic" }
-agentmod-harness-fixture-service = { path = "../service" }
-agentmod-harness-protocol = { path = "../../../protocols/harness-protocol" }
+agentmod-harness-fixture-data = { version = "0.1.0", path = "../data" }
+agentmod-harness-fixture-dependency = { version = "0.1.0", path = "../dependency" }
+agentmod-harness-fixture-logic = { version = "0.1.0", path = "../logic" }
+agentmod-harness-fixture-service = { version = "0.1.0", path = "../service" }
+agentmod-harness-protocol = { version = "0.1.0", path = "../../../protocols/harness-protocol" }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["io-std"] }
 
@@ -24,6 +24,6 @@ kind = "composition-root"
 process = "harness-fixture"
 
 [dev-dependencies]
-agentmod-primitives = { path = "../../../core/primitives" }
+agentmod-primitives = { version = "0.1.0", path = "../../../core/primitives" }
 blake3.workspace = true
 uuid.workspace = true

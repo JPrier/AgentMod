@@ -338,10 +338,7 @@ impl execution::ProviderCancellationDependency for CompositeProviderCatalogDepen
         &self,
         cancellation_reference: &str,
     ) -> Result<bool, execution::ProviderExecutionDependencyError> {
-        if self
-            .deterministic
-            .cancel_provider(cancellation_reference)?
-        {
+        if self.deterministic.cancel_provider(cancellation_reference)? {
             return Ok(true);
         }
         self.live.cancel_provider(cancellation_reference)

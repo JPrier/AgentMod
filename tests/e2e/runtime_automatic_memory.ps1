@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $repository = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 Push-Location $repository
 try {
-    cargo build --locked -p agentmod-runtime -p agentmod-scheduler `
+    cargo build --locked -p agentmod-runtime -p agentmod-scheduler -p agentmod-harness -p agentmod-cli -p agentmod-filesystem-host
         -p agentmod-harness -p agentmod-cli
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
 
@@ -25,17 +25,10 @@ try {
     $workspace = Join-Path $runRoot "workspace"
     $styleRoot = Join-Path $runRoot "styles\user"
     New-Item -ItemType Directory -Path $workspace, $styleRoot -Force | Out-Null
-    $style = (
-        Get-Content tests\fixtures\styles\persistent-file-none.toml -Raw
-    ).Replace(
-        'id = "e2e-persistent-file"',
-        'id = "e2e-automatic-memory"'
-    ).Replace(
-        'write_policy = "explicit_only"',
-        'write_policy = "turn_completion"'
-    )
-    $stylePath = Join-Path $styleRoot "automatic-memory.toml"
-    Set-Content -LiteralPath $stylePath -Value $style -NoNewline
+    Copy-Item -Path (Join-Path $repository "tests/fixtures/styles/automatic-memory-file.toml") -Destination (Join-Path $styleRoot "automatic-memory.toml")
+    # The style graph uses a fixed `filesystem.read` gate; make the read succeed.
+    New-Item -ItemType Directory -Path (Join-Path $workspace "src") -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $workspace 'src/lib.rs') -Value 'pub fn fixture() -> bool { true }' -NoNewline
 
     $env:AGENTMOD_RUNTIME_ENDPOINT = (
         "\\.\pipe\agentmod-automatic-memory-e2e-" +
@@ -45,6 +38,7 @@ try {
         "0123456789abcdef0123456789abcdef0123456789abcdef"
     )
     $env:AGENTMOD_HARNESS_PROGRAM = $harness
+    $env:AGENTMOD_FILESYSTEM_HOST_PROGRAM = (Resolve-Path (Join-Path $debugRoot "agentmod-filesystem-host.exe")).Path
     $env:AGENTMOD_MEMORY_WRITE_POST_PERSIST_DELAY_MS = "10000"
     $runtimeErr = Join-Path $runRoot "runtime.stderr.log"
 
@@ -375,6 +369,7 @@ try {
         $daemon.WaitForExit()
         $env:AGENTMOD_MEMORY_WRITE_PERMISSION_MODE = "ask"
         $env:AGENTMOD_HARNESS_PROGRAM = $harness
+    $env:AGENTMOD_FILESYSTEM_HOST_PROGRAM = (Resolve-Path (Join-Path $debugRoot "agentmod-filesystem-host.exe")).Path
         Start-Runtime
 
         $askSession = & $cli session create --workspace $workspace `

@@ -37,7 +37,7 @@ Must be expressible:
 
 - Plugins are uncategorized. One generic shape: event in → contributed context + output events. "Memory", "compaction", "introspection", "frontend", "tool", "provider" are things plugins happen to do — never runtime concepts.
 - Plugin authorship is language-agnostic. Writing a plugin must not require Rust, so existing tools can be wrapped as plugins.
-- Hot-swap at runtime: plugins and integrations change without core restarts, while 10–100 concurrent sessions keep running through the experiment.
+- Hot-swap at runtime: plugins and integrations change without core restarts, while live sessions keep running through the experiment; changes take effect at the next applicable step without a forced full-turn wait or user-visible reconfiguration pause.
 - State changes only through plugin invocations. A plugin may leave state unchanged; when state changes, the change is attributable to exactly one recorded invocation.
 
 ### History and observability
@@ -54,7 +54,9 @@ Must be expressible:
 
 ### Performance
 
-- Runtime overhead is imperceptible against model latency: the core's own event path — routing, pipeline traversal, plugin dispatch, history writes — adds no more than ~10 ms end-to-end versus a direct API call, sustained at 100 concurrent sessions on developer hardware. Plugin execution time is outside this budget and is the plugin author's responsibility.
+- Harness resource demand grows proportionally with equivalent active work, with stable per-session overhead given sufficient compute. The current use case is 200 active sessions, with hundreds of thousands a future design consideration and no arbitrary session ceiling.
+- Saved or inactive sessions impose no ongoing execution overhead merely by existing. With insufficient compute, runnable work waits and eventually continues without lost progress; finite physical resources still impose limits.
+- Implement required features efficiently. Evaluate alternatives against the [problem statement's capability gates](problem-statement.md) before comparative performance analysis; no fixed 10 ms threshold applies.
 - Interactive streaming remains token-smooth.
 
 ### Deployment

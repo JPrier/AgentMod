@@ -1,79 +1,109 @@
-# Framework research against AgentMod problem rubric
+# Orchestration frameworks against the AgentMod problem rubric
 
-Issue #15 | Research date: 2026-09-13
+Research date: 2026-09-13. Decision ticket: [Research: orchestration frameworks scored against the problem rubric](https://github.com/JPrier/AgentMod/issues/15).
 
-## Method
+## Scope and method
 
-This is a capability-first desk review of first-party documentation and public source repositories. A verdict is **Pass** only where ordinary supported extension interfaces demonstrate the complete requirement. **Fail** means the documented architecture contradicts the requirement. **Unverified** means the evidence is insufficient; it is not an impossibility claim. No performance scoring was performed because no candidate qualified all mandatory capability gates.
+This survey covers LangGraph/Platform, Amazon Strands, Temporal, Restate, Mastra, Inngest, and OpenClaw-as-platform against the [approved requirements](https://github.com/JPrier/AgentMod/blob/main/docs/design/problem-statement.md). Luna workers investigated candidate groups; the parent reviewed and corrected the synthesis.
 
-## Results
+This is documentation research, not an executed compatibility test or exhaustive source audit. Documentation is rolling/current as accessed; installed versions were not pinned. Results must not be represented as certified compatibility for any release. Some worker searches yielded only snippets or landing pages; those do not establish complete capability guarantees.
 
-| Candidate | C1 | C2 | C3 | C4 | C5 | C6 | C7 | C8 | Qualification |
-|---|---|---|---|---|---|---|---|---|---|
-| LangGraph / Platform | Fail | Pass | Pass | Pass | Pass | Fail | Unverified | Fail | Does not qualify |
-| Amazon Strands | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Does not qualify |
-| Temporal | Fail | Unverified | Pass | Unverified | Pass | Pass | Pass | Fail | Does not qualify |
-| Restate | Fail | Unverified | Pass | Unverified | Pass | Pass | Pass | Fail | Does not qualify |
-| Mastra | Pass | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Does not qualify |
-| Inngest | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Fail | Does not qualify |
-| OpenClaw as platform | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Does not qualify |
+Pass means the documented supported interface establishes the requirement. Unverified means the complete requirement was not established, even where useful building blocks exist. Absence of a built-in agent-context object does not establish failure: application-defined nodes, tools, hooks, storage adapters, and plugins can qualify without a core fork. A fork or major core rework remains disallowed.
 
-The Fail verdicts reflect documented abstraction boundaries: workflow engines persist workflow state and inputs/outputs but do not expose arbitrary model context as a first-class, editable state at every model/tool boundary. Where the documentation did not settle a requirement, the verdict remains Unverified.
+## Capability matrix
 
-## Evidence by candidate
+| Candidate | C1 Context control | C2 Every boundary | C3 Full history | C4 Audited restore | C5 Branching | C6 Live changes | C7 Full stop | C8 Complete extension feasibility |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| LangGraph / Platform | Unverified | Unverified | Unverified | Unverified | Pass | Unverified | Unverified | Unverified |
+| Amazon Strands | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
+| Temporal | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
+| Restate | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
+| Mastra | Pass | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
+| Inngest | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified* | Unverified |
+| OpenClaw | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
 
-### LangGraph and LangGraph Platform
+*Inngest's stock cancellation fails the active-step termination component of C7. Whether an ordinary extension supplying independent process supervision can satisfy the complete requirement remains unverified; the matrix evaluates extension feasibility rather than only stock behavior.
 
-Official docs describe graph state, checkpoints, persistence, time travel, interrupts, and subgraphs. These support reconstructable state, replay/branch-like workflows, and boundary interrupts: [Graph API](https://docs.langchain.com/oss/python/langgraph/graph-api), [Persistence](https://docs.langchain.com/oss/python/langgraph/persistence), [Time travel](https://docs.langchain.com/oss/python/langgraph/use-time-travel), [Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts), [LangGraph Platform](https://docs.langchain.com/langgraph-platform/).
+No candidate is established as a complete match. This is not proof that none can meet the requirements. In particular, the many Unverified cells must not be converted into architectural Fail verdicts.
 
-C1 is Fail for the rubric’s stronger requirement: graph state is controllable, but the exact provider request context and all harness-owned context are not exposed as an arbitrary editable state through the normal graph extension API. C2–C5 have substantial support through nodes, checkpoints, interrupts, and replay/time-travel. C6 is Fail as documented: graph/application deployment changes are deployment operations, while changing model/tools/context policy live for an existing running session without restart is not a supported general capability. C7 is Unverified for guaranteed process-level kill of arbitrary tool subprocesses and provider requests. C8 is Fail because meeting C1/C6 would require changing core execution/context ownership, beyond a plugin.
+## Candidate evidence and remaining gaps
+
+### LangGraph and Platform
+
+LangGraph explicitly provides checkpoint-based state branching: `get_state_history` selects an earlier state, `update_state` creates a new checkpoint with modified values, and `invoke` continues it while preserving original history. Subgraph checkpoint configuration affects the available granularity. This establishes C5 for graph-owned context and user-defined continuation/results; it does not establish a universal log of every provider request. [Time travel](https://docs.langchain.com/oss/python/langgraph/use-time-travel).
+
+Checkpointers persist graph state. Exact requests and tool outputs must be captured in that state or an extension-owned record; persistence alone does not prove C3. [Persistence](https://docs.langchain.com/oss/python/langgraph/persistence).
+
+User-authored nodes and explicit interrupts provide control points, but node boundaries do not automatically expose every tool/model boundary inside a node. C1/C2 need inspection of the chosen model/tool adapter and graph composition. [Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts), [Graph API](https://docs.langchain.com/oss/python/langgraph/graph-api).
+
+Platform run cancellation offers interrupt and rollback actions. A rollback option that removes run data is unsuitable for the required auditable restore; its existence does not prevent an extension implementing append-only restoration. Cancellation documentation does not establish arbitrary subprocess termination. [Cancel a run](https://docs.langchain.com/langsmith/cancel-run).
+
+C4 remains unverified for explicit restoration provenance and revert-of-revert. C6 remains unverified for all live configuration/memory/tool changes, and C7 for full process supervision. None of these findings demonstrates that a fork is required.
 
 ### Amazon Strands
 
-Strands documents model-driven agents, tools, multi-agent patterns, hooks, streaming events, session/conversation management, and model/provider integrations: [Strands Agents docs](https://strandsagents.com/latest/documentation/docs/), [Agent hooks](https://strandsagents.com/latest/documentation/docs/user-guide/agents/hooks/), [Tools](https://strandsagents.com/latest/documentation/docs/user-guide/concepts/tools/), [Multi-agent systems](https://strandsagents.com/latest/documentation/docs/user-guide/concepts/multi-agent-systems/).
+The investigated surfaces include agent lifecycle hooks, tools, session/conversation management, and multi-agent composition. These are plausible supported extension points, not evidence that context ownership must be changed in the core. [Documentation](https://strandsagents.com/latest/documentation/docs/), [Hooks](https://strandsagents.com/latest/documentation/docs/user-guide/agents/hooks/), [Tools](https://strandsagents.com/latest/documentation/docs/user-guide/concepts/tools/).
 
-The sources establish useful extension points but do not establish C1–C8 at the required strength: arbitrary replacement of the complete provider context at every boundary, immutable full event history with exact request reconstruction, reversible restoration, live hot swap of running sessions, or a platform-level kill guarantee. These therefore remain Unverified pending a focused prototype/source audit. With mandatory capabilities unverified, it does not qualify and receives no performance evaluation.
+Access to detailed hook documentation was incomplete in this review. We did not establish which complete request fields are mutable at each boundary, the durability ordering of exact request/tool records, or a documented no-fork implementation of restore, fork, and hard-stop semantics. Accordingly all complete gates remain Unverified. This candidate received weaker evidence coverage than LangGraph and Mastra; the table is not a ranking.
+
+The specific remaining investigation is the hook event payloads and session-manager contract, including what an adapter can replace and persist, rather than whether a built-in memory option exists.
 
 ### Temporal
 
-Temporal documents durable, replayable workflows, Signals, Updates, cancellation, child workflows, and worker versioning: [Temporal docs](https://docs.temporal.io/), [Workflows](https://docs.temporal.io/workflows), [Signals](https://docs.temporal.io/workflows#signal), [Updates](https://docs.temporal.io/encyclopedia/workflow-message-passing), [Cancellation](https://docs.temporal.io/workflows#cancellation), [Worker Versioning](https://docs.temporal.io/production-deployment/worker-versioning).
+Workflow history and activity boundaries are useful foundations, and application code can own model input. This is not a C1 failure merely because context is represented by application data. Signals/Updates are relevant to state changes, but do not alone demonstrate arbitrary live plugin replacement. [Workflow model](https://docs.temporal.io/workflows), [Message passing](https://docs.temporal.io/encyclopedia/workflow-message-passing).
 
-Temporal’s event history and workflow state support C3, while child workflows support C5 and Signals/Updates/versioning support controlled workflow changes. C1 is Fail: Temporal is a durable workflow engine; arbitrary LLM prompt/context assembly is application code inside workflow/activity boundaries, not a universally inspectable and mutable runtime context. C7 is Unverified: cancellation is documented, but hard process termination is not established, but this does not guarantee undo of external effects. C8 is Fail for the complete rubric because the missing context ownership would require a separate agent harness or core adaptation. C2/C4 remain Unverified at the exact model/tool boundary granularity.
+The Python documentation distinguishes cancellation from termination. Cancellation is cooperative; regular activities need heartbeats to receive cancellation. Workflow termination records an event and stops workflow execution, which does not establish OS-level termination of arbitrary activity subprocesses. Reset creates a new execution from a selected history point and records a reason; exact context restoration and reversal across retained histories still need validation. [Cancellation, termination, and reset](https://docs.temporal.io/develop/python/workflows/cancellation).
+
+C3 requires more than replay: exact context/tool records, indefinite retention configuration, and reload reconstruction must be demonstrated. Child workflows are not sufficient evidence for C5 arbitrary-context branching. A custom activity supervisor and audit adapter may be possible without a fork, but the complete supported composition and its scope were not established.
 
 ### Restate
 
-Restate documents durable virtual objects, workflows, promises, journaling, awake/sleep behavior, and deployment/versioning: [Restate docs](https://docs.restate.dev/), [Virtual Objects](https://docs.restate.dev/fundamentals/virtual-objects), [Workflows](https://docs.restate.dev/fundamentals/workflows), [Durable promises](https://docs.restate.dev/fundamentals/durable-promises), [Deployments](https://docs.restate.dev/deploy/deployments).
+Restate documents durable execution, stateful services, and workflows. These supply journaled application operations and a place for application-owned context; they do not imply that arbitrary context manipulation requires modifying Restate. [Documentation](https://docs.restate.dev/), [Virtual objects](https://docs.restate.dev/fundamentals/virtual-objects), [Workflows](https://docs.restate.dev/fundamentals/workflows).
 
-Restate’s journal gives durable execution history and its object/workflow model supports independent continuations and message-driven changes. C1 is Fail for the same reason as Temporal: the system persists invocation/journal state, not an arbitrary editable LLM context window exposed at every model/tool boundary. C7 is Unverified: cancellation is documented, but hard process termination is not established subject to external side effects. C2/C4 are Unverified for exact context boundary semantics; C8 is Unverified for this requirement set.
+The review did not establish an exact-request audit layer, arbitrary historical context restoration with restoration provenance, parallel continuations from that state, or hard termination of running external tool processes through a supported extension composition. Durable replay must not be scored as all those features.
+
+Evidence coverage was limited to documented durable-execution building blocks. All complete gates remain Unverified; neither feasibility nor necessity of major rework is demonstrated.
 
 ### Mastra
 
-Mastra documents agents, workflows, memory, tools, processors, observability, and storage: [Mastra docs](https://mastra.ai/docs), [Agents](https://mastra.ai/docs/agents/overview), [Workflows](https://mastra.ai/docs/workflows/overview), [Memory](https://mastra.ai/docs/memory/overview), [Processors](https://mastra.ai/docs/agents/agent-memory#processors), [Observability](https://mastra.ai/docs/observability/overview).
+Mastra has concrete supported context-editing interfaces. `processInput` can replace messages and system messages. `processInputStep` runs on loop steps, including tool continuations, and can override model, tools, and messages. `processLLMRequest` rewrites the final provider-facing prompt immediately before invocation. This supports C1. Its edits are transient rather than automatically written back to conversation memory, so C3 requires explicit capture. `processLLMResponse` supplies corresponding response information. [Processors](https://mastra.ai/docs/agents/processors).
 
-Mastra clearly supplies configurable agent/workflow building blocks and persistent memory/storage. The reviewed first-party material does not establish the stronger guarantees for C1/C2 (complete arbitrary context replacement at every request/tool boundary), C4 (auditable reversible restoration), C5 (history-preserving branch continuations), C6 (live per-session reconfiguration without restart), or C7 (kill of arbitrary running tool processes). These remain Unverified; C8 therefore remains Unverified and the candidate cannot qualify.
+These interfaces also provide meaningful partial C6 support. They do not, by themselves, establish every individual tool boundary, arbitrary live replacement of all memory/configuration, audited restore, or complete branching. A worker's claim of a missing hook based on an unlocated issue was excluded; C2 is Unverified, not Fail.
+
+An abort signal is not proof of terminating a noncooperative child process. C7 and complete extension feasibility remain unverified. [Generate reference](https://mastra.ai/reference/agents/generate).
 
 ### Inngest
 
-Inngest documents durable functions, steps, retries, event history, cancellation, concurrency, throttling, and function versioning: [Inngest docs](https://www.inngest.com/docs), [Functions](https://www.inngest.com/docs/functions), [Steps](https://www.inngest.com/docs/features/inngest-functions/steps-workflows), [Cancellation](https://www.inngest.com/docs/features/inngest-functions/cancellation), [Concurrency](https://www.inngest.com/docs/learn/inngest-steps).
+Middleware offers lifecycle transformations around function/step execution. Application-owned context can pass through these interfaces; no built-in LLM context is required by the rubric. Exact tool/model boundary coverage and full audit semantics still need demonstration. [Python middleware lifecycle](https://www.inngest.com/docs/reference/python/middleware/lifecycle).
 
-These support durable workflow execution, independent events, concurrency controls, and cancellation. C1 is Fail: Inngest steps do not provide an agent-specific editable context window; context assembly remains application/model integration code. C5/C6 are Pass at the workflow/event deployment level (parallel functions and evolving deployed code), but this is not proof of mutating an already-running session’s agent context and configuration at the next boundary. C7 is Pass for function cancellation within documented semantics, with external side-effect limits. C8 is Fail for the complete rubric because the central context ownership requirement is outside the extension model.
+There is a concrete stock limitation: cancellation does not stop an actively executing step, which continues to completion. Canceling runs also does not prevent new runs being enqueued. These semantics do not satisfy the required full stop on their own. An independent extension supervisor may address the gap, but that composition was not established. [Cancellation](https://www.inngest.com/docs/features/inngest-functions/cancellation).
 
-### OpenClaw as platform
+Replay is not automatically arbitrary context restoration or branch consolidation. History retention and exact payload capture need separate verification. [Replay](https://www.inngest.com/docs/platform/replay).
 
-OpenClaw’s public repository and documentation describe a gateway, channels, agents, tools, sessions, memory, and skills: [OpenClaw repository](https://github.com/openclaw/openclaw), [OpenClaw docs](https://docs.openclaw.ai/).
+### OpenClaw-as-platform
 
-The available first-party material establishes an extensible agent product, but does not provide sufficient stable platform contracts to verify C1–C8 at the AgentMod strength—especially exact per-request context replacement, append-only reconstructable history, reversible restoration, branch semantics, live hot swap of running sessions, and hard process interruption. All mandatory rows remain Unverified. It therefore does not qualify; performance analysis is deferred.
+OpenClaw supplies a persistent gateway, external application interfaces, session operations, and plugins. Those are relevant platform surfaces but do not establish all context/history contracts. [Repository](https://github.com/openclaw/openclaw), [External applications](https://docs.openclaw.ai/gateway/external-apps).
 
-## Additional primary-source corrections
+The configuration documentation distinguishes hot-applied settings from changes needing restart, so C6 needs a setting/plugin-specific assessment rather than a blanket pass or failure. [Configuration](https://docs.openclaw.ai/gateway/configuration).
 
-The following evidence narrows the earlier desk-review verdicts. Mastra processors document `processInput` and `processInputStep` message/system-message replacement, and `processLLMRequest` can rewrite the provider-facing prompt immediately before the call ([processors](https://mastra.ai/docs/agents/processors)). This establishes C1 Pass through a supported extension interface. It does not establish complete after-tool interception, durable exact-context snapshots, restoration, or live replacement of all memory/configuration, so those remain Unverified.
+Gateway event delivery and session persistence are different: a non-replayed event stream is not proof that persisted history is missing. Nor is an observable tool event proof of a mutable context hook. [Gateway](https://docs.openclaw.ai/gateway).
 
-Temporal cancellation is cooperative for activities that heartbeat; termination records a Terminated event and stops workflow scheduling, without proving arbitrary tool-process termination ([cancellation](https://docs.temporal.io/develop/python/workflows/cancellation)). Temporal reset copies history to a selected point but does not by itself prove AgentMod restoration semantics. Restate evidence establishes durable completed-step journaling but not exact context interception or arbitrary restore/branch. Inngest middleware has per-function/per-step lifecycle hooks, but its cancellation documentation explicitly says an active step runs to completion ([cancellation](https://www.inngest.com/docs/features/inngest-functions/cancellation)); C7 is therefore Fail for the stock platform. OpenClaw documents RPC cancellation and config hot reload, but events are not replayed and no exact context mutation or restoration contract is documented.
+The complete exact-input editing, append-only reconstruction, auditable restore/branch, and process-stop contracts were not established. All gates remain Unverified; no claim that a fork is necessary is supported.
 
-These are capability findings, not performance results.
+## Additional issue criteria
 
-## Build-vs-buy conclusion
+| Criterion from the research ticket | Finding |
+| --- | --- |
+| Language-agnostic components and fault isolation | SDK language choices or remote calls do not prove a generic plugin protocol or containment of a hung tool. Complete requirements were not established for any candidate. |
+| Always-on multi-session runtime | Deployment services, durable workflow engines, and OpenClaw's gateway offer relevant hosting models. None was tested against the approved session-scale requirements. |
+| Harness-grade interactive frontend | Workflow dashboards and development studios are not automatically daily-driver agent frontends. Complete frontend parity was not established. |
+| Config-driven workflow composition | User-authored graph/function code does not automatically provide config-driven composition; a supported configuration interpreter may be possible. Its necessity is separate from proving a core fork is required. |
+| Complete boundary observability | Checkpoints, traces, and event streams each cover different information. None alone proves C3. |
 
-No candidate is established as qualified: every candidate has at least one mandatory row Unverified or Fail. The strongest partial foundations are LangGraph (checkpoint/time-travel/interrupt concepts), Temporal (durable history, signals, cancellation, versioning), Restate (journaling and durable objects), and Inngest (durable event workflows), but each leaves arbitrary model-context ownership outside the platform contract. Combining those systems would still require selecting and designing a context/history/runtime architecture, rather than simply installing a plugin. The research does not establish that any candidate is impossible and does not by itself justify a build conclusion.
+## Outcome and limits
 
-Performance was intentionally not compared because the capability gates were not passed.
+The seven-candidate desk survey is complete; compatibility certification is not. Mastra demonstrates useful final-prompt control, LangGraph demonstrates history-preserving state forks, and Inngest documents a stock hard-stop limitation. The remaining gaps are explicit rather than silently scored as failures.
+
+No comparative performance analysis was performed, as requested. No candidate has all capability gates established. The survey does not justify choosing to build solely by elimination, and it does not recommend a fork.
+
+If further build-versus-buy certainty is needed, the highest-value empirical checks are exact-request capture plus per-tool edits in Mastra, and an audited restore/live-update/process-stop extension in LangGraph. These are proposed follow-up checks, not agreed designs or claims that those candidates will pass. No new HITL decisions were made by the research agents.

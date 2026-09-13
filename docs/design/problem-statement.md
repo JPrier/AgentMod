@@ -95,4 +95,4 @@ The runtime must not need built-in knowledge of each memory or context-managemen
 
 ## Decision context
 
-This approved statement supersedes the earlier approximately 10 ms / 100-session performance bar. The North Star has been reconciled to proportional scaling, a current use case of 200 active sessions, and capability-first evaluation. Framework research and later performance analysis remain subsequent work.
+This approved statement supersedes the earlier approximately 10 ms / 100-session performance bar. The North Star still requires reconciliation to proportional scaling, a current use case of 200 active sessions, and capability-first evaluation. That separate edit is pending authorization. Framework research and later performance analysis remain subsequent work.

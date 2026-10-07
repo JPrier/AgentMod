@@ -119,6 +119,9 @@ definePlugin({
         if (req.url.startsWith('/api/')) {
           const handled = await route(req, res);
           if (handled === null) send(res, 404, { error: 'no such endpoint' });
+        } else if (req.url.startsWith('/plugins/')) {
+          // Plugin sources, so the in-browser runtime can also be tried from here.
+          serveStatic(req, res, path.resolve('.'));
         } else {
           serveStatic(req, res, root);
         }

@@ -37,12 +37,16 @@ module = "plugins/titler/main.js"
 command = ["node", "plugins/memory/main.js"]
 module = "plugins/memory/main.js"
 
-# --- providers (swap live via config apply) -----------------------------------
-[plugins.scripted-model]
-command = ["node", "plugins/scripted-model/main.js"]
-module = "plugins/scripted-model/main.js"
-config = { delay_ms = 25 }
+# --- model providers -----------------------------------------------------------
+# OpenRouter is the model provider. A key is required: export OPENROUTER_API_KEY
+# before `serve` (read from the environment, never written to the log). Without
+# it the plugin refuses its handshake and the runtime will not start.
+[plugins.openrouter-model]
+command = ["node", "plugins/openrouter-model/main.js"]
+module = "plugins/openrouter-model/main.js"
+config = { model = "openai/gpt-4o-mini", api_key_env = "OPENROUTER_API_KEY", max_tokens = 1024 }
 
+# Alternative LLM provider for any OpenAI-compatible endpoint (unused by default).
 [plugins.openai-model]
 command = ["node", "plugins/openai-model/main.js"]
 module = "plugins/openai-model/main.js"
@@ -82,7 +86,7 @@ subscribers = [
   { plugin = "redactor" },
   { plugin = "approval-gate" },
   { plugin = "chat-context" },
-  { plugin = "scripted-model" },
+  { plugin = "openrouter-model" },
   { plugin = "titler" },
   { plugin = "memory" },
   { plugin = "tool-clock" },
@@ -96,7 +100,7 @@ description = "Sub-agent session started by `delegate`; reports back to its pare
 subscribers = [
   { plugin = "web-ui" },
   { plugin = "chat-context" },
-  { plugin = "scripted-model" },
+  { plugin = "openrouter-model" },
   { plugin = "tool-clock" },
   { plugin = "tool-calc" },
   { plugin = "subagent-reporter" },

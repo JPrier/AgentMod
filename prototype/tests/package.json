@@ -1,0 +1,7 @@
+{
+  "name": "agentmod-prototype-tests",
+  "private": true,
+  "type": "module",
+  "scripts": { "browser": "node browser.mjs" },
+  "devDependencies": { "puppeteer-core": "^25.0.0" }
+}

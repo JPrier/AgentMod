@@ -1,1 +1,24 @@
-<!doctype html><title>placeholder</title>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AgentMod prototype</title>
+  <meta name="description" content="AgentMod: a config-compiled event bus for agents. Every capability is a plugin and every step is in an append-only log you can inspect, branch, and replay.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230E7C7B'/%3E%3Cpath d='M7 11h7m4 0h7M7 21h18M14 11v10' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app" class="app">
+    <div class="boot" id="boot">
+      <div class="boot-mark" aria-hidden="true"></div>
+      <p id="boot-msg">Starting the runtime…</p>
+    </div>
+  </div>
+  <noscript>This prototype runs the AgentMod kernel in your browser and needs JavaScript.</noscript>
+  <script type="module" src="app.js"></script>
+</body>
+</html>

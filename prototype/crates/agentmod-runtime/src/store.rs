@@ -55,10 +55,20 @@ impl Store {
     /// I/O failures.
     pub fn open(dir: &Path, spill_threshold: usize) -> Result<Self, String> {
         for sub in ["sessions", "spill", "configs"] {
-            fs::create_dir_all(dir.join(sub)).map_err(|e| format!("creating {}: {e}", dir.join(sub).display()))?;
+            fs::create_dir_all(dir.join(sub))
+                .map_err(|e| format!("creating {}: {e}", dir.join(sub).display()))?;
         }
-        let mut store = Store { dir: dir.to_path_buf(), spill_threshold, writers: BTreeMap::new(), index: Index::default(), index_dirty: false };
-        match fs::read_to_string(dir.join("index.json")).ok().and_then(|t| serde_json::from_str::<Index>(&t).ok()) {
+        let mut store = Store {
+            dir: dir.to_path_buf(),
+            spill_threshold,
+            writers: BTreeMap::new(),
+            index: Index::default(),
+            index_dirty: false,
+        };
+        match fs::read_to_string(dir.join("index.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<Index>(&t).ok())
+        {
             Some(idx) if store.index_consistent(&idx) => store.index = idx,
             _ => store.rebuild_index()?,
         }
@@ -70,8 +80,13 @@ impl Store {
     }
 
     fn index_consistent(&self, idx: &Index) -> bool {
-        let Ok(rd) = fs::read_dir(self.dir.join("sessions")) else { return false };
-        let on_disk = rd.filter_map(Result::ok).filter(|e| e.path().extension().is_some_and(|x| x == "jsonl")).count();
+        let Ok(rd) = fs::read_dir(self.dir.join("sessions")) else {
+            return false;
+        };
+        let on_disk = rd
+            .filter_map(Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+            .count();
         on_disk == idx.sessions.len()
     }
 
@@ -80,7 +95,10 @@ impl Store {
     /// # Errors
     /// I/O failures.
     pub fn rebuild_index(&mut self) -> Result<(), String> {
-        let mut idx = Index { next_session: 1, sessions: BTreeMap::new() };
+        let mut idx = Index {
+            next_session: 1,
+            sessions: BTreeMap::new(),
+        };
         let rd = fs::read_dir(self.dir.join("sessions")).map_err(|e| e.to_string())?;
         for entry in rd.filter_map(Result::ok) {
             let path = entry.path();
@@ -94,7 +112,11 @@ impl Store {
             }
             // Unknown work state after an index loss: scan it on recovery.
             e.active = true;
-            if let Some(n) = e.session_id.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()) {
+            if let Some(n) = e
+                .session_id
+                .strip_prefix('s')
+                .and_then(|n| n.parse::<u64>().ok())
+            {
                 idx.next_session = idx.next_session.max(n + 1);
             }
             if !e.session_id.is_empty() {
@@ -121,14 +143,24 @@ impl Store {
         }
         let line = serde_json::to_string(&v).map_err(|e| e.to_string())?;
         if !self.writers.contains_key(&r.session_id) {
-            let f = OpenOptions::new().create(true).append(true).open(self.session_path(&r.session_id)).map_err(|e| e.to_string())?;
+            let f = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.session_path(&r.session_id))
+                .map_err(|e| e.to_string())?;
             self.writers.insert(r.session_id.clone(), f);
         }
         let f = self.writers.get_mut(&r.session_id).expect("writer");
-        f.write_all(line.as_bytes()).and_then(|()| f.write_all(b"\n")).map_err(|e| e.to_string())?;
+        f.write_all(line.as_bytes())
+            .and_then(|()| f.write_all(b"\n"))
+            .map_err(|e| e.to_string())?;
         let e = self.index.sessions.entry(r.session_id.clone()).or_default();
         observe(e, r);
-        if let Some(n) = r.session_id.strip_prefix('s').and_then(|n| n.parse::<u64>().ok()) {
+        if let Some(n) = r
+            .session_id
+            .strip_prefix('s')
+            .and_then(|n| n.parse::<u64>().ok())
+        {
             self.index.next_session = self.index.next_session.max(n + 1);
         }
         self.index_dirty = true;
@@ -161,7 +193,9 @@ impl Store {
     }
 
     pub fn set_active(&mut self, sid: &str, active: bool, state: &str) -> bool {
-        let Some(e) = self.index.sessions.get_mut(sid) else { return false };
+        let Some(e) = self.index.sessions.get_mut(sid) else {
+            return false;
+        };
         let changed = e.active != active || e.state != state;
         if changed {
             let became_active = active && !e.active;
@@ -182,7 +216,11 @@ impl Store {
             return Ok(());
         }
         let tmp = self.dir.join("index.json.tmp");
-        fs::write(&tmp, serde_json::to_vec_pretty(&self.index).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        fs::write(
+            &tmp,
+            serde_json::to_vec_pretty(&self.index).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
         fs::rename(&tmp, self.dir.join("index.json")).map_err(|e| e.to_string())?;
         self.index_dirty = false;
         Ok(())
@@ -203,7 +241,9 @@ impl Store {
     /// Every stored compilation.
     #[must_use]
     pub fn compilations(&self) -> Vec<Compilation> {
-        let Ok(rd) = fs::read_dir(self.dir.join("configs")) else { return Vec::new() };
+        let Ok(rd) = fs::read_dir(self.dir.join("configs")) else {
+            return Vec::new();
+        };
         rd.filter_map(Result::ok)
             .filter_map(|e| fs::read(e.path()).ok())
             .filter_map(|b| serde_json::from_slice::<Compilation>(&b).ok())
@@ -213,7 +253,11 @@ impl Store {
     /// Append a runtime-level journal entry (config applies, unrecordable refusals).
     pub fn journal(&self, at: u64, kind: &str, detail: &Value) {
         let line = json!({ "at": at, "kind": kind, "detail": detail }).to_string();
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(self.dir.join("journal.jsonl")) {
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("journal.jsonl"))
+        {
             let _ = writeln!(f, "{line}");
         }
     }
@@ -223,7 +267,9 @@ fn observe(e: &mut IndexEntry, r: &Record) {
     e.last_sequence = r.sequence;
     e.updated_at = r.at;
     match &r.body {
-        Body::SessionCreated { definition, cause, .. } => {
+        Body::SessionCreated {
+            definition, cause, ..
+        } => {
             e.session_id.clone_from(&r.session_id);
             e.definition.clone_from(definition);
             e.created_at = r.at;
@@ -233,10 +279,10 @@ fn observe(e: &mut IndexEntry, r: &Record) {
         }
         Body::InvocationCompleted { contributions, .. } => {
             for c in contributions {
-                if let ContextOp::Add { slot, value } = c {
-                    if slot == "title" {
-                        e.title = value.as_str().map(str::to_owned);
-                    }
+                if let ContextOp::Add { slot, value } = c
+                    && slot == "title"
+                {
+                    e.title = value.as_str().map(str::to_owned);
                 }
             }
         }
@@ -283,7 +329,8 @@ fn rehydrate(v: &mut Value, dir: &Path) -> Result<(), String> {
         Value::Object(m) => {
             if let Some(Value::String(h)) = m.get("$spill") {
                 let hash = h.trim_start_matches("sha256:");
-                let bytes = fs::read(dir.join("spill").join(format!("{hash}.json"))).map_err(|e| format!("spill {hash}: {e}"))?;
+                let bytes = fs::read(dir.join("spill").join(format!("{hash}.json")))
+                    .map_err(|e| format!("spill {hash}: {e}"))?;
                 let digest = hex::encode(Sha256::digest(&bytes));
                 if digest != hash {
                     return Err(format!("spill {hash} failed integrity check"));
@@ -308,7 +355,10 @@ fn rehydrate(v: &mut Value, dir: &Path) -> Result<(), String> {
 fn read_jsonl(path: &Path, dir: &Path) -> Result<Vec<Record>, String> {
     let f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut out = Vec::new();
-    let lines: Vec<String> = BufReader::new(f).lines().collect::<Result<_, _>>().map_err(|e| e.to_string())?;
+    let lines: Vec<String> = BufReader::new(f)
+        .lines()
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
     let n = lines.len();
     for (i, line) in lines.into_iter().enumerate() {
         if line.trim().is_empty() {
@@ -321,7 +371,9 @@ fn read_jsonl(path: &Path, dir: &Path) -> Result<Vec<Record>, String> {
             Err(e) => return Err(format!("{}:{}: {e}", path.display(), i + 1)),
         };
         rehydrate(&mut v, dir)?;
-        out.push(serde_json::from_value(v).map_err(|e| format!("{}:{}: {e}", path.display(), i + 1))?);
+        out.push(
+            serde_json::from_value(v).map_err(|e| format!("{}:{}: {e}", path.display(), i + 1))?,
+        );
     }
     Ok(out)
 }
@@ -333,20 +385,47 @@ mod tests {
     use agentmod_core::types::{Cause, EventRecord, Lane, Origin};
 
     fn rec(sid: &str, seq: u64, body: Body) -> Record {
-        Record { session_id: sid.into(), sequence: seq, at: seq * 10, body }
+        Record {
+            session_id: sid.into(),
+            sequence: seq,
+            at: seq * 10,
+            body,
+        }
     }
 
     #[test]
     fn spill_round_trip_and_torn_tail() {
         let dir = tempfile::tempdir().unwrap();
-        let mut s = Store::open(dir.path(), 256).unwrap();
-        let created = rec("s0001", 1, Body::SessionCreated { definition: "chat".into(), config: "c".into(), cause: Cause::Root { plugin: "ui".into() }, fork_of: None });
+        let mut s = Store::open(dir.path(), 1024).unwrap();
+        let created = rec(
+            "s0001",
+            1,
+            Body::SessionCreated {
+                definition: "chat".into(),
+                config: "c".into(),
+                cause: Cause::Root {
+                    plugin: "ui".into(),
+                },
+                fork_of: None,
+            },
+        );
         let big = "x".repeat(5000);
         let ev = rec(
             "s0001",
             2,
             Body::EventAppended {
-                event: EventRecord { event_id: "s0001/e2".into(), event_name: "user-message".into(), lane: Lane::Normal, cause: Cause::Root { plugin: "ui".into() }, origin: Origin::Core, depth: 0, payload: json!({ "text": big, "small": 1 }), ui: None },
+                event: EventRecord {
+                    event_id: "s0001/e2".into(),
+                    event_name: "user-message".into(),
+                    lane: Lane::Normal,
+                    cause: Cause::Root {
+                        plugin: "ui".into(),
+                    },
+                    origin: Origin::Core,
+                    depth: 0,
+                    payload: json!({ "text": big, "small": 1 }),
+                    ui: None,
+                },
             },
         );
         s.append(&created).unwrap();
@@ -357,7 +436,10 @@ mod tests {
         assert!(raw.contains("\"small\":1"), "small siblings stay inline");
         assert!(raw.len() < 2000);
         // A torn final line is ignored.
-        let mut f = OpenOptions::new().append(true).open(dir.path().join("sessions/s0001.jsonl")).unwrap();
+        let mut f = OpenOptions::new()
+            .append(true)
+            .open(dir.path().join("sessions/s0001.jsonl"))
+            .unwrap();
         f.write_all(b"{\"session_id\":\"s0001\",\"seq").unwrap();
         let back = s.read("s0001").unwrap();
         assert_eq!(back, vec![created, ev]);
@@ -365,7 +447,7 @@ mod tests {
         // Index rebuild from logs.
         s.flush_index().unwrap();
         fs::remove_file(dir.path().join("index.json")).unwrap();
-        let s2 = Store::open(dir.path(), 256).unwrap();
+        let s2 = Store::open(dir.path(), 1024).unwrap();
         assert_eq!(s2.index.next_session, 2);
         assert!(s2.index.sessions["s0001"].active);
     }

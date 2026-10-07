@@ -5,6 +5,7 @@
 //! agentmod compile [--config agentmod.toml] [--json]
 //! agentmod inspect [--data .agentmod] [SESSION] [--json]
 //! agentmod verify  [--data .agentmod]
+//! agentmod config  [--config agentmod.toml]
 //! ```
 
 mod config;
@@ -29,7 +30,13 @@ struct Args {
 fn parse() -> Result<Args, String> {
     let mut it = std::env::args().skip(1);
     let cmd = it.next().unwrap_or_else(|| "help".into());
-    let mut a = Args { cmd, config: PathBuf::from("agentmod.toml"), data: PathBuf::from(".agentmod"), json: false, positional: Vec::new() };
+    let mut a = Args {
+        cmd,
+        config: PathBuf::from("agentmod.toml"),
+        data: PathBuf::from(".agentmod"),
+        json: false,
+        positional: Vec::new(),
+    };
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--config" | "-c" => a.config = it.next().ok_or("--config needs a path")?.into(),
@@ -49,6 +56,7 @@ USAGE:
   agentmod compile [--config agentmod.toml] [--json]             handshake plugins and validate the graph
   agentmod inspect [--data .agentmod] [SESSION] [--json]         read logs (replay-as-reading; runs no plugins)
   agentmod verify  [--data .agentmod]                            replay every log through a fresh kernel
+  agentmod config  [--config agentmod.toml]                      print the config as JSON (used by the browser runtime)
 ";
 
 #[tokio::main]
@@ -63,8 +71,13 @@ async fn main() -> ExitCode {
     let result = match args.cmd.as_str() {
         "serve" => serve(&args, false).await,
         "compile" => serve(&args, true).await,
-        "inspect" => inspect::inspect(&args.data, args.positional.first().map(String::as_str), args.json),
+        "inspect" => inspect::inspect(
+            &args.data,
+            args.positional.first().map(String::as_str),
+            args.json,
+        ),
         "verify" => inspect::verify(&args.data),
+        "config" => export_config(&args),
         _ => {
             print!("{HELP}");
             Ok(())
@@ -81,9 +94,18 @@ async fn main() -> ExitCode {
 
 async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
     let loaded = config::load(&args.config)?;
-    let (host, compilation) = host::Host::boot(host::Options { config: loaded.config, base_dir: loaded.base_dir, data_dir: args.data.clone(), compile_only }).await?;
+    let (host, compilation) = host::Host::boot(host::Options {
+        config: loaded.config,
+        base_dir: loaded.base_dir,
+        data_dir: args.data.clone(),
+        compile_only,
+    })
+    .await?;
     if compile_only && args.json {
-        println!("{}", serde_json::to_string_pretty(&compilation).map_err(|e| e.to_string())?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&compilation).map_err(|e| e.to_string())?
+        );
     } else {
         for d in &compilation.diagnostics {
             let sev = match d.severity {
@@ -91,7 +113,15 @@ async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
                 Severity::Warning => "warning",
                 Severity::Info => "info",
             };
-            let loc = [d.definition.as_deref(), d.plugin.as_deref(), d.event.as_deref()].into_iter().flatten().collect::<Vec<_>>().join(" / ");
+            let loc = [
+                d.definition.as_deref(),
+                d.plugin.as_deref(),
+                d.event.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" / ");
             eprintln!("{sev}[{}] {loc}: {}", d.code, d.message);
         }
         if compile_only {
@@ -100,10 +130,18 @@ async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
                 for (event, p) in &def.pipelines {
                     let b: Vec<&str> = p.blocking.iter().map(|s| s.plugin.as_str()).collect();
                     let a: Vec<&str> = p.asyncs.iter().map(|s| s.plugin.as_str()).collect();
-                    println!("  {event:<20} blocking [{}]  async [{}]", b.join(" → "), a.join(", "));
+                    println!(
+                        "  {event:<20} blocking [{}]  async [{}]",
+                        b.join(" → "),
+                        a.join(", ")
+                    );
                 }
             }
-            println!("config {} — {}", compilation.hash, if compilation.ok { "ok" } else { "REJECTED" });
+            println!(
+                "config {} — {}",
+                compilation.hash,
+                if compilation.ok { "ok" } else { "REJECTED" }
+            );
         }
     }
     if !compilation.ok {
@@ -112,7 +150,11 @@ async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
     if compile_only {
         return Ok(());
     }
-    eprintln!("agentmod: runtime ready — config {} — data in {}", compilation.hash, args.data.display());
+    eprintln!(
+        "agentmod: runtime ready — config {} — data in {}",
+        compilation.hash,
+        args.data.display()
+    );
     let tx = host.sender();
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
@@ -120,5 +162,17 @@ async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
         let _ = tx.send(proc::Msg::Shutdown);
     });
     host.run().await;
+    Ok(())
+}
+
+fn export_config(args: &Args) -> Result<(), String> {
+    let mut loaded = config::load(&args.config)?;
+    for p in loaded.config.plugins.values_mut() {
+        p.binary_hash = None;
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&loaded.config).map_err(|e| e.to_string())?
+    );
     Ok(())
 }

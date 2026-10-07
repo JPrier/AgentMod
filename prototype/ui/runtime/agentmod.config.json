@@ -1,0 +1,213 @@
+{
+  "runtime": {
+    "max_causal_depth": 64,
+    "spill_threshold_bytes": 16384,
+    "max_attempts": 3
+  },
+  "plugins": {
+    "approval-gate": {
+      "command": [
+        "node",
+        "plugins/approval-gate/main.js"
+      ],
+      "module": "plugins/approval-gate/main.js",
+      "config": {
+        "require": [
+          "delegate"
+        ]
+      }
+    },
+    "chat-context": {
+      "command": [
+        "node",
+        "plugins/chat-context/main.js"
+      ],
+      "module": "plugins/chat-context/main.js",
+      "config": null
+    },
+    "heartbeat": {
+      "command": [
+        "node",
+        "plugins/heartbeat/main.js"
+      ],
+      "module": "plugins/heartbeat/main.js",
+      "config": {
+        "agent_definition": "chat",
+        "agent_every": 0,
+        "every_seconds": 0
+      }
+    },
+    "memory": {
+      "command": [
+        "node",
+        "plugins/memory/main.js"
+      ],
+      "module": "plugins/memory/main.js",
+      "config": null
+    },
+    "openai-model": {
+      "command": [
+        "node",
+        "plugins/openai-model/main.js"
+      ],
+      "module": "plugins/openai-model/main.js",
+      "config": {
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4o-mini"
+      }
+    },
+    "openrouter-model": {
+      "command": [
+        "node",
+        "plugins/openrouter-model/main.js"
+      ],
+      "module": "plugins/openrouter-model/main.js",
+      "config": {
+        "api_key_env": "OPENROUTER_API_KEY",
+        "max_tokens": 1024,
+        "model": "openai/gpt-4o-mini"
+      }
+    },
+    "py-wordcount": {
+      "command": [
+        "python3",
+        "plugins/py-wordcount/main.py"
+      ],
+      "config": null
+    },
+    "redactor": {
+      "command": [
+        "node",
+        "plugins/redactor/main.js"
+      ],
+      "module": "plugins/redactor/main.js",
+      "config": null
+    },
+    "subagent": {
+      "command": [
+        "node",
+        "plugins/subagent/main.js"
+      ],
+      "module": "plugins/subagent/main.js",
+      "config": null
+    },
+    "subagent-reporter": {
+      "command": [
+        "node",
+        "plugins/subagent-reporter/main.js"
+      ],
+      "module": "plugins/subagent-reporter/main.js",
+      "config": null
+    },
+    "titler": {
+      "command": [
+        "node",
+        "plugins/titler/main.js"
+      ],
+      "module": "plugins/titler/main.js",
+      "config": null
+    },
+    "tool-calc": {
+      "command": [
+        "node",
+        "plugins/tool-calc/main.js"
+      ],
+      "module": "plugins/tool-calc/main.js",
+      "config": null
+    },
+    "tool-clock": {
+      "command": [
+        "node",
+        "plugins/tool-clock/main.js"
+      ],
+      "module": "plugins/tool-clock/main.js",
+      "config": null
+    },
+    "web-ui": {
+      "command": [
+        "node",
+        "plugins/web-ui/main.js"
+      ],
+      "config": {
+        "host": "127.0.0.1",
+        "port": 7700,
+        "static_dir": "ui"
+      }
+    }
+  },
+  "definitions": {
+    "chat": {
+      "description": "Interactive chat agent with tools, memory, approval, and sub-agents",
+      "subscribers": [
+        {
+          "plugin": "web-ui"
+        },
+        {
+          "plugin": "redactor"
+        },
+        {
+          "plugin": "approval-gate"
+        },
+        {
+          "plugin": "chat-context"
+        },
+        {
+          "plugin": "openrouter-model"
+        },
+        {
+          "plugin": "titler"
+        },
+        {
+          "plugin": "memory"
+        },
+        {
+          "plugin": "tool-clock"
+        },
+        {
+          "plugin": "tool-calc"
+        },
+        {
+          "plugin": "py-wordcount"
+        },
+        {
+          "plugin": "subagent"
+        }
+      ]
+    },
+    "heartbeat": {
+      "description": "Journal session for the heartbeat trigger (one record per fire)",
+      "subscribers": [
+        {
+          "plugin": "web-ui"
+        },
+        {
+          "plugin": "heartbeat"
+        }
+      ]
+    },
+    "worker": {
+      "description": "Sub-agent session started by `delegate`; reports back to its parent",
+      "subscribers": [
+        {
+          "plugin": "web-ui"
+        },
+        {
+          "plugin": "chat-context"
+        },
+        {
+          "plugin": "openrouter-model"
+        },
+        {
+          "plugin": "tool-clock"
+        },
+        {
+          "plugin": "tool-calc"
+        },
+        {
+          "plugin": "subagent-reporter"
+        }
+      ]
+    }
+  }
+}

@@ -1306,7 +1306,16 @@ fn published_links_survive_replay_and_retry() {
         }
         sim.behave(&plugin, &req);
     };
-    let mk = |t: &str| PublishRequest { plugin: "model".into(), invocation_id: Some(model.invocation_id.clone()), cite: None, event_name: "stream-chunk".into(), payload: json!({ "text": t }), ui: None, lane: Lane::Normal, target_session: None };
+    let mk = |t: &str| PublishRequest {
+        plugin: "model".into(),
+        invocation_id: Some(model.invocation_id.clone()),
+        cite: None,
+        event_name: "stream-chunk".into(),
+        payload: json!({ "text": t }),
+        ui: None,
+        lane: Lane::Normal,
+        target_session: None,
+    };
     sim.publish(mk("a")).unwrap();
     // Crash + replay + retry: the earlier output stays linked to the invocation.
     let log = sim.log(&sid).to_vec();
@@ -1320,6 +1329,11 @@ fn published_links_survive_replay_and_retry() {
     fresh.publish(mk("b")).unwrap();
     fresh.complete(&model.invocation_id, InvocationResult::default());
     let view = project(fresh.log(&sid));
-    let inv = view.events.iter().flat_map(|e| &e.invocations).find(|i| i.invocation_id == model.invocation_id).unwrap();
+    let inv = view
+        .events
+        .iter()
+        .flat_map(|e| &e.invocations)
+        .find(|i| i.invocation_id == model.invocation_id)
+        .unwrap();
     assert_eq!(inv.published.len(), 2, "{:?}", inv.published);
 }

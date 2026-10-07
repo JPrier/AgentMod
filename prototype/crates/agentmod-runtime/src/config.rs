@@ -17,10 +17,18 @@ pub struct Loaded {
 /// # Errors
 /// I/O or parse failures.
 pub fn load(path: &Path) -> Result<Loaded, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    let mut config: DeploymentConfig = toml::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
-    let base_dir = path.parent().map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let base_dir = if base_dir.as_os_str().is_empty() { PathBuf::from(".") } else { base_dir };
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let mut config: DeploymentConfig =
+        toml::from_str(&text).map_err(|e| format!("parsing {}: {e}", path.display()))?;
+    let base_dir = path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let base_dir = if base_dir.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        base_dir
+    };
     stamp_binaries(&mut config, &base_dir);
     Ok(Loaded { config, base_dir })
 }

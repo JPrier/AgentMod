@@ -45,8 +45,17 @@ impl ProcHandle {
 ///
 /// # Errors
 /// When the command is empty or cannot be started.
-pub fn spawn(id: u64, name: &str, command: &[String], base_dir: &Path, data_dir: &Path, out: mpsc::UnboundedSender<Msg>) -> Result<ProcHandle, String> {
-    let (program, args) = command.split_first().ok_or_else(|| format!("plugin `{name}` has an empty command"))?;
+pub fn spawn(
+    id: u64,
+    name: &str,
+    command: &[String],
+    base_dir: &Path,
+    data_dir: &Path,
+    out: mpsc::UnboundedSender<Msg>,
+) -> Result<ProcHandle, String> {
+    let (program, args) = command
+        .split_first()
+        .ok_or_else(|| format!("plugin `{name}` has an empty command"))?;
     let mut child = Command::new(program)
         .args(args)
         .current_dir(base_dir)
@@ -65,7 +74,9 @@ pub fn spawn(id: u64, name: &str, command: &[String], base_dir: &Path, data_dir:
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
-            if stdin.write_all(line.as_bytes()).await.is_err() || stdin.write_all(b"\n").await.is_err() {
+            if stdin.write_all(line.as_bytes()).await.is_err()
+                || stdin.write_all(b"\n").await.is_err()
+            {
                 break;
             }
             let _ = stdin.flush().await;
@@ -98,5 +109,9 @@ pub fn spawn(id: u64, name: &str, command: &[String], base_dir: &Path, data_dir:
         };
         let _ = out.send(Msg::Exited { proc: id, status });
     });
-    Ok(ProcHandle { tx, pid, kill: Some(kill_tx) })
+    Ok(ProcHandle {
+        tx,
+        pid,
+        kill: Some(kill_tx),
+    })
 }

@@ -96,6 +96,7 @@ export function slot(context, name) {
  * @param {object} spec
  * @param {object} spec.manifest  name, version, consumes, emits, transforms, capabilities
  * @param {Record<string, Function>} spec.handlers  event name (or '*') -> async (ctx) => result
+ * @param {Function} [spec.validate] async (config, {env}) => void; throw to refuse the handshake
  * @param {Function} [spec.init]   async (plugin) => void, after the handshake
  * @param {Function} [spec.onRecord] (record) => void, for plugins that `watch`
  */
@@ -161,6 +162,16 @@ class Plugin {
         case 'initialize': {
           this.config = params.config || {};
           this.instance = params.plugin;
+          if (this.spec.validate) {
+            // A plugin may refuse to start (e.g. a required secret is missing);
+            // the runtime then cannot compile a config that uses it.
+            try {
+              await this.spec.validate(this.config, { env: this.transport.env });
+            } catch (e) {
+              this.send({ id, error: { code: -32010, message: e.message } });
+              return;
+            }
+          }
           this.storage = await createStorage(params.plugin || this.name, this.transport.env);
           this.send({ id, result: { protocol: PROTOCOL, manifest: this.spec.manifest } });
           if (this.spec.init) {

@@ -2701,7 +2701,9 @@ mod tests {
                 }],
                 client_name: "agentmod".into(),
                 client_version: "0.1.0".into(),
-                request_timeout: Duration::from_secs(2),
+                // This bounds the whole POST + resume sequence, which makes a
+                // durable cursor write per hop; slow Windows runners need slack.
+                request_timeout: Duration::from_secs(15),
                 maximum_message_bytes: 64 * 1024,
                 maximum_servers: 1,
                 authorization_owner: "owner".into(),

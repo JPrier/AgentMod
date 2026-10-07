@@ -1,0 +1,101 @@
+name: Prototype
+
+# The High-Level Design prototype (prototype/): tests, end-to-end checks, and
+# the GitHub Pages build of the in-browser runtime.
+
+on:
+  push:
+    paths: ["prototype/**", ".github/workflows/prototype.yml"]
+  pull_request:
+    paths: ["prototype/**", ".github/workflows/prototype.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: prototype-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: prototype
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Core and runtime
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prototype
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Native end-to-end (real plugin processes, mock OpenRouter)
+        run: cargo build -p agentmod-runtime && ./tests/e2e.sh
+
+  site:
+    name: Browser runtime and site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: prototype
+      - name: Install wasm tooling
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo install wasm-bindgen-cli --version 0.2.100 --locked
+      - name: Check the browser config matches agentmod.toml
+        run: |
+          cargo run -q -p agentmod-runtime -- config > /tmp/config.json
+          diff -u ui/runtime/agentmod.config.json /tmp/config.json
+      - run: ./scripts/build-wasm.sh
+      - run: ./scripts/build-site.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Browser end-to-end (headless Chrome)
+        run: |
+          cd tests && npm install --no-audit --no-fund && cd ..
+          CHROME_PATH=$(which google-chrome || which chromium) SHOTS_DIR=$PWD/target/shots node tests/browser.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-screenshots
+          path: prototype/target/shots
+          if-no-files-found: ignore
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: prototype/dist
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: [rust, site]
+    # The github-pages environment only accepts deployments from main.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

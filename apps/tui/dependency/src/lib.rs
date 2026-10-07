@@ -2295,7 +2295,9 @@ mod tests {
     fn attachment_workspace() -> PathBuf {
         let root = std::env::temp_dir().join(format!("agentmod-tui-attachment-{}", Uuid::now_v7()));
         fs::create_dir(&root).expect("attachment workspace");
-        root
+        // The confined opener refuses symlinked path components, and the
+        // macOS temp dir lives under the `/var -> /private/var` symlink.
+        fs::canonicalize(&root).expect("canonical attachment workspace")
     }
 
     #[test]

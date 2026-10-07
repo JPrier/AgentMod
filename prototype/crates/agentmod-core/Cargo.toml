@@ -1,0 +1,15 @@
+[package]
+name = "agentmod-core"
+description = "Deterministic, sans-I/O kernel of the AgentMod event bus prototype"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[lints]
+workspace = true

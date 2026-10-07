@@ -1,0 +1,5 @@
+# The prototype tracks stable (the root pins 1.91.1 for the existing workspace).
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

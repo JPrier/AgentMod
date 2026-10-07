@@ -71,9 +71,14 @@ fn git(directory: &Path, arguments: &[&str]) -> String {
         .to_owned()
 }
 
+/// Output limit for the overflow test. It must exceed the repository path that
+/// `discover` reads back (temp paths on macOS and Windows runners exceed 64
+/// bytes) while staying below the diff produced by `OVERFLOWING_CONTENT`.
+const OVERFLOW_LIMIT: u64 = 512;
+
 #[tokio::test]
 async fn discovers_statuses_diffs_and_exports_overflow() {
-    let fixture = Fixture::new(64);
+    let fixture = Fixture::new(OVERFLOW_LIMIT);
     let nested = fixture.repository.join("nested");
     fs::create_dir(&nested).expect("nested");
     let discovered = fixture
@@ -88,7 +93,7 @@ async fn discovers_statuses_diffs_and_exports_overflow() {
 
     fs::write(
         fixture.repository.join("tracked.txt"),
-        "changed content that creates a bounded binary-capable patch projection\n",
+        "changed content that creates a bounded binary-capable patch projection\n".repeat(16),
     )
     .expect("modify");
     fs::write(fixture.repository.join("untracked.txt"), "new\n").expect("untracked");
@@ -127,8 +132,11 @@ async fn discovers_statuses_diffs_and_exports_overflow() {
         .diff(diff_repository)
         .await
         .expect("diff");
-    assert!(diff.total_bytes > 64);
-    assert_eq!(diff.inline.len(), 64);
+    assert!(diff.total_bytes > OVERFLOW_LIMIT);
+    assert_eq!(
+        diff.inline.len(),
+        usize::try_from(OVERFLOW_LIMIT).expect("limit fits usize")
+    );
     assert!(
         diff.overflow_artifact
             .as_ref()

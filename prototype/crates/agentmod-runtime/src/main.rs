@@ -93,7 +93,8 @@ async fn main() -> ExitCode {
 }
 
 async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
-    let loaded = config::load(&args.config)?;
+    let mut loaded = config::load(&args.config)?;
+    config::disable_unrunnable(&mut loaded.config);
     let (host, compilation) = host::Host::boot(host::Options {
         config: loaded.config,
         base_dir: loaded.base_dir,

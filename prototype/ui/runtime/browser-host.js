@@ -8,6 +8,7 @@
 
 import init, { WasmKernel, compile, project, context_at } from '../pkg/agentmod_wasm.js';
 import { WEB_UI_MANIFEST } from '../plugins/web-ui/manifest.js';
+import { Devices } from './devices.js';
 
 const PROTOCOL = 'agentmod/0.1';
 const CANCEL_GRACE_MS = 3000;
@@ -107,6 +108,9 @@ export class BrowserRuntime {
     this.maxAttempts = 3;
     this.journal = [];
     this.mode = 'browser';
+    // Page-only resources lent to plugins that declare them (see devices.js).
+    // They outlive plugin workers, so a restarted plugin finds its VM running.
+    this.devices = new Devices();
   }
 
   // ------------------------------------------------------------------
@@ -301,6 +305,8 @@ export class BrowserRuntime {
           this.listeners.add(l);
           return { watching: true };
         });
+      case 'device':
+        return answer(() => this.devices.call(proc.name, proc.manifest, params));
       case 'log':
         this.log(`[${proc.name}] ${params.message}`);
         return undefined;

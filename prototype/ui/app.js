@@ -7,6 +7,7 @@
 import { markdown } from './runtime/markdown.js';
 import { LiveClient } from './runtime/live-client.js';
 import { listModels, describe } from './runtime/models.js';
+import { isolated, isolationSupported, ensureIsolation, enableIsolation, disableIsolation, takeAfterReload } from './runtime/isolation.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 
@@ -287,7 +288,10 @@ async function connect(host) {
   }
   stopSub = state.client.onRecord(onRecord);
   await refreshAll();
-  if (!state.sessions.length) {
+  const after = takeAfterReload();
+  if (after && state.definitions.includes(after)) {
+    await newSession(after);
+  } else if (!state.sessions.length) {
     await newSession('chat');
   } else if (state.sessions.length) {
     await select(state.sessions[state.sessions.length - 1].session_id);
@@ -597,11 +601,50 @@ function chat() {
   const items = threadItems(v);
   const empty = !v.events.some((e) => e.event_name === 'user-message');
   const thread = h('div.thread', { 'aria-live': 'polite' },
-    h('div.thread-inner', items, empty && v.definition !== 'heartbeat' && suggestions()));
+    h('div.thread-inner', sandboxNotice(v), items, empty && v.definition !== 'heartbeat' && suggestions(v)));
   return h('main.chat', head, thread, composer(v));
 }
 
-function suggestions() {
+// ---- the Linux sandbox (linux-sandbox plugin) -----------------------------------
+
+const SANDBOX = 'linux-sandbox';
+
+/** Status line for sessions whose definition includes the in-browser Linux sandbox. */
+function sandboxNotice(v) {
+  const configured = state.config?.config?.definitions?.[v.definition]?.subscribers?.some((s) => s.plugin === SANDBOX);
+  if (!configured) return null;
+  const active = state.graph?.definitions?.[v.definition]?.plugins?.includes(SANDBOX);
+  if (!active) {
+    return h('div.notice', h('b', 'Linux sandbox unavailable on this host. '),
+      'It runs only in the in-browser runtime (CheerpX needs a browser); this runtime disabled it, so the coding tools are missing here.');
+  }
+  if (isolated()) {
+    return h('div.notice.ok', h('b', 'Linux sandbox: '),
+      'an x86 Debian VM running in this tab (CheerpX), on your CPU and RAM. It starts on the first tool call; /workspace persists in this browser. ',
+      h('button.linkish', { onclick: () => disableIsolation() }, 'Turn off isolation'));
+  }
+  if (!isolationSupported()) {
+    return h('div.notice', h('b', 'Linux sandbox unavailable: '), 'it needs a secure (https or localhost) page with service workers to enable cross-origin isolation.');
+  }
+  return h('div.notice',
+    h('p', h('b', 'Enable the Linux sandbox to let the agent code here. '),
+      'It runs an x86 Linux VM in this tab with CheerpX, which needs a cross-origin-isolated page. Enabling installs a small service worker that adds the isolation headers, then reloads the page. ',
+      'In-browser sessions live in memory, so this one ends on reload (export logs first to keep it).'),
+    h('div.row-actions', h('button.btn.primary', { onclick: () => act(() => enableIsolation(v.definition)) }, 'Enable the Linux sandbox')),
+    h('p.help', 'Works in current Chrome, Edge, and Firefox. CheerpX is by Leaning Technologies and free for personal and open-source use.'));
+}
+
+function suggestions(v) {
+  if (state.graph?.definitions?.[v?.definition]?.plugins?.includes(SANDBOX)) {
+    const s = [
+      'What languages and build tools are installed in the sandbox?',
+      'Write a C program that prints the first 20 primes, compile it with gcc, and run it',
+      'Create a Python module with a slugify() function plus unit tests, and run the tests',
+      'Import the GitHub repo antirez/kilo, build it with make, and explain how it draws the screen',
+    ];
+    return h('div.empty', h('h2', 'Code in your browser'), h('p', 'The agent edits files and runs commands in a Linux VM on your machine. Every tool call, file diff, and result is an event in this session\u2019s log.'),
+      h('div.suggest', s.map((t) => h('button', { onclick: () => send(t) }, t))));
+  }
   const s = ['What time is it?', 'Calculate (12+30)*7', 'Remember that the deploy is on Friday', 'Delegate: summarize the launch plan', 'my token: sk-test1234567890abcdef please keep it safe'];
   return h('div.empty', h('h2', 'Talk to the agent'), h('p', 'Every reply is produced by plugins: an OpenRouter model, tools, memory, an approval gate, and sub-agents. Watch the pipeline on the right as it runs.'),
     h('div.suggest', s.map((t) => h('button', { onclick: () => send(t) }, t))));
@@ -1063,6 +1106,8 @@ function logPane() {
 // ---------------------------------------------------------------------------
 
 async function start() {
+  // The Linux sandbox's opt-in cross-origin isolation may need one reload.
+  if (await ensureIsolation()) return;
   const params = new URLSearchParams(location.search);
   const runtime = params.get('runtime');
   // Test hook: point the OpenRouter plugin at another OpenAI-compatible endpoint.

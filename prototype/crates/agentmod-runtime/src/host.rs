@@ -17,7 +17,7 @@ use agentmod_core::types::Stamp;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::config::stamp_binaries;
+use crate::config::{disable_unrunnable, stamp_binaries};
 use crate::proc::{Msg, ProcHandle, spawn};
 use crate::store::Store;
 
@@ -945,6 +945,7 @@ impl Host {
             self.ensure_loaded(session_id)?;
         }
         stamp_binaries(&mut config, &self.base_dir);
+        disable_unrunnable(&mut config);
         let mut waiting = BTreeSet::new();
         for (name, cfg) in config.plugins.iter().filter(|(_, c)| !c.disabled) {
             let k = key(name, &cfg.stamp());

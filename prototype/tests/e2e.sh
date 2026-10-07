@@ -2,7 +2,8 @@
 # Native end-to-end test: real runtime + real plugin processes, OpenRouter
 # replaced by a local mock. Covers a tool loop, approval + sub-agent, hot
 # config apply (and rejection), hard stop, plugin crash isolation, SIGKILL of
-# the runtime mid-stream with recovery from the log, and full log verification.
+# the runtime mid-stream with recovery from the log, the coding tools through
+# a real session (local-workspace), and full log verification.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 BIN=${AGENTMOD_BIN:-target/debug/agentmod}
@@ -11,8 +12,16 @@ PORT=7799
 B=http://127.0.0.1:$PORT/api
 CFG=$(mktemp --suffix=.toml -p .)
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$DATA" "$CFG"' EXIT
-sed -e "s|max_tokens = 1024 }|max_tokens = 1024, base_url = \"http://127.0.0.1:8766/api/v1\" }|" \
-    -e "s|port = 7700|port = $PORT|" agentmod.toml > "$CFG"
+sed -e "s|max_tokens = 4096 }|max_tokens = 4096, base_url = \"http://127.0.0.1:8766/api/v1\" }|" \
+    -e "s|port = 7700|port = $PORT|" \
+    -e "s#root = \".agentmod/workspace\"#root = \"$DATA/ws\"#" agentmod.toml > "$CFG"
+# local-workspace is in no default definition (it is not a sandbox); opt in here.
+cat >> "$CFG" <<'TOML'
+
+[definitions.coder-local]
+description = "Coding tools against a local directory (test only)"
+subscribers = [{ plugin = "web-ui" }, { plugin = "chat-context" }, { plugin = "openrouter-model" }, { plugin = "local-workspace" }]
+TOML
 MOCK_DELAY_MS=150 node tests/mock-openrouter.mjs 8766 2>/dev/null &
 export OPENROUTER_API_KEY=test-key
 
@@ -68,8 +77,20 @@ chunks=[e for e in d['events'] if e['event_name']=='stream-chunk']
 idx=[e['payload']['index'] for e in chunks]
 assert idx==list(range(len(idx))), idx
 assert any(i['attempts']>1 for e in d['events'] for i in e['invocations'])" || fail "recovery"
+
+echo "8. coding tools: the shared tool layer through a real session (local-workspace)"
+post_json() { python3 -c "import json,sys; print(json.dumps({'definition':'coder-local','text':sys.argv[1]} if sys.argv[2]=='new' else {'text':sys.argv[1]}))" "$1" "$2"; }
+curl -s -XPOST $B/sessions -d "$(post_json 'tool write_file {"path":"hello.sh","content":"echo hello from the workspace\n"}' new)" >/dev/null
+wait_for s0006 "assert any(e['event_name']=='tool-result' and e['payload']['name']=='write_file' and not e['payload'].get('error') for e in d['events'])" 100
+wait_for s0006 "assert any(e['event_name']=='workspace-change' and '+echo hello' in e['payload']['unified'] for e in d['events'])" 20
+wait_for s0006 "assert any(e['event_name']=='assistant-message' for e in d['events'])" 100
+test -f "$DATA/ws/hello.sh" || fail "write_file did not create the file"
+curl -s -XPOST $B/sessions/s0006/messages -d "$(post_json 'tool run {"command":"bash hello.sh && pwd"}' msg)" >/dev/null
+wait_for s0006 "assert any(e['event_name']=='tool-result' and e['payload']['name']=='run' and 'hello from the workspace' in e['payload']['output'] for e in d['events'])" 100
+curl -s -XPOST $B/sessions/s0006/messages -d "$(post_json 'tool read_file {"path":"../../etc/passwd"}' msg)" >/dev/null
+wait_for s0006 "assert any(e['event_name']=='tool-result' and e['payload']['name']=='read_file' and e['payload']['error'] and 'outside the workspace' in e['payload']['output'] for e in d['events'])" 100
 kill $RT; wait $RT 2>/dev/null || true
 
-echo "8. every log replays through a fresh kernel"
+echo "9. every log replays through a fresh kernel"
 "$BIN" verify --data "$DATA"
 echo "e2e: all checks passed"

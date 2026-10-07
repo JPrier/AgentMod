@@ -1,6 +1,6 @@
 {
   "runtime": {
-    "max_causal_depth": 64,
+    "max_causal_depth": 256,
     "spill_threshold_bytes": 16384,
     "max_attempts": 3
   },
@@ -37,6 +37,24 @@
         "every_seconds": 0
       }
     },
+    "linux-sandbox": {
+      "command": [],
+      "module": "plugins/linux-sandbox/main.js",
+      "config": {
+        "workspace": "default"
+      },
+      "timeout_ms": 1200000
+    },
+    "local-workspace": {
+      "command": [
+        "node",
+        "plugins/local-workspace/main.js"
+      ],
+      "config": {
+        "root": ".agentmod/workspace"
+      },
+      "timeout_ms": 1200000
+    },
     "memory": {
       "command": [
         "node",
@@ -65,7 +83,7 @@
       "module": "plugins/openrouter-model/main.js",
       "config": {
         "api_key_env": "OPENROUTER_API_KEY",
-        "max_tokens": 1024,
+        "max_tokens": 4096,
         "model": "openai/gpt-4o-mini"
       }
     },
@@ -172,6 +190,32 @@
         },
         {
           "plugin": "subagent"
+        }
+      ]
+    },
+    "coder": {
+      "description": "Coding agent: writes, builds, and runs code in a Linux sandbox inside your browser",
+      "subscribers": [
+        {
+          "plugin": "web-ui"
+        },
+        {
+          "plugin": "redactor"
+        },
+        {
+          "plugin": "approval-gate"
+        },
+        {
+          "plugin": "chat-context"
+        },
+        {
+          "plugin": "openrouter-model"
+        },
+        {
+          "plugin": "titler"
+        },
+        {
+          "plugin": "linux-sandbox"
         }
       ]
     },

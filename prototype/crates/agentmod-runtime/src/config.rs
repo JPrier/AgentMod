@@ -52,3 +52,41 @@ pub fn stamp_binaries(config: &mut DeploymentConfig, base_dir: &Path) {
         plugin.binary_hash = Some(hex::encode(h.finalize())[..16].to_owned());
     }
 }
+
+/// Disable plugins this host cannot run. A plugin with a `module` but no
+/// `command` is a worker-only plugin for the browser runtime (for example
+/// `linux-sandbox`, which needs a browser for CheerpX). This mirrors the
+/// browser host, which disables command-only plugins; the compiler reports
+/// each skipped subscriber as `disabled-plugin` info.
+pub fn disable_unrunnable(config: &mut DeploymentConfig) {
+    for plugin in config.plugins.values_mut() {
+        if plugin.command.is_empty() && plugin.module.is_some() {
+            plugin.disabled = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worker_only_plugins_are_disabled_natively() {
+        let mut config: DeploymentConfig = toml::from_str(
+            r#"
+            [plugins.both]
+            command = ["node", "both.js"]
+            module = "both.js"
+            [plugins.native]
+            command = ["python3", "native.py"]
+            [plugins.worker]
+            module = "worker.js"
+            "#,
+        )
+        .unwrap();
+        disable_unrunnable(&mut config);
+        assert!(!config.plugins["both"].disabled);
+        assert!(!config.plugins["native"].disabled);
+        assert!(config.plugins["worker"].disabled);
+    }
+}

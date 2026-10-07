@@ -99,6 +99,8 @@ export function cheerpxTarget(options = {}) {
     if (why) throw new Error(`Linux sandbox unavailable: ${why}`);
     await lock();
     status('booting', 'Starting the Linux sandbox in your browser (CheerpX). The first start streams the disk image; later starts reuse the local cache…');
+    // CheerpX expects a page; in a worker, `window` is the worker's global.
+    globalThis.window ??= globalThis;
     const CheerpX = await import(/* @vite-ignore */ cfg.cheerpx_url || `https://cxrtnc.leaningtech.com/${cfg.cheerpx_version}/cx.esm.js`);
     let block;
     if (cfg.image_type === 'cloud') {

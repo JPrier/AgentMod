@@ -79,6 +79,7 @@ export function createCheerpxVm(options = {}) {
   let queue = Promise.resolve();
   let seq = 0;
   let consoleTail = '';
+  let broken = null; // set when the VM stops responding
   let releaseLock = null;
 
   /** Serialize VM operations. */
@@ -158,10 +159,11 @@ export function createCheerpxVm(options = {}) {
     // redirected into the scratch filesystem so it can be read back exactly.
     // GNU `timeout` does not fire under CheerpX (its timer never expires), so a
     // watchdog subshell sleeps and then kills the command. Signals to a pid work
-    // under CheerpX but process-group kills do not, so the watchdog walks the
-    // process tree (`pgrep -P`) and kills it bottom-up. The watchdog's marker
-    // and its kill are tied to this operation (n), so a watchdog that outlives
-    // its command can never affect a later one.
+    // under CheerpX but process-group kills do not, so on timeout the watchdog
+    // walks the process tree (`pgrep -P`) and kills it bottom-up; the normal
+    // path never touches /proc. The watchdog's marker and its kill are tied to
+    // this operation (n), so a watchdog that outlives its command (its `sleep`
+    // is left to finish) can never affect a later one.
     const wrapper = [
       `: >${OUT}/stdout; : >${OUT}/stderr`,
       `cd -- "$1" 2>${OUT}/stderr || exit 126`,
@@ -173,27 +175,43 @@ export function createCheerpxVm(options = {}) {
       'wd=$!',
       'wait $pid; rc=$?',
       `echo "${n} done" >${OUT}/pid`,
-      'killtree $wd 2>/dev/null',
+      'kill -KILL $wd 2>/dev/null',
       `[ -e ${OUT}/timedout-${n} ] && { rm -f ${OUT}/timedout-${n}; exit 124; }`,
       'exit $rc',
     ].join('\n');
     const started = Date.now();
-    const { status } = await cx.run('/bin/bash', ['-c', wrapper, `agentmod-op-${n}`, cwd, String(timeoutSeconds), command], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid });
+    // If CheerpX itself dies (a WebAssembly trap), cx.run never settles; stop
+    // waiting well after the command's own timeout and retire the VM.
+    let guard;
+    const stalled = new Promise((_, reject) => {
+      guard = setTimeout(() => {
+        broken = 'the Linux sandbox stopped responding (the VM may have crashed); reload the page to restart it. /workspace is kept.';
+        reject(new Error(broken));
+      }, (timeoutSeconds + 60) * 1000);
+    });
+    let status;
+    try {
+      ({ status } = await Promise.race([cx.run('/bin/bash', ['-c', wrapper, `agentmod-op-${n}`, cwd, String(timeoutSeconds), command], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid }), stalled]));
+    } finally {
+      clearTimeout(guard);
+    }
     const [stdout, stderr] = await Promise.all([io.readFileAsBlob('/stdout').then(blobBytes), io.readFileAsBlob('/stderr').then(blobBytes)]);
     const timedOut = status === 124 && Date.now() - started >= timeoutSeconds * 1000;
     return { exitCode: status, stdout, stderr, timedOut };
   }
 
   const ready = () => {
+    if (broken) throw new Error(broken);
     if (!cx) throw new Error('the Linux sandbox is not booted');
   };
 
   return {
     state() {
-      return { booted: !!cx, booting: !!booting && !cx, info, unavailable: unavailableReason() };
+      return { booted: !!cx && !broken, booting: !!booting && !cx, info, unavailable: broken || unavailableReason() };
     },
 
     boot() {
+      if (broken) return Promise.reject(new Error(broken));
       if (!booting) {
         booting = serial(boot).catch((e) => {
           booting = null;

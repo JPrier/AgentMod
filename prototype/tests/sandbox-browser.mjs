@@ -128,6 +128,21 @@ try {
   check('python3', r.ok, r.out);
   r = await tool('run', { command: 'git --version && cd /workspace && git init -q demo && echo ok-git' }, /ok-git/);
   check('git', r.ok, r.out);
+  r = await tool('run', { command: 'node -e "console.log(6*7)" && node --version' }, /\b42\b/);
+  check('node', r.ok, r.out);
+  r = await tool('list_files', {}, /hello\.c/);
+  check('list_files', r.ok, r.out);
+  await shot('03-work');
+
+  // Persistence: reload the page; the workspace lives in IndexedDB.
+  await page.reload();
+  await page.waitForSelector('.chat-head', { timeout: 60000 });
+  await newCoderSession();
+  r = await tool('read_file', { path: 'hello.c' }, /hi from gcc in the browser/, BOOT_MS);
+  check('workspace persists across reload', r.ok, r.out);
+  await shot('04-after-reload');
+
+  // Last: process control (a VM crash here must not hide the results above).
   // Diagnostics: how signals behave in the guest (each line: what, exit code, seconds waited).
   r = await tool('run', { command: [
     "w() { s=$(date +%s); wait $1; echo \"$2 rc=$? waited=$(( $(date +%s) - s ))s\"; }",
@@ -145,19 +160,7 @@ try {
   const t1 = Date.now();
   r = await tool('run', { command: 'sleep 30', timeout_seconds: 3 }, /timed out after 3s/, 120000);
   check('timeout kills a command', r.ok && Date.now() - t1 < 25000, `${Math.round((Date.now() - t1) / 1000)}s; ${r.out}`);
-  r = await tool('run', { command: 'node -e "console.log(6*7)" && node --version' }, /\b42\b/);
-  check('node', r.ok, r.out);
-  r = await tool('list_files', {}, /hello\.c/);
-  check('list_files', r.ok, r.out);
-  await shot('03-work');
-
-  // Persistence: reload the page; the workspace lives in IndexedDB.
-  await page.reload();
-  await page.waitForSelector('.chat-head', { timeout: 60000 });
-  await newCoderSession();
-  r = await tool('read_file', { path: 'hello.c' }, /hi from gcc in the browser/, BOOT_MS);
-  check('workspace persists across reload', r.ok, r.out);
-  await shot('04-after-reload');
+  await shot('05-process-control');
 } catch (e) {
   failed = true;
   report.error = e.message;

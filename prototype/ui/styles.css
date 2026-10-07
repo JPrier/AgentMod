@@ -313,3 +313,7 @@ table.matrix tbody th { text-align: left; font-family: var(--mono); font-weight:
 .gate-card label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
 .gate-card input { padding: 9px 11px; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--panel); color: var(--ink); }
 .gate-err { color: var(--bad); }
+
+.model-field { display: grid; gap: 4px; }
+.model-status { margin: 0; font-size: 12px; color: var(--muted); }
+.gate-card label.inline-check, .provider-panel label.inline-check { display: flex; flex-direction: row; gap: 6px; align-items: center; font-size: 12.5px; cursor: pointer; }

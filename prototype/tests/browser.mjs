@@ -42,14 +42,34 @@ try {
   await page.goto(URLARG || 'http://localhost:8099/?host=browser&openrouter_base=http://127.0.0.1:8765/api/v1');
   if (!URLARG) {
     await page.waitForSelector('.gate-card input[type=password]', { timeout: 15000 });
+    // The model list comes from the provider's /models endpoint, not the page.
+    await page.waitForFunction(() => document.querySelectorAll('.gate-card datalist option').length === 2, { timeout: 10000 });
+    const opts = await page.$$eval('.gate-card datalist option', (o) => o.map((x) => x.value));
+    if (opts.join() !== 'mock/tool-model,openai/gpt-4o-mini') throw new Error(`unexpected model options ${opts}`);
+    await page.click('.gate-card .inline-check input');
+    await page.waitForFunction(() => document.querySelectorAll('.gate-card datalist option').length === 3);
     await shot('00-gate');
+    const modelInput = '.gate-card input[aria-label="OpenRouter model"]';
+    await page.$eval(modelInput, (el) => { el.value = ''; });
+    await page.type(modelInput, 'nobody/not-a-model');
+    await page.type('.gate-card input[type=password]', 'test-key');
+    await page.click('.gate-card button.btn.primary');
+    await waitText('not in OpenRouter');
+    await page.waitForFunction(() => document.querySelectorAll('.gate-card datalist option').length >= 2);
+    await page.$eval(modelInput, (el) => { el.value = ''; });
+    await page.type(modelInput, 'mock/tool-model');
     await page.type('.gate-card input[type=password]', 'wrong-key');
     await page.click('.gate-card button.btn.primary');
     await waitText('rejected that key');
+    await page.$eval(modelInput, (el) => { el.value = 'mock/tool-model'; });
     await page.type('.gate-card input[type=password]', 'test-key');
     await page.click('.gate-card button.btn.primary');
   }
   await page.waitForSelector('.chat-head', { timeout: 30000 });
+  if (!URLARG) {
+    const label = await page.$eval('.provider .btn', (b) => b.textContent);
+    if (!label.includes('mock/tool-model')) throw new Error(`chosen model not applied: ${label}`);
+  }
   await shot('01-boot');
   await page.click('.suggest button:nth-child(2)');
   await waitText('The tool returned: 294');

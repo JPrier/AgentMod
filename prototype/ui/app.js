@@ -6,6 +6,7 @@
 
 import { markdown } from './runtime/markdown.js';
 import { LiveClient } from './runtime/live-client.js';
+import { listModels, describe } from './runtime/models.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 
@@ -63,7 +64,97 @@ const MODEL_PLUGINS = ['openrouter-model', 'openai-model'];
 const KEY_STORE = 'agentmod.openrouter.key';
 const MODEL_STORE = 'agentmod.openrouter.model';
 const BASE_STORE = 'agentmod.openrouter.base';
-const DEFAULT_OR_MODEL = 'openai/gpt-4o-mini';
+const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
+
+/** The deployment's configured default model (agentmod.toml), not a UI constant. */
+function configuredModel(config) {
+  return config?.plugins?.['openrouter-model']?.config?.model || '';
+}
+
+function openrouterBase(config) {
+  return sessionStorage.getItem(BASE_STORE) || config?.plugins?.['openrouter-model']?.config?.base_url || OPENROUTER_BASE;
+}
+
+// ---------------------------------------------------------------------------
+// Model picker: the catalog comes live from the provider's /models endpoint.
+// ---------------------------------------------------------------------------
+
+const modelCache = new Map(); // base -> ModelInfo[] | Error
+let showAllModels = false;
+let pickerSeq = 0;
+
+function fillModelOptions(list, models) {
+  list.replaceChildren(...models.filter((m) => showAllModels || m.tools).map((m) => h('option', { value: m.id }, describe(m))));
+}
+
+function modelStatus(status, base, value) {
+  const got = modelCache.get(base);
+  status.replaceChildren();
+  if (got instanceof Error) {
+    status.append(`Couldn't load the model list (${got.message}). Enter any model id OpenRouter accepts.`);
+    return;
+  }
+  if (!got) {
+    status.append('Loading models from OpenRouter…');
+    return;
+  }
+  const shown = got.filter((m) => showAllModels || m.tools).length;
+  const match = got.find((m) => m.id === value.trim());
+  status.append(
+    `${shown} of ${got.length} models${showAllModels ? '' : ' (tool-capable only)'}. `,
+    match ? describe(match) || match.name : value.trim() ? 'Not in OpenRouter’s catalog.' : '',
+  );
+}
+
+/** Input + live datalist for choosing an OpenRouter model. */
+function modelPicker({ value, base, keyInput, label = 'Model' }) {
+  const listId = `or-models-${++pickerSeq}`;
+  const list = h(`datalist#${listId}`);
+  const input = h('input', { value, list: listId, 'aria-label': 'OpenRouter model', autocomplete: 'off', spellcheck: 'false', placeholder: 'provider/model' });
+  const status = h('span.help.model-status');
+  const toggle = h('input', { type: 'checkbox', checked: showAllModels });
+  const refresh = () => {
+    const got = modelCache.get(base);
+    if (Array.isArray(got)) fillModelOptions(list, got);
+    modelStatus(status, base, input.value);
+  };
+  toggle.addEventListener('change', () => {
+    showAllModels = toggle.checked;
+    refresh();
+  });
+  input.addEventListener('input', refresh);
+  const load = () => {
+    const key = keyInput?.value.trim() || localStorage.getItem(KEY_STORE) || '';
+    listModels(base, key).then(
+      (models) => modelCache.set(base, models),
+      (e) => modelCache.set(base, e instanceof Error ? e : new Error(String(e))),
+    ).then(refresh);
+  };
+  refresh();
+  if (!Array.isArray(modelCache.get(base))) load();
+  // If the list needed a key we did not have yet, retry once one is entered.
+  keyInput?.addEventListener('change', () => {
+    if (!Array.isArray(modelCache.get(base))) {
+      modelCache.delete(base);
+      refresh();
+      load();
+    }
+  });
+  const field = h('div.model-field',
+    h('label', label, input),
+    list,
+    status,
+    h('label.inline-check', toggle, 'Include models without tool calling'));
+  return { field, input, validate: () => validateModel(base, input.value.trim()) };
+}
+
+/** Returns an error message, or null when the model can be used. */
+function validateModel(base, id) {
+  if (!id) return 'Choose a model.';
+  const got = modelCache.get(base);
+  if (Array.isArray(got) && !got.some((m) => m.id === id)) return `“${id}” is not in OpenRouter’s model catalog.`;
+  return null;
+}
 
 function withProvider(config, provider, extra) {
   const cfg = structuredClone(config);
@@ -81,7 +172,7 @@ function currentProvider(cfg) {
 
 /** The browser runtime always runs a real LLM: the OpenRouter key is required to boot. */
 function browserBootConfig(config, key) {
-  const extra = { api_key: key, model: localStorage.getItem(MODEL_STORE) || config.plugins['openrouter-model']?.config?.model || DEFAULT_OR_MODEL };
+  const extra = { api_key: key, model: localStorage.getItem(MODEL_STORE) || configuredModel(config) };
   const base = sessionStorage.getItem(BASE_STORE);
   if (base) extra.base_url = base;
   return withProvider(config, 'openrouter-model', extra);
@@ -90,7 +181,7 @@ function browserBootConfig(config, key) {
 async function updateOpenRouter({ key, model }) {
   const active = state.config?.config;
   if (!active) return;
-  const extra = { model: model || DEFAULT_OR_MODEL };
+  const extra = { model };
   if (state.host === 'browser') {
     if (!key) return toast('An OpenRouter API key is required.', true);
     extra.api_key = key;
@@ -106,11 +197,18 @@ async function updateOpenRouter({ key, model }) {
   render();
 }
 
-function keyGate(error) {
+async function keyGate(error) {
+  let base = OPENROUTER_BASE;
+  let fallback = '';
+  try {
+    const config = await (await fetch('runtime/agentmod.config.json')).json();
+    base = openrouterBase(config);
+    fallback = configuredModel(config);
+  } catch { /* the runtime boot will report a missing config */ }
   const app = $('#app');
   app.innerHTML = '';
   const key = h('input', { type: 'password', placeholder: 'sk-or-v1-…', autocomplete: 'off', required: true, 'aria-label': 'OpenRouter API key' });
-  const model = h('input', { value: localStorage.getItem(MODEL_STORE) || DEFAULT_OR_MODEL, list: 'gate-models', 'aria-label': 'Model' });
+  const picker = modelPicker({ value: localStorage.getItem(MODEL_STORE) || fallback, base, keyInput: key });
   app.append(
     h('div.boot.gate',
       h('div.gate-card',
@@ -120,29 +218,30 @@ function keyGate(error) {
         h('form', { onsubmit: async (e) => {
           e.preventDefault();
           const k = key.value.trim();
-          const btn = e.target.querySelector('button');
+          const m = picker.input.value.trim();
+          const badModel = picker.validate();
+          if (badModel) return keyGate(badModel);
+          const btn = e.target.querySelector('button[type=submit]');
           btn.disabled = true;
           btn.textContent = 'Checking the key…';
-          const problem = await checkKey(k);
+          const problem = await checkKey(k, base);
           if (problem) return keyGate(problem);
           localStorage.setItem(KEY_STORE, k);
-          localStorage.setItem(MODEL_STORE, model.value.trim() || DEFAULT_OR_MODEL);
+          localStorage.setItem(MODEL_STORE, m);
           connect('browser');
         } },
           h('label', 'OpenRouter API key', key),
-          h('label', 'Model', model),
-          h('datalist#gate-models', OR_MODELS.map((m) => h('option', { value: m }))),
+          picker.field,
           h('button.btn.primary', { type: 'submit' }, 'Start the runtime')),
         h('p.help', 'The key is kept in this browser (localStorage) and sent only to openrouter.ai by the openrouter-model plugin worker. Exported logs omit it. Get a key at ', h('a', { href: 'https://openrouter.ai/keys', target: '_blank', rel: 'noopener' }, 'openrouter.ai/keys'), '.'),
-        h('p.help', 'Or ', h('button.linkish', { onclick: () => promptLive() }, 'attach to a local runtime'), ' started with ', h('code', 'OPENROUTER_API_KEY=… agentmod serve'), '.'))),
+        h('p.help', 'Or ', h('button.linkish', { type: 'button', onclick: () => promptLive() }, 'attach to a local runtime'), ' started with ', h('code', 'OPENROUTER_API_KEY=… agentmod serve'), '.'))),
   );
   key.focus();
 }
 
 /** Ask OpenRouter whether the key is valid. Returns an error message, or null. */
-async function checkKey(key) {
+async function checkKey(key, base) {
   if (!key) return 'Enter your OpenRouter API key.';
-  const base = sessionStorage.getItem(BASE_STORE) || 'https://openrouter.ai/api/v1';
   try {
     const r = await fetch(`${base}/key`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(8000) });
     if (r.status === 401 || r.status === 403) return 'OpenRouter rejected that key. Check it and try again.';
@@ -151,8 +250,6 @@ async function checkKey(key) {
     return null; // Offline or blocked: let the plugin report errors on first use.
   }
 }
-
-const OR_MODELS = ['openai/gpt-4o-mini', 'anthropic/claude-haiku-4.5', 'anthropic/claude-sonnet-4.5', 'google/gemini-2.5-flash', 'meta-llama/llama-3.3-70b-instruct', 'qwen/qwen3-coder'];
 
 // ---------------------------------------------------------------------------
 // Boot and host selection
@@ -417,7 +514,7 @@ function topbar() {
 function providerButton() {
   const p = currentProvider(state.config?.config);
   const model = state.config?.config?.plugins?.[p]?.config?.model;
-  const label = p === 'openrouter-model' ? `OpenRouter · ${model || DEFAULT_OR_MODEL}` : p ? `${p} · ${model || ''}` : 'No model';
+  const label = p === 'openrouter-model' ? `OpenRouter · ${model}` : p ? `${p} · ${model || ''}` : 'No model';
   return h('div.provider',
     h('button.btn', { onclick: () => { state.showProvider = !state.showProvider; render(); }, 'aria-expanded': String(!!state.showProvider), title: 'The model is a plugin; changing it is a live config apply' }, label),
     state.showProvider && providerPanel());
@@ -426,17 +523,21 @@ function providerButton() {
 function providerPanel() {
   const browser = state.host === 'browser';
   const key = h('input', { type: 'password', value: localStorage.getItem(KEY_STORE) || '', autocomplete: 'off', 'aria-label': 'OpenRouter API key' });
-  const model = h('input', { value: state.config?.config?.plugins?.['openrouter-model']?.config?.model || DEFAULT_OR_MODEL, 'aria-label': 'OpenRouter model', list: 'or-models' });
+  const cfg = state.config?.config;
+  const picker = modelPicker({ value: configuredModel(cfg), base: openrouterBase(cfg), keyInput: browser ? key : undefined });
   return h('div.provider-panel', { role: 'dialog', 'aria-label': 'Model provider' },
     h('h3', 'OpenRouter'),
     browser
       ? h('p.help', 'The key stays in this browser and is sent only to openrouter.ai. Exported logs omit it.')
       : h('p.help', 'The native runtime reads the key from OPENROUTER_API_KEY on the machine running agentmod serve.'),
     browser && h('label', 'API key', key),
-    h('label', 'Model', model),
-    h('datalist#or-models', OR_MODELS.map((m) => h('option', { value: m }))),
+    picker.field,
     h('div.row-actions',
-      h('button.btn.primary', { onclick: () => updateOpenRouter({ key: key.value.trim(), model: model.value.trim() }) }, 'Apply'),
+      h('button.btn.primary', { onclick: () => {
+        const bad = picker.validate();
+        if (bad) return toast(bad, true);
+        updateOpenRouter({ key: key.value.trim(), model: picker.input.value.trim() });
+      } }, 'Apply'),
       browser && h('button.btn.ghost', { onclick: () => { localStorage.removeItem(KEY_STORE); location.reload(); } }, 'Forget key')),
     h('p.help', 'Applying is a live config apply: sessions pick up the change at their next event boundary.'));
 }

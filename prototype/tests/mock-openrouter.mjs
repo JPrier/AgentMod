@@ -7,6 +7,16 @@ http.createServer(async (req, res) => {
   res.setHeader('access-control-allow-headers', '*');
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
   const ok = req.headers.authorization === 'Bearer test-key';
+  if (req.method === 'GET' && req.url.endsWith('/models')) {
+    // Shape of https://openrouter.ai/api/v1/models (public; no key needed).
+    const model = (id, name, tools, prompt) => ({ id, name, context_length: 128000, pricing: { prompt, completion: String(Number(prompt) * 4) }, supported_parameters: tools ? ['tools', 'temperature'] : ['temperature'] });
+    res.writeHead(200, { 'content-type': 'application/json' });
+    return res.end(JSON.stringify({ data: [
+      model('openai/gpt-4o-mini', 'OpenAI: GPT-4o-mini', true, '0.00000015'),
+      model('mock/tool-model', 'Mock: Tool Model', true, '0'),
+      model('mock/chat-only', 'Mock: Chat Only', false, '0.000001'),
+    ] }));
+  }
   if (req.method === 'GET' && req.url.endsWith('/key')) { res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' }); return res.end(ok ? '{"data":{"label":"test"}}' : '{"error":{"message":"bad key"}}'); }
   let body = ''; for await (const c of req) body += c;
   const j = JSON.parse(body || '{}');

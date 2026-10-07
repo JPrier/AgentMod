@@ -54,7 +54,7 @@ triggers, and the model itself are all plugins:
 | `tool-clock`, `tool-calc`, `py-wordcount` (Python) | Tools: a tool call is an event; a plugin that answers it is a tool. |
 | `memory` | `remember`/`recall` tools and memory injection into new sessions. |
 | `subagent`, `subagent-reporter` | `delegate` starts a worker session; the worker reports back cross-session. |
-| `linux-sandbox` | Coding tools (`run`, `read_file`, `write_file`, `edit_file`, `list_files`, `import_repo`) in an x86 Linux VM inside the browser (CheerpX). Browser runtime only. |
+| `linux-sandbox` | Coding tools (`run`, `read_file`, `write_file`, `edit_file`, `list_files`, `import_repo`) in an x86 Linux VM inside the browser. Browser runtime only; the VM (CheerpX) is the page's `linux-vm` host device (`ui/runtime/devices.js`), which the plugin declares and drives. |
 | `local-workspace` | The same coding tools in a local directory. Native runtime only; not a sandbox, so in no default definition. |
 | `titler` | Async session auto-titling. |
 | `heartbeat` | Trigger plugin with a journal session (`every_seconds` in config; off by default). |

@@ -71,8 +71,9 @@ async function newCoderSession() {
 }
 
 async function say(text) {
-  await page.type('#composer', text);
-  await page.keyboard.press('Enter');
+  // Set and submit in one step: the thread can re-render while typing.
+  await page.waitForSelector('#composer');
+  await page.evaluate((t) => { const ta = document.querySelector('#composer'); ta.value = t; ta.form.requestSubmit(); }, text);
 }
 
 /** Send a direct tool call (the mock model echoes "tool <name> <json>") and wait for its result row. */
@@ -127,8 +128,18 @@ try {
   check('python3', r.ok, r.out);
   r = await tool('run', { command: 'git --version && cd /workspace && git init -q demo && echo ok-git' }, /ok-git/);
   check('git', r.ok, r.out);
-  r = await tool('run', { command: 'sleep 30 & p=$!; kill $p; wait $p; echo rc=$?' }, /rc=143/, 120000);
-  check('signals reach guest processes', r.ok, r.out);
+  // Diagnostics: how signals behave in the guest (each line: what, exit code, seconds waited).
+  r = await tool('run', { command: [
+    "w() { s=$(date +%s); wait $1; echo \"$2 rc=$? waited=$(( $(date +%s) - s ))s\"; }",
+    'sleep 6 & p=$!; kill -TERM $p; w $p term-sleep',
+    'sleep 6 & p=$!; kill -KILL $p; w $p kill-sleep',
+    'yes >/dev/null & p=$!; sleep 1; kill -TERM $p; w $p term-busy-syscalls',
+    'python3 -c "while True: pass" & p=$!; sleep 1; kill -TERM $p; w $p term-busy-cpu',
+    "bash -c 'trap \"exit 3\" TERM; sleep 6 & wait' & p=$!; sleep 1; kill -TERM $p; w $p trap-term",
+    's=$(date +%s); timeout 2 sleep 6; echo "gnu-timeout rc=$? waited=$(( $(date +%s) - s ))s"',
+  ].join('\n'), timeout_seconds: 120 }, /term-sleep rc=143 waited=[01]s/, 180000);
+  report.signals = r.out;
+  check('signals end a sleeping process promptly', r.ok, r.out);
   const t1 = Date.now();
   r = await tool('run', { command: 'sleep 30', timeout_seconds: 3 }, /timed out after 3s/, 120000);
   check('timeout kills a command', r.ok && Date.now() - t1 < 25000, `${Math.round((Date.now() - t1) / 1000)}s; ${r.out}`);
@@ -159,8 +170,8 @@ try {
   fs.writeFileSync(path.join(SHOTS, 'sandbox-report.json'), JSON.stringify(report, null, 2));
   if (process.env.GITHUB_ACTIONS) {
     // Annotations: readable from the checks API without downloading logs.
-    const esc = (t) => String(t).replace(/%/g, '%25').replace(/\r/g, '').replace(/\n/g, '%0A').slice(0, 3000);
-    const lines = Object.entries(report.checks).map(([k, v]) => `${v.ok ? 'ok' : 'FAIL'} ${k}${v.detail ? ` — ${v.detail.slice(0, 200)}` : ''}`);
+    const esc = (t) => String(t).replace(/%/g, '%25').replace(/\r/g, '').replace(/\n/g, '%0A').slice(0, 4000);
+    const lines = Object.entries(report.checks).map(([k, v]) => `${v.ok ? 'ok' : 'FAIL'} ${k}${v.detail ? ` — ${v.detail.slice(0, k.startsWith("signals") ? 900 : 200)}` : ''}`);
     console.log(`::${failed ? 'error' : 'notice'} title=Linux sandbox (CheerpX)::${esc([report.error ? `error: ${report.error}` : null, ...lines].filter(Boolean).join('\n'))}`);
     if (failed) {
       console.log(`::warning title=Linux sandbox console::${esc(report.console.join('\n').slice(-2500) || '(no console output)')}`);

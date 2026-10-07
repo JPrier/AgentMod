@@ -6,7 +6,7 @@ use std::{
     process::{Command, Stdio},
     sync::mpsc,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use agentmod_primitives::{ContentHash, TimestampMillis};
@@ -83,17 +83,6 @@ fn foreground_request_can_be_cancelled_concurrently() {
     )
     .expect("run request");
     stdin.flush().expect("flush");
-    thread::sleep(Duration::from_millis(300));
-    writeln!(
-        stdin,
-        "{}",
-        json!({
-            "command":"cancel",
-            "value":{"cancellation_id":cancellation}
-        })
-    )
-    .expect("cancel request");
-    stdin.flush().expect("flush");
 
     let (event_sender, event_receiver) = mpsc::channel();
     let reader_thread = thread::spawn(move || {
@@ -104,31 +93,48 @@ fn foreground_request_can_be_cancelled_concurrently() {
             }
         }
     });
+    // A cancel sent before the run is registered is rejected as unknown, and
+    // registration (spawning the compiled fixture) can exceed any fixed delay
+    // on slow Windows runners. Resend the cancel until it is acknowledged.
+    let cancel_line = json!({
+        "command":"cancel",
+        "value":{"cancellation_id":cancellation}
+    })
+    .to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut next_cancel = Instant::now() + Duration::from_millis(300);
     let mut saw_cancelled = false;
     let mut saw_completed = false;
     let mut observed = Vec::new();
-    for _ in 0..6 {
-        let line = match event_receiver.recv_timeout(Duration::from_secs(5)) {
+    while !(saw_cancelled && saw_completed) {
+        let now = Instant::now();
+        if now >= deadline {
+            let _ = host.kill();
+            let _ = host.wait();
+            let mut diagnostics = String::new();
+            let _ = stderr.read_to_string(&mut diagnostics);
+            let _ = reader_thread.join();
+            panic!(
+                "timed out waiting for process events; observed={observed:?}; stderr={diagnostics}"
+            );
+        }
+        if !saw_cancelled && now >= next_cancel {
+            writeln!(stdin, "{cancel_line}").expect("cancel request");
+            stdin.flush().expect("flush");
+            next_cancel = now + Duration::from_millis(250);
+        }
+        let line = match event_receiver.recv_timeout(Duration::from_millis(50)) {
             Ok(Ok(line)) => line,
             Ok(Err(error)) => panic!("host output read failed: {error}"),
-            Err(error) => {
-                let _ = host.kill();
-                let _ = host.wait();
-                let mut diagnostics = String::new();
-                let _ = stderr.read_to_string(&mut diagnostics);
-                let _ = reader_thread.join();
-                panic!(
-                    "timed out waiting for process events: {error}; observed={observed:?}; stderr={diagnostics}"
-                );
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("host closed its output early; observed={observed:?}")
             }
         };
         let event: Value = serde_json::from_str(&line).expect("event");
         observed.push(event.clone());
         saw_cancelled |= event["event"] == "cancelled";
         saw_completed |= event["event"] == "completed";
-        if saw_cancelled && saw_completed {
-            break;
-        }
     }
     assert!(
         saw_cancelled,

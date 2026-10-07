@@ -40,8 +40,9 @@ jobs:
         shell: bash
         run: |
           # Make failures readable from the checks UI and API without the raw log.
-          grep -nE "^test .* FAILED|panicked at|^---- .* stdout ----|^error(\[|:)|assertion .* failed|left:|right:" test-output.log \
-            | head -n 40 | while IFS= read -r line; do echo "::error title=cargo test::${line}"; done || true
+          # Each panic location plus the message line that follows it.
+          grep -nE -A1 "^test .* FAILED|panicked at|^error(\[|:)|assertion .* failed|left:|right:" test-output.log \
+            | grep -v '^--$' | head -n 60 | while IFS= read -r line; do echo "::error title=cargo test::${line}"; done || true
       - name: Documentation tests
         run: cargo test --workspace --doc --all-features --locked
 

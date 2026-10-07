@@ -227,21 +227,32 @@ async fn foreground_captures_output_before_remove_always_cleanup() {
             ))
             .await
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let records = dependency_for_input
-        .list(DependencyListRequest {
-            authorization: authorization(
-                "owner",
-                "session",
-                "list",
-                "process.list",
-                "list-cancel",
-                "n2",
-                canonical_list_operation("list-cancel").expect("canonical list"),
-            ),
-        })
-        .await
-        .expect("list");
+    // Wait for the process to be registered rather than sleeping a fixed
+    // interval: process startup on slow (Windows) runners exceeds 100 ms.
+    let mut attempt = 0_u32;
+    let records = loop {
+        let cancellation = format!("list-cancel-{attempt}");
+        let records = dependency_for_input
+            .list(DependencyListRequest {
+                authorization: authorization(
+                    "owner",
+                    "session",
+                    &format!("list-{attempt}"),
+                    "process.list",
+                    &cancellation,
+                    &format!("n2-{attempt}"),
+                    canonical_list_operation(&cancellation).expect("canonical list"),
+                ),
+            })
+            .await
+            .expect("list");
+        if !records.is_empty() {
+            break records;
+        }
+        attempt += 1;
+        assert!(attempt < 400, "process was never registered");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
     let id = records[0].process_id.as_str().to_owned();
     let mut input_request = DependencyProcessInputRequest {
         authorization: authorization(

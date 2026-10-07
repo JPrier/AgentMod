@@ -31,7 +31,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Workspace tests
-        run: cargo test --workspace --all-targets --all-features --locked
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace --all-targets --all-features --locked 2>&1 | tee test-output.log
+      - name: Surface failing tests as annotations
+        if: failure()
+        shell: bash
+        run: |
+          # Make failures readable from the checks UI and API without the raw log.
+          grep -nE "^test .* FAILED|panicked at|^---- .* stdout ----|^error(\[|:)|assertion .* failed|left:|right:" test-output.log \
+            | head -n 40 | while IFS= read -r line; do echo "::error title=cargo test::${line}"; done || true
       - name: Documentation tests
         run: cargo test --workspace --doc --all-features --locked
 
@@ -95,11 +105,29 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # The runtime spawns its sibling hosts (scheduler, harness, tool and
+      # plugin hosts), so every workspace binary must be built.
       - name: Build release binaries
-        run: cargo build --locked --release -p agentmod-runtime -p agentmod-harness -p agentmod-cli
-      - name: Runtime health smoke
-        run: cargo run --locked --release -p agentmod-runtime
-      - name: Harness health smoke
-        run: cargo run --locked --release -p agentmod-harness
-      - name: CLI doctor smoke
-        run: cargo run --locked --release -p agentmod-cli -- doctor --json --strict
+        run: cargo build --locked --release --workspace --bins
+      - name: Runtime ↔ harness smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          output=$(target/release/agentmod-runtime harness-smoke)
+          echo "$output"
+          grep -q '"status":"ok"' <<<"$output"
+      - name: Daemon + CLI doctor smoke
+        shell: bash
+        env:
+          AGENTMOD_RUNTIME_AUTH_TOKEN: packaging-smoke-0123456789abcdef0123456789abcdef
+        run: |
+          set -euo pipefail
+          bin="$PWD/target/release"
+          work=$(mktemp -d)
+          # Unix sockets need a short path; Windows uses its default named pipe.
+          if [[ "$RUNNER_OS" != "Windows" ]]; then export AGENTMOD_RUNTIME_ENDPOINT="$work/rt.sock"; fi
+          (cd "$work" && exec "$bin/agentmod-runtime" serve > "$work/serve.log" 2>&1) &
+          daemon=$!
+          trap 'kill $daemon 2>/dev/null || true; cat "$work/serve.log"' EXIT
+          for _ in $(seq 1 100); do "$bin/agentmod" doctor --json >/dev/null 2>&1 && break; sleep 0.2; done
+          "$bin/agentmod" doctor --json --strict

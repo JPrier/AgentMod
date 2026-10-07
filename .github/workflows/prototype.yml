@@ -84,7 +84,8 @@ jobs:
   deploy:
     name: Deploy to GitHub Pages
     needs: [rust, site]
-    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/prototype/event-bus' || github.event_name == 'workflow_dispatch')
+    # The github-pages environment only accepts deployments from main.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       pages: write

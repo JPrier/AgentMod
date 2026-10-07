@@ -34,7 +34,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          cargo test --workspace --all-targets --all-features --locked 2>&1 | tee test-output.log
+          cargo test --workspace --all-targets --all-features --locked --no-fail-fast 2>&1 | tee test-output.log
       - name: Surface failing tests as annotations
         if: failure()
         shell: bash

@@ -1,5 +1,5 @@
 // Unit tests for the shared coding-tool layer, the local execution target,
-// and the tar writer the browser sandbox uses. Run: node --test tests/
+// and the tar writer the browser sandbox's VM device uses. Run: node --test tests/*.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -8,7 +8,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { normalizePath, resolveIn, unifiedDiff, truncate, workspaceTools, parseRepo } from '../plugins/sdk/workspace-tools.js';
 import { localTarget } from '../plugins/local-workspace/target.js';
-import { makeTar } from '../plugins/linux-sandbox/tar.js';
+import { makeTar } from '../ui/runtime/devices/tar.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'agentmod-ws-'));
 

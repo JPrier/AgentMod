@@ -1,242 +1,70 @@
-// Execution target: an x86 Linux VM running in this browser through CheerpX
-// (https://cheerpx.io). Implements the interface in ../sdk/workspace-tools.js.
-//
-// This file is deliberately "stupid": it boots the VM and moves bytes and
-// commands in and out. What a tool *means* lives in the shared tool layer.
-//
-// Filesystems (all persisted in this browser's IndexedDB):
-//
-//   /               read-only Debian image streamed on demand  +  writable overlay
-//                   (IndexedDB "agentmod-root-<image>"; disposable: reset to factory)
-//   /workspace      the project files (IndexedDB "agentmod-workspace-<name>"),
-//                   kept separate so resetting the OS never touches the work
-//   /agentmod-in    DataDevice: bytes the page writes for the guest to read
-//   /agentmod-out   IndexedDB scratch: bytes the guest writes for the page to read
-//
-// Commands run through `cx.run('/bin/bash', …)` with output redirected to
-// /agentmod-out, so stdout, stderr and the exit code come back separately.
-// The VM is shared by every session this plugin serves; operations are
-// serialized, which keeps the single-console VM simple and deterministic.
-import { makeTar } from './tar.js';
+// Execution target: the browser host's `linux-vm` device (an x86 Linux VM the
+// page runs with CheerpX; see ui/runtime/devices/cheerpx-vm.js). Implements the
+// interface in ../sdk/workspace-tools.js by calling the device over the
+// plugin's own connection. CheerpX needs the page (`window`, `document`), so
+// the VM cannot live in this worker; the plugin keeps all the logic.
+import { toB64, fromB64 } from '../sdk/b64.js';
 
-export const SANDBOX_DEFAULTS = Object.freeze({
-  cheerpx_version: '1.4.0',
-  // The public Debian image WebVM uses (32-bit x86; gcc, python3, git, …).
-  image: 'wss://disks.webvm.io/debian_buster_large_permis_fixed_01-06-2026.ext2',
-  image_type: 'cloud', // cloud (wss/https chunked) | bytes (plain HTTP range requests) | github
-  workspace: 'default',
-  uid: 0,
-  gid: 0,
-});
+export const DEVICE = 'linux-vm';
 
-const ENV = [
-  'HOME=/root',
-  'USER=root',
-  'SHELL=/bin/bash',
-  'TERM=dumb',
-  'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-  'LANG=en_US.UTF-8',
-  'LC_ALL=C',
-  'PYTHONIOENCODING=utf-8',
-  'CARGO_NET_OFFLINE=true',
-];
+// Plugin config keys that describe the VM (the rest configure the tools).
+const VM_KEYS = ['cheerpx_version', 'cheerpx_url', 'image', 'image_type', 'workspace', 'workspace_path', 'uid', 'gid', 'in_path', 'out_path'];
 
-async function hash(text) {
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
-  return [...new Uint8Array(buf)].slice(0, 6).map((b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-const blobBytes = async (blob) => (blob ? new Uint8Array(await blob.arrayBuffer()) : new Uint8Array());
-
-/** Why the sandbox cannot start in this context, or null. */
-export function unavailableReason() {
-  if (typeof WebAssembly === 'undefined') return 'this browser has no WebAssembly';
-  if (typeof SharedArrayBuffer === 'undefined' || !globalThis.crossOriginIsolated) {
-    return 'the page is not cross-origin isolated, which CheerpX needs (SharedArrayBuffer). Use "Enable the Linux sandbox" in the coder session, which reloads the page with isolation on (current Chrome, Edge, or Firefox).';
-  }
-  if (typeof indexedDB === 'undefined') return 'IndexedDB is unavailable (private browsing?)';
-  return null;
-}
-
-export function cheerpxTarget(options = {}) {
-  const cfg = { ...SANDBOX_DEFAULTS, ...options };
-  // Guest mount points of the byte channels (overridable for tests).
-  const IN = cfg.in_path || '/agentmod-in';
-  const OUT = cfg.out_path || '/agentmod-out';
-  let cx = null;
-  let io = null; // IDBDevice behind /agentmod-out
-  let data = null; // DataDevice behind /agentmod-in
-  let booting = null;
-  let queue = Promise.resolve();
-  let seq = 0;
-  let consoleTail = '';
-  let releaseLock = null;
-
-  /** Serialize VM operations. */
-  function serial(fn) {
-    const run = queue.then(fn, fn);
-    queue = run.catch(() => {});
-    return run;
-  }
-
-  async function lock() {
-    if (!globalThis.navigator?.locks) return;
-    // One live VM per workspace across tabs: the IndexedDB disks are not shared-safe.
-    await new Promise((resolve, reject) => {
-      navigator.locks.request(`agentmod-linux-sandbox:${cfg.workspace}`, { ifAvailable: true }, (l) => {
-        if (!l) {
-          reject(new Error(`the Linux sandbox for workspace "${cfg.workspace}" is already running in another tab; close it there first`));
-          return undefined;
-        }
-        resolve();
-        return new Promise((r) => { releaseLock = r; });
-      });
-    });
-  }
-
-  async function boot(status) {
-    const why = unavailableReason();
-    if (why) throw new Error(`Linux sandbox unavailable: ${why}`);
-    await lock();
-    status('booting', 'Starting the Linux sandbox in your browser (CheerpX). The first start streams the disk image; later starts reuse the local cache…');
-    // CheerpX expects a page; in a worker, `window` is the worker's global.
-    globalThis.window ??= globalThis;
-    const CheerpX = await import(/* @vite-ignore */ cfg.cheerpx_url || `https://cxrtnc.leaningtech.com/${cfg.cheerpx_version}/cx.esm.js`);
-    let block;
-    if (cfg.image_type === 'cloud') {
-      try {
-        block = await CheerpX.CloudDevice.create(cfg.image);
-      } catch (e) {
-        if (!cfg.image.startsWith('wss:')) throw e;
-        block = await CheerpX.CloudDevice.create(cfg.image.replace(/^wss:/, 'https:'));
-      }
-    } else if (cfg.image_type === 'bytes') {
-      block = await CheerpX.HttpBytesDevice.create(new URL(cfg.image, globalThis.location?.href).href);
-    } else if (cfg.image_type === 'github') {
-      block = await CheerpX.GitHubDevice.create(cfg.image);
-    } else {
-      throw new Error(`unknown image_type ${cfg.image_type}`);
-    }
-    const cache = await CheerpX.IDBDevice.create(`agentmod-root-${await hash(cfg.image)}`);
-    const root = await CheerpX.OverlayDevice.create(block, cache);
-    const workspace = await CheerpX.IDBDevice.create(`agentmod-workspace-${cfg.workspace}`);
-    io = await CheerpX.IDBDevice.create(`agentmod-io-${cfg.workspace}`);
-    data = await CheerpX.DataDevice.create();
-    cx = await CheerpX.Linux.create({
-      mounts: [
-        { type: 'ext2', path: '/', dev: root },
-        { type: 'dir', path: cfg.workspace_path || '/workspace', dev: workspace },
-        { type: 'dir', path: IN, dev: data },
-        { type: 'dir', path: OUT, dev: io },
-        { type: 'devs', path: '/dev' },
-        { type: 'devpts', path: '/dev/pts' },
-        { type: 'proc', path: '/proc' },
-        { type: 'sys', path: '/sys' },
-      ],
-    });
-    // Nothing is meant to reach the console (all output is redirected), but keep
-    // a tail of whatever does for error messages.
-    cx.setCustomConsole((buf) => {
-      consoleTail = (consoleTail + new TextDecoder().decode(buf)).slice(-2000);
-    }, 120, 40);
-    const probe = await rawExec('uname -srm; . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"; for t in gcc g++ make python3 node git; do command -v $t >/dev/null && printf "%s " $t; done; echo', '/', 60);
-    const text = new TextDecoder().decode(probe.stdout).trim().split('\n');
-    status('ready', `Linux sandbox ready — ${text[1] || 'Linux'} (${text[0] || 'x86'}); tools: ${text[2] || 'unknown'}. Work persists in this browser.`);
-  }
-
-  /** One command, outside the queue (callers serialize). */
-  async function rawExec(command, cwd, timeoutSeconds) {
-    const n = ++seq;
-    // $0 marks the operation; $1 cwd, $2 timeout, $3 command. Output is
-    // redirected into the scratch filesystem so it can be read back exactly.
-    const wrapper = `: >${OUT}/stdout; : >${OUT}/stderr; cd -- "$1" 2>${OUT}/stderr || exit 126; timeout -k 5 "$2" /bin/bash -c "$3" </dev/null >${OUT}/stdout 2>>${OUT}/stderr`;
-    const started = Date.now();
-    const { status } = await cx.run('/bin/bash', ['-c', wrapper, `agentmod-op-${n}`, cwd, String(timeoutSeconds), command], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid });
-    const [stdout, stderr] = await Promise.all([io.readFileAsBlob('/stdout').then(blobBytes), io.readFileAsBlob('/stderr').then(blobBytes)]);
-    const timedOut = status === 124 || (status === 137 && Date.now() - started >= timeoutSeconds * 1000);
-    return { exitCode: status, stdout, stderr, timedOut };
-  }
-
-  /** Best-effort interruption of the running command (the VM itself keeps running). */
-  async function interrupt() {
-    try {
-      await cx?.run('/bin/bash', ['-c', 'pkill -TERM -x timeout'], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid });
-    } catch { /* nothing to interrupt */ }
-  }
-
-  function withAbort(promise, signal) {
-    if (!signal) return promise;
-    if (signal.aborted) return Promise.reject(new Error('cancelled'));
-    return new Promise((resolve, reject) => {
-      const onAbort = () => { interrupt(); reject(new Error('cancelled')); };
-      signal.addEventListener('abort', onAbort, { once: true });
-      promise.then(
-        (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
-        (e) => { signal.removeEventListener('abort', onAbort); reject(e); },
-      );
-    });
-  }
+export function linuxVmTarget({ host, config = {} }) {
+  const vm = Object.fromEntries(VM_KEYS.filter((k) => config[k] !== undefined).map((k) => [k, config[k]]));
+  const call = (op, args = {}) => host.device(DEVICE, op, args, vm);
+  let ready = null;
 
   return {
-    async ensureReady({ status }) {
-      if (!booting) {
-        booting = serial(() => boot(status)).catch((e) => {
-          booting = null;
-          releaseLock?.();
-          releaseLock = null;
-          throw new Error(`${e.message || e}${consoleTail ? `\n(console: ${consoleTail.slice(-400)})` : ''}`);
-        });
-      }
-      await booting;
+    ensureReady({ status }) {
+      ready ??= (async () => {
+        const st = await call('state');
+        if (st.booted) return;
+        if (st.unavailable) throw new Error(`Linux sandbox unavailable: ${st.unavailable}`);
+        await status('booting', 'Starting the Linux sandbox in your browser (CheerpX). The first start streams the disk image; later starts reuse the local cache…');
+        const info = await call('boot');
+        await status('ready', `Linux sandbox ready — ${info.os} (${info.kernel}); tools: ${info.tools.join(' ') || 'none found'}. Work persists in this browser.`);
+      })().catch((e) => {
+        ready = null;
+        throw e;
+      });
+      return ready;
     },
 
     exec({ command, cwd, timeoutMs, signal }) {
-      const secs = Math.max(1, Math.ceil(timeoutMs / 1000));
-      return withAbort(serial(() => rawExec(command, cwd, secs)), signal);
+      if (signal?.aborted) return Promise.reject(new Error('cancelled'));
+      const run = call('exec', { command, cwd, timeoutSeconds: Math.ceil(timeoutMs / 1000) }).then((r) => ({
+        exitCode: r.exitCode,
+        timedOut: r.timedOut,
+        stdout: fromB64(r.stdout),
+        stderr: fromB64(r.stderr),
+      }));
+      if (!signal) return run;
+      // The VM cannot be stopped mid-call; return at once and interrupt the command.
+      return new Promise((resolve, reject) => {
+        const onAbort = () => {
+          call('interrupt').catch(() => {});
+          reject(new Error('cancelled'));
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        run.then(
+          (v) => { signal.removeEventListener('abort', onAbort); resolve(v); },
+          (e) => { signal.removeEventListener('abort', onAbort); reject(e); },
+        );
+      });
     },
 
-    readFile(path) {
-      return serial(async () => {
-        const q = quote(path);
-        const r = await rawExec(`[ -f ${q} ] || exit 3; cp -- ${q} ${OUT}/file`, '/', 120);
-        if (r.exitCode === 3) return null;
-        if (r.exitCode !== 0) throw new Error(`reading ${path} failed: ${new TextDecoder().decode(r.stderr).slice(0, 300)}`);
-        return blobBytes(await io.readFileAsBlob('/file'));
-      });
+    async readFile(path) {
+      const data = await call('readFile', { path });
+      return data == null ? null : fromB64(data);
     },
 
     writeFile(path, bytes) {
       return this.writeFiles([{ path, bytes }]);
     },
 
-    writeFiles(files) {
-      return serial(async () => {
-        if (!files.length) return;
-        const n = ++seq;
-        let r;
-        if (files.length === 1 && !files[0].executable) {
-          await data.writeFile(`/blob-${n}`, files[0].bytes);
-          const dst = quote(files[0].path);
-          r = await rawExec(`mkdir -p -- "$(dirname -- ${dst})" && cp -- ${IN}/blob-${n} ${dst}`, '/', 120);
-        } else {
-          // Many files: one tar archive, one process.
-          await data.writeFile(`/batch-${n}.tar`, makeTar(files));
-          r = await rawExec(`tar -xf ${IN}/batch-${n}.tar -C / --no-same-owner`, '/', 600);
-        }
-        if (r.exitCode !== 0) throw new Error(`writing files failed (exit ${r.exitCode}): ${new TextDecoder().decode(r.stderr).slice(0, 400)}`);
-      });
-    },
-
-    async dispose() {
-      try { cx?.delete(); } catch { /* already gone */ }
-      cx = null;
-      booting = null;
-      releaseLock?.();
-      releaseLock = null;
+    async writeFiles(files) {
+      await call('writeFiles', { files: files.map((f) => ({ path: f.path, data: toB64(f.bytes), executable: !!f.executable })) });
     },
   };
-}
-
-function quote(s) {
-  return `'${String(s).replace(/'/g, `'\\''`)}'`;
 }

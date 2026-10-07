@@ -1,32 +1,35 @@
 // The linux-sandbox plugin file the browser loads, run as a plugin process over
-// the AgentMod wire protocol (JSON-RPC lines) with the fake CheerpX module:
-// handshake, tool offer, a tool call answered with publishes, and calls for
-// other plugins' tools ignored.
+// the AgentMod wire protocol (JSON-RPC lines). The test plays the browser host:
+// it answers `publish` and routes `device` requests to the real page-side
+// `linux-vm` device (with the fake CheerpX module). Covers the handshake, the
+// tool offer, tool calls answered with publishes, and other tools ignored.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
 import { spawn } from 'node:child_process';
-import { pathToFileURL, fileURLToPath } from 'node:url';
+import { fileURLToPath } from 'node:url';
+import { fakeVmConfig, hostDevices } from './stage.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const FAKE = pathToFileURL(path.join(here, 'fake-cheerpx.mjs')).href;
-// What a cross-origin-isolated page gives a worker, as far as the plugin checks.
-const GLOBALS = `data:text/javascript,${encodeURIComponent('globalThis.crossOriginIsolated = true; globalThis.indexedDB ??= {};')}`;
 
-function startPlugin() {
-  const child = spawn(process.execPath, ['--import', GLOBALS, path.join(here, '..', 'plugins', 'linux-sandbox', 'main.js')], { stdio: ['pipe', 'pipe', 'inherit'] });
+function startPlugin(devices) {
+  const child = spawn(process.execPath, [path.join(here, '..', 'plugins', 'linux-sandbox', 'main.js')], { stdio: ['pipe', 'pipe', 'inherit'] });
+  let manifest = null;
   const pending = new Map();
   const publishes = [];
   let id = 1;
   readline.createInterface({ input: child.stdout }).on('line', (line) => {
     const msg = JSON.parse(line);
+    const reply = (result, error) => child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, ...(error ? { error } : { result }) }) + '\n');
     if (msg.method === 'publish') {
       publishes.push(msg.params);
-      child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result: { event_id: `e${publishes.length}` } }) + '\n');
+      reply({ event_id: `e${publishes.length}` });
+    } else if (msg.method === 'device') {
+      devices.call('linux-sandbox', manifest, msg.params).then((r) => reply(r), (e) => reply(null, { code: e.code ?? -32001, message: e.message }));
     } else if (msg.method === undefined) {
+      if (msg.result?.manifest) manifest = msg.result.manifest;
       pending.get(msg.id)?.(msg);
       pending.delete(msg.id);
     }
@@ -42,14 +45,18 @@ function startPlugin() {
 const event = (event_name, payload, n) => ({ event_id: `s1.e${n}`, session_id: 's1', event_name, sequence: n, payload, context: [] });
 
 test('linux-sandbox speaks the plugin protocol and answers its tools', async () => {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'sbx-plugin-'));
-  const ws = path.join(base, 'workspace');
-  const config = { cheerpx_url: FAKE, in_path: path.join(base, 'in'), out_path: path.join(base, 'out'), workspace_path: ws };
-  const p = startPlugin();
+  // The page the device runs on is cross-origin isolated.
+  globalThis.crossOriginIsolated = true;
+  globalThis.indexedDB ??= {};
+  const config = fakeVmConfig();
+  const ws = config.workspace_path;
+  const devices = await hostDevices();
+  const p = startPlugin(devices);
   try {
     const init = await p.call('initialize', { protocol: 'agentmod/0.1', plugin: 'linux-sandbox', config });
     const m = init.result.manifest;
     assert.equal(m.name, 'linux-sandbox');
+    assert.deepEqual(m.devices, ['linux-vm']);
     assert.deepEqual(m.consumes.map((c) => c.event), ['session-started', 'config-applied', 'tool-call']);
     assert.equal(m.consumes[2].mode, 'async');
     assert.deepEqual(m.emits.map((e) => e.event), ['tool-result', 'workspace-change', 'workspace-status']);
@@ -83,5 +90,6 @@ test('linux-sandbox speaks the plugin protocol and answers its tools', async () 
     assert.equal(p.publishes.length, 0, 'other plugins’ tools are not answered');
   } finally {
     p.child.kill();
+    await devices.dispose();
   }
 });

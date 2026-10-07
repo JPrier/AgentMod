@@ -17,7 +17,8 @@ import { workspaceTools } from './workspace-tools.js';
 /**
  * @param {object} spec
  * @param {object} spec.manifest     name, version, description, config_schema
- * @param {(config) => object} spec.createTarget   build the execution target (may boot lazily)
+ * @param {(config, { host }) => object} spec.createTarget   build the execution target (may boot lazily);
+ *        `host` is the plugin's host API (e.g. `host.device(...)` in the browser runtime)
  * @param {(config) => string} spec.root           workspace root for this config
  * @param {(config) => string} spec.describe       system-prompt text describing the target
  * @param {Function} [spec.validate]  handshake validation (throw to refuse)
@@ -25,10 +26,11 @@ import { workspaceTools } from './workspace-tools.js';
 export function defineWorkspacePlugin(spec) {
   let state = null; // { key, target, tools } for the current plugin config
 
-  function current(config) {
+  function current(ctx) {
+    const config = ctx.config;
     const key = JSON.stringify(config ?? {});
     if (!state || state.key !== key) {
-      const target = spec.createTarget(config ?? {});
+      const target = spec.createTarget(config ?? {}, { host: ctx.host });
       const tools = workspaceTools({
         target,
         root: spec.root(config ?? {}),
@@ -41,7 +43,7 @@ export function defineWorkspacePlugin(spec) {
   }
 
   function offer(ctx) {
-    const { tools } = current(ctx.config);
+    const { tools } = current(ctx);
     offerTools(ctx, tools.specs);
     const note = spec.describe(ctx.config ?? {});
     if (note && !ctx.slot('system').includes(note)) ctx.add('system', note);
@@ -70,7 +72,7 @@ export function defineWorkspacePlugin(spec) {
       'config-applied': offer,
       'tool-call': async (ctx) => {
         const { call_id, name, args } = ctx.payload;
-        const { target, tools } = current(ctx.config);
+        const { target, tools } = current(ctx);
         if (!tools.names.has(name)) return;
         const status = (st, message) =>
           ctx.publish('workspace-status', { state: st, message, call_id }, { ui: { v: 1, kind: 'progress', label: message } });

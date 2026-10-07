@@ -1,7 +1,7 @@
 // A stand-in for the CheerpX module (https://cxrtnc.leaningtech.com/<v>/cx.esm.js)
-// so the linux-sandbox target can be tested under Node: devices are temp
+// so the browser host's `linux-vm` device can be tested under Node: devices are temp
 // directories, `dir` mounts move them to their mount paths, and
-// `Linux.run` runs the program on the host. It exercises everything the target
+// `Linux.run` runs the program on the host. It exercises everything the device
 // does around CheerpX (wrapper script, byte channels, tar batches) — not
 // CheerpX itself; tests/sandbox-browser.mjs covers the real thing.
 import { spawn } from 'node:child_process';
@@ -59,11 +59,22 @@ export class Linux {
 
   run(file, args, opts = {}) {
     Linux.runs = (Linux.runs || 0) + 1;
+    this.running ??= new Set();
+    // The device interrupts with `pkill -x timeout` inside its VM; here that
+    // would hit the whole host, so stop only what this fake VM started.
+    if (args[1] === 'pkill -TERM -x timeout') {
+      for (const pid of this.running) { try { process.kill(-pid, 'SIGTERM'); } catch { /* gone */ } }
+      return Promise.resolve({ status: 0 });
+    }
     const env = Object.fromEntries((opts.env || []).map((kv) => [kv.slice(0, kv.indexOf('=')), kv.slice(kv.indexOf('=') + 1)]));
     return new Promise((resolve, reject) => {
-      const c = spawn(file, args, { cwd: opts.cwd || '/', env: { ...env, PATH: `${env.PATH}:${process.env.PATH}` }, stdio: 'ignore' });
+      const c = spawn(file, args, { cwd: opts.cwd || '/', env: { ...env, PATH: `${env.PATH}:${process.env.PATH}` }, stdio: 'ignore', detached: true });
+      this.running.add(c.pid);
       c.on('error', reject);
-      c.on('close', (code, sig) => resolve({ status: code ?? (sig ? 128 + 9 : 1) }));
+      c.on('close', (code, sig) => {
+        this.running.delete(c.pid);
+        resolve({ status: code ?? (sig ? 128 + 9 : 1) });
+      });
     });
   }
 

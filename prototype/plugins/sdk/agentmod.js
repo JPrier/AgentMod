@@ -144,6 +144,8 @@ class Plugin {
       command: (session_id, command) => this.request('command', { session_id, command }),
       applyConfig: (config, scope) => this.request('apply_config', { config, scope }),
       watch: () => this.request('watch', {}),
+      /** Use a host device the manifest declares (browser runtime; see ui/runtime/devices.js). */
+      device: (device, op, args = {}, config = {}) => this.request('device', { device, op, args, config }),
     };
   }
 

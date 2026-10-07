@@ -4,6 +4,10 @@
 // RAM, with nothing executed on a server. Browser runtime only (it has a
 // `module` and no `command`, so the native runtime disables it).
 //
+// CheerpX needs the page itself, so the VM is a host device (`linux-vm`, see
+// ui/runtime/devices.js) that this plugin declares and drives; every decision
+// about what a tool does is made here, in the plugin.
+//
 // It is an ordinary tool plugin: a tool call is an event, and this plugin
 // answers the ones it owns. Policy (approval-gate), the loop (chat-context),
 // the model, and rendering (web-ui) are other plugins; see README.md.
@@ -21,17 +25,29 @@
 // CheerpX is proprietary software by Leaning Technologies, free for personal
 // and open-source use; other uses need their commercial licence.
 import { defineWorkspacePlugin } from '../sdk/workspace-plugin.js';
-import { cheerpxTarget, SANDBOX_DEFAULTS } from './target.js';
+import { linuxVmTarget, DEVICE } from './target.js';
 
 defineWorkspacePlugin({
   manifest: {
     name: 'linux-sandbox',
     version: '0.1.0',
     description: 'Coding tools in an x86 Linux VM running in the browser (CheerpX). Browser runtime only.',
-    config_schema: { ...SANDBOX_DEFAULTS, import_repos: true, limits: {} },
+    // Host devices this plugin uses (enforced by the browser host).
+    devices: [DEVICE],
+    config_schema: {
+      image: 'wss://disks.webvm.io/… (WebVM\'s public Debian image)',
+      image_type: 'cloud | bytes | github',
+      cheerpx_version: '1.4.0',
+      workspace: 'default',
+      workspace_path: '/workspace',
+      uid: 0,
+      gid: 0,
+      import_repos: true,
+      limits: {},
+    },
   },
   root: (cfg) => cfg.workspace_path || '/workspace',
-  createTarget: (cfg) => cheerpxTarget(cfg),
+  createTarget: (cfg, { host }) => linuxVmTarget({ host, config: cfg }),
   describe: (cfg) =>
     'You can write and run code with the run, read_file, write_file, edit_file, list_files and import_repo tools. ' +
     'They act on a Linux sandbox: a 32-bit x86 Debian VM (CheerpX) running inside the user\'s browser, on their own machine. ' +

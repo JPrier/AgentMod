@@ -167,6 +167,11 @@ a { color: var(--teal); }
 
 .empty { margin: auto; max-width: 520px; text-align: center; color: var(--muted); padding: 40px 20px; }
 .empty h2 { color: var(--ink); font-size: 22px; letter-spacing: -0.015em; margin: 0 0 8px; }
+.notice { border: 1px solid var(--line); background: var(--raised); border-radius: 10px; padding: 10px 14px; margin: 0 0 14px; font-size: 13.5px; color: var(--muted); }
+.notice b { color: var(--ink); }
+.notice p { margin: 0 0 8px; }
+.notice.ok { border-color: var(--teal); background: var(--teal-soft); color: var(--ink); }
+.notice .row-actions { margin: 4px 0 8px; }
 .suggest { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 18px; }
 .suggest button { border: 1px solid var(--line); background: var(--raised); border-radius: 999px; padding: 6px 13px; cursor: pointer; font-size: 13.5px; }
 .suggest button:hover { border-color: var(--teal); color: var(--teal); }

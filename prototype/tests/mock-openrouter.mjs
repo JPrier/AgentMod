@@ -29,7 +29,9 @@ http.createServer(async (req, res) => {
   const call = (name, args) => send({ model: j.model, choices: [{ delta: { tool_calls: [{ index: 0, id: `call_${Date.now()}`, function: { name, arguments: JSON.stringify(args) } }] } }] });
   const t = String(last.content || '');
   let text;
-  if (last.role === 'user' && /time/i.test(t) && tools.has('clock')) call('clock', {});
+  const direct = last.role === 'user' && t.match(/^tool (\w+) (\{[\s\S]*\})$/);
+  if (direct && tools.has(direct[1])) call(direct[1], JSON.parse(direct[2])); // "tool <name> <json args>": call it verbatim
+  else if (last.role === 'user' && /time/i.test(t) && tools.has('clock')) call('clock', {});
   else if (last.role === 'user' && /calculate/i.test(t) && tools.has('calc')) call('calc', { expression: t.replace(/.*calculate\s*/i, '') });
   else if (last.role === 'user' && /^delegate/i.test(t) && tools.has('delegate')) call('delegate', { task: t.replace(/^delegate:?\s*/i, '') });
   else if (last.role === 'user' && /remember/i.test(t) && tools.has('remember')) call('remember', { note: t.replace(/.*remember( that)?\s*/i, '') });

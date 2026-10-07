@@ -42,6 +42,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Plugin unit tests (coding tools, sandbox target, plugin protocol)
+        run: node --test tests/*.test.mjs
       - name: Native end-to-end (real plugin processes, mock OpenRouter)
         run: cargo build -p agentmod-runtime && ./tests/e2e.sh
 
@@ -71,6 +73,14 @@ jobs:
         run: |
           cd tests && npm install --no-audit --no-fund && cd ..
           CHROME_PATH=$(which google-chrome || which chromium) SHOTS_DIR=$PWD/target/shots node tests/browser.mjs
+      # The real CheerpX in headless Chrome: boot, commands, files, gcc, and
+      # persistence. It depends on Leaning Technologies' CDN and the WebVM disk
+      # server, so it reports (job summary + sandbox-report.json) without
+      # blocking the build or the Pages deploy.
+      - name: Linux sandbox in the browser (CheerpX; network)
+        continue-on-error: true
+        timeout-minutes: 20
+        run: CHROME_PATH=$(which google-chrome || which chromium) SHOTS_DIR=$PWD/target/shots node tests/sandbox-browser.mjs
       - uses: actions/upload-artifact@v4
         if: always()
         with:

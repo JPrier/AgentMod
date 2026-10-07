@@ -9,6 +9,10 @@ WebAssembly, every plugin in its own Web Worker, the model reached through the O
 It asks for an OpenRouter API key before the runtime starts (kept in your browser, sent only to
 openrouter.ai, omitted from exported logs).
 
+**Code in the browser:** start a `coder` session. The `linux-sandbox` plugin runs an x86 Linux VM
+in your tab (CheerpX), so the agent writes, compiles, and runs code on your own machine; see
+[plugins/linux-sandbox](plugins/linux-sandbox/README.md).
+
 ## What is here
 
 ```text
@@ -50,6 +54,8 @@ triggers, and the model itself are all plugins:
 | `tool-clock`, `tool-calc`, `py-wordcount` (Python) | Tools: a tool call is an event; a plugin that answers it is a tool. |
 | `memory` | `remember`/`recall` tools and memory injection into new sessions. |
 | `subagent`, `subagent-reporter` | `delegate` starts a worker session; the worker reports back cross-session. |
+| `linux-sandbox` | Coding tools (`run`, `read_file`, `write_file`, `edit_file`, `list_files`, `import_repo`) in an x86 Linux VM inside the browser (CheerpX). Browser runtime only. |
+| `local-workspace` | The same coding tools in a local directory. Native runtime only; not a sandbox, so in no default definition. |
 | `titler` | Async session auto-titling. |
 | `heartbeat` | Trigger plugin with a journal session (`every_seconds` in config; off by default). |
 | `web-ui` | The web frontend: HTTP + SSE gateway natively, the page itself in the browser. |
@@ -96,14 +102,17 @@ cargo install wasm-bindgen-cli --version 0.2.100 --locked
 
 ```shell
 cargo test --workspace                 # compiler, kernel scenarios, randomized replay equivalence, store
+node --test tests/*.test.mjs           # coding tools, the sandbox target (fake CheerpX), plugin protocol
 ./tests/e2e.sh                         # native: real runtime + plugin processes, mock OpenRouter
 (cd tests && npm install) && node tests/browser.mjs   # headless Chrome against dist/
+node tests/sandbox-browser.mjs         # real CheerpX in headless Chrome (needs network)
 ```
 
 `tests/e2e.sh` covers: key enforcement, a tool loop, approval + sub-agent, hot apply and
 whole-config rejection, hard stop mid-stream, a killed plugin being retried while other sessions
 continue, SIGKILL of the runtime mid-stream with recovery from the log (no duplicate or missing
-stream chunks), and `verify` over every log. The kernel tests include randomized interleavings of
+stream chunks), the coding tools through a real session (`local-workspace`), and `verify` over
+every log. The kernel tests include randomized interleavings of
 publishes, completions, retries, commands, and config applies, checking after every step that a
 fresh kernel rebuilt from the log matches the live one exactly.
 
@@ -136,6 +145,7 @@ experiments to inform those decisions, not resolutions of them.
 
 ## Known limits
 
-Single process, single machine; no sandboxing (by design, approval is a plugin); the browser
-runtime keeps logs in memory (export them from the top bar); tool descriptions contributed before
-a plugin is removed stay in context until edited out.
+Single process, single machine; no sandboxing of plugins themselves (by design, approval is a
+plugin; code the agent runs can be sandboxed by choosing `linux-sandbox`); the browser runtime
+keeps logs in memory (export them from the top bar); tool descriptions contributed before a plugin
+is removed stay in context until edited out.

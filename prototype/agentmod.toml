@@ -5,7 +5,8 @@
 # subscribers run in this order). Plugin commands run from this directory.
 
 [runtime]
-max_causal_depth = 64          # runtime bound for cyclic graphs (agent loops)
+max_causal_depth = 256         # runtime bound for cyclic graphs (agent loops; a coding
+                               # task's tool loop is ~4 events per round)
 spill_threshold_bytes = 16384  # larger payloads spill to content-addressed files
 max_attempts = 3               # orphan restarts before an invocation is failed
 
@@ -44,7 +45,7 @@ module = "plugins/memory/main.js"
 [plugins.openrouter-model]
 command = ["node", "plugins/openrouter-model/main.js"]
 module = "plugins/openrouter-model/main.js"
-config = { model = "openai/gpt-4o-mini", api_key_env = "OPENROUTER_API_KEY", max_tokens = 1024 }
+config = { model = "openai/gpt-4o-mini", api_key_env = "OPENROUTER_API_KEY", max_tokens = 4096 }
 
 # Alternative LLM provider for any OpenAI-compatible endpoint (unused by default).
 [plugins.openai-model]
@@ -71,6 +72,28 @@ module = "plugins/subagent/main.js"
 [plugins.subagent-reporter]
 command = ["node", "plugins/subagent-reporter/main.js"]
 module = "plugins/subagent-reporter/main.js"
+
+# --- coding: execution targets ---------------------------------------------------
+# The coding tools (run, read_file, write_file, edit_file, list_files,
+# import_repo) are answered by whichever execution-target plugin a definition
+# lists, the way a definition picks its model provider. Both share
+# plugins/sdk/workspace-tools.js. See plugins/linux-sandbox/README.md.
+#
+# linux-sandbox: an x86 Linux VM running inside the browser (CheerpX), on the
+# user's own CPU and RAM. Browser runtime only — it has a `module` and no
+# `command`, so the native runtime disables it.
+[plugins.linux-sandbox]
+module = "plugins/linux-sandbox/main.js"
+timeout_ms = 1200000           # first boot streams the disk image; commands may run 15 min
+config = { workspace = "default" }
+
+# local-workspace: the same tools in a local directory, native runtime only.
+# It is NOT a sandbox (commands run as you), so no definition uses it by
+# default. To opt in, add it to a definition and guard `run` with approval-gate.
+[plugins.local-workspace]
+command = ["node", "plugins/local-workspace/main.js"]
+timeout_ms = 1200000
+config = { root = ".agentmod/workspace" }
 
 # --- triggers -------------------------------------------------------------------
 [plugins.heartbeat]
@@ -104,6 +127,18 @@ subscribers = [
   { plugin = "tool-clock" },
   { plugin = "tool-calc" },
   { plugin = "subagent-reporter" },
+]
+
+[definitions.coder]
+description = "Coding agent: writes, builds, and runs code in a Linux sandbox inside your browser"
+subscribers = [
+  { plugin = "web-ui" },
+  { plugin = "redactor" },
+  { plugin = "approval-gate" },
+  { plugin = "chat-context" },
+  { plugin = "openrouter-model" },
+  { plugin = "titler" },
+  { plugin = "linux-sandbox" },
 ]
 
 [definitions.heartbeat]

@@ -66,7 +66,7 @@ const bodyHas = (t, ms) => page.waitForFunction((t) => document.body.innerText.i
 async function newCoderSession() {
   await page.waitForSelector('.new-session select', { timeout: 60000 });
   await page.select('.new-session select', 'coder');
-  await page.click('.new-session .btn.primary');
+  await page.evaluate(() => document.querySelector('.new-session .btn.primary').click());
   await page.waitForFunction(() => document.querySelector('.chat-head .sub')?.textContent.includes('coder'), { timeout: 20000 });
 }
 

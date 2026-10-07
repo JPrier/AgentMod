@@ -38,11 +38,22 @@ struct Fixture {
     plugin_id: String,
     provider_id: String,
     handler: String,
+    operation_timeout_ms: u64,
 }
+
+/// Operation timeout for fixtures that exercise the timeout path.
+const SHORT_OPERATION_TIMEOUT_MS: u64 = 50;
+/// Operation timeout for fixtures that cancel an in-flight invocation. With
+/// 50 ms the cancellation had to land within 50 ms of dispatch, which slow
+/// Windows runners (timers tick at ~16 ms) miss, yielding `AlreadyTerminal`.
+/// The handler sleeps 250 ms, so the invocation now stays open for ~250 ms;
+/// it must not exceed the manifest's 500 ms plugin timeout.
+const CANCELLABLE_OPERATION_TIMEOUT_MS: u64 = 400;
 
 fn operation(
     handler: &str,
     idempotency: DependencyOperationIdempotency,
+    timeout_ms: u64,
 ) -> DependencyOperationDeclaration {
     let non_idempotent = idempotency == DependencyOperationIdempotency::NonIdempotent;
     DependencyOperationDeclaration {
@@ -51,7 +62,7 @@ fn operation(
         output_schema: String::from(
             r#"{"type":"object","required":["accepted"],"properties":{"accepted":{"type":"boolean"}},"additionalProperties":false}"#,
         ),
-        timeout_ms: 50,
+        timeout_ms,
         failure_policy: String::from(if non_idempotent { "reject" } else { "retry" }),
         max_attempts: if non_idempotent { 1 } else { 3 },
         retry_backoff_ms: u64::from(!non_idempotent),
@@ -69,6 +80,7 @@ fn manifest(
     provider_id: &str,
     handler: &str,
     write: bool,
+    operation_timeout_ms: u64,
 ) -> DependencyManifest {
     let selected_operation = operation(
         handler,
@@ -77,6 +89,7 @@ fn manifest(
         } else {
             DependencyOperationIdempotency::Idempotent
         },
+        operation_timeout_ms,
     );
     DependencyManifest {
         schema_version: 1,
@@ -125,6 +138,7 @@ fn manifest(
                 operation(
                     "unused_retrieve",
                     DependencyOperationIdempotency::Idempotent,
+                    SHORT_OPERATION_TIMEOUT_MS,
                 )
             } else {
                 selected_operation.clone()
@@ -178,6 +192,10 @@ fn authorization<T: Serialize>(
 }
 
 async fn fixture(handler: &str, write: bool) -> Fixture {
+    fixture_with_timeout(handler, write, SHORT_OPERATION_TIMEOUT_MS).await
+}
+
+async fn fixture_with_timeout(handler: &str, write: bool, operation_timeout_ms: u64) -> Fixture {
     let root = tempfile::tempdir().expect("fixture root");
     let executable = PathBuf::from(env!("CARGO_BIN_EXE_agentmod-plugin-fixture-worker"));
     let executable_root = executable.parent().expect("executable root").to_owned();
@@ -187,7 +205,14 @@ async fn fixture(handler: &str, write: bool) -> Fixture {
         ContentHash::digest(&serde_json::to_vec(&configuration).expect("configuration bytes"));
     let plugin_id = format!("fixture.memory.{}", Uuid::now_v7());
     let provider_id = String::from("fixture.memory.provider");
-    let manifest = manifest(&executable, &plugin_id, &provider_id, handler, write);
+    let manifest = manifest(
+        &executable,
+        &plugin_id,
+        &provider_id,
+        handler,
+        write,
+        operation_timeout_ms,
+    );
     let declaration_hash = ContentHash::digest(
         &serde_json::to_vec(&manifest.memory_providers[0]).expect("declaration bytes"),
     );
@@ -232,6 +257,7 @@ async fn fixture(handler: &str, write: bool) -> Fixture {
         plugin_id,
         provider_id,
         handler: handler.to_owned(),
+        operation_timeout_ms,
     }
 }
 
@@ -351,7 +377,7 @@ fn retrieve_request(
         &fixture.provider_id,
         "1.0.0",
         &fixture.handler,
-        50,
+        fixture.operation_timeout_ms,
         protocol::PluginOperationIdempotency::Idempotent,
         &typed_request,
         &readable_state,
@@ -364,7 +390,7 @@ fn retrieve_request(
             fixture.provider_id.as_str(),
             "1.0.0",
             fixture.handler.as_str(),
-            50_u64,
+            fixture.operation_timeout_ms,
             DependencyOperationIdempotency::Idempotent,
             &request,
             &readable_state,
@@ -378,7 +404,7 @@ fn retrieve_request(
         provider_id: fixture.provider_id.clone(),
         provider_version: String::from("1.0.0"),
         handler: fixture.handler.clone(),
-        timeout_ms: 50,
+        timeout_ms: fixture.operation_timeout_ms,
         idempotency: DependencyOperationIdempotency::Idempotent,
         request,
         readable_state,
@@ -411,7 +437,7 @@ fn write_request(
         &fixture.provider_id,
         "1.0.0",
         &fixture.handler,
-        50,
+        fixture.operation_timeout_ms,
         protocol::PluginOperationIdempotency::NonIdempotent,
         &typed_request,
         &readable_state,
@@ -424,7 +450,7 @@ fn write_request(
             fixture.provider_id.as_str(),
             "1.0.0",
             fixture.handler.as_str(),
-            50_u64,
+            fixture.operation_timeout_ms,
             DependencyOperationIdempotency::NonIdempotent,
             &request,
             &readable_state,
@@ -438,7 +464,7 @@ fn write_request(
         provider_id: fixture.provider_id.clone(),
         provider_version: String::from("1.0.0"),
         handler: fixture.handler.clone(),
-        timeout_ms: 50,
+        timeout_ms: fixture.operation_timeout_ms,
         idempotency: DependencyOperationIdempotency::NonIdempotent,
         request,
         readable_state,
@@ -614,7 +640,12 @@ async fn every_post_dispatch_write_receipt_failure_is_ambiguous_and_never_retrie
         );
     }
 
-    let cancelled = fixture("timeout_memory_write", true).await;
+    let cancelled = fixture_with_timeout(
+        "timeout_memory_write",
+        true,
+        CANCELLABLE_OPERATION_TIMEOUT_MS,
+    )
+    .await;
     let request = write_request(&cancelled, "write-cancelled", "cancel-write-live");
     let cancel_request = cancellation_request(
         &request.binding,
@@ -706,7 +737,12 @@ async fn terminal_success_crash_malformed_and_cancellation_are_redacted_and_sing
         assert_eq!(audit.attempts, 1);
     }
 
-    let cancelled = fixture("timeout_memory_retrieve", false).await;
+    let cancelled = fixture_with_timeout(
+        "timeout_memory_retrieve",
+        false,
+        CANCELLABLE_OPERATION_TIMEOUT_MS,
+    )
+    .await;
     let invocation_id = String::from("retrieve-cancelled");
     let request = retrieve_request(&cancelled, &invocation_id, "cancel-live");
     let cancel_request = cancellation_request(

@@ -1,0 +1,6 @@
+{
+  "name": "agentmod-prototype-plugins",
+  "private": true,
+  "type": "module",
+  "description": "Bundled AgentMod prototype plugins. Each runs under Node (native runtime) or as a module Web Worker (browser runtime)."
+}

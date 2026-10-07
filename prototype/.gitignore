@@ -1,0 +1,6 @@
+/target
+/.agentmod
+/ui/pkg
+/node_modules
+/dist
+__pycache__/

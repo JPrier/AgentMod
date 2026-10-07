@@ -1,0 +1,110 @@
+# AgentMod prototype — default deployment.
+#
+# Everything here is a plugin; the core ships no agent features. Session
+# definitions list which plugins participate and in what order (blocking
+# subscribers run in this order). Plugin commands run from this directory.
+
+[runtime]
+max_causal_depth = 64          # runtime bound for cyclic graphs (agent loops)
+spill_threshold_bytes = 16384  # larger payloads spill to content-addressed files
+max_attempts = 3               # orphan restarts before an invocation is failed
+
+# --- frontends ---------------------------------------------------------------
+[plugins.web-ui]
+command = ["node", "plugins/web-ui/main.js"]
+config = { port = 7700, host = "127.0.0.1", static_dir = "ui" }
+
+# --- hooks / transformers ----------------------------------------------------
+[plugins.redactor]
+command = ["node", "plugins/redactor/main.js"]
+module = "plugins/redactor/main.js"
+
+[plugins.approval-gate]
+command = ["node", "plugins/approval-gate/main.js"]
+module = "plugins/approval-gate/main.js"
+config = { require = ["delegate"] }
+
+# --- context + loop ----------------------------------------------------------
+[plugins.chat-context]
+command = ["node", "plugins/chat-context/main.js"]
+module = "plugins/chat-context/main.js"
+
+[plugins.titler]
+command = ["node", "plugins/titler/main.js"]
+module = "plugins/titler/main.js"
+
+[plugins.memory]
+command = ["node", "plugins/memory/main.js"]
+module = "plugins/memory/main.js"
+
+# --- providers (swap live via config apply) -----------------------------------
+[plugins.scripted-model]
+command = ["node", "plugins/scripted-model/main.js"]
+module = "plugins/scripted-model/main.js"
+config = { delay_ms = 25 }
+
+[plugins.openai-model]
+command = ["node", "plugins/openai-model/main.js"]
+module = "plugins/openai-model/main.js"
+config = { base_url = "https://api.openai.com/v1", model = "gpt-4o-mini", api_key_env = "OPENAI_API_KEY" }
+
+# --- tools ---------------------------------------------------------------------
+[plugins.tool-clock]
+command = ["node", "plugins/tool-clock/main.js"]
+module = "plugins/tool-clock/main.js"
+
+[plugins.tool-calc]
+command = ["node", "plugins/tool-calc/main.js"]
+module = "plugins/tool-calc/main.js"
+
+[plugins.py-wordcount]
+command = ["python3", "plugins/py-wordcount/main.py"]
+
+[plugins.subagent]
+command = ["node", "plugins/subagent/main.js"]
+module = "plugins/subagent/main.js"
+
+[plugins.subagent-reporter]
+command = ["node", "plugins/subagent-reporter/main.js"]
+module = "plugins/subagent-reporter/main.js"
+
+# --- triggers -------------------------------------------------------------------
+[plugins.heartbeat]
+command = ["node", "plugins/heartbeat/main.js"]
+module = "plugins/heartbeat/main.js"
+config = { every_seconds = 0, agent_every = 0, agent_definition = "chat" }
+
+# --- session definitions ----------------------------------------------------------
+[definitions.chat]
+description = "Interactive chat agent with tools, memory, approval, and sub-agents"
+subscribers = [
+  { plugin = "web-ui" },
+  { plugin = "redactor" },
+  { plugin = "approval-gate" },
+  { plugin = "chat-context" },
+  { plugin = "scripted-model" },
+  { plugin = "titler" },
+  { plugin = "memory" },
+  { plugin = "tool-clock" },
+  { plugin = "tool-calc" },
+  { plugin = "py-wordcount" },
+  { plugin = "subagent" },
+]
+
+[definitions.worker]
+description = "Sub-agent session started by `delegate`; reports back to its parent"
+subscribers = [
+  { plugin = "web-ui" },
+  { plugin = "chat-context" },
+  { plugin = "scripted-model" },
+  { plugin = "tool-clock" },
+  { plugin = "tool-calc" },
+  { plugin = "subagent-reporter" },
+]
+
+[definitions.heartbeat]
+description = "Journal session for the heartbeat trigger (one record per fire)"
+subscribers = [
+  { plugin = "web-ui" },
+  { plugin = "heartbeat" },
+]

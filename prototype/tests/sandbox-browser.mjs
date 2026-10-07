@@ -147,10 +147,21 @@ try {
   await shot('99-failure').catch(() => {});
 } finally {
   report.finished = new Date().toISOString();
-  report.console = logs.filter((l) => /linux-sandbox|cheerpx|CheerpX|error/i.test(l)).slice(-60);
+  report.console = logs.slice(-60);
+  report.thread = await page.evaluate(() => document.querySelector('.thread')?.innerText.slice(-1500)).catch(() => null);
   failed ||= Object.values(report.checks).some((c) => !c.ok);
   report.ok = !failed;
   fs.writeFileSync(path.join(SHOTS, 'sandbox-report.json'), JSON.stringify(report, null, 2));
+  if (process.env.GITHUB_ACTIONS) {
+    // Annotations: readable from the checks API without downloading logs.
+    const esc = (t) => String(t).replace(/%/g, '%25').replace(/\r/g, '').replace(/\n/g, '%0A').slice(0, 3000);
+    const lines = Object.entries(report.checks).map(([k, v]) => `${v.ok ? 'ok' : 'FAIL'} ${k}${v.detail ? ` — ${v.detail.slice(0, 200)}` : ''}`);
+    console.log(`::${failed ? 'error' : 'notice'} title=Linux sandbox (CheerpX)::${esc([report.error ? `error: ${report.error}` : null, ...lines].filter(Boolean).join('\n'))}`);
+    if (failed) {
+      console.log(`::warning title=Linux sandbox console::${esc(report.console.join('\n').slice(-2500) || '(no console output)')}`);
+      console.log(`::warning title=Linux sandbox thread::${esc(report.thread || '(no thread)')}`);
+    }
+  }
   if (process.env.GITHUB_STEP_SUMMARY) {
     const rows = Object.entries(report.checks).map(([k, v]) => `| ${v.ok ? '✅' : '❌'} | ${k} | ${(v.detail || '').replace(/\|/g, '\\|').replace(/\n/g, ' ').slice(0, 160)} |`);
     fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, `### Linux sandbox (CheerpX) feasibility\n\n| | check | detail |\n|---|---|---|\n${rows.join('\n')}\n\n${report.error ? `Error: ${report.error}\n` : ''}`);

@@ -56,11 +56,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// How long the slow memory handlers run. Tests that time these out or cancel
+/// them need margin over worker startup, which is slow on Windows runners.
+const SLOW_MEMORY_HANDLER: std::time::Duration = std::time::Duration::from_secs(3);
+
 fn memory_retrieve(request: &Value) -> Value {
     mark_memory_invocation(request);
     match request.get("handler").and_then(Value::as_str) {
         Some("timeout_memory_retrieve") => {
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            std::thread::sleep(SLOW_MEMORY_HANDLER);
         }
         Some("crash_memory_retrieve") => std::process::exit(17),
         Some("invalid_memory_retrieve") => {
@@ -103,7 +107,7 @@ fn memory_write(request: &Value) -> Value {
         request.get("handler").and_then(Value::as_str),
         Some("timeout_memory_write" | "ambiguous_memory_write")
     ) {
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(SLOW_MEMORY_HANDLER);
     }
     if request.get("handler").and_then(Value::as_str) == Some("invalid_memory_write") {
         return json!({"result":"tool_result","value":{"invalid":true}});

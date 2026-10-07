@@ -127,12 +127,16 @@ commands in and out. The plugin side (`target.js`) is a thin client of it.
   command travels as an argument (no quoting); its stdout and stderr are redirected into
   `/agentmod-out`, so they come back exactly and separately, with the real exit code. The
   console is not part of the protocol.
-- **Timeouts** use a watchdog in the wrapper (sleep, then signal the command's process group).
-  GNU `timeout` never fires under CheerpX, which the probe found.
+- **Timeouts** use a watchdog in the wrapper: a subshell that polls once a second, exits by
+  itself when the command finishes, and on expiry kills the command (children first, where
+  `pgrep -P` can see them). GNU `timeout` never fires under CheerpX, process-group kills do
+  nothing, and SIGKILLing a process that still has a running child crashed the VM, so the
+  watchdog is never killed and nothing kills a group.
 - **Writes** go through `DataDevice` then one `cp`; many files (repository import) go as one tar
   archive and one `tar -x`, not one process per file.
-- **Operations are serialized** per VM. A cancelled call returns at once; the running command's
-  process group is signalled, and its timeout bounds it regardless.
+- **Operations are serialized** per VM. A cancelled call returns at once and the running command
+  is killed the same way. If CheerpX itself stops responding (a WebAssembly trap), the device
+  retires the VM after the command's timeout plus a minute and says so, instead of hanging.
 - **One VM per workspace across tabs** (Web Locks), because the IndexedDB disks are not safe to
   share between two live VMs.
 - **Repositories are imported outside the guest** (GitHub API + raw files, from the worker), so
@@ -170,7 +174,10 @@ blocking the build, and reports each check as an annotation on the job. What it 
 | Does the page-hosted VM run the plugin's tools end to end? | Yes: boot in seconds, `uname` → `i386`, separate stdout/stderr and exit codes, write/edit/read, `gcc` compile + run, `python3`, `git`, `list_files`. |
 | Do IndexedDB `dir` mounts and `readFileAsBlob` see what the guest just wrote? | Yes (every result above comes back that way). |
 | Does `/workspace` survive a page reload? | Yes. |
-| Does GNU `timeout` work? | **No** (the command ran to completion), hence the watchdog. |
+| Does GNU `timeout` work? | **No** (the command ran to completion), hence the watchdog, which does: a 3 s timeout on `sleep 30` returns after 3 s. |
+| Do signals work? | To a pid, yes (`kill` ends a sleeping, busy, or syscall-heavy process at once; `trap` runs). Process-group kills do nothing. `pgrep -P` finds no children. |
+| Anything that crashes the VM? | SIGKILLing a process while its child runs ("memory access out of bounds" on the next command). The wrapper avoids it. |
+| Boot time? | About 3–4 s to the first command's result on a GitHub runner. |
 
 Still open: the public disk image URL (`image`) must stay available; self-hosting an image is
 one config change (`image_type = "bytes"` with an HTTP-range-capable server).
@@ -184,6 +191,8 @@ one config change (`image_type = "bytes"` with an HTTP-range-capable server).
 - No package downloads inside the VM yet. The planned path is a policy-controlled fetch
   capability (an event, so it is logged and can be gated), not open guest networking.
 - No PTY, background processes, or LSP yet; `run` is foreground and non-interactive.
+- A timeout or cancel kills the command's shell; processes *it* started (e.g. `make`'s
+  compilers) cannot be found under CheerpX and run to completion on their own.
 - One shared `/workspace` per browser (named by `workspace`); per-session worktrees would let
   parallel sub-agents work without collisions.
 - No sandbox reset tool yet (`IDBDevice.reset()` on the root overlay); clearing site data resets

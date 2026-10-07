@@ -127,8 +127,13 @@ try {
   check('python3', r.ok, r.out);
   r = await tool('run', { command: 'git --version && cd /workspace && git init -q demo && echo ok-git' }, /ok-git/);
   check('git', r.ok, r.out);
+  r = await tool('run', { command: 'sleep 30 & p=$!; kill $p; wait $p; echo rc=$?' }, /rc=143/, 120000);
+  check('signals reach guest processes', r.ok, r.out);
+  const t1 = Date.now();
   r = await tool('run', { command: 'sleep 30', timeout_seconds: 3 }, /timed out after 3s/, 120000);
-  check('timeout kills a command', r.ok, r.out);
+  check('timeout kills a command', r.ok && Date.now() - t1 < 25000, `${Math.round((Date.now() - t1) / 1000)}s; ${r.out}`);
+  r = await tool('run', { command: 'node -e "console.log(6*7)" && node --version' }, /\b42\b/);
+  check('node', r.ok, r.out);
   r = await tool('list_files', {}, /hello\.c/);
   check('list_files', r.ok, r.out);
   await shot('03-work');

@@ -17,7 +17,8 @@
 //   /agentmod-out   IndexedDB scratch: bytes the guest writes for the page to read
 //
 // Commands run through `cx.run('/bin/bash', …)` with output redirected into
-// /agentmod-out, so stdout, stderr and the exit code come back separately.
+// /agentmod-out, so stdout, stderr and the exit code come back separately; a
+// watchdog in the wrapper enforces the timeout.
 // Operations are serialized: one VM, one operation at a time.
 import { makeTar } from './tar.js';
 
@@ -152,11 +153,27 @@ export function createCheerpxVm(options = {}) {
     const n = ++seq;
     // $0 marks the operation; $1 cwd, $2 timeout, $3 command. Output is
     // redirected into the scratch filesystem so it can be read back exactly.
-    const wrapper = `: >${OUT}/stdout; : >${OUT}/stderr; cd -- "$1" 2>${OUT}/stderr || exit 126; timeout -k 5 "$2" /bin/bash -c "$3" </dev/null >${OUT}/stdout 2>>${OUT}/stderr`;
+    // GNU `timeout` does not fire under CheerpX (its timer never expires), so a
+    // watchdog subshell sleeps and signals the command's process group instead.
+    // `set -m` gives the command its own group, so its children go with it.
+    const wrapper = [
+      `: >${OUT}/stdout; : >${OUT}/stderr; rm -f ${OUT}/timedout`,
+      `cd -- "$1" 2>${OUT}/stderr || exit 126`,
+      'set -m',
+      `/bin/bash -c "$3" </dev/null >${OUT}/stdout 2>>${OUT}/stderr &`,
+      'pid=$!',
+      `echo $pid >${OUT}/pid`,
+      `( sleep "$2"; : >${OUT}/timedout; kill -TERM -- -$pid; sleep 5; kill -KILL -- -$pid ) </dev/null >/dev/null 2>&1 &`,
+      'wd=$!',
+      'wait $pid; rc=$?',
+      'kill -KILL -- -$wd 2>/dev/null',
+      `[ -e ${OUT}/timedout ] && exit 124`,
+      'exit $rc',
+    ].join('\n');
     const started = Date.now();
     const { status } = await cx.run('/bin/bash', ['-c', wrapper, `agentmod-op-${n}`, cwd, String(timeoutSeconds), command], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid });
     const [stdout, stderr] = await Promise.all([io.readFileAsBlob('/stdout').then(blobBytes), io.readFileAsBlob('/stderr').then(blobBytes)]);
-    const timedOut = status === 124 || (status === 137 && Date.now() - started >= timeoutSeconds * 1000);
+    const timedOut = status === 124 && Date.now() - started >= timeoutSeconds * 1000;
     return { exitCode: status, stdout, stderr, timedOut };
   }
 
@@ -219,7 +236,7 @@ export function createCheerpxVm(options = {}) {
     /** Best-effort interruption of the running command (outside the queue). */
     async interrupt() {
       try {
-        await cx?.run('/bin/bash', ['-c', 'pkill -TERM -x timeout'], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid });
+        await cx?.run('/bin/bash', ['-c', `p=$(cat ${OUT}/pid 2>/dev/null) && kill -TERM -- -$p`], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid });
       } catch { /* nothing to interrupt */ }
       return true;
     },

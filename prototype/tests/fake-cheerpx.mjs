@@ -60,9 +60,10 @@ export class Linux {
   run(file, args, opts = {}) {
     Linux.runs = (Linux.runs || 0) + 1;
     this.running ??= new Set();
-    // The device interrupts with `pkill -x timeout` inside its VM; here that
-    // would hit the whole host, so stop only what this fake VM started.
-    if (args[1] === 'pkill -TERM -x timeout') {
+    // The device interrupts by signalling the running command's process group
+    // (whose pid it recorded); stop what this fake VM started instead, so a
+    // stale pid file can never signal an unrelated host process.
+    if (/^p=\$\(cat .*\/pid 2>\/dev\/null\) && kill -TERM -- -\$p$/.test(args[1] || '')) {
       for (const pid of this.running) { try { process.kill(-pid, 'SIGTERM'); } catch { /* gone */ } }
       return Promise.resolve({ status: 0 });
     }

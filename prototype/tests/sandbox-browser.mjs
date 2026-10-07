@@ -137,7 +137,9 @@ try {
     'python3 -c "while True: pass" & p=$!; sleep 1; kill -TERM $p; w $p term-busy-cpu',
     "bash -c 'trap \"exit 3\" TERM; sleep 6 & wait' & p=$!; sleep 1; kill -TERM $p; w $p trap-term",
     's=$(date +%s); timeout 2 sleep 6; echo "gnu-timeout rc=$? waited=$(( $(date +%s) - s ))s"',
-  ].join('\n'), timeout_seconds: 120 }, /term-sleep rc=143 waited=[01]s/, 180000);
+    "bash -c 'sleep 6; :' & p=$!; sleep 1; echo \"children=$(pgrep -P $p | wc -l)\"; kill $p; wait $p",
+    'sleep 6 & p=$!; kill -TERM -- -$p 2>/dev/null; w $p group-kill',
+  ].join('\n'), timeout_seconds: 120 }, /term-sleep rc=1(37|43) waited=[01]s/, 180000);
   report.signals = r.out;
   check('signals end a sleeping process promptly', r.ok, r.out);
   const t1 = Date.now();

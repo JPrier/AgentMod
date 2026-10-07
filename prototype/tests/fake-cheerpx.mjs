@@ -63,7 +63,7 @@ export class Linux {
     // The device interrupts by signalling the running command's process group
     // (whose pid it recorded); stop what this fake VM started instead, so a
     // stale pid file can never signal an unrelated host process.
-    if (/\/pid 2>\/dev\/null\); \[ "\$2" \] && \[ "\$2" != done \] && kill -TERM -- -\$2$/.test(args[1] || '')) {
+    if (/\[ "\$2" != done \] && killtree \$2$/.test(args[1] || '')) {
       for (const pid of this.running) { try { process.kill(-pid, 'SIGTERM'); } catch { /* gone */ } }
       return Promise.resolve({ status: 0 });
     }

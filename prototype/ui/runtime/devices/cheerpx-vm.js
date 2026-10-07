@@ -50,6 +50,9 @@ async function hash(text) {
   return [...new Uint8Array(buf)].slice(0, 6).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// Kill a process and its descendants, children first (no process groups needed).
+const KILLTREE = 'killtree() { local c; for c in $(pgrep -P "$1"); do killtree "$c"; done; kill -KILL "$1" 2>/dev/null; }';
+
 const blobBytes = async (blob) => (blob ? new Uint8Array(await blob.arrayBuffer()) : new Uint8Array());
 const quote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
 
@@ -154,22 +157,23 @@ export function createCheerpxVm(options = {}) {
     // $0 marks the operation; $1 cwd, $2 timeout, $3 command. Output is
     // redirected into the scratch filesystem so it can be read back exactly.
     // GNU `timeout` does not fire under CheerpX (its timer never expires), so a
-    // watchdog subshell sleeps and then signals the command's process group.
-    // `set -m` gives the command its own group, so its children go with it.
-    // The watchdog's marker and its kill are tied to this operation (n), so a
-    // watchdog that outlives its command can never affect a later one.
+    // watchdog subshell sleeps and then kills the command. Signals to a pid work
+    // under CheerpX but process-group kills do not, so the watchdog walks the
+    // process tree (`pgrep -P`) and kills it bottom-up. The watchdog's marker
+    // and its kill are tied to this operation (n), so a watchdog that outlives
+    // its command can never affect a later one.
     const wrapper = [
       `: >${OUT}/stdout; : >${OUT}/stderr`,
       `cd -- "$1" 2>${OUT}/stderr || exit 126`,
-      'set -m',
+      KILLTREE,
       `/bin/bash -c "$3" </dev/null >${OUT}/stdout 2>>${OUT}/stderr &`,
       'pid=$!',
       `echo "${n} $pid" >${OUT}/pid`,
-      `( sleep "$2"; [ "$(cat ${OUT}/pid)" = "${n} $pid" ] || exit 0; : >${OUT}/timedout-${n}; kill -TERM -- -$pid; sleep 5; [ "$(cat ${OUT}/pid)" = "${n} $pid" ] && kill -KILL -- -$pid ) </dev/null >/dev/null 2>&1 &`,
+      `( sleep "$2"; [ "$(cat ${OUT}/pid)" = "${n} $pid" ] || exit 0; : >${OUT}/timedout-${n}; killtree $pid ) </dev/null >/dev/null 2>&1 &`,
       'wd=$!',
       'wait $pid; rc=$?',
       `echo "${n} done" >${OUT}/pid`,
-      'kill -KILL -- -$wd 2>/dev/null',
+      'killtree $wd 2>/dev/null',
       `[ -e ${OUT}/timedout-${n} ] && { rm -f ${OUT}/timedout-${n}; exit 124; }`,
       'exit $rc',
     ].join('\n');
@@ -239,7 +243,7 @@ export function createCheerpxVm(options = {}) {
     /** Best-effort interruption of the running command (outside the queue). */
     async interrupt() {
       try {
-        await cx?.run('/bin/bash', ['-c', `set -- $(cat ${OUT}/pid 2>/dev/null); [ "$2" ] && [ "$2" != done ] && kill -TERM -- -$2`], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid });
+        await cx?.run('/bin/bash', ['-c', `${KILLTREE}\nset -- $(cat ${OUT}/pid 2>/dev/null); [ "$2" ] && [ "$2" != done ] && killtree $2`], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid });
       } catch { /* nothing to interrupt */ }
       return true;
     },

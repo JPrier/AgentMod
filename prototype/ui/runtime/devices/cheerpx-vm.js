@@ -158,24 +158,25 @@ export function createCheerpxVm(options = {}) {
     // $0 marks the operation; $1 cwd, $2 timeout, $3 command. Output is
     // redirected into the scratch filesystem so it can be read back exactly.
     // GNU `timeout` does not fire under CheerpX (its timer never expires), so a
-    // watchdog subshell sleeps and then kills the command. Signals to a pid work
-    // under CheerpX but process-group kills do not, so on timeout the watchdog
-    // walks the process tree (`pgrep -P`) and kills it bottom-up; the normal
-    // path never touches /proc. The watchdog's marker and its kill are tied to
-    // this operation (n), so a watchdog that outlives its command (its `sleep`
-    // is left to finish) can never affect a later one.
+    // watchdog subshell counts seconds and kills the command when time is up.
+    // Two CheerpX findings shape it: signals to a pid work but process-group
+    // kills do not, and SIGKILLing a process that still has a running child
+    // can crash the VM. So the watchdog is never killed — it polls once a
+    // second and exits by itself once the command is done — and on timeout it
+    // kills the command's process tree children-first (`pgrep -P`). Its marker
+    // and its kill are tied to this operation (n), so it can never affect a
+    // later one.
     const wrapper = [
       `: >${OUT}/stdout; : >${OUT}/stderr`,
       `cd -- "$1" 2>${OUT}/stderr || exit 126`,
       KILLTREE,
+      'set -m',
       `/bin/bash -c "$3" </dev/null >${OUT}/stdout 2>>${OUT}/stderr &`,
       'pid=$!',
       `echo "${n} $pid" >${OUT}/pid`,
-      `( sleep "$2"; [ "$(cat ${OUT}/pid)" = "${n} $pid" ] || exit 0; : >${OUT}/timedout-${n}; killtree $pid ) </dev/null >/dev/null 2>&1 &`,
-      'wd=$!',
+      `( i=0; while [ $i -lt "$2" ]; do sleep 1; i=$((i+1)); [ "$(cat ${OUT}/pid)" = "${n} $pid" ] || exit 0; done; : >${OUT}/timedout-${n}; killtree $pid ) </dev/null >/dev/null 2>&1 &`,
       'wait $pid; rc=$?',
       `echo "${n} done" >${OUT}/pid`,
-      'kill -KILL $wd 2>/dev/null',
       `[ -e ${OUT}/timedout-${n} ] && { rm -f ${OUT}/timedout-${n}; exit 124; }`,
       'exit $rc',
     ].join('\n');

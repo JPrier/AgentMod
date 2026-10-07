@@ -41,14 +41,23 @@ struct Fixture {
     operation_timeout_ms: u64,
 }
 
+// Timing budget. The slow fixture handlers run for 3 s after the worker
+// starts. Worker startup on Windows runners can take hundreds of
+// milliseconds, so every window below leaves wide margin over it:
+//
+// * the timeout path must expire after the worker has started (and written its
+//   marker) but before the handler finishes;
+// * a cancellation must reach the invocation while it is still open, so its
+//   timeout must outlast the handler;
+// * operation timeouts may not exceed the manifest's plugin timeout.
+/// Plugin-level timeout ceiling declared in the fixture manifest.
+const PLUGIN_TIMEOUT_MS: u64 = 10_000;
 /// Operation timeout for fixtures that exercise the timeout path.
-const SHORT_OPERATION_TIMEOUT_MS: u64 = 50;
-/// Operation timeout for fixtures that cancel an in-flight invocation. With
-/// 50 ms the cancellation had to land within 50 ms of dispatch, which slow
-/// Windows runners (timers tick at ~16 ms) miss, yielding `AlreadyTerminal`.
-/// The handler sleeps 250 ms, so the invocation now stays open for ~250 ms;
-/// it must not exceed the manifest's 500 ms plugin timeout.
-const CANCELLABLE_OPERATION_TIMEOUT_MS: u64 = 400;
+const SHORT_OPERATION_TIMEOUT_MS: u64 = 1_500;
+/// Operation timeout for fixtures that cancel an in-flight invocation.
+const CANCELLABLE_OPERATION_TIMEOUT_MS: u64 = 8_000;
+/// How long to wait for the worker to record that the handler started.
+const MARKER_WAIT: Duration = Duration::from_secs(5);
 
 fn operation(
     handler: &str,
@@ -114,7 +123,7 @@ fn manifest(
         before: BTreeSet::new(),
         stage: 0,
         priority: 0,
-        timeout_ms: 500,
+        timeout_ms: PLUGIN_TIMEOUT_MS,
         failure_policy: String::from("reject"),
         max_attempts: 1,
         retry_backoff_ms: 0,
@@ -658,11 +667,11 @@ async fn every_post_dispatch_write_receipt_failure_is_ambiguous_and_never_retrie
         let dependency = cancelled.dependency.clone();
         tokio::spawn(async move { dependency.invoke_memory_write(request).await })
     };
-    for _ in 0..100 {
-        if marker_lines(&cancelled.marker).await == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+    let marker_deadline = tokio::time::Instant::now() + MARKER_WAIT;
+    while marker_lines(&cancelled.marker).await == 0
+        && tokio::time::Instant::now() < marker_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let receipt = cancelled
         .dependency
@@ -756,11 +765,11 @@ async fn terminal_success_crash_malformed_and_cancellation_are_redacted_and_sing
         let dependency = cancelled.dependency.clone();
         tokio::spawn(async move { dependency.invoke_memory_retrieve(request).await })
     };
-    for _ in 0..100 {
-        if marker_lines(&cancelled.marker).await == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
+    let marker_deadline = tokio::time::Instant::now() + MARKER_WAIT;
+    while marker_lines(&cancelled.marker).await == 0
+        && tokio::time::Instant::now() < marker_deadline
+    {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let receipt = cancelled
         .dependency

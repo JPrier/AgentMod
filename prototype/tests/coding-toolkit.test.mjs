@@ -103,8 +103,17 @@ test('globs', () => {
   assert.ok(m('test_?.py', 'test_a.py') && !m('test_?.py', 'test_ab.py'));
 });
 
+const hasRg = (() => {
+  try {
+    execFileSync('rg', ['--version'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
 for (const engine of ['ripgrep', 'grep']) {
-  test(`search_text (${engine}): structured, sorted, bounded, filters`, async () => {
+  test(`search_text (${engine}): structured, sorted, bounded, filters`, { skip: engine === 'ripgrep' && !hasRg && 'ripgrep is not installed' }, async () => {
     const noRg = (root) => {
       const t = localTarget({ root });
       const exec = t.exec.bind(t);

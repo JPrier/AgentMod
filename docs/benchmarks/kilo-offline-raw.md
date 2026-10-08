@@ -1,0 +1,254 @@
+# Kilo benchmark — offline (scripted model, fake GitHub, real tools)
+
+Task: _Import the GitHub repo antirez/kilo, build it with make, and explain how it draws the screen._
+
+## Control plane: same trajectory, before vs after
+
+| Metric                             | Before           | After            | Change    |
+|------------------------------------|------------------|------------------|-----------|
+| Task success                       | yes              | yes              | —         |
+| Build success                      | yes              | yes              | —         |
+| Answer quality (rubric)            | 4/4              | 4/4              | —         |
+| Model calls                        | 23               | 23               | +0%       |
+| Tool calls                         | 22               | 22               | +0%       |
+| Failed tools                       | 1                | 1                | +0%       |
+| Runtime recoveries                 | —                | —                | —         |
+| Wall time (s)                      | 5.3              | 5.1              | -3%       |
+| Prompt tokens                      | 123,300          | 131,576          | +7%       |
+| Cached prompt tokens               | 110,895          | 118,409          | +7%       |
+| Uncached prompt tokens             | 12,405           | 13,167           | +6%       |
+| Completion tokens                  | 949              | 949              | +0%       |
+| Cost ($, simulated pricing)        | 0.0107           | 0.0114           | +6%       |
+| Canonical events                   | 415              | 104              | -75%      |
+|   of which stream-chunk events     | 311              | —                | —         |
+| Pipeline executions                | 415              | 104              | -75%      |
+| Plugin invocations                 | 739              | 150              | -80%      |
+|   no-op invocations                | 635              | 45               | -93%      |
+|   tool-call invocations            | 242              | 44               | -82%      |
+|   exact-owner dispatches           | —                | 22               | —         |
+|   broadcast dispatches             | 220              | —                | —         |
+| Stream provider events             | 311              | 455              | +46%      |
+| Live frames                        | 311              | 255              | -18%      |
+| UI deliveries (SSE messages)       | 2,724            | 735              | -73%      |
+| UI bytes received                  | 993,460          | 433,456          | -56%      |
+| First visible text, median (ms)    | 19               | 15               | -21%      |
+| First visible text, max (ms)       | 105              | 75               | -29%      |
+| Journal records                    | 2,724            | 613              | -77%      |
+| Journal bytes                      | 936,243          | 369,679          | -61%      |
+| Pipelines / semantic event         | 4.0              | 1                | -75%      |
+| Plugin invocations / tool call     | 11               | 2                | -82%      |
+| Live frames / provider event       | 1                | 0.5600           | -44%      |
+| Canonical events / model response  | 18.0             | 4.5              | -75%      |
+| Journal bytes / useful output byte | 36.5             | 14.4             | -61%      |
+
+## Turns: the adaptive script on each harness (simulated model)
+
+| Metric                             | Before           | After            | Change    |
+|------------------------------------|------------------|------------------|-----------|
+| Task success                       | yes              | yes              | —         |
+| Build success                      | yes              | yes              | —         |
+| Answer quality (rubric)            | 4/4              | 4/4              | —         |
+| Model calls                        | 23               | 10               | -57%      |
+| Tool calls                         | 22               | 18               | -18%      |
+| Failed tools                       | 1                | 1                | +0%       |
+| Wall time (s)                      | 5.8              | 4.3              | -26%      |
+| Prompt tokens                      | 123,300          | 52,763           | -57%      |
+| Cached prompt tokens               | 110,895          | 42,470           | -62%      |
+| Uncached prompt tokens             | 12,405           | 10,293           | -17%      |
+| Completion tokens                  | 949              | 783              | -17%      |
+| Cost ($, simulated pricing)        | 0.0107           | 0.0052           | -52%      |
+| Journal records                    | 2,724            | 409              | -85%      |
+| Journal bytes                      | 936,257          | 276,767          | -70%      |
+| Journal bytes / useful output byte | 36.5             | 11.6             | -68%      |
+
+## Why each model request happened (bench/turns.mjs)
+
+| category | before · coder · fixed | before · coder · adaptive | before · minimal · adaptive | after · coder · fixed | after · coder · adaptive | after · minimal · adaptive |
+|---|---|---|---|---|---|---|
+| avoidable serial step | 7 | 7 | 6 | 7 | 0 | 6 |
+| bad arguments | 1 | 1 | 0 | 1 | 1 | 0 |
+| build/test iteration | 1 | 1 | 1 | 1 | 1 | 1 |
+| environment probing | 2 | 2 | 1 | 2 | 0 | 1 |
+| final answer | 1 | 1 | 1 | 1 | 1 | 1 |
+| initial | 1 | 1 | 1 | 1 | 1 | 1 |
+| plan only | 2 | 2 | 0 | 2 | 0 | 0 |
+| redundant reinspection | 1 | 1 | 0 | 1 | 0 | 0 |
+| repository navigation | 5 | 5 | 2 | 5 | 5 | 2 |
+| tool discovery | 1 | 1 | 0 | 1 | 0 | 0 |
+| tool result follow-up | 1 | 1 | 1 | 1 | 1 | 1 |
+| **total model requests** | 23 | 23 | 13 | 23 | 10 | 13 |
+| **avoidable (classifier)** | 13 | 13 | 7 | 13 | 0 | 7 |
+
+## Minimal loop vs the coder harness (after)
+
+| Metric                             | Minimal           | Coder             | Change    |
+|------------------------------------|------------------|------------------|-----------|
+| Task success                       | yes              | yes              | —         |
+| Build success                      | yes              | yes              | —         |
+| Answer quality (rubric)            | 4/4              | 4/4              | —         |
+| Model calls                        | 13               | 10               | -23%      |
+| Tool calls                         | 12               | 18               | +50%      |
+| Failed tools                       | —                | 1                | —         |
+| Runtime recoveries                 | —                | —                | —         |
+| Wall time (s)                      | 2.9              | 4.3              | +49%      |
+| Prompt tokens                      | 21,741           | 52,763           | +143%     |
+| Cached prompt tokens               | 12,602           | 42,470           | +237%     |
+| Uncached prompt tokens             | 9,139            | 10,293           | +13%      |
+| Completion tokens                  | 552              | 783              | +42%      |
+| Cost ($, simulated pricing)        | 0.0026           | 0.0052           | +96%      |
+| Canonical events                   | 53               | 70               | +32%      |
+|   of which stream-chunk events     | —                | —                | —         |
+| Pipeline executions                | 53               | 70               | +32%      |
+| Plugin invocations                 | 53               | 99               | +87%      |
+|   no-op invocations                | 1                | 28               | +2700%    |
+|   tool-call invocations            | 12               | 36               | +200%     |
+|   exact-owner dispatches           | 12               | 18               | +50%      |
+|   broadcast dispatches             | —                | —                | —         |
+| Stream provider events             | 283              | 338              | +19%      |
+| Live frames                        | 146              | 148              | +1%       |
+| UI deliveries (SSE messages)       | 340              | 475              | +40%      |
+| UI bytes received                  | 216,452          | 315,393          | +46%      |
+| First visible text, median (ms)    | 8                | 20               | +150%     |
+| First visible text, max (ms)       | 53               | 94               | +77%      |
+| Journal records                    | 266              | 409              | +54%      |
+| Journal bytes                      | 181,889          | 276,767          | +52%      |
+| Pipelines / semantic event         | 1                | 1                | +0%       |
+| Plugin invocations / tool call     | 1                | 2                | +100%     |
+| Live frames / provider event       | 0.5160           | 0.4380           | -15%      |
+| Canonical events / model response  | 4.1              | 7                | +72%      |
+| Journal bytes / useful output byte | 10.4             | 11.6             | +12%      |
+
+<details><summary>before (d073dd7 d073dd7) · coder · fixed: per-turn classification</summary>
+
+1. initial — update_plan
+2. **avoidable** plan only — tool_search
+3. **avoidable** tool discovery — import_repo
+4. tool result follow-up — shell
+5. **avoidable** environment probing — shell (uname -a && cat /etc/os-release)
+6. **avoidable** environment probing — list_dir (which gcc cc make)
+7. repository navigation — read_file
+8. **avoidable** avoidable serial step — read_file
+9. repository navigation — shell
+10. build/test iteration — shell
+11. repository navigation — update_plan
+12. **avoidable** plan only — search_text
+13. bad arguments — search_files (search_text: kilo/kilo.c is not a directory)
+14. **avoidable** avoidable serial step — search_text
+15. repository navigation — read_file
+16. **avoidable** avoidable serial step — read_file
+17. **avoidable** avoidable serial step — read_file
+18. **avoidable** avoidable serial step — read_file
+19. **avoidable** avoidable serial step — search_text
+20. **avoidable** avoidable serial step — search_text
+21. repository navigation — read_file
+22. **avoidable** redundant reinspection — update_plan (read_file:kilo/kilo.c:882:990::)
+23. final answer — text (after plan only)
+
+</details>
+
+<details><summary>before (d073dd7 d073dd7) · coder · adaptive: per-turn classification</summary>
+
+1. initial — update_plan
+2. **avoidable** plan only — tool_search
+3. **avoidable** tool discovery — import_repo
+4. tool result follow-up — shell
+5. **avoidable** environment probing — shell (uname -a && cat /etc/os-release)
+6. **avoidable** environment probing — list_dir (which gcc cc make)
+7. repository navigation — read_file
+8. **avoidable** avoidable serial step — read_file
+9. repository navigation — shell
+10. build/test iteration — shell
+11. repository navigation — update_plan
+12. **avoidable** plan only — search_text
+13. bad arguments — search_files (search_text: kilo/kilo.c is not a directory)
+14. **avoidable** avoidable serial step — search_text
+15. repository navigation — read_file
+16. **avoidable** avoidable serial step — read_file
+17. **avoidable** avoidable serial step — read_file
+18. **avoidable** avoidable serial step — read_file
+19. **avoidable** avoidable serial step — search_text
+20. **avoidable** avoidable serial step — search_text
+21. repository navigation — read_file
+22. **avoidable** redundant reinspection — update_plan (read_file:kilo/kilo.c:882:990::)
+23. final answer — text (after plan only)
+
+</details>
+
+<details><summary>before (d073dd7 d073dd7) · minimal · adaptive: per-turn classification</summary>
+
+1. initial — shell
+2. tool result follow-up — shell
+3. **avoidable** environment probing — shell (uname -a && which gcc cc make)
+4. repository navigation — shell
+5. build/test iteration — shell
+6. repository navigation — shell
+7. **avoidable** avoidable serial step — shell
+8. **avoidable** avoidable serial step — shell
+9. **avoidable** avoidable serial step — shell
+10. **avoidable** avoidable serial step — shell
+11. **avoidable** avoidable serial step — shell
+12. **avoidable** avoidable serial step — shell
+13. final answer — text (after repository navigation)
+
+</details>
+
+<details><summary>after (working tree) · coder · fixed: per-turn classification</summary>
+
+1. initial — update_plan
+2. **avoidable** plan only — tool_search
+3. **avoidable** tool discovery — import_repo
+4. tool result follow-up — shell
+5. **avoidable** environment probing — shell (uname -a && cat /etc/os-release)
+6. **avoidable** environment probing — list_dir (which gcc cc make)
+7. repository navigation — read_file
+8. **avoidable** avoidable serial step — read_file
+9. repository navigation — shell
+10. build/test iteration — shell
+11. repository navigation — update_plan
+12. **avoidable** plan only — search_text
+13. bad arguments — search_files (search_text: search_text `path` must be a directory; kilo/kilo.c is a file. To search inside that file )
+14. **avoidable** avoidable serial step — search_text
+15. repository navigation — read_file
+16. **avoidable** avoidable serial step — read_file
+17. **avoidable** avoidable serial step — read_file
+18. **avoidable** avoidable serial step — read_file
+19. **avoidable** avoidable serial step — search_text
+20. **avoidable** avoidable serial step — search_text
+21. repository navigation — read_file
+22. **avoidable** redundant reinspection — update_plan (read_file:kilo/kilo.c:882:990::)
+23. final answer — text (after plan only)
+
+</details>
+
+<details><summary>after (working tree) · coder · adaptive: per-turn classification</summary>
+
+1. initial — update_plan, import_repo
+2. tool result follow-up — list_dir, read_file, read_file
+3. repository navigation — shell
+4. build/test iteration — shell
+5. repository navigation — update_plan, search_text
+6. bad arguments — search_text (search_text: search_text `path` must be a directory; kilo/kilo.c is a file. To search inside that file )
+7. repository navigation — read_file, read_file, read_file, read_file
+8. repository navigation — search_text, search_text
+9. repository navigation — update_plan, read_file
+10. final answer — text (read_file:kilo/kilo.c:882:990::)
+
+</details>
+
+<details><summary>after (working tree) · minimal · adaptive: per-turn classification</summary>
+
+1. initial — shell
+2. tool result follow-up — shell
+3. **avoidable** environment probing — shell (uname -a && which gcc cc make)
+4. repository navigation — shell
+5. build/test iteration — shell
+6. repository navigation — shell
+7. **avoidable** avoidable serial step — shell
+8. **avoidable** avoidable serial step — shell
+9. **avoidable** avoidable serial step — shell
+10. **avoidable** avoidable serial step — shell
+11. **avoidable** avoidable serial step — shell
+12. **avoidable** avoidable serial step — shell
+13. final answer — text (after repository navigation)
+
+</details>

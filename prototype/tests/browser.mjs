@@ -103,7 +103,10 @@ try {
   // Hard stop mid-stream, then resume.
   await page.type('#composer', 'tell me about yourself in detail');
   await page.keyboard.press('Enter');
-  await new Promise((r) => setTimeout(r, 400));
+  // Live text renders from the stream hub (no stream-chunk events in the log).
+  await page.waitForFunction(() => [...document.querySelectorAll('.msg.assistant.streaming')].some((el) => el.textContent.trim().length > 10), { timeout: 15000 });
+  const chunks = await page.evaluate(async () => (await window.__agentmod?.client?.getSession?.(window.__agentmod.selected))?.events?.filter((e) => e.event_name === 'stream-chunk').length ?? 0);
+  if (chunks) throw new Error(`${chunks} stream-chunk events in the log`);
   await page.evaluate(() => [...document.querySelectorAll('.controls button')].find((b) => b.textContent === 'Hard stop').click());
   await waitText('Hard stop by');
   await shot('07-hardstop');

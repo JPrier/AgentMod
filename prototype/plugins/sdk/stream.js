@@ -90,6 +90,8 @@ export function createStreamWriter(ctx, { flushMs = 16, maxBatchBytes = 64 * 102
   let batch = [];
   let bytes = 0;
   let timer = null;
+  let lastSend = 0;
+  const led = new Set(); // blocks whose first delta was sent at once
   let closed = false;
   const usage = new UsageAccumulator();
   const stats = { provider_events: 0, frames: 0, batches: 0, attempts: 0, transport_chunks: 0 };
@@ -103,6 +105,7 @@ export function createStreamWriter(ctx, { flushMs = 16, maxBatchBytes = 64 * 102
     const frames = batch;
     batch = [];
     bytes = 0;
+    lastSend = Date.now();
     stats.batches++;
     const params = { invocation_id: inv, frames };
     // Intermediate batches are notifications; the last is a request whose reply
@@ -118,8 +121,13 @@ export function createStreamWriter(ctx, { flushMs = 16, maxBatchBytes = 64 * 102
     batch.push({ attempt, ...frame });
     stats.frames++;
     bytes += (frame.text?.length || 0) + 48;
-    if (bytes >= maxBatchBytes) send(false);
-    else if (!timer) timer = setTimeout(() => send(false), flushMs);
+    // Leading edge: after a quiet period a frame goes out at once (first-token
+    // latency); within the window frames batch until it closes.
+    const since = Date.now() - lastSend;
+    const first = /-delta$/.test(frame.type) && !led.has(`${attempt}/${frame.block}`);
+    if (first) led.add(`${attempt}/${frame.block}`);
+    if (first || bytes >= maxBatchBytes || (!timer && since >= flushMs)) send(false);
+    else if (!timer) timer = setTimeout(() => send(false), flushMs - since);
   };
 
   return {

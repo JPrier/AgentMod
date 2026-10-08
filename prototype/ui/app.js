@@ -300,6 +300,8 @@ async function connect(host) {
 
 let stopSub = null;
 let stopStream = null;
+// For tests and debugging in the console (read-only handles).
+window.__agentmod = { get client() { return state.client; }, get selected() { return state.selected; }, streams: null };
 
 // ---------------------------------------------------------------------------
 // Live streams: presentation state, rendered in place at most once per frame.
@@ -308,6 +310,7 @@ let stopStream = null;
 const liveEls = new Map(); // stream_id -> element
 const streamStore = new StreamStore({ onChange: () => scheduleLive(), onResync: () => hydrateStreams() });
 const scheduleLive = renderScheduler(() => renderLive());
+window.__agentmod.streams = streamStore;
 
 async function hydrateStreams() {
   if (!state.client?.streamSnapshots) return;

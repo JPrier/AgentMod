@@ -3,6 +3,10 @@
 // It picks tools by keyword, like a (very) small model would, or follows a
 // scripted scenario ("script:<name>" in the user's message) for harness tests.
 import http from 'node:http';
+import { serveGithub, isKiloTask, kiloStep, simulatedUsage } from '../bench/kilo-world.mjs';
+
+const PORT = Number(process.argv[2] || 8765);
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const lastOut = (outs) => outs[outs.length - 1] || '';
 const SCRIPTS = {
@@ -58,6 +62,7 @@ http.createServer(async (req, res) => {
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-headers', '*');
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+  if (serveGithub(req, res)) return; // the benchmark's offline GitHub
   const ok = req.headers.authorization === 'Bearer test-key';
   if (req.method === 'GET' && req.url.endsWith('/models')) {
     // Shape of https://openrouter.ai/api/v1/models (public; no key needed).
@@ -78,6 +83,28 @@ http.createServer(async (req, res) => {
   const send = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
   const last = [...j.messages].reverse().find((m) => m.role !== 'system') || j.messages.at(-1);
   const tools = new Set((j.tools || []).map((t) => t.function.name));
+  // Tool arguments arrive in small fragments, as real providers send them.
+  const streamCalls = async (calls) => {
+    for (const [i, [fn, args]] of calls.entries()) {
+      const json = JSON.stringify(args);
+      const id = `call_${i}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      for (let k = 0; k < json.length || k === 0; k += 16) {
+        send({ model: j.model, choices: [{ delta: { tool_calls: [{ index: i, ...(k === 0 ? { id, function: { name: fn, arguments: json.slice(0, 16) } } : { function: { arguments: json.slice(k, k + 16) } }) }] } }] });
+      }
+    }
+  };
+  if (isKiloTask(j.messages)) {
+    const step = kiloStep(j, { mode: process.env.MOCK_KILO || 'adaptive', minimal: !tools.has('read_file'), base: `http://127.0.0.1:${PORT}` });
+    console.error('MOCK kilo', JSON.stringify(step).slice(0, 160));
+    for (const w of String(step.text || '').split(/(?<= )/)) {
+      send({ model: j.model, choices: [{ delta: { content: w } }] });
+      await sleepMs(Number(process.env.MOCK_DELAY_MS || 2));
+    }
+    if (step.calls?.length) await streamCalls(step.calls);
+    const usage = simulatedUsage(j, `${step.text || ''}${JSON.stringify(step.calls || [])}`);
+    send({ model: j.model, choices: [{ delta: {}, finish_reason: step.calls?.length ? 'tool_calls' : 'stop' }], usage });
+    return res.end('data: [DONE]\n\n');
+  }
   const call = (name, args) => send({ model: j.model, choices: [{ delta: { tool_calls: [{ index: 0, id: `call_${Date.now()}`, function: { name, arguments: JSON.stringify(args) } }] } }] });
   const t = String(last.content || '');
   let text;
@@ -93,7 +120,7 @@ http.createServer(async (req, res) => {
     if (out) {
       console.error('MOCK script', name, step, JSON.stringify(out).slice(0, 200));
       if (out.calls) {
-        out.calls.forEach(([fn, args], i) => send({ model: j.model, choices: [{ delta: { tool_calls: [{ index: i, id: `call_${name}_${step}_${i}_${Date.now()}`, function: { name: fn, arguments: JSON.stringify(args) } }] } }] }));
+        await streamCalls(out.calls);
         send({ model: j.model, choices: [{ delta: {}, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 1000 + step, completion_tokens: 20, prompt_tokens_details: { cached_tokens: 800 }, cost: 0.0001 } });
         return res.end('data: [DONE]\n\n');
       }
@@ -111,4 +138,4 @@ http.createServer(async (req, res) => {
   if (text) for (const w of text.split(/(?<= )/)) { send({ model: j.model, choices: [{ delta: { content: w } }] }); await new Promise((r) => setTimeout(r, Number(process.env.MOCK_DELAY_MS || 40))); }
   send({ model: j.model, choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 900, completion_tokens: 30, prompt_tokens_details: { cached_tokens: 600 }, cost: 0.0001 } });
   res.end('data: [DONE]\n\n');
-}).listen(Number(process.argv[2] || 8765), () => console.error('mock OpenRouter listening'));
+}).listen(PORT, () => console.error('mock OpenRouter listening'));

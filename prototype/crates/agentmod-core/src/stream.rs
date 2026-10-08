@@ -383,6 +383,8 @@ struct Stream {
     last_pseq: Option<u64>,
     pending: Option<Pending>,
     segments: u32,
+    /// Blocks whose first delta already went out (leading-edge flush).
+    led: BTreeSet<u32>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -503,6 +505,7 @@ impl StreamHub {
                     last_pseq: None,
                     pending: None,
                     segments: 0,
+                    led: BTreeSet::new(),
                 },
             );
         }
@@ -527,6 +530,7 @@ impl StreamHub {
             }
             s.state.attempt.clone_from(&f.attempt);
             s.state.blocks.clear();
+            s.led.clear();
             s.state.usage = None;
             s.state.error = None;
             s.state.truncated = false;
@@ -596,6 +600,9 @@ impl StreamHub {
                 self.flush(stream_id, out);
             }
             let s = self.streams.get_mut(stream_id).expect("stream");
+            // The first delta of a block goes out at once (first-token
+            // latency); the rest coalesce.
+            let leading = s.led.insert(block);
             let p = s.pending.get_or_insert_with(|| Pending {
                 block,
                 kind,
@@ -606,7 +613,7 @@ impl StreamHub {
             });
             p.text.push_str(text);
             p.to_seq = seq;
-            if p.text.len() >= self.settings.flush_bytes {
+            if leading || p.text.len() >= self.settings.flush_bytes {
                 self.flush(stream_id, out);
             }
             return;
@@ -817,6 +824,7 @@ impl StreamHub {
                 last_pseq: None,
                 pending: None,
                 segments: 0,
+                led: BTreeSet::new(),
             },
         );
     }
@@ -841,6 +849,7 @@ impl StreamHub {
                             last_pseq: None,
                             pending: None,
                             segments: 0,
+                    led: BTreeSet::new(),
                         },
                     );
                 }
@@ -1082,27 +1091,30 @@ mod tests {
         batch.push(start("a", 1, BlockKind::Text));
         batch.extend((0..10).map(|_| text("a", 1, "hello ")));
         h.ingest("s1/i2", batch, 5, &mut out);
-        // The text run is still pending (under time and size): nothing yet.
+        // Each block's first delta goes out at once (first-token latency);
+        // the rest of the run coalesces, and the text run is still pending.
         let got = h.drain(c, usize::MAX);
         let kinds: Vec<&Frame> = frames(&got);
         assert!(matches!(kinds[0], Frame::Open { .. }));
-        assert!(matches!(kinds[2], Frame::ReasoningDelta { text, .. } if text.len() == 100));
-        assert!(matches!(kinds[3], Frame::BlockStart { block: 1, .. }));
-        assert_eq!(kinds.len(), 4);
+        assert!(matches!(kinds[2], Frame::ReasoningDelta { text, .. } if text.len() == 1));
+        assert!(matches!(kinds[3], Frame::ReasoningDelta { text, .. } if text.len() == 99));
+        assert!(matches!(kinds[4], Frame::BlockStart { block: 1, .. }));
+        assert!(matches!(kinds[5], Frame::TextDelta { text, .. } if text == "hello "));
+        assert_eq!(kinds.len(), 6);
         // Time flushes the pending run.
         assert_eq!(h.next_deadline(), Some(5 + 33));
         h.poll(40, &mut out);
         let got = h.drain(c, usize::MAX);
         assert!(
-            matches!(&got[0], LiveMsg::Frame { frame: Frame::TextDelta { text, .. }, seq, from_seq, .. } if text.len() == 60 && *seq - *from_seq == 9)
+            matches!(&got[0], LiveMsg::Frame { frame: Frame::TextDelta { text, .. }, seq, from_seq, .. } if text.len() == 54 && *seq - *from_seq == 8)
         );
         // Size flushes too.
         h.ingest("s1/i2", vec![text("a", 1, &"x".repeat(600))], 41, &mut out);
         assert_eq!(h.drain(c, usize::MAX).len(), 1);
-        // 113 normalized frames became 6 live frames.
+        // 113 normalized frames became 8 live frames.
         let st = &h.snapshots(None)[0];
         assert_eq!(st.stats.frames, 114);
-        assert_eq!(st.stats.live_frames, 6);
+        assert_eq!(st.stats.live_frames, 8);
         assert_eq!(st.blocks[1].text.len(), 660);
     }
 

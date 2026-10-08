@@ -419,6 +419,7 @@ async function select(id) {
   state.selected = id;
   state.expanded.clear();
   state.view = id ? await state.client.getSession(id) : null;
+  await refreshMetrics();
   state.graphDef = state.view?.definition || state.graphDef;
   state.mobileView = 'chat';
   render(true);
@@ -448,6 +449,7 @@ async function flush() {
     }
     if (state.selected && touched.has(state.selected)) {
       state.view = await state.client.getSession(state.selected);
+      await refreshMetrics();
       // Canonical responses replace their live streams.
       const done = canonicalStreams(state.view);
       streamStore.prune(done);
@@ -1000,8 +1002,35 @@ function inspector() {
     pane = h('p.help', `This view failed to render: ${e.message}`);
   }
   return h('section.inspector', { 'aria-label': 'Inspector' },
-    h('div.tabs', { role: 'tablist' }, tabs.map(([id, label]) => h('button', { role: 'tab', 'aria-selected': String(state.tab === id), onclick: () => { state.tab = id; state.resetPane = true; render(); } }, label))),
+    h('div.tabs', { role: 'tablist' }, tabs.map(([id, label]) => h('button', { role: 'tab', 'aria-selected': String(state.tab === id), onclick: async () => { state.tab = id; state.resetPane = true; await refreshMetrics(); render(); } }, label))),
     h('div.pane', { role: 'tabpanel' }, pane));
+}
+
+/** Control-plane cost of the session (from its log) and live-stream counters (this page). */
+function hotPathSection(row, n) {
+  const m = state.metrics?.session === state.selected ? state.metrics.m : null;
+  if (!m) return null;
+  const r = m.ratios || {};
+  const st = streamStore.stats;
+  return h('section', h('h4', 'Hot path'),
+    row('records · bytes', `${n(m.records)} · ${n(m.record_bytes)}`),
+    row('events · pipelines', `${n(m.events)} (${n(m.semantic_events)} semantic) · ${n(m.pipeline_starts)}`),
+    row('plugin invocations', `${n(m.plugin_invocations)} (${n(m.blocking_invocations)} blocking, ${n(m.async_invocations)} async, ${n(m.noop_invocations)} no-op)`),
+    row('tool dispatch', `${n(m.exact_owner_dispatches)} to owners, ${n(m.candidate_dispatches)} broadcast; ${r.plugin_invocations_per_tool_call ?? '-'} invocations per call`),
+    row('streams', `${n(m.stream_provider_events)} provider events → ${n(m.stream_live_frames)} live frames (${r.live_frames_per_provider_event ?? '-'} per event)`),
+    row('per model response', `${r.canonical_events_per_model_response ?? '-'} events, ${r.records_per_model_response ?? '-'} records`),
+    row('journal bytes / useful byte', r.journal_bytes_per_useful_output_byte ?? '-'),
+    row('this page', `${n(st.messages)} stream messages, ${n(st.renders)} renders, ${n(st.resyncs)} resyncs`));
+}
+
+async function refreshMetrics() {
+  const sid = state.selected;
+  if (!sid || !state.client?.getSessionMetrics || state.tab !== 'harness') return;
+  try {
+    state.metrics = { session: sid, m: await state.client.getSessionMetrics(sid) };
+  } catch {
+    state.metrics = null;
+  }
 }
 
 function harnessPane() {
@@ -1022,6 +1051,7 @@ function harnessPane() {
       (x.usage.elided || x.usage.dropped) ? row('compaction', `${x.usage.elided} old outputs elided, ${x.usage.dropped} messages summarized (projection only; the log is complete)`) : null,
       x.usage.retries ? row('provider retries', x.usage.retries) : null,
       x.recovery ? row('recovered invocations', x.recovery) : null),
+    hotPathSection(row, n),
     x.workspace && h('section', h('h4', 'Workspace'),
       row('root', x.workspace.root), row('mode', x.workspace.mode), row('environment', x.workspace.environment ? `${x.workspace.environment.kind} (${x.workspace.environment.id})` : null),
       row('git', x.workspace.git ? `${x.workspace.git.branch}@${(x.workspace.git.head || '').slice(0, 10)}${x.workspace.git.dirty ? `, ${x.workspace.git.dirty} changed` : ''}` : null),

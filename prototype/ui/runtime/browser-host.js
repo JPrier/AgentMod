@@ -6,7 +6,7 @@
 // itself, presented to the kernel as the `web-ui` plugin with the same
 // manifest the native gateway uses.
 
-import init, { WasmKernel, WasmStreamHub, compile, project, context_at, replay_recovery } from '../pkg/agentmod_wasm.js';
+import init, { WasmKernel, WasmStreamHub, compile, project, context_at, replay_recovery, session_metrics } from '../pkg/agentmod_wasm.js';
 import { WEB_UI_MANIFEST } from '../plugins/web-ui/manifest.js';
 import { Devices } from './devices.js';
 import { openStore } from './persist.js';
@@ -639,6 +639,8 @@ export class BrowserRuntime {
         return J(this.kernel.status(session_id));
       case 'streams':
         return J(this.hub.snapshots(session_id || ''));
+      case 'session-metrics':
+        return J(session_metrics(JSON.stringify(recs())));
       case 'routes':
         return { routes: J(this.kernel.routes(session_id)) };
       case 'metrics':
@@ -822,6 +824,10 @@ export class BrowserRuntime {
 
   async getMetrics() {
     return this.query({ what: 'metrics' });
+  }
+
+  async getSessionMetrics(id) {
+    return this.query({ what: 'session-metrics', session_id: id });
   }
 
   async startSession({ definition, text, fork_from }) {

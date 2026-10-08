@@ -3,6 +3,7 @@
 use std::path::Path;
 
 use agentmod_core::kernel::Kernel;
+use agentmod_core::metrics::session_metrics;
 use agentmod_core::projection::project;
 use agentmod_core::record::Outcome;
 use serde_json::json;
@@ -134,98 +135,17 @@ pub fn verify(data: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Metrics derived from a session's log (no telemetry backend: the log is the record).
-fn session_metrics(records: &[agentmod_core::record::Record]) -> serde_json::Value {
-    use serde_json::Value;
-    let view = project(records);
-    let num = |v: Option<&Value>| v.and_then(Value::as_f64).unwrap_or(0.0);
-    let mut m = serde_json::Map::new();
-    let mut add = |k: &str, x: f64| {
-        let cur = m.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-        m.insert(k.to_owned(), json!(cur + x));
-    };
-    let mut max_context = 0.0_f64;
-    let mut schema_tokens = 0.0_f64;
-    let mut first_edit: Option<u64> = None;
-    let first_at = records.first().map_or(0, |r| r.at);
-    for e in &view.events {
-        let p = &e.payload;
-        match e.event_name.as_str() {
-            "model-response" => {
-                let mt = p.get("metrics");
-                add("model_requests", 1.0);
-                add("input_tokens", num(mt.and_then(|x| x.get("input_tokens"))));
-                add(
-                    "output_tokens",
-                    num(mt.and_then(|x| x.get("output_tokens"))),
-                );
-                add(
-                    "cached_tokens",
-                    num(mt.and_then(|x| x.get("cached_tokens"))),
-                );
-                add("cost", num(mt.and_then(|x| x.get("cost"))));
-                add(
-                    "model_latency_ms",
-                    num(mt.and_then(|x| x.get("latency_ms"))),
-                );
-                add("provider_retries", num(mt.and_then(|x| x.get("retries"))));
-                add(
-                    "elided_tool_outputs",
-                    num(mt.and_then(|x| x.get("elided_tool_outputs"))),
-                );
-                add(
-                    "dropped_messages",
-                    num(mt.and_then(|x| x.get("dropped_messages"))),
-                );
-                max_context = max_context.max(num(mt.and_then(|x| x.get("context_tokens"))));
-                schema_tokens =
-                    schema_tokens.max(num(mt.and_then(|x| x.get("tool_schema_tokens"))));
-            }
-            "tool-call" if p.get("approved").is_none() => add("tool_calls", 1.0),
-            "tool-result" => {
-                if p.get("error").and_then(Value::as_bool) == Some(true) {
-                    add("tool_errors", 1.0);
-                }
-                add("tool_time_ms", num(p.get("duration_ms")));
-            }
-            "workspace-change" => {
-                add("edits", 1.0);
-                first_edit.get_or_insert(e.at);
-            }
-            "approval-requested" => add("permission_prompts", 1.0),
-            "user-input-requested" => add("questions", 1.0),
-            "subagent-started" => add("child_agents", 1.0),
-            "checkpoint-created" => add("checkpoints", 1.0),
-            "workspace-restored" => add("restores", 1.0),
-            "process-started" => add("processes", 1.0),
-            "budget-exhausted" => add("budget_exhausted", 1.0),
-            _ => {}
-        }
-        for i in &e.invocations {
-            if i.attempts > 1 {
-                add("recovered_invocations", 1.0);
-            }
-        }
-    }
-    m.insert("max_context_tokens".into(), json!(max_context));
-    m.insert("tool_schema_tokens".into(), json!(schema_tokens));
-    m.insert(
-        "wall_ms".into(),
-        json!(records.last().map_or(0, |r| r.at.saturating_sub(first_at))),
-    );
-    m.insert(
-        "time_to_first_edit_ms".into(),
-        first_edit.map_or(Value::Null, |t| json!(t.saturating_sub(first_at))),
-    );
-    m.insert("records".into(), json!(records.len()));
-    Value::Object(m)
-}
-
 /// Print metrics for one session or every session (derived from logs only).
 ///
 /// # Errors
 /// Store failures or an unknown session.
-pub fn metrics(data: &Path, session: Option<&str>, as_json: bool) -> Result<(), String> {
+pub fn metrics(
+    data: &Path,
+    session: Option<&str>,
+    as_json: bool,
+    turns: bool,
+) -> Result<(), String> {
+    use serde_json::Value;
     let store = Store::open(data, usize::MAX)?;
     let ids: Vec<String> = match session {
         Some(s) => vec![s.to_owned()],
@@ -234,7 +154,11 @@ pub fn metrics(data: &Path, session: Option<&str>, as_json: bool) -> Result<(), 
     let mut out = serde_json::Map::new();
     for sid in ids {
         let records = store.read(&sid)?;
-        out.insert(sid, session_metrics(&records));
+        let mut m = session_metrics(&records);
+        if !turns && let Some(o) = m.as_object_mut() {
+            o.remove("turns");
+        }
+        out.insert(sid, m);
     }
     if as_json {
         println!(
@@ -244,13 +168,19 @@ pub fn metrics(data: &Path, session: Option<&str>, as_json: bool) -> Result<(), 
         return Ok(());
     }
     for (sid, m) in &out {
-        let g = |k: &str| m.get(k).and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        let g = |k: &str| m.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+        let r = |k: &str| {
+            m.pointer(&format!("/ratios/{k}"))
+                .and_then(Value::as_f64)
+                .map_or_else(|| "-".to_owned(), |x| format!("{x}"))
+        };
         println!(
-            "{sid}: {} model requests, {} in / {} out tokens ({} cached), ${:.4}, {} tool calls ({} errors), {} edits, {} prompts, {} children, max context ≈{} tokens, schema ≈{} tokens, {:.1}s",
+            "{sid}: {} model requests, {} in ({} cached, {} uncached) / {} out tokens, ${:.4}, {} tool calls ({} errors), {} edits, {} prompts, {} children, max context ~{} tokens, {:.1}s",
             g("model_requests"),
             g("input_tokens"),
-            g("output_tokens"),
             g("cached_tokens"),
+            g("uncached_input_tokens"),
+            g("output_tokens"),
             g("cost"),
             g("tool_calls"),
             g("tool_errors"),
@@ -258,9 +188,65 @@ pub fn metrics(data: &Path, session: Option<&str>, as_json: bool) -> Result<(), 
             g("permission_prompts"),
             g("child_agents"),
             g("max_context_tokens"),
-            g("tool_schema_tokens"),
             g("wall_ms") / 1000.0
         );
+        println!(
+            "  control plane: {} records / {} bytes, {} events ({} semantic, {} stream-chunk), {} pipelines, {} invocations ({} blocking, {} async, {} no-op), tool dispatch: {} owner / {} broadcast",
+            g("records"),
+            g("record_bytes"),
+            g("events"),
+            g("semantic_events"),
+            g("stream_chunk_events"),
+            g("pipeline_starts"),
+            g("plugin_invocations"),
+            g("blocking_invocations"),
+            g("async_invocations"),
+            g("noop_invocations"),
+            g("exact_owner_dispatches"),
+            g("candidate_dispatches"),
+        );
+        println!(
+            "  streams: {} provider events -> {} frames -> {} live frames; pipelines/event {}, invocations/tool call {}, live frames/provider event {}, events/model response {}, journal bytes/useful byte {}",
+            g("stream_provider_events"),
+            g("stream_frames"),
+            g("stream_live_frames"),
+            r("pipelines_per_semantic_event"),
+            r("plugin_invocations_per_tool_call"),
+            r("live_frames_per_provider_event"),
+            r("canonical_events_per_model_response"),
+            r("journal_bytes_per_useful_output_byte"),
+        );
+        if let Some(ts) = m.get("turns").and_then(Value::as_array) {
+            println!(
+                "  {:>4} {:>8} {:>7} {:>9} {:>6} {:>9} {:>11} {:>5} {:>8}",
+                "turn",
+                "at s",
+                "records",
+                "bytes",
+                "events",
+                "pipelines",
+                "invocations",
+                "tools",
+                "context"
+            );
+            for (i, t) in ts.iter().enumerate() {
+                let n = |k: &str| t.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                println!(
+                    "  {:>4} {:>8.1} {:>7} {:>9} {:>6} {:>9} {:>11} {:>5} {:>8}",
+                    i + 1,
+                    n("at_ms") / 1000.0,
+                    n("records"),
+                    n("record_bytes"),
+                    n("events"),
+                    n("pipelines"),
+                    n("invocations"),
+                    n("tool_calls"),
+                    t.pointer("/model/context_tokens")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0),
+                );
+            }
+        }
     }
     Ok(())
 }

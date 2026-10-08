@@ -862,6 +862,10 @@ impl Host {
                 Ok(json!(context_at(&records, seq)))
             }
             "status" => Ok(json!(self.kernel.status(sid))),
+            "session-metrics" => {
+                let records = self.session_records(sid).map_err(err)?;
+                Ok(agentmod_core::metrics::session_metrics(&records))
+            }
             "streams" => Ok(json!(self.hub.snapshots(
                 Some(sid).filter(|s| !s.is_empty())
             ))),

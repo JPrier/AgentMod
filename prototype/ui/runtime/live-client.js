@@ -48,6 +48,7 @@ export class LiveClient {
   }
 
   getMetrics() { return this.req('/api/metrics'); }
+  getSessionMetrics(id) { return this.req(`/api/sessions/${id}/metrics`); }
 
   close() {
     this.es?.close();

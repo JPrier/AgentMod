@@ -103,6 +103,7 @@ async function route(req, res) {
     if (sub === 'records') return send(res, 200, await q('records', { session_id: sid }));
     if (sub === 'context') return send(res, 200, await q('context', { session_id: sid, sequence: url.searchParams.has('sequence') ? Number(url.searchParams.get('sequence')) : undefined }));
     if (sub === 'status') return send(res, 200, await q('status', { session_id: sid }));
+    if (sub === 'metrics') return send(res, 200, await q('session-metrics', { session_id: sid }));
     if (req.method === 'POST') {
       const b = await readBody(req);
       if (sub === 'commands') return send(res, 200, await plugin.host.command(sid, b.command));

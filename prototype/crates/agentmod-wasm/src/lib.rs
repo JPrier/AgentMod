@@ -55,6 +55,16 @@ pub fn project(records_json: &str) -> String {
     }
 }
 
+/// Model-efficiency and control-plane metrics of a session's records.
+#[wasm_bindgen]
+#[must_use]
+pub fn session_metrics(records_json: &str) -> String {
+    match serde_json::from_str::<Vec<Record>>(records_json) {
+        Ok(r) => out(&agentmod_core::metrics::session_metrics(&r)),
+        Err(e) => err(e),
+    }
+}
+
 /// Context as it stood after a sequence number.
 #[wasm_bindgen]
 #[must_use]

@@ -18,7 +18,7 @@ async function hostModule() {
   const site = stageSite();
   const pkg = path.join(site, 'pkg');
   fs.mkdirSync(pkg, { recursive: true });
-  fs.writeFileSync(path.join(pkg, 'agentmod_wasm.js'), 'export default async function init() {}\nexport class WasmKernel {}\nexport class WasmStreamHub {}\nexport const compile = () => "{}", project = () => "{}", context_at = () => "[]", replay_recovery = () => "null";\n');
+  fs.writeFileSync(path.join(pkg, 'agentmod_wasm.js'), 'export default async function init() {}\nexport class WasmKernel {}\nexport class WasmStreamHub {}\nexport const compile = () => "{}", project = () => "{}", context_at = () => "[]", replay_recovery = () => "null", session_metrics = () => "{}";\n');
   globalThis.location ??= { href: 'http://localhost/' };
   return import(pathToFileURL(path.join(site, 'runtime', 'browser-host.js')).href);
 }

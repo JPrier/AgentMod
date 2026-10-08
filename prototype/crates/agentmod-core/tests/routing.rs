@@ -626,3 +626,26 @@ fn routed_logs_replay_exactly() {
         "shell"
     );
 }
+
+#[test]
+fn metrics_count_owner_dispatch_and_amplification() {
+    let mut sim = Sim::new(compile(&config(ALL), &manifests()));
+    let sid = sim.start("go");
+    sim.run(&["read_file", "shell", "list_dir"], None);
+    let m = agentmod_core::metrics::session_metrics(&sim.logs[&sid]);
+    assert_eq!(m["tool_calls"], 3.0);
+    assert_eq!(m["exact_owner_dispatches"], 3.0);
+    // ui and audit observe each call (broadcast, not owners).
+    assert_eq!(m["candidate_dispatches"], 6.0);
+    assert_eq!(m["tool_call_invocations"], 12.0);
+    assert_eq!(m["ratios"]["plugin_invocations_per_tool_call"], 4.0);
+    assert_eq!(
+        m["records"].as_f64().unwrap() as usize,
+        sim.logs[&sid].len()
+    );
+    assert!(m["record_bytes"].as_f64().unwrap() > 0.0);
+    assert!(
+        m["noop_invocations"].as_f64().unwrap() >= 6.0,
+        "observers that did nothing"
+    );
+}

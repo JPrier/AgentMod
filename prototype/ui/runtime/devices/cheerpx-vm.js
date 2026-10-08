@@ -71,18 +71,44 @@ export function createCheerpxVm(options = {}) {
   // Guest mount points of the byte channels (overridable for tests).
   const IN = cfg.in_path || '/agentmod-in';
   const OUT = cfg.out_path || '/agentmod-out';
+  // How long past a command's own timeout to wait before declaring the VM dead.
+  const STALL_GRACE = Number(cfg.stall_grace_seconds ?? 60);
   let cx = null;
   let io = null; // IDBDevice behind OUT
   let data = null; // DataDevice behind IN
   let booting = null;
   let info = null;
+  let bootedAt = null;
   let queue = Promise.resolve();
+  let gen = 0; // bumped by stop/restart: work from an older VM is discarded
   let seq = 0;
   let consoleTail = '';
   let broken = null; // set when the VM stops responding
   let releaseLock = null;
+  let running = null; // the operation in flight: { n, command, started }
+  let processes = 0; // processes CheerpX reports created since boot
+  const stats = { ops: 0, failed: 0, timedOut: 0, boots: 0 };
 
-  /** Serialize VM operations. */
+  // The VM journal: what happened to the VM itself, kept on the page so it
+  // survives a crash of the guest. The agent reads it with `sandbox_logs`.
+  const journal = [];
+  const log = (kind, detail = {}) => {
+    journal.push({ at: Date.now(), kind, ...detail });
+    if (journal.length > 500) journal.splice(0, journal.length - 500);
+  };
+  const clip = (t, n = 160) => (String(t).length > n ? `${String(t).slice(0, n)}…` : String(t));
+
+  // Page-level errors while the VM is up: a CheerpX crash surfaces here (for
+  // example a WebAssembly "memory access out of bounds"), not inside the guest.
+  const onError = (e) => log('page-error', { message: clip(e?.message || e?.error?.message || String(e), 400) });
+  const onRejection = (e) => log('page-error', { message: clip(e?.reason?.message || String(e?.reason), 400), unhandled: true });
+  const watchPage = (on) => {
+    if (typeof globalThis.addEventListener !== 'function') return;
+    globalThis[on ? 'addEventListener' : 'removeEventListener']('error', onError);
+    globalThis[on ? 'addEventListener' : 'removeEventListener']('unhandledrejection', onRejection);
+  };
+
+  /** Serialize VM operations (per VM generation). */
   function serial(fn) {
     const run = queue.then(fn, fn);
     queue = run.catch(() => {});
@@ -107,6 +133,8 @@ export function createCheerpxVm(options = {}) {
   async function boot() {
     const why = unavailableReason();
     if (why) throw new Error(`Linux sandbox unavailable: ${why}`);
+    const t0 = Date.now();
+    log('boot-start', { image: cfg.image, cheerpx: cfg.cheerpx_version, workspace: cfg.workspace });
     await lock();
     const CheerpX = await import(/* @vite-ignore */ cfg.cheerpx_url || `https://cxrtnc.leaningtech.com/${cfg.cheerpx_version}/cx.esm.js`);
     let block;
@@ -115,6 +143,7 @@ export function createCheerpxVm(options = {}) {
         block = await CheerpX.CloudDevice.create(cfg.image);
       } catch (e) {
         if (!cfg.image.startsWith('wss:')) throw e;
+        log('note', { message: `wss: disk connection failed (${clip(e.message || e)}); retrying over https:` });
         block = await CheerpX.CloudDevice.create(cfg.image.replace(/^wss:/, 'https:'));
       }
     } else if (cfg.image_type === 'bytes') {
@@ -129,6 +158,7 @@ export function createCheerpxVm(options = {}) {
     const workspace = await CheerpX.IDBDevice.create(`agentmod-workspace-${cfg.workspace}`);
     io = await CheerpX.IDBDevice.create(`agentmod-io-${cfg.workspace}`);
     data = await CheerpX.DataDevice.create();
+    watchPage(true);
     cx = await CheerpX.Linux.create({
       mounts: [
         { type: 'ext2', path: '/', dev: root },
@@ -142,19 +172,26 @@ export function createCheerpxVm(options = {}) {
       ],
     });
     // Nothing is meant to reach the console (all output is redirected), but keep
-    // a tail of whatever does for error messages.
+    // a tail of whatever does: it is often the VM's last words.
     cx.setCustomConsole((buf) => {
-      consoleTail = (consoleTail + new TextDecoder().decode(buf)).slice(-2000);
+      consoleTail = (consoleTail + new TextDecoder().decode(buf)).slice(-4000);
     }, 120, 40);
+    try {
+      cx.registerCallback?.('processCreated', () => { processes += 1; });
+    } catch { /* optional instrumentation */ }
     const probe = await rawExec('uname -srm; . /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"; for t in gcc g++ make python3 node git; do command -v $t >/dev/null && printf "%s " $t; done; echo', '/', 60);
     const [kernel, os, tools] = new TextDecoder().decode(probe.stdout).trim().split('\n');
     info = { kernel: kernel || 'x86', os: os || 'Linux', tools: (tools || '').trim().split(/\s+/).filter(Boolean) };
+    bootedAt = Date.now();
+    stats.boots += 1;
+    log('boot-ok', { ms: bootedAt - t0, ...info });
     return info;
   }
 
   /** One command, outside the queue (callers serialize). */
   async function rawExec(command, cwd, timeoutSeconds) {
     const n = ++seq;
+    const myGen = gen;
     // $0 marks the operation; $1 cwd, $2 timeout, $3 command. Output is
     // redirected into the scratch filesystem so it can be read back exactly.
     // GNU `timeout` does not fire under CheerpX (its timer never expires), so a
@@ -181,47 +218,123 @@ export function createCheerpxVm(options = {}) {
       'exit $rc',
     ].join('\n');
     const started = Date.now();
+    running = { n, command: clip(command), started };
     // If CheerpX itself dies (a WebAssembly trap), cx.run never settles; stop
     // waiting well after the command's own timeout and retire the VM.
     let guard;
     const stalled = new Promise((_, reject) => {
       guard = setTimeout(() => {
-        broken = 'the Linux sandbox stopped responding (the VM may have crashed); reload the page to restart it. /workspace is kept.';
+        if (myGen !== gen) return;
+        broken = `the Linux sandbox stopped responding during operation #${n} (\`${clip(command, 80)}\`); the VM has probably crashed. Call sandbox_logs to see why and sandbox_restart to start a fresh VM (/workspace is kept).`;
+        log('stalled', { op: n, command: clip(command), waited_ms: Date.now() - started, console_tail: clip(consoleTail.slice(-600), 600) });
         reject(new Error(broken));
-      }, (timeoutSeconds + 60) * 1000);
+      }, (timeoutSeconds + STALL_GRACE) * 1000);
     });
     let status;
     try {
       ({ status } = await Promise.race([cx.run('/bin/bash', ['-c', wrapper, `agentmod-op-${n}`, cwd, String(timeoutSeconds), command], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid }), stalled]));
+    } catch (e) {
+      if (myGen === gen && !broken) log('op-error', { op: n, command: clip(command), error: clip(e?.message || e, 400) });
+      throw e;
     } finally {
       clearTimeout(guard);
+      if (running?.n === n) running = null;
     }
+    if (myGen !== gen) throw new Error('the Linux sandbox was restarted while this command ran');
     const [stdout, stderr] = await Promise.all([io.readFileAsBlob('/stdout').then(blobBytes), io.readFileAsBlob('/stderr').then(blobBytes)]);
     const timedOut = status === 124 && Date.now() - started >= timeoutSeconds * 1000;
+    stats.ops += 1;
+    if (status !== 0) stats.failed += 1;
+    if (timedOut) stats.timedOut += 1;
+    log('op', { op: n, command: clip(command), cwd, exit: status, ms: Date.now() - started, ...(timedOut ? { timed_out: true } : {}), stdout_bytes: stdout.length, stderr_bytes: stderr.length });
     return { exitCode: status, stdout, stderr, timedOut };
   }
 
   const ready = () => {
     if (broken) throw new Error(broken);
-    if (!cx) throw new Error('the Linux sandbox is not booted');
+    if (!cx) throw new Error('the Linux sandbox is not running');
   };
+
+  function stop(reason) {
+    gen += 1;
+    queue = Promise.resolve(); // a stalled operation no longer blocks anything
+    try { cx?.delete(); } catch (e) { log('note', { message: `deleting the old VM failed: ${clip(e?.message || e)}` }); }
+    watchPage(false);
+    const wasUp = !!cx || !!booting;
+    cx = null;
+    io = null;
+    data = null;
+    booting = null;
+    info = null;
+    bootedAt = null;
+    broken = null;
+    running = null;
+    releaseLock?.();
+    releaseLock = null;
+    if (wasUp) log('stopped', { reason });
+  }
+
+  function start() {
+    if (broken) return Promise.reject(new Error(broken));
+    if (!booting) {
+      booting = serial(boot).catch((e) => {
+        log('boot-failed', { error: clip(e?.message || e, 400), console_tail: clip(consoleTail.slice(-600), 600) });
+        booting = null;
+        watchPage(false);
+        releaseLock?.();
+        releaseLock = null;
+        throw new Error(`${e.message || e}${consoleTail ? `\n(console: ${consoleTail.slice(-400)})` : ''}`);
+      });
+    }
+    return booting;
+  }
 
   return {
     state() {
-      return { booted: !!cx && !broken, booting: !!booting && !cx, info, unavailable: broken || unavailableReason() };
+      return { booted: !!cx && !broken, booting: !!booting && !cx, broken, info, unavailable: broken || unavailableReason() };
     },
 
-    boot() {
-      if (broken) return Promise.reject(new Error(broken));
-      if (!booting) {
-        booting = serial(boot).catch((e) => {
-          booting = null;
-          releaseLock?.();
-          releaseLock = null;
-          throw new Error(`${e.message || e}${consoleTail ? `\n(console: ${consoleTail.slice(-400)})` : ''}`);
-        });
-      }
-      return booting;
+    /** Everything known about the VM, for `sandbox_status`. */
+    status() {
+      const env = globalThis.navigator || {};
+      return {
+        state: broken ? 'crashed' : cx ? (running ? 'busy' : 'running') : booting ? 'booting' : 'stopped',
+        broken,
+        info,
+        uptime_s: bootedAt ? Math.round((Date.now() - bootedAt) / 1000) : null,
+        running: running ? { op: running.n, command: running.command, for_s: Math.round((Date.now() - running.started) / 1000) } : null,
+        stats: { ...stats, processes_created: processes },
+        config: { image: cfg.image, image_type: cfg.image_type, cheerpx: cfg.cheerpx_version, workspace: cfg.workspace, workspace_path: cfg.workspace_path },
+        page: {
+          cross_origin_isolated: !!globalThis.crossOriginIsolated,
+          user_agent: env.userAgent || null,
+          cores: env.hardwareConcurrency || null,
+          memory_gb: env.deviceMemory || null,
+          js_heap_mb: globalThis.performance?.memory ? Math.round(globalThis.performance.memory.usedJSHeapSize / 1048576) : null,
+        },
+        unavailable: unavailableReason(),
+      };
+    },
+
+    /** The VM journal (newest last), plus the console tail. */
+    logs({ limit = 100, kinds } = {}) {
+      const want = Array.isArray(kinds) && kinds.length ? new Set(kinds) : null;
+      const entries = journal.filter((e) => !want || want.has(e.kind));
+      return { entries: entries.slice(-Math.max(1, Math.min(500, limit))), total: entries.length, console_tail: consoleTail.slice(-2000) };
+    },
+
+    boot: start,
+
+    /** Throw away the current VM (crashed or not) and boot a fresh one. */
+    async restart() {
+      stop('restart');
+      log('restart', {});
+      return start();
+    },
+
+    stop() {
+      stop('stop');
+      return true;
     },
 
     exec({ command, cwd, timeoutSeconds }) {
@@ -261,19 +374,16 @@ export function createCheerpxVm(options = {}) {
 
     /** Best-effort interruption of the running command (outside the queue). */
     async interrupt() {
+      if (!cx || broken) return false;
+      log('interrupt', { op: running?.n ?? null });
       try {
-        await cx?.run('/bin/bash', ['-c', `${KILLTREE}\nset -- $(cat ${OUT}/pid 2>/dev/null); [ "$2" ] && [ "$2" != done ] && killtree $2`], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid });
+        await cx.run('/bin/bash', ['-c', `${KILLTREE}\nset -- $(cat ${OUT}/pid 2>/dev/null); [ "$2" ] && [ "$2" != done ] && killtree $2`], { env: ENV, cwd: '/', uid: cfg.uid, gid: cfg.gid });
       } catch { /* nothing to interrupt */ }
       return true;
     },
 
     dispose() {
-      try { cx?.delete(); } catch { /* already gone */ }
-      cx = null;
-      booting = null;
-      info = null;
-      releaseLock?.();
-      releaseLock = null;
+      stop('dispose');
     },
   };
 }

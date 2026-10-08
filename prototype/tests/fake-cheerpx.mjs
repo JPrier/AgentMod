@@ -21,8 +21,14 @@ class DirDevice {
   }
 }
 
+// IndexedDB stores persist by name across boots, as in a browser.
+const stores = new Map();
+
 export class IDBDevice extends DirDevice {
-  static async create(name) { return new IDBDevice('idb', name); }
+  static async create(name) {
+    if (!stores.has(name)) stores.set(name, new IDBDevice('idb', name));
+    return stores.get(name);
+  }
   async readFileAsBlob(p) {
     try { return new Blob([fs.readFileSync(path.join(this.dir, p))]); } catch { return null; }
   }
@@ -45,7 +51,7 @@ export class Linux {
     const l = new Linux();
     l.mounts = mounts;
     for (const m of mounts) {
-      if (m.type !== 'dir') continue;
+      if (m.type !== 'dir' || m.dev.dir === m.path) continue; // already mounted there (a reboot)
       // The device's directory moves to the mount path (a real directory, not a
       // symlink, as a mount looks to the guest).
       fs.mkdirSync(path.dirname(m.path), { recursive: true });
@@ -66,6 +72,12 @@ export class Linux {
     if (/\[ "\$2" != done \] && killtree \$2$/.test(args[1] || '')) {
       for (const pid of this.running) { try { process.kill(-pid, 'SIGTERM'); } catch { /* gone */ } }
       return Promise.resolve({ status: 0 });
+    }
+    // A command containing FAKE_CRASH stands in for CheerpX dying mid-run:
+    // cx.run never settles and the VM answers nothing afterwards.
+    if (this.crashed || args.some((a) => String(a).includes('FAKE_CRASH'))) {
+      this.crashed = true;
+      return new Promise(() => {});
     }
     const env = Object.fromEntries((opts.env || []).map((kv) => [kv.slice(0, kv.indexOf('=')), kv.slice(kv.indexOf('=') + 1)]));
     return new Promise((resolve, reject) => {

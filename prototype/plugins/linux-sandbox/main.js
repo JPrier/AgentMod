@@ -21,6 +21,8 @@
 //   uid, gid         guest identity for commands (default root inside the VM)
 //   import_repos     offer `import_repo` (default true)
 //   limits           overrides for the shared tool limits
+//   stall_grace_seconds  how long past a command's timeout before the VM is
+//                    declared crashed (default 60)
 //
 // CheerpX is proprietary software by Leaning Technologies, free for personal
 // and open-source use; other uses need their commercial licence.
@@ -55,5 +57,7 @@ defineWorkspacePlugin({
     'The VM has no network access, so apt, pip, npm and cargo cannot download anything; ' +
     'use what is installed (check with `run`) and use import_repo to bring in public GitHub repositories. ' +
     'Emulation is slower than native hardware: prefer small, incremental builds and tests. ' +
-    'Do not claim something works until you have run it.',
+    'Do not claim something works until you have run it. ' +
+    'You also control the VM itself: sandbox_status, sandbox_logs (its journal, which survives a crash), sandbox_restart (a fresh VM; the workspace is kept) and sandbox_stop. ' +
+    'If tools report that the sandbox stopped responding, read sandbox_logs to see why, then sandbox_restart and carry on.',
 });

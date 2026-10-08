@@ -39,6 +39,21 @@ All execution targets answer the same tools (`plugins/sdk/workspace-tools.js`):
 Paths are confined to `/workspace` for the file tools and `run`'s `cwd`. A command can still
 touch anything in the VM — the VM is the sandbox.
 
+The agent also controls the VM itself (these appear for any execution target that runs a
+machine; `local-workspace` has none):
+
+| Tool | Does |
+| --- | --- |
+| `sandbox_status` | state (running, busy, stopped, crashed), the command in flight, uptime, operation and process counts, image, and the browser it runs in |
+| `sandbox_logs` | the VM journal, kept on the page so it survives a crash: boots, every command with exit code and duration, timeouts, stalls, page errors such as a CheerpX trap, and the VM console tail; filter by `kinds` |
+| `sandbox_restart` | throw away the current VM (crashed or not) and boot a fresh one; `/workspace` is kept |
+| `sandbox_stop` | free the browser's CPU and memory; the next coding tool boots the VM again |
+
+When the VM stops answering, the failing tool says so and points at `sandbox_logs` and
+`sandbox_restart`, so the agent can diagnose and recover on its own instead of giving up. The
+journal also lands in the session log through those tool results, so an exported log carries the
+evidence.
+
 ## How it fits the plugin system
 
 Nothing in the kernel knows about coding. A tool call is an event; a plugin that answers it is a

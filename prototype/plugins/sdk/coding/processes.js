@@ -21,6 +21,11 @@ import { sha256 } from './text.js';
 
 const KILLTREE = 'killtree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do killtree "$c" "$2"; done; kill -"$2" "$1" 2>/dev/null; }';
 
+// The wrapper runs the command as a child, records the child's pid, and waits:
+// terminating a process signals that child (leaf first), never the waiting
+// wrapper, which then records the exit status itself. This matters under
+// CheerpX, where `pgrep -P` sees no children and SIGKILLing a process that
+// still has a running child can crash the VM.
 const WRAPPER = [
   '#!/bin/bash',
   '# agentmod process wrapper: $1 = process directory',
@@ -30,11 +35,13 @@ const WRAPPER = [
   'if [ -f "$D/stdin" ]; then',
   '  exec 3< <(exec tail -c +1 -f "$D/stdin" 2>/dev/null)',
   '  echo $! > "$D/tailpid"',
-  '  /bin/bash -c "$(cat "$D/cmd")" <&3 >>"$D/stdout" 2>>"$D/stderr"; rc=$?',
-  '  kill "$(cat "$D/tailpid")" 2>/dev/null',
+  '  /bin/bash -c "$(cat "$D/cmd")" <&3 >>"$D/stdout" 2>>"$D/stderr" &',
   'else',
-  '  /bin/bash -c "$(cat "$D/cmd")" </dev/null >>"$D/stdout" 2>>"$D/stderr"; rc=$?',
+  '  /bin/bash -c "$(cat "$D/cmd")" </dev/null >>"$D/stdout" 2>>"$D/stderr" &',
   'fi',
+  'echo $! > "$D/cmdpid"',
+  'wait $!; rc=$?',
+  '[ -f "$D/tailpid" ] && kill "$(cat "$D/tailpid")" 2>/dev/null',
   'echo "$rc" > "$D/exit.tmp"; mv "$D/exit.tmp" "$D/exit"',
 ].join('\n');
 
@@ -73,7 +80,8 @@ export function makeProcesses({ runner, target, stateDir }) {
     const meta = (() => { try { return JSON.parse(rest.join('|') || '{}'); } catch { return {}; } })();
     const exitCode = exit === '' ? null : Number(exit);
     let state;
-    if (exitCode != null) state = 'exited';
+    if (exitCode != null && killed) state = 'killed';
+    else if (exitCode != null) state = 'exited';
     else if (alive === '1') state = 'running';
     else if (killed) state = 'killed';
     else state = 'lost';
@@ -194,7 +202,12 @@ export function makeProcesses({ runner, target, stateDir }) {
     if (r.exitCode === 4) throw new Error(`process ${id} was not started with stdin: true`);
   }
 
-  /** Terminate (SIGTERM) or force-kill (SIGKILL) a process and its children. */
+  /**
+   * Terminate (SIGTERM) or force-kill (SIGKILL) a process: its command and the
+   * command's children (where the OS lets us see them), leaf first. The
+   * wrapper is left to record the exit status; it is signalled only when the
+   * command's pid is unknown (a process started before this wrapper format).
+   */
   async function kill(id, { force = false } = {}) {
     const D = `${PROCS}/${id}`;
     const sig = force ? 'KILL' : 'TERM';
@@ -206,8 +219,8 @@ export function makeProcesses({ runner, target, stateDir }) {
       ALIVE,
       '[ "$alive" = 1 ] || exit 0',
       `echo "SIG${sig} $(date +%s)" > "$D/killed"`,
-      `killtree "$pid" ${sig}`,
-      'tp=$(cat "$D/tailpid" 2>/dev/null); [ -n "$tp" ] && kill "$tp" 2>/dev/null',
+      'cpid=$(cat "$D/cmdpid" 2>/dev/null)',
+      `if [ -n "$cpid" ] && kill -0 "$cpid" 2>/dev/null; then killtree "$cpid" ${sig}; else killtree "$pid" ${sig}; fi`,
       ':',
     ].join('\n');
     const r = await runner.run(script, { cwd: '/', timeoutMs: 30_000 });

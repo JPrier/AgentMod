@@ -132,7 +132,7 @@ try {
   check('node', r.ok, r.out);
   r = await tool('list_dir', {}, /hello\.c/);
   check('list_dir', r.ok, r.out);
-  r = await tool('search_text', { pattern: 'gcc in the browser' }, /hello\.c/);
+  r = await tool('search_text', { query: 'gcc in the browser' }, /hello\.c/);
   check('search_text', r.ok, r.out);
   await shot('03-work');
 
@@ -160,6 +160,17 @@ try {
   check('sandbox_stop', r.ok, r.out);
   r = await tool('shell', { command: 'echo back-after-stop' }, /back-after-stop/, BOOT_MS);
   check('the next command restarts a stopped VM', r.ok, r.out);
+
+  // Background processes: start, read, kill (the wrapper kills the command's own pid).
+  r = await tool('process', { action: 'start', command: 'for i in 1 2 3 4 5 6 7 8 9; do echo tick-$i; sleep 1; done; sleep 60', name: 'ticker' }, /Started \S+[\s\S]*running/, 120000);
+  check('process start', r.ok, r.out);
+  const pid = /Started (\S+?)(?: \[|:)/.exec(r.out)?.[1];
+  r = await tool('process', { action: 'wait', id: pid, until: 'tick-3', timeout_seconds: 30 }, /tick-3/, 60000);
+  check('process output streams while it runs', r.ok, r.out);
+  r = await tool('process', { action: 'kill', id: pid }, /Stopped\. \S+ \[ticker\]: killed/, 60000);
+  check('process kill', r.ok, r.out);
+  r = await tool('shell', { command: 'echo vm-alive-after-kill' }, /vm-alive-after-kill/, 60000);
+  check('the VM survives a process kill', r.ok, r.out);
 
   // Last: process control (a VM crash here must not hide the results above).
   // Diagnostics: how signals behave in the guest (each line: what, exit code, seconds waited).

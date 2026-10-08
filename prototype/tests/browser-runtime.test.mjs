@@ -129,3 +129,51 @@ test('the harness view summarizes a session from its log', async () => {
   assert.equal(x.checkpoints[0].checkpoint, 'abc');
   assert.equal(x.children[0].activity, 'running');
 });
+
+test('stream recovery ops: segments append, snapshots compact, discard removes', { skip: !idb && 'fake-indexeddb not installed' }, async () => {
+  const { openStore } = await import(pathToFileURL(path.join(stageSite(), 'runtime', 'persist.js')).href);
+  globalThis.IDBKeyRange ??= (await import('fake-indexeddb')).IDBKeyRange;
+  const store = await openStore({ idb, name: `s-${Date.now()}` });
+  const seg = (id, n) => ({ op: 'append', stream_id: id, session_id: 's1', segment: { seq: n } });
+  await store.streamOps([seg('s1/i2', 1), seg('s1/i2', 2), seg('s1/i5', 1)]);
+  await store.streamOps([{ op: 'snapshot', state: { stream_id: 's1/i2', seq: 2 } }, seg('s1/i2', 3)]);
+  let streams = await store.loadStreams();
+  const a = streams.find((ops) => (ops[0].stream_id ?? ops[0].state?.stream_id) === 's1/i2');
+  assert.deepEqual(a.map((o) => o.op), ['snapshot', 'append'], 'compaction replaced the earlier segments');
+  await store.streamOps([{ op: 'discard', stream_id: 's1/i2' }]);
+  streams = await store.loadStreams();
+  assert.equal(streams.length, 1);
+  assert.equal(streams[0][0].stream_id, 's1/i5');
+});
+
+test('browser host: provider frames go to the hub, never the log; streams end with their invocation', async () => {
+  const { BrowserRuntime } = await hostModule();
+  const rt = new BrowserRuntime({ base: new URL('http://localhost/'), log: () => {}, persistence: false });
+  const calls = [];
+  const ops = [];
+  rt.store = { streamOps: async (o) => { ops.push(...o); } };
+  rt.kernel = { invocation: (inv) => JSON.stringify(inv === 's1/i3' ? ['model', true] : ['model', false]) };
+  let open = true;
+  rt.hub = {
+    ingest: (id, frames, now) => { calls.push(['ingest', id, JSON.parse(frames).length]); return JSON.stringify({ result: { seq: 2 }, output: { recovery: [{ op: 'append', stream_id: id }], ready: [7] } }); },
+    drain: (c) => JSON.stringify(c === 7 ? [{ type: 'frame', stream_id: 's1/i3', seq: 2 }] : []),
+    next_deadline: () => -1,
+    is_open: () => open,
+    finalize: (id, outcome) => { calls.push(['finalize', id, outcome]); open = false; return JSON.stringify({ recovery: [{ op: 'discard', stream_id: id }], ready: [] }); },
+    attach: () => JSON.stringify({ client: 7, streams: [] }),
+    detach: () => {},
+  };
+  const got = [];
+  rt.onStream((m) => got.push(...m));
+  const r = rt.streamAs('model', { invocation_id: 's1/i3', frames: [{ type: 'open', attempt: '1.1' }, { type: 'text-delta', attempt: '1.1', block: 0, text: 'hi' }] });
+  assert.equal(r.seq, 2);
+  assert.deepEqual(got, [{ type: 'frame', stream_id: 's1/i3', seq: 2 }]);
+  assert.throws(() => rt.streamAs('model', { invocation_id: 's1/i9', frames: [] }), /not an open invocation/);
+  assert.throws(() => rt.streamAs('other', { invocation_id: 's1/i3', frames: [] }), /not an open invocation/);
+  // No record was appended for any of it.
+  assert.equal(rt.records.size, 0);
+  rt.streamRecords([{ type: 'invocation-completed', invocation_id: 's1/i3', outcome: { status: 'ok' } }]);
+  assert.deepEqual(calls.at(-1), ['finalize', 's1/i3', 'complete']);
+  await rt.streamTail;
+  assert.deepEqual(ops.map((o) => o.op), ['append', 'discard']);
+});

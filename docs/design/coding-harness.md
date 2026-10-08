@@ -306,6 +306,11 @@ reload instead of continuing.
 
 ### 4.5 Observability without a telemetry backend
 
+Control-plane cost (records, events, pipelines, plugin invocations, owner vs
+broadcast dispatch, stream frames, amplification ratios) and the hot-path
+changes behind it — live streams outside the log, compiled tool ownership,
+batch settlement, turn economy — are in [hot-paths.md](hot-paths.md).
+
 Providers record per-call metrics on `model-response` (latency, time to first
 token, tokens, cached tokens, cost, retries, finish reason); the projection
 records `tool_schema_tokens`, `tools_sent`, and context size on

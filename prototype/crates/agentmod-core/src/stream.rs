@@ -849,7 +849,7 @@ impl StreamHub {
                             last_pseq: None,
                             pending: None,
                             segments: 0,
-                    led: BTreeSet::new(),
+                            led: BTreeSet::new(),
                         },
                     );
                 }

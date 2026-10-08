@@ -273,6 +273,14 @@ pub fn compile(config: &DeploymentConfig, manifests: &BTreeMap<String, Manifest>
     let mut definitions = BTreeMap::new();
     for (def_name, def) in &config.definitions {
         cx.def = Some(def_name);
+        let first_diag = cx.diags.len();
+        // A host disables plugins it cannot run (a worker-only plugin natively,
+        // a process-only one in the browser). A definition that is broken only
+        // because of that is unavailable on this host, not a configuration error.
+        let host_scoped = def
+            .subscribers
+            .iter()
+            .any(|s| config.plugins.get(&s.plugin).is_some_and(|p| p.disabled));
         let mut cd = CompiledDefinition {
             description: def.description.clone(),
             ..Default::default()
@@ -471,6 +479,30 @@ pub fn compile(config: &DeploymentConfig, manifests: &BTreeMap<String, Manifest>
                     config.runtime.max_causal_depth
                 ),
             );
+        }
+        if host_scoped {
+            let broken: Vec<Diagnostic> = cx.diags[first_diag..]
+                .iter()
+                .filter(|d| d.severity == Severity::Error)
+                .cloned()
+                .collect();
+            if let Some(first) = broken.first() {
+                cx.diags.retain(|d| {
+                    d.definition.as_deref() != Some(def_name.as_str())
+                        || d.severity != Severity::Error
+                });
+                cx.push(
+                    Severity::Warning,
+                    "definition-unavailable",
+                    None,
+                    None,
+                    format!(
+                        "`{def_name}` cannot run on this host (its disabled plugins leave it incomplete: {}); skipped",
+                        first.message
+                    ),
+                );
+                continue;
+            }
         }
         definitions.insert(def_name.clone(), cd);
     }
@@ -738,6 +770,43 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["c", "b"]
         );
+    }
+
+    #[test]
+    fn a_definition_left_incomplete_by_host_disabled_plugins_is_skipped() {
+        let a = manifest(
+            "a",
+            vec![consume("session-started", &[])],
+            vec![emit("x", &["k"])],
+        );
+        let b = manifest("b", vec![consume("x", &["k"])], vec![]);
+        let (mut cfg, ms) = setup(vec![a, b], &[("a", None), ("b", None)]);
+        let healthy = cfg.definitions["d"].clone();
+        cfg.definitions.insert("ok".into(), healthy);
+        cfg.plugins.get_mut("a").unwrap().disabled = true;
+        cfg.definitions
+            .get_mut("ok")
+            .unwrap()
+            .subscribers
+            .retain(|s| s.plugin == "b");
+        let out = compile(&cfg, &ms);
+        // `d` lost its only emitter of `x` to the host: unavailable, not an error.
+        assert!(
+            codes(&out).contains(&"definition-unavailable".to_owned()),
+            "{:?}",
+            out.diagnostics
+        );
+        assert!(!out.definitions.contains_key("d"));
+        // `ok` has no disabled plugin, so the same dead listener is still an error.
+        assert!(!out.ok);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == "dead-listener" && d.definition.as_deref() == Some("ok"))
+        );
+        cfg.definitions.remove("ok");
+        let out = compile(&cfg, &ms);
+        assert!(out.ok, "{:?}", out.diagnostics);
     }
 
     #[test]

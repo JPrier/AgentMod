@@ -374,11 +374,13 @@ tool-schema cost is about 1.9k tokens for `coder` against about 80 for
 ### Known limits
 
 - Not verified in this change against real services: a real model (no key in
-  the build environment), real CheerpX and headless Chrome (the build
-  environment could not download the wasm32 target or Chrome). The browser
-  host, devices, CDP client, and VM device are tested in Node against fakes;
-  `tests/browser.mjs` and `tests/sandbox-browser.mjs` are updated for the new
-  UI and tools and run in CI.
+  the build environment) and real CheerpX (its CDN was unreachable). The
+  in-browser runtime was built to WebAssembly and `tests/browser.mjs` passes in
+  headless Chromium; the VM device and CDP client are tested in Node against
+  fakes, and `tests/sandbox-browser.mjs` runs against real CheerpX in CI.
+- A definition whose plugins a host cannot run (e.g. `minimal`, which is
+  native-only, in the browser) is skipped on that host with a
+  `definition-unavailable` warning instead of failing the whole config.
 - Shell classification is a heuristic; anything not recognised as read-only is
   treated as mutating (checkpoint first, policy may ask). On `local-workspace`
   shell commands are not path-confined.

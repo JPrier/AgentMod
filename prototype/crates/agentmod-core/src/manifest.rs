@@ -42,6 +42,49 @@ pub struct Consume {
     /// Whether the assembled context is delivered with the envelope.
     #[serde(default = "yes")]
     pub context: bool,
+    /// Keyed dispatch: this consumer owns only the events whose payload `key`
+    /// equals one of `values` (a value ending in `*` is a prefix). The compiler
+    /// turns every keyed consumer of an event into one deterministic owner
+    /// table, and the kernel dispatches each event to exactly the one owner its
+    /// key selects instead of broadcasting it (tool calls → the tool's plugin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyed: Option<Keyed>,
+}
+
+/// The values of one payload key a consumer owns (see [`Consume::keyed`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Keyed {
+    /// Payload key (dotted path) whose value selects the owner, e.g. `name`.
+    pub key: String,
+    /// Owned values; a trailing `*` makes a value a prefix (`mcp__github__*`).
+    pub values: Vec<String>,
+}
+
+impl Keyed {
+    /// Does this declaration own `value`?
+    #[must_use]
+    pub fn owns(&self, value: &str) -> bool {
+        self.values.iter().any(|v| match v.strip_suffix('*') {
+            Some(prefix) => value.starts_with(prefix),
+            None => v == value,
+        })
+    }
+}
+
+/// A tool a plugin answers, declared at handshake so ownership and schemas are
+/// compile-time facts (the model-facing spec is still contributed to context).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ToolDecl {
+    /// Exact name, or a prefix ending in `*` for dynamic families (MCP servers).
+    pub name: String,
+    /// JSON-schema `properties` of the arguments (object), when known.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub parameters: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<String>,
+    /// `core` or `deferred` (documentation; the projection reads the context spec).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
 }
 
 fn yes() -> bool {
@@ -108,6 +151,9 @@ pub struct Manifest {
     /// Host devices the plugin uses (browser runtime; enforced by that host).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<String>,
+    /// Tools this plugin answers (validated by the compiler; see [`ToolDecl`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDecl>,
 }
 
 impl Manifest {
@@ -156,6 +202,10 @@ pub struct PluginConfig {
     /// Hosts may disable a plugin they cannot run (e.g. native-only plugins in a browser).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub disabled: bool,
+    /// Required plugin version (exact, or a `major.minor` prefix). The compiler
+    /// rejects a config whose plugin reports another version at handshake.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 impl PluginConfig {
@@ -187,12 +237,16 @@ pub struct Subscriber {
 }
 
 /// A named session definition: which plugins participate, in what order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Definition {
     #[serde(default)]
     pub description: String,
     /// Declared order: blocking subscribers run in this order.
     pub subscribers: Vec<Subscriber>,
+    /// Explicit owners for keyed dispatch, `{ event: { value: plugin } }`, to
+    /// resolve two plugins claiming the same key value (e.g. the same tool).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub route_owners: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 /// Core runtime settings.
@@ -207,6 +261,9 @@ pub struct RuntimeSettings {
     /// Invocation attempts before an orphan is recorded as failed.
     #[serde(default = "default_attempts")]
     pub max_attempts: u32,
+    /// Live stream delivery (coalescing, client bounds, recovery compaction).
+    #[serde(default)]
+    pub streaming: crate::stream::StreamSettings,
 }
 
 fn default_depth() -> u32 {
@@ -225,6 +282,7 @@ impl Default for RuntimeSettings {
             max_causal_depth: default_depth(),
             spill_threshold_bytes: default_spill(),
             max_attempts: default_attempts(),
+            streaming: crate::stream::StreamSettings::default(),
         }
     }
 }

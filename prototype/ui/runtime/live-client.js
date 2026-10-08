@@ -22,8 +22,32 @@ export class LiveClient {
       const r = JSON.parse(e.data);
       for (const l of this.listeners) l(r);
     });
+    this.streamListeners ??= new Set();
+    this.es.addEventListener('hello', (e) => {
+      this.clientId = JSON.parse(e.data).client;
+      // A reconnect is a new subscription: re-hydrate.
+      for (const l of this.streamListeners) l([{ type: 'resync-required' }]);
+    });
+    this.es.addEventListener('stream', (e) => {
+      const msgs = JSON.parse(e.data);
+      for (const l of this.streamListeners) l(msgs);
+    });
     return info;
   }
+
+  /** Live stream messages (frames, finalization, resync-required). */
+  onStream(cb) {
+    this.streamListeners ??= new Set();
+    this.streamListeners.add(cb);
+    return () => this.streamListeners.delete(cb);
+  }
+
+  /** Snapshots of the open streams (of one session), with their sequences. */
+  streamSnapshots(sessionId) {
+    return this.req(`/api/streams?session=${encodeURIComponent(sessionId || '')}&client=${this.clientId ?? ''}`);
+  }
+
+  getMetrics() { return this.req('/api/metrics'); }
 
   close() {
     this.es?.close();

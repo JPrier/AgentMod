@@ -143,6 +143,14 @@ async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
                         b.join(" → "),
                         a.join(", ")
                     );
+                    if let Some(r) = &p.routed {
+                        let owners: Vec<String> = r
+                            .entries()
+                            .into_iter()
+                            .map(|(v, o)| format!("{v}→{o}"))
+                            .collect();
+                        println!("  {:<20} owner by `{}`: {}", "", r.key, owners.join(" "));
+                    }
                 }
             }
             println!(

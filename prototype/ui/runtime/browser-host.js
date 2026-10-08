@@ -6,7 +6,7 @@
 // itself, presented to the kernel as the `web-ui` plugin with the same
 // manifest the native gateway uses.
 
-import init, { WasmKernel, compile, project, context_at } from '../pkg/agentmod_wasm.js';
+import init, { WasmKernel, WasmStreamHub, compile, project, context_at, replay_recovery } from '../pkg/agentmod_wasm.js';
 import { WEB_UI_MANIFEST } from '../plugins/web-ui/manifest.js';
 import { Devices } from './devices.js';
 import { openStore } from './persist.js';
@@ -134,6 +134,105 @@ export class BrowserRuntime {
     this.devices = new Devices();
     this.persistence = persistence;
     this.store = store;
+    // Live streams: page clients (client id -> callback) and counters.
+    this.streamClients = new Map();
+    this.counters = { records: 0, invocations: 0, routed_invocations: 0, stream_messages: 0, stream_frames_in: 0, live_messages_out: 0 };
+  }
+
+  // ------------------------------------------------------------------
+  // Live streams (outside the event pipeline and the log)
+  // ------------------------------------------------------------------
+
+  newHub() {
+    this.hub = new WasmStreamHub(JSON.stringify(this.streamSettings || {}));
+  }
+
+  /** Execute hub output: recovery ops (IndexedDB), delivery, the flush timer. */
+  streamEffects(output) {
+    if (!output) return;
+    if (output.recovery?.length && this.store?.streamOps) {
+      const ops = output.recovery;
+      this.streamTail = (this.streamTail || Promise.resolve()).then(() => this.store.streamOps(ops)).catch((e) => this.log(`stream recovery write failed: ${e?.message || e}`));
+    }
+    for (const c of output.ready || []) this.deliverLive(c);
+    const at = this.hub.next_deadline();
+    if (at >= 0 && (this.pollAt == null || at < this.pollAt)) {
+      this.pollAt = at;
+      clearTimeout(this.pollTimer);
+      this.pollTimer = setTimeout(() => {
+        this.pollAt = null;
+        this.streamEffects(J(this.hub.poll(Date.now())));
+      }, Math.max(0, at - Date.now()));
+    }
+  }
+
+  deliverLive(client) {
+    const cb = this.streamClients.get(client);
+    if (!cb) return;
+    const msgs = J(this.hub.drain(client, 1 << 20));
+    if (!msgs.length) return;
+    this.counters.live_messages_out += msgs.length;
+    try { cb(msgs); } catch (e) { this.log(`stream listener failed: ${e.message}`); }
+  }
+
+  /** Provider frames from a plugin worker (its open invocation is the stream). */
+  streamAs(plugin, params) {
+    const inv = params.invocation_id;
+    const info = J(this.kernel.invocation(inv));
+    if (!info || info[0] !== plugin || !info[1]) throw Object.assign(new Error(`\`${inv}\` is not an open invocation of \`${plugin}\``), { code: -32001 });
+    this.counters.stream_messages++;
+    this.counters.stream_frames_in += params.frames?.length || 0;
+    const { result, output } = J(this.hub.ingest(inv, JSON.stringify(params.frames || []), Date.now()));
+    this.streamEffects(output);
+    return result;
+  }
+
+  /** Records that end or restart a stream's invocation. */
+  streamRecords(records) {
+    if (!this.hub) return;
+    for (const r of records) {
+      if (r.type === 'invocation-started') {
+        this.counters.invocations++;
+        if (r.route) this.counters.routed_invocations++;
+      } else if (r.type === 'invocation-completed' && this.hub.is_open(r.invocation_id)) {
+        const s = r.outcome?.status;
+        this.streamEffects(J(this.hub.finalize(r.invocation_id, s === 'ok' ? 'complete' : s === 'cancelled' ? 'cancelled' : 'failed')));
+      } else if (r.type === 'invocation-retried' && this.hub.is_open(r.invocation_id)) {
+        this.streamEffects(J(this.hub.interrupt(r.invocation_id)));
+      }
+    }
+  }
+
+  /** Subscribe the page to live stream messages; returns an unsubscribe. */
+  onStream(cb) {
+    const { client } = J(this.hub.attach(''));
+    this.streamClients.set(client, cb);
+    return () => {
+      this.streamClients.delete(client);
+      this.hub.detach(client);
+    };
+  }
+
+  /** Snapshots of open streams (resumes delivery to page clients that fell behind). */
+  async streamSnapshots(sessionId) {
+    for (const c of this.streamClients.keys()) J(this.hub.resync(c));
+    return J(this.hub.snapshots(sessionId || ''));
+  }
+
+  async restoreStreams() {
+    if (!this.store?.loadStreams) return;
+    for (const ops of await this.store.loadStreams()) {
+      const st = J(replay_recovery(JSON.stringify(ops), JSON.stringify(this.streamSettings || {})));
+      if (st) J(this.hub.restore(JSON.stringify(st)));
+    }
+  }
+
+  /** Drop restored streams whose invocation is no longer open (finalized before the crash). */
+  settleRestoredStreams() {
+    for (const st of J(this.hub.snapshots(''))) {
+      const info = J(this.kernel.invocation(st.stream_id));
+      if (!info || !info[1]) this.streamEffects(J(this.hub.finalize(st.stream_id, 'interrupted')));
+    }
   }
 
   // ------------------------------------------------------------------
@@ -148,6 +247,8 @@ export class BrowserRuntime {
     this.kernel = new WasmKernel();
     const cfg = await this.prepare(config ?? (await (await fetch(new URL('runtime/agentmod.config.json', this.base))).json()));
     this.maxAttempts = cfg.runtime?.max_attempts ?? 3;
+    this.streamSettings = cfg.runtime?.streaming || {};
+    this.newHub();
     await Promise.all(Object.entries(cfg.plugins).filter(([, p]) => !p.disabled && p.module).map(([n, p]) => this.ensureProcByConfig(n, p).whenReady()));
     const comp = J(compile(JSON.stringify(cfg), JSON.stringify(this.manifestsFor(cfg))));
     if (!comp.ok) {
@@ -185,12 +286,14 @@ export class BrowserRuntime {
         this.journal.push({ at: Date.now(), kind: 'session-unrecoverable', detail: { session_id: sid, error: e.message } });
       }
     }
+    await this.restoreStreams();
     this.tick = setInterval(() => this.onTick(), 250);
     for (const sid of this.records.keys()) {
       const orphans = J(this.kernel.status(sid))?.open_invocations?.length || 0;
       if (orphans) recovered.push({ session_id: sid, orphans });
       this.execute(J(this.kernel.recover(sid, this.maxAttempts, Date.now())).effects);
     }
+    this.settleRestoredStreams();
     if (stored.sessions.size) this.journal.push({ at: Date.now(), kind: 'sessions-restored', detail: { sessions: stored.sessions.size, recovered } });
     return comp;
   }
@@ -296,11 +399,14 @@ export class BrowserRuntime {
       this.records.get(r.session_id).push(r);
       appended.push(r);
     }
+    this.counters.records += appended.length;
     const act = () => {
       for (const fx of effects) {
         if (fx.type === 'invoke') this.dispatch(fx);
         else if (fx.type === 'cancel') this.cancel(fx);
       }
+      // A stream ends with its invocation, once that record is durable.
+      this.streamRecords(appended);
       for (const r of appended) for (const l of this.listeners) l(r);
     };
     if (!this.store) return act();
@@ -386,6 +492,8 @@ export class BrowserRuntime {
     switch (msg.method) {
       case 'publish':
         return answer(() => this.publishAs(proc.name, params));
+      case 'stream':
+        return answer(() => this.streamAs(proc.name, params));
       case 'start_session':
         return answer(() => this.startAs(proc.name, params));
       case 'query':
@@ -529,6 +637,12 @@ export class BrowserRuntime {
         return J(context_at(JSON.stringify(recs()), sequence ?? Number.MAX_SAFE_INTEGER));
       case 'status':
         return J(this.kernel.status(session_id));
+      case 'streams':
+        return J(this.hub.snapshots(session_id || ''));
+      case 'routes':
+        return { routes: J(this.kernel.routes(session_id)) };
+      case 'metrics':
+        return { host: this.counters, streams: J(this.hub.counters()), stream_clients: this.streamClients.size };
       case 'graph':
         return J(this.kernel.active());
       case 'config':
@@ -630,6 +744,19 @@ export class BrowserRuntime {
     const active = this.kernel.active_hash();
     this.kernel.free?.();
     this.kernel = new WasmKernel();
+    // Live streams restart from recovery state, as after a reload.
+    const memoryStreams = this.store ? null : J(this.hub.snapshots(''));
+    const clients = [...this.streamClients.values()];
+    this.streamClients.clear();
+    this.hub.free?.();
+    this.newHub();
+    if (this.store) await this.restoreStreams();
+    else for (const st of memoryStreams) J(this.hub.restore(JSON.stringify(st)));
+    for (const cb of clients) {
+      const { client } = J(this.hub.attach(''));
+      this.streamClients.set(client, cb);
+      cb([{ type: 'resync-required' }]);
+    }
     for (const c of this.compilations.values()) J(this.kernel.install(JSON.stringify(c)));
     J(this.kernel.set_active(active));
     const recovered = [];
@@ -640,6 +767,7 @@ export class BrowserRuntime {
     }
     this.tick = setInterval(() => this.onTick(), 250);
     for (const sid of this.records.keys()) this.execute(J(this.kernel.recover(sid, this.maxAttempts, Date.now())).effects);
+    this.settleRestoredStreams();
     this.journal.push({ at: Date.now(), kind: 'crash-recovered', detail: { recovered } });
     return recovered;
   }
@@ -690,6 +818,10 @@ export class BrowserRuntime {
 
   async getConfig() {
     return this.query({ what: 'config' });
+  }
+
+  async getMetrics() {
+    return this.query({ what: 'metrics' });
   }
 
   async startSession({ definition, text, fork_from }) {

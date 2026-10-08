@@ -13,6 +13,8 @@
 //   api_key      key value (browser runtime only; never set this in agentmod.toml)
 //   temperature, max_tokens, provider (OpenRouter provider-routing preferences)
 //   max_context_tokens   override the context budget (default: 75% of the model's window)
+//   fallback_models      models tried in order when the model fails (each a new stream attempt)
+//   stream_retries       retries of a stream that fails after HTTP 200 (default 1)
 import { definePlugin } from '../sdk/agentmod.js';
 import { complete, resolveKey } from '../sdk/openai-compat.js';
 import { fetchCatalog, contextBudget } from '../sdk/catalog.js';
@@ -26,10 +28,9 @@ definePlugin({
     version: '0.2.0',
     description: 'OpenRouter provider: any OpenRouter model, streamed, with tool calls.',
     consumes: [{ event: 'model-request', demands: ['turn'], mode: 'async' }],
-    emits: [
-      { event: 'stream-chunk', supplies: ['stream_id', 'text'] },
-      { event: 'model-response', supplies: ['text', 'stream_id'] },
-    ],
+    // One canonical event per model turn. Token deltas are not events: they
+    // stream to the host's stream hub (sdk/stream.js) for live delivery.
+    emits: [{ event: 'model-response', supplies: ['text', 'stream_id'] }],
     // Read-only services frontends can call through the host (not recorded:
     // they change no state; choosing a model is a recorded config apply).
     services: [
@@ -73,6 +74,9 @@ definePlugin({
         key,
         model,
         temperature: cfg.temperature ?? 0.3,
+        fallbackModels: cfg.fallback_models || [],
+        streamRetries: cfg.stream_retries ?? 1,
+        provider: 'openrouter',
         headers: { 'HTTP-Referer': cfg.referer || 'https://github.com/JPrier/AgentMod', 'X-Title': 'AgentMod prototype' },
         extra,
         // Anthropic models cache only at explicit breakpoints; the system prompt

@@ -2,7 +2,14 @@
   "runtime": {
     "max_causal_depth": 2048,
     "spill_threshold_bytes": 16384,
-    "max_attempts": 3
+    "max_attempts": 3,
+    "streaming": {
+      "flush_ms": 33,
+      "flush_bytes": 512,
+      "client_queue_bytes": 262144,
+      "max_stream_bytes": 4194304,
+      "compact_after_segments": 64
+    }
   },
   "plugins": {
     "approval-gate": {

@@ -22,6 +22,8 @@ fail() { echo "FAIL: $*" >&2; echo "data: $DATA" >&2; exit 1; }
 py() { python3 -c "import json,sys; d=json.load(sys.stdin); $1"; }
 start() { "$BIN" serve --config "$CFG" --data "$DATA" > "$DATA/serve.log" 2>&1 & RT=$!; for _ in $(seq 50); do curl -sf $B/info >/dev/null && return; sleep 0.2; done; cat "$DATA/serve.log"; fail "runtime did not start"; }
 wait_for() { for _ in $(seq ${3:-100}); do if curl -s "$B/sessions/$1" | py "$2" >/dev/null 2>&1; then return; fi; sleep 0.2; done; fail "timed out waiting on $1: $2"; }
+# A provider stream in flight: live state from the stream hub, not the log.
+wait_stream() { for _ in $(seq ${2:-100}); do if curl -s "$B/streams?session=$1" | py "assert any(s['status']=='open' and any(b['text'] for b in s['blocks']) for s in d)" >/dev/null 2>&1; then return; fi; sleep 0.1; done; fail "no live stream in $1"; }
 
 echo "1. key is mandatory"
 if env -u OPENROUTER_API_KEY "$BIN" serve --config "$CFG" --data "$DATA/nokey" > "$DATA/nokey.log" 2>&1; then fail "started without a key"; fi
@@ -48,12 +50,15 @@ curl -s -XPOST $B/config/apply -d "$BAD" | py "assert not d['ok'] and any(x['cod
 
 echo "5. hard stop mid-stream"
 curl -s -XPOST $B/sessions -d '{"definition":"chat","text":"tell me a story"}' >/dev/null
-wait_for s0003 "assert any(e['event_name']=='stream-chunk' for e in d['events'])"
+wait_stream s0003
 curl -s -XPOST $B/sessions/s0003/commands -d '{"command":"hard-stop"}' | py "assert d['status']['state']=='halted' and not d['status']['open_invocations']" || fail "hard stop"
+# The stream ended with its invocation; no token fragment entered the log.
+curl -s "$B/streams?session=s0003" | py "assert d==[], d" || fail "stream not finalized by hard stop"
+curl -s $B/sessions/s0003 | py "assert not any(e['event_name']=='stream-chunk' for e in d['events'])" || fail "token fragments in the log"
 
 echo "6. plugin crash is isolated and retried"
 curl -s -XPOST $B/sessions -d '{"definition":"chat","text":"hello again"}' >/dev/null
-wait_for s0004 "assert any(e['event_name']=='stream-chunk' for e in d['events'])"
+wait_stream s0004
 PID=$(grep -o "started plugin .openrouter-model. (pid Some([0-9]*)" "$DATA/serve.log" | tail -1 | grep -o "[0-9]*" | tail -1)
 kill -9 "$PID"
 wait_for s0004 "assert any(e['event_name']=='assistant-message' for e in d['events'])" 200
@@ -61,15 +66,23 @@ curl -s $B/sessions/s0004 | py "assert any(i['attempts']>1 for e in d['events'] 
 
 echo "7. SIGKILL the runtime mid-stream; recover from the log"
 curl -s -XPOST $B/sessions -d '{"definition":"chat","text":"one more long answer please"}' >/dev/null
-wait_for s0005 "assert any(e['event_name']=='stream-chunk' for e in d['events'])"
+wait_stream s0005
 kill -9 $RT; wait $RT 2>/dev/null || true
+ls "$DATA/streams/"*.jsonl >/dev/null 2>&1 || fail "no recovery state for the stream in flight"
 start
 wait_for s0005 "assert any(e['event_name']=='assistant-message' for e in d['events'])" 200
 curl -s $B/sessions/s0005 | py "
-chunks=[e for e in d['events'] if e['event_name']=='stream-chunk']
-idx=[e['payload']['index'] for e in chunks]
-assert idx==list(range(len(idx))), idx
+r=[e['payload'] for e in d['events'] if e['event_name']=='model-response']
+assert len(r)==1, len(r)
+t=r[0]['text']
+# The retry is a fresh attempt: its text is not the partial text plus a new copy.
+assert t.count('Mock OpenRouter')==1, t
+assert r[0]['metrics']['stream']['live_frames']>=1, r[0]['metrics']
+assert not any(e['event_name']=='stream-chunk' for e in d['events'])
 assert any(i['attempts']>1 for e in d['events'] for i in e['invocations'])" || fail "recovery"
+# Finalized: the canonical response is logged, so the partial state is gone.
+for _ in $(seq 50); do ls "$DATA/streams/"*.jsonl >/dev/null 2>&1 || break; sleep 0.1; done
+ls "$DATA/streams/"*.jsonl >/dev/null 2>&1 && fail "recovery state left after finalization"
 
 echo "8. coding tools through a real session (coder: local-workspace + policy)"
 msg() { python3 -c "import json,sys; print(json.dumps({'text':sys.argv[1]}))" "$1"; }

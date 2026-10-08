@@ -21,6 +21,7 @@ pub mod kernel;
 pub mod manifest;
 pub mod projection;
 pub mod record;
+pub mod stream;
 pub mod types;
 
 pub use compiler::{Compilation, compile};

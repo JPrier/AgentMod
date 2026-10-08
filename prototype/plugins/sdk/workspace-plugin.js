@@ -23,8 +23,8 @@
 //             process-started / process-exited
 //             diagnostics                        typed compiler/test findings
 //             workspace-status                   target lifecycle (booting, ready, failed)
-import { definePlugin, offerTools } from './agentmod.js';
-import { codingToolkit } from './coding/toolkit.js';
+import { declareTools, definePlugin, offerTools, ownTools } from './agentmod.js';
+import { codingToolkit, toolSpecs } from './coding/toolkit.js';
 import { normalizePath, shq } from './coding/paths.js';
 
 const WORKSPACE_EVENTS = ['workspace-info', 'workspace-change', 'checkpoint-created', 'workspace-restored', 'process-started', 'process-exited', 'diagnostics', 'workspace-status'];
@@ -37,6 +37,7 @@ const WORKSPACE_EVENTS = ['workspace-info', 'workspace-change', 'checkpoint-crea
  * @param {(config) => string} spec.describe       system-prompt text describing the target
  * @param {(config) => object} [spec.secrets]      resolve configured secrets to { NAME: { value, env, commands } }
  * @param {Function} [spec.validate]  handshake validation (throw to refuse)
+ * @param {boolean} [spec.lifecycle]   the target is a machine with sandbox_* lifecycle tools
  */
 export function defineWorkspacePlugin(spec) {
   let state = null; // { key, target } for the current plugin config
@@ -231,20 +232,29 @@ export function defineWorkspacePlugin(spec) {
     return { output: lines.join('\n'), error: res.adopted.length === 0 && res.conflicts.length > 0, summary: `${res.adopted.length} adopted`, data: { adopted: res.adopted, conflicts: res.conflicts, checkpoint: res.checkpoint, from: other, from_tree: snap.tree } };
   }
 
+  // The tools this plugin owns, from config alone (compile-time ownership).
+  const declared = (cfg) => [
+    ...toolSpecs({ root: normalizePath(spec.root(cfg || {})), lifecycle: !!spec.lifecycle, importRepos: (cfg || {}).import_repos !== false }),
+    ADOPT_SPEC,
+    LOAD_SKILL_SPEC,
+  ];
+
   return definePlugin({
-    manifest: {
+    name: spec.manifest.name,
+    manifest: (cfg) => ({
       ...spec.manifest,
       consumes: [
         { event: 'session-started' },
         { event: 'config-applied' },
-        { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false },
+        ownTools(declared(cfg).map((t) => t.name)),
         { event: 'ui-action', demands: ['reply_to', 'action'], mode: 'async', context: false },
       ],
+      tools: declareTools(declared(cfg)),
       emits: [
         { event: 'tool-result', supplies: ['call_id', 'name', 'output'] },
         ...WORKSPACE_EVENTS.map((event) => ({ event, supplies: [] })),
       ],
-    },
+    }),
     validate: spec.validate,
     shutdown: async () => {
       await state?.target?.dispose?.();

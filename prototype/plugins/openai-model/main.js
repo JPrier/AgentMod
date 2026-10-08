@@ -1,6 +1,7 @@
 // openai-model: live provider for any OpenAI-compatible /chat/completions
 // endpoint (OpenAI, Ollama, vLLM, LM Studio...).
-// Config: { base_url, model, api_key_env? (native), api_key? (browser), temperature?, max_context_tokens? }
+// Config: { base_url, model, api_key_env? (native), api_key? (browser), temperature?, max_context_tokens?,
+//           fallback_models?, stream_retries? }
 import { definePlugin } from '../sdk/agentmod.js';
 import { complete, resolveKey } from '../sdk/openai-compat.js';
 import { fetchCatalog } from '../sdk/catalog.js';
@@ -13,10 +14,9 @@ definePlugin({
     version: '0.2.0',
     description: 'Live OpenAI-compatible chat-completions provider with streaming and tool calls.',
     consumes: [{ event: 'model-request', demands: ['turn'], mode: 'async' }],
-    emits: [
-      { event: 'stream-chunk', supplies: ['stream_id', 'text'] },
-      { event: 'model-response', supplies: ['text', 'stream_id'] },
-    ],
+    // One canonical event per model turn. Token deltas are not events: they
+    // stream to the host's stream hub (sdk/stream.js) for live delivery.
+    emits: [{ event: 'model-response', supplies: ['text', 'stream_id'] }],
     services: [{ name: 'model-catalog', description: 'List models served by the endpoint' }],
     settings: [
       { key: 'base_url', label: 'Endpoint (OpenAI-compatible)', required: true },
@@ -37,6 +37,9 @@ definePlugin({
         key: resolveKey(cfg, 'OPENAI_API_KEY'),
         model: cfg.model || 'gpt-4o-mini',
         temperature: cfg.temperature ?? 0.3,
+        fallbackModels: cfg.fallback_models || [],
+        streamRetries: cfg.stream_retries ?? 1,
+        provider: 'openai-compatible',
         projection: cfg.minimal ? { minimal: true } : { maxContextTokens: cfg.max_context_tokens || 96_000 },
       });
       await ctx.publish('model-response', { ...out, provider: 'openai-compatible' });

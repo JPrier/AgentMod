@@ -51,6 +51,7 @@ defineWorkspacePlugin({
     },
   },
   root: (cfg) => cfg.workspace_path || '/workspace',
+  lifecycle: true,
   createTarget: (cfg, { host }) => linuxVmTarget({ host, config: cfg }),
   describe: (cfg) =>
     'Your workspace is a Linux sandbox: a 32-bit x86 Debian VM (CheerpX) running inside the user\'s browser, on their own machine. ' +

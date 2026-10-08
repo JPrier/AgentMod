@@ -9,6 +9,9 @@ use agentmod_core::kernel::{InvocationResult, Kernel, PublishRequest, Scope, Sta
 use agentmod_core::manifest::{DeploymentConfig, Manifest};
 use agentmod_core::projection;
 use agentmod_core::record::{Command, Record};
+use agentmod_core::stream::{
+    InFrame, Materialized, RecoveryOp, StreamHub, StreamOutput, StreamSettings, StreamStatus,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -208,6 +211,131 @@ impl WasmKernel {
     pub fn is_loaded(&self, session_id: &str) -> bool {
         self.k.is_loaded(session_id)
     }
+
+    /// Compiled keyed-dispatch tables of a session's config.
+    #[must_use]
+    pub fn routes(&self, session_id: &str) -> String {
+        out(&self.k.routes(session_id))
+    }
+
+    /// `[plugin, open]` for an invocation, or null.
+    #[must_use]
+    pub fn invocation(&self, invocation_id: &str) -> String {
+        out(&self.k.invocation(invocation_id))
+    }
+}
+
+/// The live stream hub (same code as the native host), for the browser host.
+#[wasm_bindgen]
+pub struct WasmStreamHub {
+    h: StreamHub,
+}
+
+fn status_of(s: &str) -> StreamStatus {
+    serde_json::from_value(Value::String(s.to_owned())).unwrap_or(StreamStatus::Interrupted)
+}
+
+#[wasm_bindgen]
+impl WasmStreamHub {
+    #[wasm_bindgen(constructor)]
+    #[must_use]
+    pub fn new(settings_json: &str) -> Self {
+        let settings: StreamSettings = serde_json::from_str(settings_json).unwrap_or_default();
+        Self {
+            h: StreamHub::new(settings),
+        }
+    }
+
+    /// Ingest frames; returns `{ result, output }`.
+    pub fn ingest(&mut self, stream_id: &str, frames_json: &str, now: f64) -> String {
+        let frames: Vec<InFrame> = match serde_json::from_str(frames_json) {
+            Ok(f) => f,
+            Err(e) => return err(format!("invalid frames: {e}")),
+        };
+        let mut o = StreamOutput::default();
+        let r = self.h.ingest(stream_id, frames, ms(now), &mut o);
+        out(&json!({ "result": r, "output": o }))
+    }
+
+    pub fn poll(&mut self, now: f64) -> String {
+        let mut o = StreamOutput::default();
+        self.h.poll(ms(now), &mut o);
+        out(&o)
+    }
+
+    /// Next flush deadline in ms, or -1.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
+    pub fn next_deadline(&self) -> f64 {
+        self.h.next_deadline().map_or(-1.0, |d| d as f64)
+    }
+
+    #[must_use]
+    pub fn is_open(&self, stream_id: &str) -> bool {
+        self.h.is_open(stream_id)
+    }
+
+    pub fn finalize(&mut self, stream_id: &str, outcome: &str) -> String {
+        let mut o = StreamOutput::default();
+        self.h.finalize(stream_id, status_of(outcome), &mut o);
+        out(&o)
+    }
+
+    pub fn interrupt(&mut self, stream_id: &str) -> String {
+        let mut o = StreamOutput::default();
+        self.h.interrupt(stream_id, &mut o);
+        out(&o)
+    }
+
+    /// Attach a client (`session` may be empty for all); `{ client, streams }`.
+    pub fn attach(&mut self, session: &str) -> String {
+        let (client, streams) = self.h.attach(Some(session).filter(|s| !s.is_empty()));
+        out(&json!({ "client": client, "streams": streams }))
+    }
+
+    pub fn detach(&mut self, client: u32) {
+        self.h.detach(u64::from(client));
+    }
+
+    pub fn drain(&mut self, client: u32, max_bytes: u32) -> String {
+        out(&self.h.drain(u64::from(client), max_bytes as usize))
+    }
+
+    pub fn resync(&mut self, client: u32) -> String {
+        out(&self.h.resync(u64::from(client)))
+    }
+
+    #[must_use]
+    pub fn snapshots(&self, session: &str) -> String {
+        out(&self.h.snapshots(Some(session).filter(|s| !s.is_empty())))
+    }
+
+    pub fn restore(&mut self, state_json: &str) -> String {
+        match serde_json::from_str::<Materialized>(state_json) {
+            Ok(s) => {
+                self.h.restore(s);
+                json!({ "ok": true }).to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    #[must_use]
+    pub fn counters(&self) -> String {
+        out(&self.h.counters)
+    }
+}
+
+/// Fold stored recovery ops back into a materialized stream (or null).
+#[wasm_bindgen]
+#[must_use]
+pub fn replay_recovery(ops_json: &str, settings_json: &str) -> String {
+    let ops: Vec<RecoveryOp> = match serde_json::from_str(ops_json) {
+        Ok(o) => o,
+        Err(e) => return err(e),
+    };
+    let settings: StreamSettings = serde_json::from_str(settings_json).unwrap_or_default();
+    out(&StreamHub::replay_recovery(&ops, &settings))
 }
 
 #[cfg(test)]

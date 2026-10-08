@@ -5,7 +5,7 @@
 // chat-context and a provider configured with `minimal: true`, it is the
 // "model → tool → result → model" loop the full harness is measured against
 // (see bench/). Native runtime only.
-import { definePlugin, offerTools, toolSpec } from '../sdk/agentmod.js';
+import { definePlugin, declareTools, offerTools, ownTools, toolSpec } from '../sdk/agentmod.js';
 import { localTarget } from '../local-workspace/target.js';
 import { truncate } from '../sdk/coding/text.js';
 
@@ -24,8 +24,9 @@ definePlugin({
     description: 'Baseline: a single shell tool, nothing else.',
     consumes: [
       { event: 'session-started' },
-      { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false },
+      ownTools(['shell']),
     ],
+    tools: declareTools([SHELL]),
     emits: [{ event: 'tool-result', supplies: ['call_id', 'name', 'output'] }],
     config_schema: { root: '.agentmod/workspace' },
   },

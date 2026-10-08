@@ -7,7 +7,7 @@
 // saved, by which session, why it was injected), and a `memory-injected` event
 // records what entered the session. Children started by `delegate` are not
 // given memory unless their definition includes this plugin.
-import { definePlugin, offerTools, toolSpec } from '../sdk/agentmod.js';
+import { definePlugin, declareTools, offerTools, ownTools, toolSpec } from '../sdk/agentmod.js';
 
 const TOOLS = [
   toolSpec('remember', 'Save a short note that future sessions will see (preferences, conventions, facts about this user or project).', { note: { type: 'string' } }, { required: ['note'], tier: 'deferred', group: 'memory', effects: 'write' }),
@@ -24,8 +24,9 @@ definePlugin({
     consumes: [
       { event: 'session-started' },
       { event: 'config-applied' },
-      { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false },
+      ownTools(TOOLS.map((t) => t.name)),
     ],
+    tools: declareTools(TOOLS),
     emits: [
       { event: 'tool-result', supplies: ['call_id', 'name', 'output'] },
       { event: 'memory-injected', supplies: ['count'] },

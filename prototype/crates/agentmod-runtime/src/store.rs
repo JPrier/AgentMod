@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use agentmod_core::compiler::Compilation;
 use agentmod_core::record::{Body, Record};
+use agentmod_core::stream::RecoveryOp;
 use agentmod_core::types::{Cause, ContextOp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -135,7 +136,7 @@ impl Store {
     ///
     /// # Errors
     /// I/O failures.
-    pub fn append(&mut self, r: &Record) -> Result<(), String> {
+    pub fn append(&mut self, r: &Record) -> Result<usize, String> {
         let mut v = serde_json::to_value(r).map_err(|e| e.to_string())?;
         if let Some(obj) = v.as_object_mut() {
             for (k, field) in obj.iter_mut() {
@@ -167,7 +168,77 @@ impl Store {
             self.index.next_session = self.index.next_session.max(n + 1);
         }
         self.index_dirty = true;
-        Ok(())
+        Ok(line.len() + 1)
+    }
+
+    // ------------------------------------------------------------------
+    // Recovery store for streams in flight (not history: dropped once the
+    // stream's invocation completes and its canonical events are logged).
+    // ------------------------------------------------------------------
+
+    fn stream_path(&self, stream_id: &str) -> PathBuf {
+        self.dir.join("streams").join(format!(
+            "{}.jsonl",
+            stream_id.replace(['/', '\\', '.'], "_")
+        ))
+    }
+
+    /// Apply one recovery op. Returns bytes written. Segments are appended
+    /// (no fsync: they only need to survive a process crash, not power loss).
+    ///
+    /// # Errors
+    /// I/O failures.
+    pub fn stream_op(&mut self, op: &RecoveryOp) -> Result<usize, String> {
+        let line = serde_json::to_string(op).map_err(|e| e.to_string())?;
+        match op {
+            RecoveryOp::Append { stream_id, .. } => {
+                fs::create_dir_all(self.dir.join("streams")).map_err(|e| e.to_string())?;
+                let mut f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.stream_path(stream_id))
+                    .map_err(|e| e.to_string())?;
+                writeln!(f, "{line}").map_err(|e| e.to_string())?;
+                Ok(line.len() + 1)
+            }
+            RecoveryOp::Snapshot { state } => {
+                fs::create_dir_all(self.dir.join("streams")).map_err(|e| e.to_string())?;
+                let p = self.stream_path(&state.stream_id);
+                let tmp = p.with_extension("tmp");
+                fs::write(&tmp, format!("{line}\n")).map_err(|e| e.to_string())?;
+                fs::rename(&tmp, &p).map_err(|e| e.to_string())?;
+                Ok(line.len() + 1)
+            }
+            RecoveryOp::Discard { stream_id } => {
+                let _ = fs::remove_file(self.stream_path(stream_id));
+                Ok(0)
+            }
+        }
+    }
+
+    /// Every stream's recovery ops, as written (a torn last line is skipped).
+    #[must_use]
+    pub fn stream_recovery(&self) -> Vec<Vec<RecoveryOp>> {
+        let Ok(rd) = fs::read_dir(self.dir.join("streams")) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for e in rd.filter_map(Result::ok) {
+            if e.path().extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(e.path()) else {
+                continue;
+            };
+            let ops: Vec<RecoveryOp> = text
+                .lines()
+                .filter_map(|l| serde_json::from_str(l).ok())
+                .collect();
+            if !ops.is_empty() {
+                out.push(ops);
+            }
+        }
+        out
     }
 
     /// Flush appended records to the OS and fsync (called before acting on them).

@@ -12,7 +12,7 @@
 // Native runtime only. Config: { chrome: "/path/to/chrome" (default: found on
 // PATH or CHROME_PATH), cdp_url: "ws://…" (attach to a running Chrome instead),
 // args: [] }
-import { definePlugin, offerTools, toolSpec } from '../sdk/agentmod.js';
+import { definePlugin, declareTools, offerTools, ownTools, toolSpec } from '../sdk/agentmod.js';
 import { Cdp, findChrome, launchChrome, SNAPSHOT_JS } from '../sdk/cdp.js';
 
 const target = (desc) => ({ ref: { type: 'string', description: `element ref from browser_snapshot (e.g. "e3")${desc ? `; ${desc}` : ''}` }, selector: { type: 'string', description: 'CSS selector (alternative to ref)' } });
@@ -129,8 +129,9 @@ definePlugin({
     consumes: [
       { event: 'session-started' },
       { event: 'config-applied' },
-      { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false },
+      ownTools(NAMES),
     ],
+    tools: declareTools(TOOLS),
     emits: [{ event: 'tool-result', supplies: ['call_id', 'name', 'output'] }],
     config_schema: { chrome: 'path (default: PATH / CHROME_PATH)', cdp_url: null, args: [] },
   },

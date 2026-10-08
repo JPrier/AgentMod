@@ -7,6 +7,7 @@
 import { markdown } from './runtime/markdown.js';
 import { LiveClient } from './runtime/live-client.js';
 import { harnessSummary } from './runtime/harness-view.js';
+import { StreamStore, renderScheduler } from './runtime/stream-store.js';
 import { isolated, isolationSupported, ensureIsolation, enableIsolation, disableIsolation, takeAfterReload } from './runtime/isolation.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -281,6 +282,10 @@ async function connect(host) {
     return;
   }
   stopSub = state.client.onRecord(onRecord);
+  // Live streams: subscribe first, then hydrate (no frame falls in between).
+  stopStream?.();
+  stopStream = state.client.onStream?.((msgs) => streamStore.applyAll(msgs)) ?? null;
+  await hydrateStreams();
   await refreshAll();
   const after = takeAfterReload();
   if (after && state.definitions.includes(after)) {
@@ -294,6 +299,85 @@ async function connect(host) {
 }
 
 let stopSub = null;
+let stopStream = null;
+
+// ---------------------------------------------------------------------------
+// Live streams: presentation state, rendered in place at most once per frame.
+// ---------------------------------------------------------------------------
+
+const liveEls = new Map(); // stream_id -> element
+const streamStore = new StreamStore({ onChange: () => scheduleLive(), onResync: () => hydrateStreams() });
+const scheduleLive = renderScheduler(() => renderLive());
+
+async function hydrateStreams() {
+  if (!state.client?.streamSnapshots) return;
+  streamStore.beginHydrate();
+  let snaps = [];
+  try {
+    snaps = await state.client.streamSnapshots('');
+  } catch (e) {
+    console.warn('stream snapshot failed', e);
+  }
+  streamStore.hydrate(snaps);
+}
+
+/** Streams whose canonical response (or closed invocation) is already in the log. */
+function canonicalStreams(v) {
+  const done = new Set();
+  for (const e of v?.events || []) {
+    if (e.event_name === 'model-response' && e.payload.stream_id) done.add(e.payload.stream_id);
+    for (const i of e.invocations) if (i.outcome) done.add(i.invocation_id);
+  }
+  return done;
+}
+
+function liveStreamEl(s) {
+  let el = liveEls.get(s.stream_id);
+  if (!el) {
+    el = h('div.msg.assistant.streaming', { 'data-stream': s.stream_id });
+    liveEls.set(s.stream_id, el);
+  }
+  const blocks = [...s.blocks.values()];
+  const parts = [];
+  for (const b of blocks) {
+    if (b.kind === 'reasoning' && b.text) parts.push(`<details class="reasoning"><summary>Thinking…</summary>${markdown(b.text)}</details>`);
+    else if (b.kind === 'text') parts.push(markdown(b.text));
+    else if (b.kind === 'tool-call') parts.push(`<div class="tool preparing"><span class="name">${(b.name || 'tool').replace(/[<&]/g, '')}</span> <span class="args">${b.text.slice(-200).replace(/[<&]/g, (c) => (c === '<' ? '&lt;' : '&amp;'))}</span> <span class="pill wait">${b.closed ? 'ready' : 'preparing'}</span></div>`);
+  }
+  if (s.error && s.status === 'open') parts.push(`<p class="note">Retrying after: ${String(s.error).replace(/[<&]/g, '')}</p>`);
+  if (s.status === 'interrupted') parts.push('<p class="note">Interrupted by a restart; the request is being retried.</p>');
+  const html = parts.join('') || '<span class="dots">…</span>';
+  if (el.dataset.html !== html) {
+    el.innerHTML = html;
+    el.dataset.html = html;
+  }
+  el.classList.toggle('streaming', s.status === 'open');
+  return el;
+}
+
+function liveItems(v) {
+  const canonical = canonicalStreams(v);
+  return streamStore.live(v.session_id, { canonical }).map(liveStreamEl);
+}
+
+/** Update only the live stream bubbles (no full re-render). */
+function renderLive() {
+  streamStore.stats.renders++;
+  const inner = $('.thread-inner');
+  const v = state.view;
+  if (!inner || !v) return;
+  const thread = $('.thread');
+  const atBottom = !thread || thread.scrollHeight - thread.scrollTop - thread.clientHeight < 80;
+  const keep = new Set();
+  for (const el of liveItems(v)) {
+    keep.add(el);
+    if (!el.isConnected) inner.append(el);
+  }
+  for (const [id, el] of liveEls) {
+    if (!keep.has(el) && el.isConnected && !streamStore.streams.has(id)) el.remove();
+  }
+  if (thread && atBottom) thread.scrollTop = thread.scrollHeight;
+}
 
 function bootMessage(msg) {
   const app = $('#app');
@@ -362,7 +446,13 @@ async function flush() {
       state.graph = await state.client.getGraph();
       state.config = await state.client.getConfig();
     }
-    if (state.selected && touched.has(state.selected)) state.view = await state.client.getSession(state.selected);
+    if (state.selected && touched.has(state.selected)) {
+      state.view = await state.client.getSession(state.selected);
+      // Canonical responses replace their live streams.
+      const done = canonicalStreams(state.view);
+      streamStore.prune(done);
+      for (const id of done) liveEls.delete(id);
+    }
   } catch (e) {
     console.warn(e);
   }
@@ -804,6 +894,7 @@ function threadItems(v) {
     }
   }
   while (ci < controls.length) out.push(controlNote(controls[ci++]));
+  out.push(...liveItems(v));
   for (const b of (v.blocked || []).slice(-3)) out.push(h('div.sys.bad', `Blocked publish from ${b.plugin} (${b.event_name}): ${b.reason}`));
   return out;
 }

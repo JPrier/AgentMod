@@ -1,6 +1,6 @@
 // tool-clock: answers `clock` tool calls. Tools are not a core concept: a tool
 // call is an event, and a plugin that answers it is a tool.
-import { definePlugin, offerTools, toolSpec } from '../sdk/agentmod.js';
+import { definePlugin, declareTools, offerTools, ownTools, toolSpec } from '../sdk/agentmod.js';
 
 const TOOLS = [toolSpec('clock', 'Current date and time.', {})];
 
@@ -12,8 +12,9 @@ definePlugin({
     consumes: [
       { event: 'session-started' },
       { event: 'config-applied' },
-      { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false },
+      ownTools(['clock']),
     ],
+    tools: declareTools(TOOLS),
     emits: [{ event: 'tool-result', supplies: ['call_id', 'name', 'output'] }],
   },
   handlers: {

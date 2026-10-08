@@ -7,7 +7,7 @@
 // names to the `tools-loaded` slot, and the projection (sdk/projection.js)
 // sends their full schemas from the next model request on. "select:a,b" loads
 // exact names. Tools the session's policy hides are never found.
-import { definePlugin, offerTools } from '../sdk/agentmod.js';
+import { definePlugin, declareTools, offerTools, ownTools } from '../sdk/agentmod.js';
 
 import { TOOL_SEARCH, searchTools, brief } from '../sdk/discovery.js';
 
@@ -19,8 +19,9 @@ definePlugin({
     consumes: [
       { event: 'session-started' },
       { event: 'config-applied' },
-      { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false },
+      ownTools(['tool_search']),
     ],
+    tools: declareTools([TOOL_SEARCH]),
     emits: [{ event: 'tool-result', supplies: ['call_id', 'name', 'output'] }],
   },
   handlers: {

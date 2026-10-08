@@ -26,6 +26,7 @@ fn c(event: &str, demands: &[&str]) -> Consume {
         demands: demands.iter().map(|s| (*s).into()).collect(),
         mode: None,
         context: true,
+        keyed: None,
     }
 }
 fn ca(event: &str) -> Consume {
@@ -34,6 +35,7 @@ fn ca(event: &str) -> Consume {
         demands: vec![],
         mode: Some(Mode::Async),
         context: false,
+        keyed: None,
     }
 }
 fn e(event: &str, supplies: &[&str]) -> Emit {
@@ -158,6 +160,7 @@ fn config(chat_subs: &[&str]) -> DeploymentConfig {
                 timeout_ms: None,
                 binary_hash: Some(format!("bin-{name}")),
                 disabled: false,
+                version: None,
             },
         );
     }
@@ -167,6 +170,7 @@ fn config(chat_subs: &[&str]) -> DeploymentConfig {
         Definition {
             description: "chat".into(),
             subscribers: chat_subs.iter().map(|s| sub(s)).collect(),
+            ..Default::default()
         },
     );
     cfg.definitions.insert(
@@ -174,6 +178,7 @@ fn config(chat_subs: &[&str]) -> DeploymentConfig {
         Definition {
             description: String::new(),
             subscribers: vec![sub("ui"), sub("ping"), sub("pong")],
+            ..Default::default()
         },
     );
     cfg.definitions.insert(
@@ -187,6 +192,7 @@ fn config(chat_subs: &[&str]) -> DeploymentConfig {
                 sub("reporter"),
                 sub("nocross"),
             ],
+            ..Default::default()
         },
     );
     cfg

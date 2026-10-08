@@ -1,5 +1,6 @@
 // web-ui (native gateway): the web frontend as an ordinary plugin. It is an
-// async `*` subscriber (its invocations are its standing citations), a
+// async subscriber of session-started (that invocation is its standing
+// citation in the session), a watcher of records and live streams, a
 // publisher of user actions (deferred publishes), and a sender of dispatcher
 // commands. It serves the static UI and a small HTTP + Server-Sent-Events API.
 //
@@ -15,7 +16,14 @@ const path = await import('node:path');
 // it, so each one starts a fresh causal chain (depth 1) instead of extending
 // the session's deepest chain.
 const cites = new Map();
+// SSE clients: { res, id, behind } — each with a bounded socket buffer. Records
+// (canonical, low-volume) always go out; live stream frames are dropped for a
+// client whose buffer is past the bound, which then gets `resync-required` and
+// re-hydrates from /api/streams (snapshot + sequence).
 const clients = new Set();
+let nextClient = 1;
+const LIVE_LIMIT = 512 * 1024;
+const live = { frames_in: 0, sse_writes: 0, dropped: 0, resyncs: 0 };
 let plugin;
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json', '.wasm': 'application/wasm', '.svg': 'image/svg+xml', '.toml': 'text/plain' };
@@ -59,11 +67,21 @@ async function route(req, res) {
   if (p === '/api/stream') {
     cors(res);
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-    res.write(': connected\n\n');
-    clients.add(res);
-    req.on('close', () => clients.delete(res));
+    const c = { res, id: nextClient++, behind: false };
+    res.write(`event: hello\ndata: ${JSON.stringify({ client: c.id })}\n\n`);
+    clients.add(c);
+    // A disconnect never cancels generation: execution owns the stream.
+    req.on('close', () => clients.delete(c));
     return;
   }
+  if (p === '/api/streams') {
+    // Hydration snapshot (subscribe first, then fetch: frames with a greater
+    // seq than the snapshot's apply on top). Clears a client's resync state.
+    const id = Number(url.searchParams.get('client'));
+    for (const c of clients) if (c.id === id) c.behind = false;
+    return send(res, 200, await q('streams', { session_id: url.searchParams.get('session') || '' }));
+  }
+  if (p === '/api/metrics') return send(res, 200, { runtime: await q('metrics'), gateway: { ...live, clients: clients.size } });
   if (p === '/api/sessions' && req.method === 'GET') return send(res, 200, await q('sessions'));
   if (p === '/api/sessions' && req.method === 'POST') {
     const b = await readBody(req);
@@ -137,14 +155,43 @@ definePlugin({
     });
     server.on('error', (e) => p.log('http error:', e.message));
     server.listen(port, host, () => p.log(`web UI on http://${host}:${port}/`));
-    await p.host.watch();
-    setInterval(() => { for (const c of clients) c.write(': ping\n\n'); }, 15000);
+    await p.host.watch({ streams: true });
+    setInterval(() => { for (const c of clients) c.res.write(': ping\n\n'); }, 15000);
   },
   onRecord: (record) => {
     const line = `event: record\ndata: ${JSON.stringify(record)}\n\n`;
-    for (const c of clients) c.write(line);
+    for (const c of clients) c.res.write(line);
+  },
+  onStream: (messages) => {
+    live.frames_in += messages.length;
+    // The runtime dropped frames for this gateway: every client re-hydrates.
+    if (messages.some((m) => m.type === 'resync-required')) {
+      plugin.host.streamResync().catch(() => {});
+      for (const c of clients) c.behind = true;
+    }
+    const line = `event: stream\ndata: ${JSON.stringify(messages.filter((m) => m.type !== 'resync-required'))}\n\n`;
+    for (const c of clients) {
+      if (c.behind) {
+        live.dropped += messages.length;
+        if (!c.notified) {
+          c.notified = true;
+          c.res.write(`event: stream\ndata: ${JSON.stringify([{ type: 'resync-required' }])}\n\n`);
+        }
+        continue;
+      }
+      if (c.res.writableLength > LIVE_LIMIT) {
+        c.behind = true;
+        c.notified = true;
+        live.resyncs++;
+        c.res.write(`event: stream\ndata: ${JSON.stringify([{ type: 'resync-required' }])}\n\n`);
+        continue;
+      }
+      c.notified = false;
+      live.sse_writes++;
+      c.res.write(line);
+    }
   },
   handlers: {
-    '*': (ctx) => { if (!cites.has(ctx.sessionId)) cites.set(ctx.sessionId, ctx.invocationId); },
+    'session-started': (ctx) => { if (!cites.has(ctx.sessionId)) cites.set(ctx.sessionId, ctx.invocationId); },
   },
 });

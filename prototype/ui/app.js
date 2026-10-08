@@ -591,6 +591,7 @@ function chat() {
     h('span.sub', `${v.session_id} · ${v.definition} · config ${v.config.slice(0, 8)}`),
     h('span.state.' + st, st),
     v.status && (v.status.queued_priority + v.status.queued_normal) > 0 && h('span.sub', `${v.status.queued_normal + v.status.queued_priority} queued`),
+    modeControl(v),
     h('div.controls',
       h('button.btn.small', { onclick: () => command('soft-stop'), disabled: !['running', 'idle'].includes(st), title: 'Finish the running pipeline, then park' }, 'Soft stop'),
       h('button.btn.small.danger', { onclick: () => command('hard-stop'), disabled: st === 'halted', title: 'Cancel in-flight invocations now' }, 'Hard stop'),
@@ -601,6 +602,28 @@ function chat() {
   const thread = h('div.thread', { 'aria-live': 'polite' },
     h('div.thread-inner', sandboxNotice(v), items, empty && v.definition !== 'heartbeat' && suggestions(v)));
   return h('main.chat', head, thread, composer(v));
+}
+
+// ---- permission mode (policy plugin), per session ---------------------------------
+
+const MODES = [['auto', 'Auto: allow unless a rule denies/asks'], ['default', 'Default: edits allowed; network, destructive, publish ask'], ['ask', 'Ask: approve every change'], ['read-only', 'Read-only: no changes (plan mode)']];
+
+function modeControl(v) {
+  const cfg = state.config?.config;
+  const subs = cfg?.definitions?.[v.definition]?.subscribers || [];
+  if (!subs.some((s) => s.plugin === 'policy') || !cfg?.plugins?.policy) return null;
+  const pc = cfg.plugins.policy.config || {};
+  const current = pc.session_mode || pc.mode || 'default';
+  return h('label.mode', { title: 'Permission mode for this session: a session-scoped config apply, recorded in its log' }, 'Mode ',
+    h('select', { onchange: (e) => setMode(v.session_id, e.target.value) }, MODES.map(([m, label]) => h('option', { value: m, selected: m === current, title: label }, m))));
+}
+
+async function setMode(sid, mode) {
+  const cfg = structuredClone(state.config.config);
+  cfg.plugins.policy.config = { ...(cfg.plugins.policy.config || {}), session_mode: mode };
+  const r = await act(() => state.client.applyConfig(cfg, { kind: 'session', session_id: sid }));
+  if (r?.ok) toast(`${sid} now runs in ${mode} mode from its next event (this session only). The policy's runtime rules still apply; a mode can never loosen a deny.`);
+  else if (r) toast(`Rejected: ${(r.diagnostics || []).filter((d) => d.severity === 'error').map((d) => d.message).join('; ')}`, true);
 }
 
 // ---- the Linux sandbox (linux-sandbox plugin) -----------------------------------

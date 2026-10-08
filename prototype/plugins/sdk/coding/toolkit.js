@@ -852,6 +852,35 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
     return out;
   }
 
+  /**
+   * Skills: compact procedures in SKILL.md files (front matter `name`,
+   * `description`). Repository skills (.agentmod/skills/*) carry workspace
+   * authority; configured directories carry the authority they were given.
+   */
+  async function skills(extraDirs = []) {
+    const dirs = [{ dir: `${ROOT}/.agentmod/skills`, authority: 'workspace' }, ...extraDirs];
+    const script = dirs.map((d, i) => `[ -d ${shq(d.dir)} ] && for f in ${shq(d.dir)}/*/SKILL.md; do [ -f "$f" ] && { printf '\\n\\0SKILL ${i} %s\\n' "$f"; head -n 12 "$f"; }; done`).join('\n') + '\ntrue';
+    const r = await runner.run(script, { cwd: '/', timeoutMs: 30_000 });
+    const out = [];
+    for (const chunk of r.stdout.split('\n\0SKILL ').slice(1)) {
+      const nl = chunk.indexOf('\n');
+      const [i, ...p] = chunk.slice(0, nl).split(' ');
+      const head = chunk.slice(nl + 1);
+      const fm = head.match(/^---\n([\s\S]*?)\n---/);
+      const field = (k) => fm?.[1].match(new RegExp(`^${k}:\\s*(.+)$`, 'm'))?.[1].trim().replace(/^["']|["']$/g, '');
+      const path = p.join(' ');
+      const name = field('name') || path.split('/').slice(-2, -1)[0];
+      out.push({ name, description: (field('description') || '').slice(0, 300), path, authority: dirs[Number(i)].authority });
+    }
+    return out.slice(0, 50);
+  }
+
+  async function readSkill(path) {
+    const r = await runner.run(`head -c 20000 ${shq(path)}`, { cwd: '/', timeoutMs: 30_000 });
+    if (r.exitCode !== 0) throw new ToolError(`cannot read ${path}`);
+    return { text: r.stdout.replace(/^---\n[\s\S]*?\n---\n?/, ''), sha256: await sha256(r.stdout) };
+  }
+
   /** The repository's own policy file (workspace scope: it may only restrict). */
   async function workspacePolicy() {
     const r = await runner.run(`[ -f ${shq(`${ROOT}/${POLICY_FILE}`)} ] && head -c 65536 ${shq(`${ROOT}/${POLICY_FILE}`)}`, { cwd: '/', timeoutMs: 30_000 });
@@ -940,5 +969,5 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
     }
   }
 
-  return { specs, names, lifecycleNames, root: ROOT, stateDir: STATE, shadowGitDir: shadowGitDir || `${STATE}/shadow.git`, call, info, instructions, workspacePolicy, checkpoints: cps, processes: procs, checkpoint, adopt, redact, runner, mutex: (fn) => mutex(ROOT, fn) };
+  return { specs, names, lifecycleNames, root: ROOT, stateDir: STATE, shadowGitDir: shadowGitDir || `${STATE}/shadow.git`, call, info, instructions, workspacePolicy, skills, readSkill, checkpoints: cps, processes: procs, checkpoint, adopt, redact, runner, mutex: (fn) => mutex(ROOT, fn) };
 }

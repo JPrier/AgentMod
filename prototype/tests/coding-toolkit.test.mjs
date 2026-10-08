@@ -482,3 +482,16 @@ test('view_image attaches images and refuses non-images', async () => {
   r = await call('view_image', { path: 'x.txt' });
   assert.match(r.output, /not a PNG/);
 });
+
+test('skills are discovered from the repository and read on demand', async () => {
+  const { tk, write, root } = setup();
+  write('.agentmod/skills/release/SKILL.md', '---\nname: release\ndescription: How to cut a release of this project\n---\n1. bump version\n2. tag\n');
+  write('.agentmod/skills/no-front/SKILL.md', 'Just text\n');
+  fs.mkdirSync(path.join(root, 'userskills', 'style'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'userskills', 'style', 'SKILL.md'), '---\nname: style\ndescription: House style\n---\nUse tabs.\n');
+  const list = await tk.skills([{ dir: path.join(root, 'userskills'), authority: 'user' }]);
+  assert.deepEqual(list.map((s) => [s.name, s.authority]).sort(), [['no-front', 'workspace'], ['release', 'workspace'], ['style', 'user']]);
+  assert.equal(list.find((s) => s.name === 'release').description, 'How to cut a release of this project');
+  const r = await tk.readSkill(list.find((s) => s.name === 'release').path);
+  assert.equal(r.text, '1. bump version\n2. tag\n');
+});

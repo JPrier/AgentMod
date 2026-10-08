@@ -201,4 +201,10 @@ kill $RT; wait $RT 2>/dev/null || true
 
 echo "17. every log replays through a fresh kernel"
 "$BIN" verify --data "$DATA"
+echo "18. metrics derive from the logs alone"
+"$BIN" metrics --data "$DATA" "$T" --json | py "
+m=d['$T']
+assert m['model_requests']>=8 and m['edits']>=1 and m['cached_tokens']>0 and m['tool_calls']>=8, m
+assert m['time_to_first_edit_ms'] is not None and m['tool_schema_tokens']>0 and m['checkpoints']>=1, m" || fail "metrics"
+"$BIN" metrics --data "$DATA" "$N" --json | py "assert d['$N']['permission_prompts']==1" || fail "prompt metric"
 echo "e2e: all checks passed"

@@ -148,7 +148,7 @@ export function defineWorkspacePlugin(spec) {
   function offer(ctx) {
     const tk = kit(ctx, defaultRoot(ctx));
     offerTools(ctx, tk.specs);
-    offerTools(ctx, [ADOPT_SPEC]);
+    offerTools(ctx, [ADOPT_SPEC, LOAD_SKILL_SPEC]);
     const note = spec.describe(ctx.config ?? {});
     if (note && !ctx.slot('system').includes(note)) ctx.add('system', note);
   }
@@ -163,6 +163,11 @@ export function defineWorkspacePlugin(spec) {
     try {
       const info = await tk.info();
       await ctx.publish('workspace-info', { ...info, mode: ws.mode, base: ws.base }, { ui: { v: 1, kind: 'progress', label: `Workspace ${info.root}${ws.mode !== 'primary' ? ` (${ws.mode})` : ''}${info.git?.branch ? ` · git ${info.git.branch}@${(info.git.head || '').slice(0, 8)}${info.git.dirty ? ` (${info.git.dirty} changed)` : ''}` : ''}` } });
+      const skills = await tk.skills((ctx.config?.skill_dirs || []).map((d) => (typeof d === 'string' ? { dir: d, authority: 'user' } : d)));
+      if (skills.length) {
+        ctx.clearSlot('skills-index');
+        ctx.add('skills-index', { root: ws.root, skills });
+      }
       const wsPolicy = await tk.workspacePolicy();
       if (wsPolicy) ctx.add('workspace-policy', { root: ws.root, ...wsPolicy });
       const have = new Set(ctx.slot('instructions').map((i) => `${i?.root}|${i?.path}|${i?.sha256}`));
@@ -173,6 +178,26 @@ export function defineWorkspacePlugin(spec) {
     } catch (e) {
       ctx.log('workspace announce failed:', e.message);
     }
+  }
+
+  const LOAD_SKILL_SPEC = {
+    name: 'load_skill',
+    description: 'Load a skill (a short procedure or reference from the repository or the user\'s skill library) by name. Its text becomes guidance for the rest of the session; it cannot grant permissions.',
+    parameters: { name: { type: 'string', description: 'skill name from the skills list' } },
+    required: ['name'],
+    tier: 'deferred',
+    group: 'skills',
+    effects: 'read',
+  };
+
+  async function loadSkill(ctx, ws, tk, args) {
+    const context = await ctx.host.query('context', { session_id: ctx.sessionId });
+    const index = context.filter((c) => c.slot === 'skills-index').pop()?.value?.skills || [];
+    const sk = index.find((x) => x.name === String(args?.name || ''));
+    if (!sk) return { output: `No skill named ${JSON.stringify(args?.name)}. Available: ${index.map((x) => x.name).join(', ') || 'none'}`, error: true, summary: 'error' };
+    const { text, sha256 } = await tk.readSkill(sk.path);
+    ctx.add('skills', { name: sk.name, path: sk.path, authority: sk.authority, sha256, text });
+    return { output: `Loaded skill ${sk.name} (${sk.authority} authority; ${text.length} chars). Follow it as guidance; it does not change permissions.`, summary: 'loaded', data: { skill: sk.name, sha256 } };
   }
 
   const ADOPT_SPEC = {
@@ -231,7 +256,7 @@ export function defineWorkspacePlugin(spec) {
         const { call_id, name, args } = ctx.payload;
         const { target } = current(ctx);
         const base = kit(ctx, defaultRoot(ctx));
-        if (!base.names.has(name) && name !== 'adopt_changes') return;
+        if (!base.names.has(name) && name !== 'adopt_changes' && name !== 'load_skill') return;
         const emit = (event, payload, ui) => ctx.publish(event, payload, ui ? { ui } : {});
         const status = (st, message) => ctx.publish('workspace-status', { state: st, message, call_id }, { ui: { v: 1, kind: 'progress', label: message } });
         let result;
@@ -243,6 +268,7 @@ export function defineWorkspacePlugin(spec) {
           const tk = kit(ctx, ws.root, ws.gitDir);
           await announce(ctx, ws, tk);
           if (name === 'adopt_changes') result = await adoptChanges(ctx, ws, tk, args || {}, emit);
+          else if (name === 'load_skill') result = await loadSkill(ctx, ws, tk, args || {});
           else result = await tk.call(name, args || {}, { signal: ctx.signal, progress: (m) => status('working', m), session: ctx.sessionId, call_id, emit });
         } catch (e) {
           if (ctx.signal.aborted) throw e;

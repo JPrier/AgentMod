@@ -11,7 +11,10 @@ const http = await import('node:http');
 const fs = await import('node:fs');
 const path = await import('node:path');
 
-const cites = new Map(); // session_id -> latest invocation dispatched to us there
+// session_id -> the first invocation dispatched to us there. User actions cite
+// it, so each one starts a fresh causal chain (depth 1) instead of extending
+// the session's deepest chain.
+const cites = new Map();
 const clients = new Set();
 let plugin;
 
@@ -40,7 +43,7 @@ async function readBody(req) {
 async function citeFor(sessionId) {
   if (cites.has(sessionId)) return cites.get(sessionId);
   const view = await plugin.host.query('session', { session_id: sessionId });
-  const inv = view.events.flatMap((e) => e.invocations).filter((i) => i.plugin === plugin.instance).pop();
+  const inv = view.events.flatMap((e) => e.invocations).find((i) => i.plugin === plugin.instance);
   if (!inv) throw new Error(`web-ui has no standing invocation in ${sessionId}`);
   cites.set(sessionId, inv.invocation_id);
   return inv.invocation_id;
@@ -142,6 +145,6 @@ definePlugin({
     for (const c of clients) c.write(line);
   },
   handlers: {
-    '*': (ctx) => { cites.set(ctx.sessionId, ctx.invocationId); },
+    '*': (ctx) => { if (!cites.has(ctx.sessionId)) cites.set(ctx.sessionId, ctx.invocationId); },
   },
 });

@@ -5,8 +5,9 @@
 # subscribers run in this order). Plugin commands run from this directory.
 
 [runtime]
-max_causal_depth = 256         # runtime bound for cyclic graphs (agent loops; a coding
-                               # task's tool loop is ~4 events per round)
+max_causal_depth = 2048        # runtime bound for cyclic graphs (agent loops; a coding
+                               # task's tool loop is ~4 events per round, so ~500 rounds
+                               # per user message; budgets bound runaway agents sooner)
 spill_threshold_bytes = 16384  # larger payloads spill to content-addressed files
 max_attempts = 3               # orphan restarts before an invocation is failed
 
@@ -142,6 +143,28 @@ config = { root = ".agentmod/workspace" }
 command = ["node", "plugins/openrouter-model/main.js"]
 config = { model = "openai/gpt-4o-mini", api_key_env = "OPENROUTER_API_KEY", max_tokens = 4096, minimal = true }
 
+# --- external capabilities (deferred tools, found through tool_search) ------------
+# Network access: policy-gated (asks in default mode unless a rule allows the
+# domain), output untrusted, private addresses refused.
+[plugins.web-fetch]
+command = ["node", "plugins/web-fetch/main.js"]
+module = "plugins/web-fetch/main.js"
+config = { max_bytes = 40000, timeout_seconds = 20 }
+
+# MCP servers as tools (native). Add servers here, e.g.
+#   [plugins.mcp-bridge.config.servers.github]
+#   command = ["npx", "-y", "@modelcontextprotocol/server-github"]
+#   env = { GITHUB_PERSONAL_ACCESS_TOKEN = "…" }
+[plugins.mcp-bridge]
+command = ["node", "plugins/mcp-bridge/main.js"]
+timeout_ms = 600000
+config = { servers = {} }
+
+# Headless Chrome for validating web apps (native; needs Chrome or Chromium).
+[plugins.browser-control]
+command = ["node", "plugins/browser-control/main.js"]
+timeout_ms = 120000
+
 # --- triggers -------------------------------------------------------------------
 [plugins.heartbeat]
 command = ["node", "plugins/heartbeat/main.js"]
@@ -203,6 +226,9 @@ subscribers = [
   { plugin = "local-workspace" },
   { plugin = "subagent" },
   { plugin = "memory" },
+  { plugin = "web-fetch" },
+  { plugin = "mcp-bridge" },
+  { plugin = "browser-control" },
 ]
 
 # Benchmark baseline: model → shell → result → model, nothing else.

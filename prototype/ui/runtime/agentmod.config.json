@@ -1,6 +1,6 @@
 {
   "runtime": {
-    "max_causal_depth": 256,
+    "max_causal_depth": 2048,
     "spill_threshold_bytes": 16384,
     "max_attempts": 3
   },
@@ -24,6 +24,14 @@
       ],
       "module": "plugins/ask-user/main.js",
       "config": null
+    },
+    "browser-control": {
+      "command": [
+        "node",
+        "plugins/browser-control/main.js"
+      ],
+      "config": null,
+      "timeout_ms": 120000
     },
     "budget": {
       "command": [
@@ -73,6 +81,16 @@
         "root": ".agentmod/workspace"
       },
       "timeout_ms": 1900000
+    },
+    "mcp-bridge": {
+      "command": [
+        "node",
+        "plugins/mcp-bridge/main.js"
+      ],
+      "config": {
+        "servers": {}
+      },
+      "timeout_ms": 600000
     },
     "memory": {
       "command": [
@@ -216,6 +234,17 @@
       "module": "plugins/tool-discovery/main.js",
       "config": null
     },
+    "web-fetch": {
+      "command": [
+        "node",
+        "plugins/web-fetch/main.js"
+      ],
+      "module": "plugins/web-fetch/main.js",
+      "config": {
+        "max_bytes": 40000,
+        "timeout_seconds": 20
+      }
+    },
     "web-ui": {
       "command": [
         "node",
@@ -308,6 +337,15 @@
         },
         {
           "plugin": "memory"
+        },
+        {
+          "plugin": "web-fetch"
+        },
+        {
+          "plugin": "mcp-bridge"
+        },
+        {
+          "plugin": "browser-control"
         }
       ]
     },

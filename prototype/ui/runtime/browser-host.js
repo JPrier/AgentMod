@@ -319,8 +319,9 @@ export class BrowserRuntime {
   dispatch(fx) {
     const inv = fx.request.invocation_id;
     if (fx.plugin === PAGE) {
-      // The page frontend answers at once; its invocations are its citations.
-      this.cites.set(fx.request.event.session_id, inv);
+      // The page frontend answers at once; its first invocation in a session is
+      // the citation for user actions, so each starts a fresh causal chain.
+      if (!this.cites.has(fx.request.event.session_id)) this.cites.set(fx.request.event.session_id, inv);
       queueMicrotask(() => this.execute(J(this.kernel.complete(inv, '{}', Date.now()))?.effects));
       return;
     }
@@ -644,7 +645,12 @@ export class BrowserRuntime {
   // ------------------------------------------------------------------
 
   citeFor(sid) {
-    const c = this.cites.get(sid);
+    let c = this.cites.get(sid);
+    if (!c) {
+      // After a reload, find the page's first invocation in the stored log.
+      c = (this.records.get(sid) || []).find((r) => r.type === 'invocation-started' && r.plugin === PAGE)?.invocation_id;
+      if (c) this.cites.set(sid, c);
+    }
     if (!c) throw new Error(`the web frontend has no standing invocation in ${sid} yet`);
     return c;
   }

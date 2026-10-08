@@ -57,24 +57,24 @@ test('boots once, runs commands, and moves files both ways', async () => {
   assert.ok(idbs.some((n) => n.startsWith('agentmod-root-')));
   assert.ok(idbs.includes(`agentmod-workspace-${config.workspace}`));
 
-  let r = await tools.call('write_file', { path: 'hello.c', content: '#include <stdio.h>\nint main(void){puts("hi");return 0;}\n' });
+  let r = await tools.call('apply_patch', { changes: [{ action: 'create', path: 'hello.c', content: '#include <stdio.h>\nint main(void){puts("hi");return 0;}\n' }] });
   assert.equal(r.error, undefined, r.output);
   assert.ok(fs.readFileSync(path.join(ws, 'hello.c'), 'utf8').includes('puts("hi")'));
-  r = await tools.call('edit_file', { path: 'hello.c', old_text: '"hi"', new_text: '"it\'s $HOME ✓"' });
+  r = await tools.call('apply_patch', { changes: [{ action: 'update', path: 'hello.c', edits: [{ old_text: '"hi"', new_text: '"it\'s $HOME ✓"' }] }] });
   assert.equal(r.error, undefined, r.output);
   r = await tools.call('read_file', { path: 'hello.c' });
   assert.match(r.output, /it's \$HOME ✓/);
-  r = await tools.call('run', { command: 'printf out; printf err >&2; exit 4' });
-  assert.match(r.output, /^exit code 4\n--- stdout ---\nout\n--- stderr ---\nerr$/);
+  r = await tools.call('shell', { command: 'printf out; printf err >&2; exit 4' });
+  assert.match(r.output, /^exit 4 · [\d.]+s\n--- stdout ---\nout\n--- stderr ---\nerr$/);
   // Output from an earlier command never leaks into a later one.
-  r = await tools.call('run', { command: 'true' });
-  assert.equal(r.output, 'exit code 0\n(no output)');
-  r = await tools.call('run', { command: 'pwd', cwd: path.join(ws, 'nope') });
+  r = await tools.call('shell', { command: 'true' });
+  assert.match(r.output, /^exit 0 · [\d.]+s\n\(no output\)$/);
+  r = await tools.call('shell', { command: 'pwd', cwd: path.join(ws, 'nope') });
   assert.equal(r.error, true);
-  assert.match(r.output, /exit code 126/);
-  r = await tools.call('run', { command: 'sleep 4', timeout_seconds: 1 });
+  assert.match(r.output, /exit 126/);
+  r = await tools.call('shell', { command: 'sleep 4', timeout_seconds: 1 });
   assert.match(r.output, /timed out after 1s/);
-  r = await tools.call('list_files', {});
+  r = await tools.call('list_dir', {});
   assert.match(r.output, /hello\.c/);
   r = await tools.call('read_file', { path: 'missing' });
   assert.match(r.output, /does not exist/);
@@ -87,16 +87,19 @@ test('boots once, runs commands, and moves files both ways', async () => {
     { path: `${ws}/proj/a.txt`, bytes: new TextEncoder().encode('A\n') },
     { path: `${ws}/proj/bin/run.sh`, bytes: new TextEncoder().encode('#!/bin/sh\necho ran\n'), executable: true },
   ]);
-  r = await tools.call('run', { command: './bin/run.sh && cat a.txt', cwd: 'proj' });
-  assert.equal(r.output, 'exit code 0\n--- stdout ---\nran\nA\n');
+  r = await tools.call('shell', { command: './bin/run.sh && cat a.txt', cwd: 'proj' });
+  assert.match(r.output, /^exit 0 · [\d.]+s\n--- stdout ---\nran\nA\n$/);
+  // Search works inside the VM too (grep/find fallbacks when ripgrep is absent).
+  r = await tools.call('search_text', { query: 'HOME' });
+  assert.match(r.output, /hello\.c\n {2}2:/);
   // Concurrent calls are serialized, not interleaved.
-  const outs = await Promise.all([1, 2, 3, 4].map((i) => tools.call('run', { command: `echo start ${i}; sleep 0.2; echo end ${i}` })));
-  outs.forEach((o, i) => assert.equal(o.output, `exit code 0\n--- stdout ---\nstart ${i + 1}\nend ${i + 1}\n`));
+  const outs = await Promise.all([1, 2, 3, 4].map((i) => tools.call('shell', { command: `echo start ${i}; sleep 0.2; echo end ${i}` })));
+  outs.forEach((o, i) => assert.match(o.output, new RegExp(`--- stdout ---\\nstart ${i + 1}\\nend ${i + 1}\\n$`)));
   // A cancelled call returns at once.
   const ac = new AbortController();
   setTimeout(() => ac.abort(), 200);
   const t0 = Date.now();
-  await assert.rejects(tools.call('run', { command: 'sleep 3' }, { signal: ac.signal }), /cancelled/);
+  await assert.rejects(tools.call('shell', { command: 'sleep 3' }, { signal: ac.signal }), /cancelled/);
   assert.ok(Date.now() - t0 < 1500);
   await devices.dispose();
   assert.equal(fake.Linux.last.deleted, true);
@@ -120,14 +123,14 @@ test('the agent can inspect, restart, and stop a crashed VM', async () => {
   assert.match(r.output, /0 of 0 entries/);
 
   await ready();
-  r = await tools.call('write_file', { path: 'keep.txt', content: 'survives\n' });
+  r = await tools.call('apply_patch', { changes: [{ action: 'create', path: 'keep.txt', content: 'survives\n' }] });
   assert.equal(r.error, undefined, r.output);
   r = await tools.call('sandbox_status', {});
   assert.match(r.output, /^state: running/);
   assert.match(r.output, /operations: \d+/);
 
   // The VM dies mid-command: the call fails after timeout + grace, and so do later ones.
-  r = await tools.call('run', { command: 'echo FAKE_CRASH', timeout_seconds: 1 });
+  r = await tools.call('shell', { command: 'echo FAKE_CRASH', timeout_seconds: 1 });
   assert.equal(r.error, true);
   assert.match(r.output, /stopped responding during operation #\d+/);
   assert.match(r.output, /sandbox_restart/);
@@ -162,7 +165,37 @@ test('the agent can inspect, restart, and stop a crashed VM', async () => {
   const statuses = [];
   await target.ensureReady({ status: (s) => statuses.push(s) });
   assert.deepEqual(statuses, ['booting', 'ready']);
-  r = await tools.call('run', { command: 'cat keep.txt' });
+  r = await tools.call('shell', { command: 'cat keep.txt' });
   assert.match(r.output, /survives/);
+  await devices.dispose();
+});
+
+test('persistent processes and checkpoints work through the VM device', async () => {
+  globalThis.crossOriginIsolated = true;
+  globalThis.indexedDB ??= {};
+  const config = fakeVmConfig();
+  const ws = config.workspace_path;
+  const devices = await hostDevices();
+  const target = linuxVmTarget({ host: jsonHost(devices), config });
+  const tools = workspaceTools({ target, root: ws, importRepos: false });
+  await target.ensureReady({ status: () => {} });
+  const ctx = (call_id) => ({ session: 's1', call_id });
+  let r = await tools.call('process', { action: 'start', command: 'echo first; sleep 1; echo ready-now; sleep 30' }, ctx('p1'));
+  assert.ok(!r.error, r.output);
+  const id = r.data.process_id;
+  // The VM's operation finished (start returned) while the process keeps running.
+  r = await tools.call('process', { action: 'wait', id, until: 'ready-now', timeout_seconds: 10 }, ctx('p2'));
+  assert.ok(r.data.matched, r.output);
+  r = await tools.call('shell', { command: 'echo concurrent works' }, ctx('p3'));
+  assert.match(r.output, /concurrent works/);
+  r = await tools.call('process', { action: 'kill', id }, ctx('p4'));
+  assert.match(r.output, /Stopped/);
+  // Checkpoint + restore inside the VM.
+  r = await tools.call('apply_patch', { changes: [{ action: 'create', path: 'v.txt', content: 'one\n' }] }, ctx('p5'));
+  r = await tools.call('apply_patch', { changes: [{ action: 'update', path: 'v.txt', content: 'two\n' }] }, ctx('p6'));
+  const cp = r.data.checkpoint;
+  r = await tools.call('checkpoints', { action: 'restore', checkpoint: cp }, ctx('p7'));
+  assert.ok(!r.error, r.output);
+  assert.equal(fs.readFileSync(path.join(ws, 'v.txt'), 'utf8'), 'one\n');
   await devices.dispose();
 });

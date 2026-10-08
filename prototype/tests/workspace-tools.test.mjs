@@ -1,22 +1,15 @@
-// Unit tests for the shared coding-tool layer, the local execution target,
-// and the tar writer the browser sandbox's VM device uses. Run: node --test tests/*.test.mjs
+// Unit tests for shared text/path helpers, repository import, and the tar writer the browser sandbox's VM device uses. Run: node --test tests/*.test.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { normalizePath, resolveIn, unifiedDiff, truncate, workspaceTools, parseRepo } from '../plugins/sdk/workspace-tools.js';
+import { normalizePath, resolveIn, unifiedDiff, truncate, workspaceTools } from '../plugins/sdk/workspace-tools.js';
 import { localTarget } from '../plugins/local-workspace/target.js';
 import { makeTar } from '../ui/runtime/devices/tar.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'agentmod-ws-'));
-
-function setup(extra = {}) {
-  const root = tmp();
-  const target = localTarget({ root });
-  return { root, target, tools: workspaceTools({ target, root, ...extra }) };
-}
 
 test('paths are confined to the workspace', () => {
   assert.equal(normalizePath('/a//b/./c/../d'), '/a/b/d');
@@ -63,69 +56,6 @@ test('long output keeps head and tail', () => {
   assert.match(t, /bytes omitted/);
 });
 
-test('write, read, edit, list', async () => {
-  const { root, tools } = setup({ importRepos: false });
-  assert.deepEqual(tools.specs.map((s) => s.name), ['run', 'read_file', 'write_file', 'edit_file', 'list_files']);
-  let r = await tools.call('write_file', { path: 'src/hello.c', content: '#include <stdio.h>\nint main(void){puts("hi");return 0;}\n' });
-  assert.equal(r.error, undefined, r.output);
-  assert.match(r.output, /^Created /);
-  assert.match(r.diff.unified, /\+int main/);
-  r = await tools.call('read_file', { path: `${root}/src/hello.c` });
-  assert.match(r.output, /lines 1-2 of 2/);
-  assert.match(r.output, /puts\("hi"\)/);
-  r = await tools.call('edit_file', { path: 'src/hello.c', old_text: 'puts("hi")', new_text: 'puts("hello")' });
-  assert.equal(r.error, undefined, r.output);
-  assert.match(r.diff.unified, /-int main\(void\)\{puts\("hi"\)/);
-  assert.match(fs.readFileSync(path.join(root, 'src/hello.c'), 'utf8'), /hello/);
-  r = await tools.call('edit_file', { path: 'src/hello.c', old_text: 'nope', new_text: 'x' });
-  assert.equal(r.error, true);
-  assert.match(r.output, /not found/);
-  await tools.call('write_file', { path: 'dup.txt', content: 'a\na\n' });
-  r = await tools.call('edit_file', { path: 'dup.txt', old_text: 'a', new_text: 'b' });
-  assert.match(r.output, /matches 2 places/);
-  r = await tools.call('edit_file', { path: 'dup.txt', old_text: 'a', new_text: 'b$&', replace_all: true });
-  assert.equal(fs.readFileSync(path.join(root, 'dup.txt'), 'utf8'), 'b$&\nb$&\n');
-  fs.mkdirSync(path.join(root, '.git'));
-  fs.writeFileSync(path.join(root, '.git', 'HEAD'), 'x');
-  r = await tools.call('list_files', {});
-  assert.equal(r.error, undefined, r.output);
-  assert.match(r.output, /^src\/$/m);
-  assert.match(r.output, /^src\/hello\.c$/m);
-  assert.doesNotMatch(r.output, /\.git/);
-  r = await tools.call('read_file', { path: '../outside' });
-  assert.equal(r.error, true);
-  r = await tools.call('read_file', { path: 'missing.txt' });
-  assert.match(r.output, /does not exist/);
-});
-
-test('run: exit codes, stderr, cwd, timeout', async () => {
-  const { tools } = setup();
-  let r = await tools.call('run', { command: 'echo hello; echo oops >&2; exit 3' });
-  assert.equal(r.error, true);
-  assert.match(r.output, /^exit code 3/);
-  assert.match(r.output, /--- stdout ---\nhello/);
-  assert.match(r.output, /--- stderr ---\noops/);
-  await tools.call('write_file', { path: 'sub/x.txt', content: 'x' });
-  r = await tools.call('run', { command: 'ls', cwd: 'sub' });
-  assert.equal(r.error, false);
-  assert.match(r.output, /x\.txt/);
-  r = await tools.call('run', { command: 'ls', cwd: '/' });
-  assert.equal(r.error, true);
-  assert.match(r.output, /outside the workspace/);
-  r = await tools.call('run', { command: 'sleep 5', timeout_seconds: 1 });
-  assert.equal(r.error, true);
-  assert.match(r.output, /timed out after 1s/);
-});
-
-test('run is cancellable', async () => {
-  const { tools } = setup();
-  const ac = new AbortController();
-  setTimeout(() => ac.abort(), 200);
-  const t0 = Date.now();
-  await assert.rejects(tools.call('run', { command: 'sleep 10' }, { signal: ac.signal }));
-  assert.ok(Date.now() - t0 < 3000);
-});
-
 test('import_repo copies a GitHub tree and commits it', async () => {
   const files = { 'README.md': '# demo\n', 'src/main.c': 'int main(){return 0;}\n', 'run.sh': '#!/bin/sh\necho ok\n' };
   const calls = [];
@@ -152,14 +82,14 @@ test('import_repo copies a GitHub tree and commits it', async () => {
   const tools = workspaceTools({ target: localTarget({ root }), root, fetch: fakeFetch });
   const r = await tools.call('import_repo', { repo: 'https://github.com/octo/demo.git' });
   assert.equal(r.error, undefined, r.output);
-  assert.match(r.output, /Imported octo\/demo at c0ffee123456 \(main\) into .*\/demo: 3 files/);
+  assert.match(r.output, /Imported octo\/demo at c0ffee123456 \(main\) into demo: 3 files/);
   assert.match(r.output, /Skipped 1: vendor\/lib \(submodule\)/);
   assert.equal(fs.readFileSync(path.join(root, 'demo/src/main.c'), 'utf8'), files['src/main.c']);
   assert.ok(fs.statSync(path.join(root, 'demo/run.sh')).mode & 0o100);
   assert.match(execFileSync('git', ['log', '--oneline'], { cwd: path.join(root, 'demo') }).toString(), /Import octo\/demo@c0ffee/);
   const again = await tools.call('import_repo', { repo: 'octo/demo' });
   assert.match(again.output, /already exists/);
-  assert.throws(() => parseRepo('not a repo'), /owner\/name/);
+  assert.match((await tools.call('import_repo', { repo: 'not a repo' })).output, /owner\/name/);
 });
 
 test('tar archives extract with tar(1), including long paths and modes', () => {

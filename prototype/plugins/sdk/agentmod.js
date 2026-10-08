@@ -270,9 +270,22 @@ class Plugin {
   }
 }
 
-/** Standard tool description contributed to the `tools` context slot. */
-export function toolSpec(name, description, parameters = {}) {
-  return { name, description, parameters };
+/**
+ * Standard tool description contributed to the `tools` context slot.
+ *
+ * `opts.tier` is `core` (sent to the model every turn) or `deferred` (found
+ * through tool_search; see sdk/projection.js). `group` names a capability
+ * family for discovery and policy, `effects` is read | write | varies, and
+ * `required` lists required parameters.
+ */
+export function toolSpec(name, description, parameters = {}, opts = {}) {
+  const spec = { name, description, parameters };
+  if (opts.required?.length) spec.required = opts.required;
+  if (opts.tier) spec.tier = opts.tier;
+  if (opts.group) spec.group = opts.group;
+  if (opts.effects) spec.effects = opts.effects;
+  if (opts.trust) spec.trust = opts.trust;
+  return spec;
 }
 
 /**

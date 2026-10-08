@@ -17,6 +17,25 @@
         ]
       }
     },
+    "ask-user": {
+      "command": [
+        "node",
+        "plugins/ask-user/main.js"
+      ],
+      "module": "plugins/ask-user/main.js",
+      "config": null
+    },
+    "budget": {
+      "command": [
+        "node",
+        "plugins/budget/main.js"
+      ],
+      "module": "plugins/budget/main.js",
+      "config": {
+        "max_model_requests": 40,
+        "max_wall_seconds": 1800
+      }
+    },
     "chat-context": {
       "command": [
         "node",
@@ -53,7 +72,7 @@
       "config": {
         "root": ".agentmod/workspace"
       },
-      "timeout_ms": 1200000
+      "timeout_ms": 1900000
     },
     "memory": {
       "command": [
@@ -62,6 +81,16 @@
       ],
       "module": "plugins/memory/main.js",
       "config": null
+    },
+    "minimal-shell": {
+      "command": [
+        "node",
+        "plugins/minimal-shell/main.js"
+      ],
+      "config": {
+        "root": ".agentmod/workspace"
+      },
+      "timeout_ms": 1900000
     },
     "openai-model": {
       "command": [
@@ -75,6 +104,18 @@
         "model": "gpt-4o-mini"
       }
     },
+    "openrouter-minimal": {
+      "command": [
+        "node",
+        "plugins/openrouter-model/main.js"
+      ],
+      "config": {
+        "api_key_env": "OPENROUTER_API_KEY",
+        "max_tokens": 4096,
+        "minimal": true,
+        "model": "openai/gpt-4o-mini"
+      }
+    },
     "openrouter-model": {
       "command": [
         "node",
@@ -85,6 +126,27 @@
         "api_key_env": "OPENROUTER_API_KEY",
         "max_tokens": 4096,
         "model": "openai/gpt-4o-mini"
+      }
+    },
+    "plan": {
+      "command": [
+        "node",
+        "plugins/plan/main.js"
+      ],
+      "module": "plugins/plan/main.js",
+      "config": null
+    },
+    "policy": {
+      "command": [
+        "node",
+        "plugins/policy/main.js"
+      ],
+      "module": "plugins/policy/main.js",
+      "config": {
+        "approvers": [
+          "web-ui"
+        ],
+        "mode": "default"
       }
     },
     "py-wordcount": {
@@ -108,7 +170,11 @@
         "plugins/subagent/main.js"
       ],
       "module": "plugins/subagent/main.js",
-      "config": null
+      "config": {
+        "definition": "worker",
+        "max_children": 8,
+        "max_steps": 30
+      }
     },
     "subagent-reporter": {
       "command": [
@@ -140,6 +206,14 @@
         "plugins/tool-clock/main.js"
       ],
       "module": "plugins/tool-clock/main.js",
+      "config": null
+    },
+    "tool-discovery": {
+      "command": [
+        "node",
+        "plugins/tool-discovery/main.js"
+      ],
+      "module": "plugins/tool-discovery/main.js",
       "config": null
     },
     "web-ui": {
@@ -194,7 +268,7 @@
       ]
     },
     "coder": {
-      "description": "Coding agent: writes, builds, and runs code in a Linux sandbox inside your browser",
+      "description": "Coding agent: plans, searches, edits with patches, runs builds/tests/servers, delegates, and can be rewound",
       "subscribers": [
         {
           "plugin": "web-ui"
@@ -203,7 +277,10 @@
           "plugin": "redactor"
         },
         {
-          "plugin": "approval-gate"
+          "plugin": "ask-user"
+        },
+        {
+          "plugin": "policy"
         },
         {
           "plugin": "chat-context"
@@ -215,7 +292,22 @@
           "plugin": "titler"
         },
         {
+          "plugin": "plan"
+        },
+        {
+          "plugin": "tool-discovery"
+        },
+        {
           "plugin": "linux-sandbox"
+        },
+        {
+          "plugin": "local-workspace"
+        },
+        {
+          "plugin": "subagent"
+        },
+        {
+          "plugin": "memory"
         }
       ]
     },
@@ -230,8 +322,8 @@
         }
       ]
     },
-    "worker": {
-      "description": "Sub-agent session started by `delegate`; reports back to its parent",
+    "minimal": {
+      "description": "Baseline loop for benchmarks: a provider, the chat loop, and one shell tool",
       "subscribers": [
         {
           "plugin": "web-ui"
@@ -240,7 +332,42 @@
           "plugin": "chat-context"
         },
         {
+          "plugin": "openrouter-minimal"
+        },
+        {
+          "plugin": "minimal-shell"
+        }
+      ]
+    },
+    "worker": {
+      "description": "Child agent started by `delegate`: scoped tools, budget, isolated workspace; reports back to its parent",
+      "subscribers": [
+        {
+          "plugin": "web-ui"
+        },
+        {
+          "plugin": "policy"
+        },
+        {
+          "plugin": "budget"
+        },
+        {
+          "plugin": "chat-context"
+        },
+        {
           "plugin": "openrouter-model"
+        },
+        {
+          "plugin": "plan"
+        },
+        {
+          "plugin": "tool-discovery"
+        },
+        {
+          "plugin": "linux-sandbox"
+        },
+        {
+          "plugin": "local-workspace"
         },
         {
           "plugin": "tool-clock"

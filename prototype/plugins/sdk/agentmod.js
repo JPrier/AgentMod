@@ -172,7 +172,10 @@ class Plugin {
             try {
               await this.spec.validate(this.config, { env: this.transport.env });
             } catch (e) {
-              this.send({ id, error: { code: -32010, message: e.message, ...(e.data ? { data: e.data } : {}) } });
+              // The refusal carries what a frontend needs to help: the settings
+              // and services the plugin declares (services stay callable).
+              const m = this.spec.manifest;
+              this.send({ id, error: { code: -32010, message: e.message, data: { ...(e.data || {}), description: m.description, settings: m.settings || [], services: m.services || [] } } });
               return;
             }
           }

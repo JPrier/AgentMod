@@ -140,7 +140,6 @@ config = { root = ".agentmod/workspace" }
 # tools every turn, no projection-side compaction) for the baseline.
 [plugins.openrouter-minimal]
 command = ["node", "plugins/openrouter-model/main.js"]
-module = "plugins/openrouter-model/main.js"
 config = { model = "openai/gpt-4o-mini", api_key_env = "OPENROUTER_API_KEY", max_tokens = 4096, minimal = true }
 
 # --- triggers -------------------------------------------------------------------

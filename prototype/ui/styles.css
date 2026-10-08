@@ -322,3 +322,30 @@ table.matrix tbody th { text-align: left; font-family: var(--mono); font-weight:
 .model-field { display: grid; gap: 4px; }
 .model-status { margin: 0; font-size: 12px; color: var(--muted); }
 .gate-card label.inline-check, .provider-panel label.inline-check { display: flex; flex-direction: row; gap: 6px; align-items: center; font-size: 12.5px; cursor: pointer; }
+
+/* --- coding harness hints ------------------------------------------------- */
+.msg.user .branch { float: right; font-size: 11px; opacity: 0; margin-left: 8px; }
+.msg.user:hover .branch, .msg.user:focus-within .branch { opacity: 0.8; }
+.plan { border: 1px solid var(--line, #ddd); border-radius: 8px; padding: 8px 12px; margin: 6px 0; font-size: 13px; }
+.plan ul, .plan-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.plan li { padding: 1px 0; }
+.plan li .mark { display: inline-block; width: 1.4em; }
+.plan li.completed, .plan-list li.completed { opacity: 0.6; text-decoration: line-through; }
+.plan li.in_progress, .plan-list li.in_progress { font-weight: 600; }
+.plan li.blocked, .plan-list li.blocked { color: var(--bad, #b42318); }
+.checkpoint { display: flex; gap: 10px; align-items: baseline; font-size: 12px; opacity: 0.85; margin: 2px 0; flex-wrap: wrap; }
+.checkpoint .cp { font-family: ui-monospace, monospace; }
+.checkpoint .why { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.diagnostics { font-size: 12px; border-left: 3px solid var(--warn, #b54708); padding: 4px 10px; margin: 6px 0; }
+.diagnostics ul { margin: 2px 0 0; padding-left: 16px; font-family: ui-monospace, monospace; }
+.diagnostics li.error { color: var(--bad, #b42318); }
+.choice form.free { display: flex; gap: 6px; margin-top: 6px; }
+.choice form.free input { flex: 1; }
+.harness section { margin-bottom: 14px; }
+.harness h4 { margin: 0 0 6px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.7; }
+.harness .kv { display: flex; gap: 10px; font-size: 12px; padding: 2px 0; }
+.harness .kv .k { flex: 0 0 38%; opacity: 0.75; overflow-wrap: anywhere; }
+.harness .kv .v { flex: 1; overflow-wrap: anywhere; }
+.harness ul { margin: 0; padding-left: 16px; font-size: 12px; }
+.gate-card fieldset { border: 1px solid var(--line, #ddd); border-radius: 8px; margin: 10px 0; padding: 8px 12px; }
+.gate-card legend { font-weight: 600; padding: 0 4px; }

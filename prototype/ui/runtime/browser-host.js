@@ -9,6 +9,7 @@
 import init, { WasmKernel, compile, project, context_at } from '../pkg/agentmod_wasm.js';
 import { WEB_UI_MANIFEST } from '../plugins/web-ui/manifest.js';
 import { Devices } from './devices.js';
+import { openStore } from './persist.js';
 
 const PROTOCOL = 'agentmod/0.1';
 const CANCEL_GRACE_MS = 3000;
@@ -19,6 +20,13 @@ const J = (s) => {
   if (v && typeof v === 'object' && !Array.isArray(v) && typeof v.error === 'string' && Object.keys(v).length === 1) throw new Error(v.error);
   return v;
 };
+
+/** Relative imports of a module's source (static `from '…'` and `import('…')`). */
+function relativeImports(src) {
+  const out = [];
+  for (const m of src.matchAll(/(?:from\s+|import\s*\(\s*|import\s+)['"](\.{1,2}\/[^'"]+)['"]/g)) out.push(m[1]);
+  return out;
+}
 
 async function sha256(text) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
@@ -81,8 +89,9 @@ class WorkerProc {
     for (const r of this.readyWaiters.splice(0)) r(this);
   }
 
-  fail() {
+  fail(refusal) {
     this.failed = true;
+    if (refusal) this.refusal = refusal;
     for (const r of this.readyWaiters.splice(0)) r(this);
   }
 
@@ -95,8 +104,20 @@ class WorkerProc {
   }
 }
 
+/** Remove secret values from a compilation (declared secret settings, api_key, secrets.*.value). */
+export function redactConfig(c) {
+  const secretKeys = new Set(['api_key']);
+  for (const m of Object.values(c.manifests || {})) for (const s of m.settings || []) if (s.secret) secretKeys.add(s.key);
+  for (const p of Object.values(c.config?.plugins || {})) {
+    if (!p.config) continue;
+    for (const k of Object.keys(p.config)) if (secretKeys.has(k)) p.config[k] = '(omitted)';
+    for (const s of Object.values(p.config.secrets || {})) if (s && typeof s === 'object' && 'value' in s) s.value = '(omitted)';
+  }
+  return c;
+}
+
 export class BrowserRuntime {
-  constructor({ base = new URL('./', location.href), log = console.log } = {}) {
+  constructor({ base = new URL('./', location.href), log = console.log, persistence = true, store = null } = {}) {
     this.base = base;
     this.log = log;
     this.procs = new Set();
@@ -111,6 +132,8 @@ export class BrowserRuntime {
     // Page-only resources lent to plugins that declare them (see devices.js).
     // They outlive plugin workers, so a restarted plugin finds its VM running.
     this.devices = new Devices();
+    this.persistence = persistence;
+    this.store = store;
   }
 
   // ------------------------------------------------------------------
@@ -127,13 +150,55 @@ export class BrowserRuntime {
     this.maxAttempts = cfg.runtime?.max_attempts ?? 3;
     await Promise.all(Object.entries(cfg.plugins).filter(([, p]) => !p.disabled && p.module).map(([n, p]) => this.ensureProcByConfig(n, p).whenReady()));
     const comp = J(compile(JSON.stringify(cfg), JSON.stringify(this.manifestsFor(cfg))));
-    if (!comp.ok) throw new Error(`config rejected: ${comp.diagnostics.filter((d) => d.severity === 'error').map((d) => d.message).join('; ')}`);
+    if (!comp.ok) {
+      const refusals = [...this.procs].filter((p) => p.failed && p.refusal).map((p) => p.refusal);
+      throw Object.assign(new Error(`config rejected: ${comp.diagnostics.filter((d) => d.severity === 'error').map((d) => d.message).join('; ')}`), { refusals, diagnostics: comp.diagnostics });
+    }
+    // Durable history: install every stored compilation (sessions reference
+    // them), then the new one, then replay every stored session.
+    if (this.persistence !== false) this.store ??= await openStore();
+    this.compilations = new Map();
+    let stored = { compilations: [], sessions: new Map() };
+    if (this.store) {
+      stored = await this.store.loadAll();
+      for (const c of stored.compilations) {
+        if (!c.ok) continue;
+        J(this.kernel.install(JSON.stringify(c)));
+        this.compilations.set(c.hash, c);
+      }
+      await this.store.putCompilation(comp);
+    }
     const { hash } = J(this.kernel.install(JSON.stringify(comp)));
     J(this.kernel.set_active(hash));
-    this.compilations = new Map([[hash, comp]]);
-    this.journal.push({ at: Date.now(), kind: 'config-loaded', detail: { hash } });
+    this.compilations.set(hash, comp);
+    this.journal.push({ at: Date.now(), kind: 'config-loaded', detail: { hash, durable: !!this.store, persisted: this.store?.persisted ?? null } });
+    const recovered = [];
+    for (const [sid, recs] of [...stored.sessions].sort(([a], [b]) => a.localeCompare(b))) {
+      try {
+        J(this.kernel.load_session(JSON.stringify(recs)));
+        this.records.set(sid, recs);
+      } catch (e) {
+        this.journal.push({ at: Date.now(), kind: 'session-unrecoverable', detail: { session_id: sid, error: e.message } });
+      }
+    }
     this.tick = setInterval(() => this.onTick(), 250);
+    for (const sid of this.records.keys()) {
+      const orphans = J(this.kernel.status(sid))?.open_invocations?.length || 0;
+      if (orphans) recovered.push({ session_id: sid, orphans });
+      this.execute(J(this.kernel.recover(sid, this.maxAttempts, Date.now())).effects);
+    }
+    if (stored.sessions.size) this.journal.push({ at: Date.now(), kind: 'sessions-restored', detail: { sessions: stored.sessions.size, recovered } });
     return comp;
+  }
+
+  /** Is history durable in this browser? (false: memory only) */
+  get durable() {
+    return !!this.store;
+  }
+
+  /** Delete every stored session and compilation (this browser only). */
+  async clearStored() {
+    await this.store?.clear();
   }
 
   /** Stamp code hashes; disable plugins this host cannot run (no `module`). */
@@ -150,8 +215,18 @@ export class BrowserRuntime {
           p.disabled = true;
           return;
         }
-        const src = await (await fetch(new URL(p.module, this.base))).text();
-        p.binary_hash = await sha256(p.module + src);
+        // The stamp covers the module and everything it imports (shared SDK
+        // modules included), so any code change is a new plugin identity.
+        const seen = new Map();
+        const visit = async (url) => {
+          if (seen.has(url.href)) return;
+          seen.set(url.href, '');
+          const src = await (await fetch(url)).text();
+          seen.set(url.href, src);
+          for (const spec of relativeImports(src)) await visit(new URL(spec, url));
+        };
+        await visit(new URL(p.module, this.base));
+        p.binary_hash = await sha256([...seen.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([u, src]) => `${u.replace(this.base.href, '')}\n${src}`).join('\n'));
       }),
     );
     return cfg;
@@ -217,11 +292,28 @@ export class BrowserRuntime {
       this.records.get(r.session_id).push(r);
       appended.push(r);
     }
-    for (const fx of effects) {
-      if (fx.type === 'invoke') this.dispatch(fx);
-      else if (fx.type === 'cancel') this.cancel(fx);
-    }
-    for (const r of appended) for (const l of this.listeners) l(r);
+    const act = () => {
+      for (const fx of effects) {
+        if (fx.type === 'invoke') this.dispatch(fx);
+        else if (fx.type === 'cancel') this.cancel(fx);
+      }
+      for (const r of appended) for (const l of this.listeners) l(r);
+    };
+    if (!this.store) return act();
+    // Write-ahead: records are durable before anything they describe happens.
+    // Batches stay in order behind one promise chain.
+    this.durableTail = (this.durableTail || Promise.resolve())
+      .then(() => this.store.appendRecords(appended))
+      .then(act, (e) => {
+        this.persistError = e;
+        this.log(`FATAL: could not persist records (${e?.message || e}); dispatch stopped`);
+        this.journal.push({ at: Date.now(), kind: 'persist-failed', detail: { error: String(e?.message || e) } });
+      });
+  }
+
+  /** Resolves once every record produced so far is durable and dispatched. */
+  flushed() {
+    return this.durableTail || Promise.resolve();
   }
 
   dispatch(fx) {
@@ -261,9 +353,14 @@ export class BrowserRuntime {
       if (p.kind === 'initialize') {
         if (msg.result?.manifest) proc.markReady(msg.result.manifest);
         else {
-          this.log(`plugin ${proc.name} failed its handshake`);
-          proc.fail();
+          // A refusal (e.g. a missing credential) keeps the worker alive so its
+          // read-only services (a model catalog) can still help the user fix it.
+          this.log(`plugin ${proc.name} refused to start: ${msg.error?.message || 'invalid handshake'}`);
+          proc.fail({ plugin: proc.name, message: msg.error?.message || 'invalid handshake', ...(msg.error?.data || {}) });
         }
+      } else if (p.kind === 'service') {
+        if (msg.error) p.reject(Object.assign(new Error(msg.error.message), { code: msg.error.code }));
+        else p.resolve(msg.result);
       } else if (p.kind === 'invoke') {
         proc.invocations.delete(p.inv);
         this.cancelDeadlines.delete(p.inv);
@@ -307,6 +404,11 @@ export class BrowserRuntime {
         });
       case 'device':
         return answer(() => this.devices.call(proc.name, proc.manifest, params));
+      case 'call_service':
+        return answer(() => {
+          if (!proc.has('control')) throw Object.assign(new Error(`\`${proc.name}\` lacks the control capability`), { code: -32003 });
+          return this.callService(params.plugin, params.service, params.args);
+        });
       case 'log':
         this.log(`[${proc.name}] ${params.message}`);
         return undefined;
@@ -425,7 +527,13 @@ export class BrowserRuntime {
       case 'graph':
         return J(this.kernel.active());
       case 'config':
-        return { hash: this.kernel.active_hash(), config: J(this.kernel.active())?.config, installed: [...this.compilations.keys()], host: 'browser' };
+        return { hash: this.kernel.active_hash(), config: J(this.kernel.active())?.config, installed: [...this.compilations.keys()], host: 'browser', durable: this.durable };
+      case 'services': {
+        const comp = J(this.kernel.active());
+        return Object.entries(comp?.manifests || {})
+          .filter(([, m]) => m.services?.length || m.settings?.length || m.provides?.length)
+          .map(([plugin, m]) => ({ plugin, description: m.description, services: m.services || [], settings: m.settings || [], provides: m.provides || [], version: m.version }));
+      }
       default:
         throw new Error(`unknown query ${what}`);
     }
@@ -441,6 +549,28 @@ export class BrowserRuntime {
     const status = J(this.kernel.status(sid));
     const parent = created.cause?.kind === 'invocation' ? created.cause.invocation_id.split('/')[0] : null;
     return { session_id: sid, definition: created.definition, title, created_at: created.at, updated_at: r[r.length - 1].at, last_sequence: r.length, parent, loaded: !!status, activity: status?.activity ?? 'idle' };
+  }
+
+  /**
+   * Call a plugin's read-only service (e.g. a provider's model catalog). Also
+   * works on a plugin that refused its handshake, so a frontend can help the
+   * user supply what it needs. Not recorded: services change no state.
+   */
+  callService(plugin, service, args = {}) {
+    const procs = [...this.procs].filter((p) => p.name === plugin && !p.draining);
+    const proc = procs.find((p) => p.ready) || procs.find((p) => p.refusal);
+    if (!proc) return Promise.reject(new Error(`no running plugin \`${plugin}\``));
+    const declared = (proc.manifest?.services || proc.refusal?.services || []).some((s) => s.name === service);
+    if (!declared) return Promise.reject(new Error(`\`${plugin}\` declares no service \`${service}\``));
+    return new Promise((resolve, reject) => {
+      const msg = { jsonrpc: '2.0', id: proc.nextId++, method: 'service', params: { service, args } };
+      proc.pending.set(msg.id, { kind: 'service', resolve, reject });
+      proc.worker.postMessage(msg);
+    });
+  }
+
+  async listServices() {
+    return this.query({ what: 'services' });
   }
 
   // ------------------------------------------------------------------
@@ -486,6 +616,12 @@ export class BrowserRuntime {
     for (const p of this.procs) p.kill();
     this.procs.clear();
     this.cancelDeadlines.clear();
+    // With durable storage, recover from what is *stored*, not from memory.
+    if (this.store) {
+      await this.flushed();
+      const stored = await this.store.loadAll();
+      this.records = new Map(stored.sessions);
+    }
     const active = this.kernel.active_hash();
     this.kernel.free?.();
     this.kernel = new WasmKernel();
@@ -568,12 +704,9 @@ export class BrowserRuntime {
   }
 
   async exportLogs() {
-    // Secrets entered in the browser (e.g. an OpenRouter key) are not exported.
-    const compilations = [...this.compilations.values()].map((c) => {
-      const copy = structuredClone(c);
-      for (const p of Object.values(copy.config?.plugins || {})) if (p.config && 'api_key' in p.config) p.config.api_key = '(omitted)';
-      return copy;
-    });
+    // Secrets entered in the browser (provider keys, any setting a plugin
+    // declares `secret`, configured secret values) are not exported.
+    const compilations = [...this.compilations.values()].map((c) => redactConfig(structuredClone(c)));
     return { sessions: Object.fromEntries(this.records), compilations, journal: this.journal };
   }
 

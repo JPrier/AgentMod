@@ -263,8 +263,17 @@ export function defineWorkspacePlugin(spec) {
       },
       'ui-action': async (ctx) => {
         const { reply_to, action } = ctx.payload;
-        if (action !== 'restore') return;
+        if (action !== 'restore' && action !== 'kill') return;
         const ev = await ctx.host.query('event', { session_id: ctx.sessionId, event_id: reply_to });
+        if (action === 'kill') {
+          // "stop" on a process from the UI: the user's own action, recorded as the ui-action.
+          if (ev?.event_name !== 'process-started') return;
+          const ws = await workspaceOf(ctx);
+          const tk = kit(ctx, ws.root, ws.gitDir);
+          const emit = (event, payload, ui) => ctx.publish(event, { ...payload, ...(event === 'process-exited' ? { by: 'user', request: reply_to } : {}) }, ui ? { ui } : {});
+          await tk.call('process', { action: 'kill', id: ev.payload.process_id }, { signal: ctx.signal, session: ctx.sessionId, call_id: `ui:${reply_to}`, emit });
+          return;
+        }
         const cp = ev?.event_name === 'checkpoint-created' ? ev.payload.checkpoint : ev?.payload?.checkpoint;
         if (!cp) return;
         const ws = await workspaceOf(ctx);

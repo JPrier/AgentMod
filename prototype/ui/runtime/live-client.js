@@ -47,6 +47,8 @@ export class LiveClient {
   contextEdit(id, ops) { return this.req(`/api/sessions/${id}/context-edit`, { ops }); }
   sendCommand(id, command) { return this.req(`/api/sessions/${id}/commands`, { command }); }
   applyConfig(config, scope) { return this.req('/api/config/apply', { config, scope }); }
+  listServices() { return this.req('/api/services'); }
+  callService(plugin, service, args = {}) { return this.req(`/api/services/${encodeURIComponent(plugin)}/${encodeURIComponent(service)}`, args); }
 
   async exportLogs() {
     const sessions = {};

@@ -42,10 +42,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Plugin unit tests (coding tools, sandbox target, plugin protocol)
-        run: node --test tests/*.test.mjs
+      - name: Plugin unit tests (coding toolkit, policy, projection, browser runtime, MCP/web, CDP, sandbox)
+        run: (cd tests && npm install --no-audit --no-fund) && node --test tests/*.test.mjs
       - name: Native end-to-end (real plugin processes, mock OpenRouter)
         run: cargo build -p agentmod-runtime && ./tests/e2e.sh
+      - name: Benchmark self-test (coder vs minimal, mock model)
+        run: node bench/run.mjs --selftest
 
   site:
     name: Browser runtime and site

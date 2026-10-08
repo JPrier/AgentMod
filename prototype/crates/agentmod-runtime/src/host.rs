@@ -502,10 +502,16 @@ impl Host {
             .manifest(&plugin)
             .is_some_and(|m| m.has_service(&service))
         {
-            return Err((-32601, format!("`{plugin}` declares no service `{service}`")));
+            return Err((
+                -32601,
+                format!("`{plugin}` declares no service `{service}`"),
+            ));
         }
         let target = self.ensure_proc(&plugin, &stamp).map_err(|e| (-32001, e))?;
-        let p = self.procs.get_mut(&target).ok_or((-32001, "plugin process gone".to_owned()))?;
+        let p = self
+            .procs
+            .get_mut(&target)
+            .ok_or((-32001, "plugin process gone".to_owned()))?;
         p.send(
             "service",
             &json!({ "service": service, "args": params.get("args").cloned().unwrap_or(json!({})) }),

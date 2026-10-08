@@ -156,7 +156,11 @@ export class BrowserRuntime {
     }
     // Durable history: install every stored compilation (sessions reference
     // them), then the new one, then replay every stored session.
-    if (this.persistence !== false) this.store ??= await openStore();
+    if (this.persistence !== false && this.store === null && !this.storeBlocked) {
+      const st = await openStore();
+      if (st?.blocked) this.storeBlocked = st.blocked;
+      else this.store = st;
+    }
     this.compilations = new Map();
     let stored = { compilations: [], sessions: new Map() };
     if (this.store) {
@@ -171,7 +175,7 @@ export class BrowserRuntime {
     const { hash } = J(this.kernel.install(JSON.stringify(comp)));
     J(this.kernel.set_active(hash));
     this.compilations.set(hash, comp);
-    this.journal.push({ at: Date.now(), kind: 'config-loaded', detail: { hash, durable: !!this.store, persisted: this.store?.persisted ?? null } });
+    this.journal.push({ at: Date.now(), kind: 'config-loaded', detail: { hash, durable: !!this.store, persisted: this.store?.persisted ?? null, blocked: this.storeBlocked ?? null } });
     const recovered = [];
     for (const [sid, recs] of [...stored.sessions].sort(([a], [b]) => a.localeCompare(b))) {
       try {
@@ -528,7 +532,7 @@ export class BrowserRuntime {
       case 'graph':
         return J(this.kernel.active());
       case 'config':
-        return { hash: this.kernel.active_hash(), config: J(this.kernel.active())?.config, installed: [...this.compilations.keys()], host: 'browser', durable: this.durable };
+        return { hash: this.kernel.active_hash(), config: J(this.kernel.active())?.config, installed: [...this.compilations.keys()], host: 'browser', durable: this.durable, storage_blocked: this.storeBlocked ?? null };
       case 'services': {
         const comp = J(this.kernel.active());
         return Object.entries(comp?.manifests || {})

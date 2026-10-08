@@ -13,7 +13,8 @@
 // storage pressure unless persistent storage is granted
 // (navigator.storage.persist()); data is per browser profile and origin; and
 // private windows may provide no IndexedDB at all, in which case the runtime
-// falls back to memory and says so.
+// falls back to memory and says so. Only one tab writes the store at a time
+// (a Web Lock); another tab runs in memory.
 
 const DB = 'agentmod-runtime';
 const VERSION = 1;
@@ -39,8 +40,20 @@ function done(tx) {
  * @param {IDBFactory} [o.idb]   injectable for tests
  * @param {string} [o.name]
  */
-export async function openStore({ idb = globalThis.indexedDB, name = DB } = {}) {
+export async function openStore({ idb = globalThis.indexedDB, name = DB, locks = globalThis.navigator?.locks } = {}) {
   if (!idb) return null;
+  // One writer per store: two tabs replaying and appending the same logs with
+  // separate kernels would interleave sequences. The first tab holds a Web
+  // Lock for its lifetime; a second tab runs in memory and says so.
+  if (locks?.request) {
+    const held = await new Promise((resolve) => {
+      locks.request(`${name}:writer`, { ifAvailable: true }, (lock) => {
+        resolve(!!lock);
+        return lock ? new Promise(() => {}) : undefined;
+      }).catch(() => resolve(true));
+    });
+    if (!held) return { blocked: 'another tab owns this browser\'s stored sessions' };
+  }
   const open = idb.open(name, VERSION);
   open.onupgradeneeded = () => {
     const db = open.result;

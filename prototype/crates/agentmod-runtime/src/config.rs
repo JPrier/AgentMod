@@ -37,7 +37,14 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
 /// (`import … from './x.js'`, `export … from '../y.js'`, `import('./z.js')`).
 fn js_imports(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for marker in ["from '", "from \"", "import('", "import(\"", "import '", "import \""] {
+    for marker in [
+        "from '",
+        "from \"",
+        "import('",
+        "import(\"",
+        "import '",
+        "import \"",
+    ] {
         let quote = marker.chars().last().unwrap_or('\'');
         let mut rest = text;
         while let Some(i) = rest.find(marker) {
@@ -61,13 +68,13 @@ fn code_closure(entry: &Path) -> Vec<PathBuf> {
     let mut seen = std::collections::BTreeSet::new();
     let mut stack = vec![entry.to_path_buf()];
     while let Some(p) = stack.pop() {
-        let Ok(canon) = p.canonicalize() else { continue };
+        let Ok(canon) = p.canonicalize() else {
+            continue;
+        };
         if !seen.insert(canon.clone()) {
             continue;
         }
-        let is_js = canon
-            .extension()
-            .is_some_and(|e| e == "js" || e == "mjs");
+        let is_js = canon.extension().is_some_and(|e| e == "js" || e == "mjs");
         if !is_js {
             continue;
         }
@@ -92,7 +99,9 @@ pub fn stamp_binaries(config: &mut DeploymentConfig, base_dir: &Path) {
             if !p.is_file() {
                 continue;
             }
-            let root = base_dir.canonicalize().unwrap_or_else(|_| base_dir.to_path_buf());
+            let root = base_dir
+                .canonicalize()
+                .unwrap_or_else(|_| base_dir.to_path_buf());
             for file in code_closure(&p) {
                 if let Ok(bytes) = std::fs::read(&file) {
                     let rel = file.strip_prefix(&root).unwrap_or(&file);
@@ -152,7 +161,11 @@ mod tests {
         std::fs::create_dir_all(dir.join("p")).unwrap();
         std::fs::create_dir_all(dir.join("sdk")).unwrap();
         std::fs::write(dir.join("p/main.js"), "import { x } from '../sdk/a.js';\n").unwrap();
-        std::fs::write(dir.join("sdk/a.js"), "export const x = 1; import('./b.js');\n").unwrap();
+        std::fs::write(
+            dir.join("sdk/a.js"),
+            "export const x = 1; import('./b.js');\n",
+        )
+        .unwrap();
         std::fs::write(dir.join("sdk/b.js"), "export const y = 1;\n").unwrap();
         let mk = || -> DeploymentConfig {
             toml::from_str("[plugins.p]\ncommand = [\"node\", \"p/main.js\"]\n").unwrap()
@@ -162,7 +175,10 @@ mod tests {
         std::fs::write(dir.join("sdk/b.js"), "export const y = 2;\n").unwrap();
         let mut b = mk();
         stamp_binaries(&mut b, &dir);
-        assert_ne!(a.plugins["p"].binary_hash, b.plugins["p"].binary_hash, "a transitive import changed the stamp");
+        assert_ne!(
+            a.plugins["p"].binary_hash, b.plugins["p"].binary_hash,
+            "a transitive import changed the stamp"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -98,7 +98,7 @@ try {
   await page.goto('http://localhost:8098/?host=browser&openrouter_base=http://127.0.0.1:8765/api/v1');
   await page.waitForSelector('.gate-card input[type=password]', { timeout: 30000 });
   await page.waitForFunction(() => document.querySelectorAll('.gate-card datalist option').length >= 2, { timeout: 15000 });
-  const modelInput = '.gate-card input[aria-label="OpenRouter model"]';
+  const modelInput = '.gate-card input[aria-label="Model"]';
   await page.$eval(modelInput, (el) => { el.value = ''; });
   await page.type(modelInput, 'mock/tool-model');
   await page.type('.gate-card input[type=password]', 'test-key');
@@ -110,28 +110,30 @@ try {
   await shot('01-coder');
 
   const t0 = Date.now();
-  let r = await tool('run', { command: 'uname -m; echo hello-from-cheerpx' }, /hello-from-cheerpx/, BOOT_MS);
+  let r = await tool('shell', { command: 'uname -m; echo hello-from-cheerpx' }, /hello-from-cheerpx/, BOOT_MS);
   report.boot_ms = Date.now() - t0;
   check('boot + first command (stdout, exit code)', r.ok, `${Math.round(report.boot_ms / 1000)}s; ${r.out}`);
   await shot('02-first-command');
   if (!r.ok) throw new Error('sandbox did not run a command; see logs');
 
-  r = await tool('run', { command: 'echo to-stderr >&2; exit 7' }, /exit code 7[\s\S]*to-stderr/);
+  r = await tool('shell', { command: 'echo to-stderr >&2; exit 7' }, /exit 7[\s\S]*to-stderr/);
   check('non-zero exit and stderr are separate', r.ok, r.out);
-  r = await tool('write_file', { path: 'hello.c', content: '#include <stdio.h>\nint main(void){puts("hi from c");return 0;}\n' }, /Created \/workspace\/hello\.c/);
-  check('write_file into /workspace', r.ok, r.out);
-  r = await tool('edit_file', { path: 'hello.c', old_text: 'hi from c', new_text: 'hi from gcc in the browser' }, /Edited \/workspace\/hello\.c/);
-  check('edit_file (read back, write)', r.ok, r.out);
-  r = await tool('run', { command: 'gcc hello.c -o hello && ./hello' }, /hi from gcc in the browser/, 300000);
+  r = await tool('apply_patch', { changes: [{ action: 'create', path: 'hello.c', content: '#include <stdio.h>\nint main(void){puts("hi from c");return 0;}\n' }] }, /Applied 1 file change[\s\S]*hello\.c/);
+  check('apply_patch create in /workspace', r.ok, r.out);
+  r = await tool('apply_patch', { changes: [{ action: 'update', path: 'hello.c', edits: [{ old_text: 'hi from c', new_text: 'hi from gcc in the browser' }] }] }, /Applied 1 file change[\s\S]*hello\.c/);
+  check('apply_patch edit (read back, checkpoint, write)', r.ok, r.out);
+  r = await tool('shell', { command: 'gcc hello.c -o hello && ./hello' }, /hi from gcc in the browser/, 300000);
   check('native compile and run (gcc)', r.ok, r.out);
-  r = await tool('run', { command: 'python3 -c "print(6*7)"' }, /\b42\b/);
+  r = await tool('shell', { command: 'python3 -c "print(6*7)"' }, /\b42\b/);
   check('python3', r.ok, r.out);
-  r = await tool('run', { command: 'git --version && cd /workspace && git init -q demo && echo ok-git' }, /ok-git/);
+  r = await tool('shell', { command: 'git --version && cd /workspace && git init -q demo && echo ok-git' }, /ok-git/);
   check('git', r.ok, r.out);
-  r = await tool('run', { command: 'node -e "console.log(6*7)" && node --version' }, /\b42\b/);
+  r = await tool('shell', { command: 'node -e "console.log(6*7)" && node --version' }, /\b42\b/);
   check('node', r.ok, r.out);
-  r = await tool('list_files', {}, /hello\.c/);
-  check('list_files', r.ok, r.out);
+  r = await tool('list_dir', {}, /hello\.c/);
+  check('list_dir', r.ok, r.out);
+  r = await tool('search_text', { pattern: 'gcc in the browser' }, /hello\.c/);
+  check('search_text', r.ok, r.out);
   await shot('03-work');
 
   // Persistence: reload the page; the workspace lives in IndexedDB.
@@ -143,6 +145,8 @@ try {
   await shot('04-after-reload');
 
   // VM control, as the agent uses it.
+  r = await tool('tool_search', { query: 'select:sandbox_status,sandbox_logs,sandbox_restart,sandbox_stop' }, /sandbox_status/);
+  check('tool_search loads the deferred sandbox tools', r.ok, r.out);
   r = await tool('sandbox_status', {}, /^done state: running[\s\S]*cross-origin isolated: true/m);
   check('sandbox_status', r.ok, r.out);
   r = await tool('sandbox_logs', {}, /boot-ok[\s\S]* op op=/);
@@ -154,12 +158,12 @@ try {
   check('workspace survives sandbox_restart', r.ok, r.out);
   r = await tool('sandbox_stop', {}, /Stopped the Linux sandbox/);
   check('sandbox_stop', r.ok, r.out);
-  r = await tool('run', { command: 'echo back-after-stop' }, /back-after-stop/, BOOT_MS);
+  r = await tool('shell', { command: 'echo back-after-stop' }, /back-after-stop/, BOOT_MS);
   check('the next command restarts a stopped VM', r.ok, r.out);
 
   // Last: process control (a VM crash here must not hide the results above).
   // Diagnostics: how signals behave in the guest (each line: what, exit code, seconds waited).
-  r = await tool('run', { command: [
+  r = await tool('shell', { command: [
     "w() { s=$(date +%s); wait $1; echo \"$2 rc=$? waited=$(( $(date +%s) - s ))s\"; }",
     'sleep 6 & p=$!; kill -TERM $p; w $p term-sleep',
     'sleep 6 & p=$!; kill -KILL $p; w $p kill-sleep',
@@ -173,7 +177,7 @@ try {
   report.signals = r.out;
   check('signals end a sleeping process promptly', r.ok, r.out);
   const t1 = Date.now();
-  r = await tool('run', { command: 'sleep 30', timeout_seconds: 3 }, /timed out after 3s/, 120000);
+  r = await tool('shell', { command: 'sleep 30', timeout_seconds: 3 }, /timed out after 3s/, 120000);
   check('timeout kills a command', r.ok && Date.now() - t1 < 25000, `${Math.round((Date.now() - t1) / 1000)}s; ${r.out}`);
   await shot('05-process-control');
 } catch (e) {

@@ -6,12 +6,17 @@ depends on nor changes the existing implementation in the repository root.
 
 **Try it in the browser:** <https://jprier.github.io/AgentMod/> — the Rust kernel compiled to
 WebAssembly, every plugin in its own Web Worker, the model reached through the OpenRouter plugin.
-It asks for an OpenRouter API key before the runtime starts (kept in your browser, sent only to
-openrouter.ai, omitted from exported logs).
+It asks for the model provider's settings (an OpenRouter API key by default) before the runtime
+starts; the form comes from the provider plugin's declared settings, the key stays in your
+browser, is sent only to the provider, and is omitted from exported logs.
 
-**Code in the browser:** start a `coder` session. The `linux-sandbox` plugin runs an x86 Linux VM
-in your tab (CheerpX), so the agent writes, compiles, and runs code on your own machine; see
-[plugins/linux-sandbox](plugins/linux-sandbox/README.md).
+**Code with it:** start a `coder` session. It is a complete coding harness built from plugins:
+shell and background processes, structured file/search/patch tools, workspace checkpoints and
+rewind, branching, a plan, questions to the user, layered permissions, isolated child agents,
+diagnostics, repo map, skills, web/MCP/browser tools found on demand, and metrics. In the browser
+the workspace is an x86 Linux VM in your tab (CheerpX, [plugins/linux-sandbox](plugins/linux-sandbox/README.md));
+natively it is a local directory (`local-workspace`). The design and its decisions are in
+[docs/design/coding-harness.md](../docs/design/coding-harness.md).
 
 ## What is here
 
@@ -24,6 +29,7 @@ prototype/
 ├── plugins/               bundled plugins (JS run under Node or as Web Workers; one in Python)
 ├── ui/                    the web frontend + in-browser runtime host
 ├── tests/                 native e2e, browser e2e, mock OpenRouter
+├── bench/                 the harness against a minimal loop (and external CLIs) on fixed tasks
 ├── scripts/               build-wasm.sh, build-site.sh
 └── agentmod.toml          the default deployment: plugins + session definitions
 ```
@@ -46,19 +52,42 @@ triggers, and the model itself are all plugins:
 
 | Plugin | Does |
 | --- | --- |
-| `openrouter-model` | The model. OpenRouter chat completions with streaming and tool calls. **Requires a key.** |
-| `openai-model` | Optional alternative provider for any OpenAI-compatible endpoint. |
+| `openrouter-model` | The model. OpenRouter chat completions with streaming and tool calls; serves its model catalog and credential check to frontends. **Requires a key.** |
+| `openai-model` | Alternative provider for any OpenAI-compatible endpoint. |
 | `chat-context` | Folds messages into context and drives the model ↔ tool loop. Stateless. |
 | `redactor` | Blocking transformer that masks credentials in user messages. |
-| `approval-gate` | Vetoes guarded tool calls until a human answers a `choice` UI hint. |
+| `policy` | Layered permissions: tool visibility, deny > ask > allow across scopes, explained decisions, digest-bound approvals revalidated on arrival, permission modes. |
+| `approval-gate` | The older tool-name approval gate (used by `chat`). |
+| `local-workspace` | The coding toolkit in a local directory. Native runtime only; not a sandbox. |
+| `linux-sandbox` | The coding toolkit in an x86 Linux VM inside the browser (CheerpX host device). |
+| `plan` | `update_plan`: a tiny, visible plan. |
+| `ask-user` | `ask_user`: a question to the user whose answer continues the tool call. |
+| `tool-discovery` | `tool_search`: finds and loads deferred tools. |
+| `budget` | Turn and token bounds (used for children). |
+| `subagent`, `subagent-reporter` | `delegate`: isolated child sessions (tool allowlist, budget, worktree, evidence); `adopt_changes`. |
+| `memory` | `remember`/`recall`; notes injected with provenance. |
+| `web-fetch` | `web_fetch` (deferred), untrusted, no private hosts. |
+| `mcp-bridge` | MCP servers (stdio/HTTP) as deferred `mcp__server__tool` tools. |
+| `browser-control` | Browser automation over the Chrome DevTools Protocol (deferred). |
+| `minimal-shell` | One `shell` tool: the minimal loop the benchmark compares against. |
 | `tool-clock`, `tool-calc`, `py-wordcount` (Python) | Tools: a tool call is an event; a plugin that answers it is a tool. |
-| `memory` | `remember`/`recall` tools and memory injection into new sessions. |
-| `subagent`, `subagent-reporter` | `delegate` starts a worker session; the worker reports back cross-session. |
-| `linux-sandbox` | Coding tools (`run`, `read_file`, `write_file`, `edit_file`, `list_files`, `import_repo`) in an x86 Linux VM inside the browser. Browser runtime only; the VM (CheerpX) is the page's `linux-vm` host device (`ui/runtime/devices.js`), which the plugin declares and drives. |
-| `local-workspace` | The same coding tools in a local directory. Native runtime only; not a sandbox, so in no default definition. |
 | `titler` | Async session auto-titling. |
 | `heartbeat` | Trigger plugin with a journal session (`every_seconds` in config; off by default). |
 | `web-ui` | The web frontend: HTTP + SSE gateway natively, the page itself in the browser. |
+
+The coding toolkit (`plugins/sdk/coding/`) is shared by every execution target:
+
+| Tool | Tier | Does |
+| --- | --- | --- |
+| `shell` | core | command with exit code, separate streams, timeout, bounded output (full output saved), parsed diagnostics; checkpoint first unless read-only |
+| `process` | core | start / status / read / write / kill / list long-running processes; they survive the runtime |
+| `read_file`, `list_dir`, `search_files`, `search_text` | core | structured, bounded, deterministic reads and searches |
+| `apply_patch` | core | atomic multi-file create/update/delete/move; refuses stale edits; checkpoint first |
+| `update_plan`, `ask_user`, `tool_search` | core | from the plugins above |
+| `checkpoints`, `view_image`, `repo_map`, `import_repo`, `load_skill`, `adopt_changes`, `delegate`, web, MCP, browser | deferred | loaded with `tool_search` |
+
+Session definitions in `agentmod.toml`: `chat` (general assistant), `coder` (the coding harness),
+`worker` (what `delegate` starts), `minimal` (provider + chat loop + one shell tool), `heartbeat`.
 
 ## Run it natively
 
@@ -76,10 +105,17 @@ The key is read from the environment by the plugin and never written to the log.
 
 Other commands:
 
+For coding against a local directory, start a `coder` session; the workspace is
+`local-workspace`'s `root` (default `.agentmod/workspace`; set it in `agentmod.toml`). Project instructions come from
+`AGENTS.md`, `CLAUDE.md`, or `.agentmod/instructions.md`; repository policy from
+`.agentmod/policy.json` (it can only restrict); skills from `.agentmod/skills/*/SKILL.md`.
+Harness state (checkpoints, processes, full outputs) lives in `<root>/.agentmod/state/`.
+
 ```shell
 cargo run -p agentmod-runtime -- compile            # handshake plugins, print pipelines + diagnostics
 cargo run -p agentmod-runtime -- inspect [s0001]    # replay-as-reading: runs no plugins
 cargo run -p agentmod-runtime -- verify             # replay every log through a fresh kernel
+cargo run -p agentmod-runtime -- metrics [s0001] [--json]   # tokens, cost, tools, context, from the logs
 cargo run -p agentmod-runtime -- config > ui/runtime/agentmod.config.json   # browser config
 ```
 
@@ -102,17 +138,21 @@ cargo install wasm-bindgen-cli --version 0.2.100 --locked
 
 ```shell
 cargo test --workspace                 # compiler, kernel scenarios, randomized replay equivalence, store
-node --test tests/*.test.mjs           # coding tools, the sandbox target (fake CheerpX), plugin protocol
+(cd tests && npm install)              # fake-indexeddb, ws (test-only)
+node --test tests/*.test.mjs           # coding toolkit, policy, projection, browser runtime, MCP/web, CDP, sandbox (fake CheerpX)
 ./tests/e2e.sh                         # native: real runtime + plugin processes, mock OpenRouter
-(cd tests && npm install) && node tests/browser.mjs   # headless Chrome against dist/
+node tests/browser.mjs                 # headless Chrome against dist/
+node bench/run.mjs --selftest          # benchmark plumbing; real runs need OPENROUTER_API_KEY (see bench/README.md)
 node tests/sandbox-browser.mjs         # real CheerpX in headless Chrome (needs network)
 ```
 
 `tests/e2e.sh` covers: key enforcement, a tool loop, approval + sub-agent, hot apply and
 whole-config rejection, hard stop mid-stream, a killed plugin being retried while other sessions
 continue, SIGKILL of the runtime mid-stream with recovery from the log (no duplicate or missing
-stream chunks), the coding tools through a real session (`local-workspace`), and `verify` over
-every log. The kernel tests include randomized interleavings of
+stream chunks), and a whole coding task through a real session (`local-workspace`): plan,
+search, patch, tests, a background server, rewind, branching, policy approval and revalidation,
+`ask_user`, delegation with adoption, child allowlists, a provider hot swap, a process surviving a
+runtime SIGKILL, `verify` over every log, and metrics. The kernel tests include randomized interleavings of
 publishes, completions, retries, commands, and config applies, checking after every step that a
 fresh kernel rebuilt from the log matches the live one exactly.
 
@@ -146,6 +186,8 @@ experiments to inform those decisions, not resolutions of them.
 ## Known limits
 
 Single process, single machine; no sandboxing of plugins themselves (by design, approval is a
-plugin; code the agent runs can be sandboxed by choosing `linux-sandbox`); the browser runtime
-keeps logs in memory (export them from the top bar); tool descriptions contributed before a plugin
-is removed stay in context until edited out.
+plugin; code the agent runs can be sandboxed by choosing `linux-sandbox`); `local-workspace` is
+not a sandbox; tool descriptions contributed before a plugin is removed stay in context until
+edited out. The browser runtime stores sessions in IndexedDB, with the platform's limits
+(eviction, one writing tab). The harness's own known limits are listed in
+[docs/design/coding-harness.md](../docs/design/coding-harness.md#known-limits).

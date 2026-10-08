@@ -13,7 +13,8 @@ call.
 3. The session shows **Enable the Linux sandbox**. CheerpX needs `SharedArrayBuffer`, which
    browsers only expose to cross-origin-isolated pages; static hosting cannot send those
    headers, so enabling installs `ui/coi-sw.js` (a 20-line service worker that adds them) and
-   reloads once. In-browser sessions live in memory, so the current one ends on that reload.
+   reloads once. Sessions are persisted to IndexedDB (write-ahead), so the current one is
+   recovered after that reload.
    **Turn off isolation** undoes it.
 4. Ask for something: *"Write a C program that prints the first 20 primes, compile it with gcc,
    and run it."* The first tool call boots the VM (seconds: the disk image streams on demand and
@@ -25,18 +26,25 @@ the page cannot be isolated, the session says why instead of failing silently.
 
 ## Tools
 
-All execution targets answer the same tools (`plugins/sdk/workspace-tools.js`):
+All execution targets answer the same coding toolkit (`plugins/sdk/coding/toolkit.js`; see
+`docs/design/coding-harness.md`). Core tools are offered every turn; deferred ones are found with
+`tool_search` and loaded on demand.
 
-| Tool | Does |
-| --- | --- |
-| `run` | bash command in the workspace; exit code, stdout and stderr returned separately; timeout (default 120 s, max 900 s); stdin is empty |
-| `read_file` | text file, paged by line (400 lines per call) |
-| `write_file` | create or overwrite; emits a `workspace-change` event with a `diff` UI hint |
-| `edit_file` | exact-text replace (must match once unless `replace_all`); emits a diff |
-| `list_files` | directory tree (skips `.git`, `node_modules`) |
-| `import_repo` | copy a public GitHub repository into the workspace and `git init` + commit it |
+| Tool | Tier | Does |
+| --- | --- | --- |
+| `shell` | core | bash command; exit code, stdout and stderr separately, bounded (full output kept in `.agentmod/state/outputs/`); diagnostics parsed from compiler/test output; timeout |
+| `process` | core | long-running commands: `start` / `status` / `read` (cursor) / `write` (stdin) / `kill` / `list`; durable under `.agentmod/state/procs/` |
+| `read_file` | core | text, paged by line, with a content hash used for stale-state checks |
+| `list_dir` | core | one directory level or a bounded tree |
+| `search_files` | core | glob/name search (rg, git ls-files, or find) |
+| `search_text` | core | regex/literal search, sorted and bounded |
+| `apply_patch` | core | multi-file edits (exact replace or `*** Begin Patch` envelope); checkpoint first; refuses stale reads; returns diff |
+| `view_image` | deferred | attach an image from the workspace to the next model turn |
+| `repo_map` | deferred | ranked symbol outline of the repository |
+| `checkpoints` | deferred | list, diff, and restore shadow-Git checkpoints |
+| `import_repo` | deferred | copy a public GitHub repository into the workspace and commit it |
 
-Paths are confined to `/workspace` for the file tools and `run`'s `cwd`. A command can still
+Paths are confined to `/workspace` for the file tools and `shell`'s `cwd`. A command can still
 touch anything in the VM — the VM is the sandbox.
 
 The agent also controls the VM itself (these appear for any execution target that runs a
@@ -64,7 +72,7 @@ user-message ─► chat-context ─► model-request ─► openrouter-model �
                                                                          │
              ┌───────────────────────────────────────────────────────────┘
              ▼
-        tool-call ──► approval-gate (blocking; vetoes guarded tools)
+        tool-call ──► policy (blocking; deny > ask > allow, with scopes and explanations)
              │
              └──► linux-sandbox worker (async)  ──── `device` requests ───►  browser host
                         │                                                   `linux-vm` device
@@ -99,7 +107,7 @@ step if more devices appear.
 | --- | --- | --- |
 | `chat-context` (or anything that emits `tool-call` / consumes `tool-result`) | **compile-time** — the compiler matches `tool-call` demand (`call_id`, `name`, `args`) to its supply | drives the model ↔ tool loop and folds results into `messages` |
 | a model plugin (`openrouter-model`, `openai-model`) | convention — reads the `tools` and `system` context slots via `sdk/openai-compat.js` | the sandbox contributes its tool specs and a system note describing the VM |
-| `approval-gate` | optional policy, by config | in the browser the VM is the boundary, so `coder` guards nothing extra by default; add `run` to `require` to approve every command |
+| `policy` | optional, by config | in the browser the VM is the boundary (containment), so the default mode asks only for destructive, publishing, or secret-touching actions; `.agentmod/policy.json` and the UI's permission mode tighten it |
 | `web-ui` | optional rendering | renders the `tool`, `progress`, and `diff` hints; any frontend falls back to raw payloads |
 | core lifecycle events | `session-started`, `config-applied` | offer tools and the system note |
 | browser host `linux-vm` device | host resource, declared in the manifest | the CheerpX VM itself |
@@ -114,7 +122,7 @@ step if more devices appear.
 - **One plugin, not separate process / filesystem / git plugins.** The research note mirrors the
   root implementation's capability hosts. Splitting files, processes, and Git across plugins
   would make three plugins share one stateful VM and split one tool vocabulary across them, with
-  nothing gained: cross-plugin effects should go through events, and Git works through `run`.
+  nothing gained: cross-plugin effects should go through events, and Git works through `shell`.
 - **The execution target is config, not code.** The tool semantics live once in
   `sdk/workspace-tools.js`; `linux-sandbox` (CheerpX) and `local-workspace` (a directory on the
   machine running the native runtime) are thin plugins over it, exactly like `openrouter-model`
@@ -167,14 +175,15 @@ which are attributed to `linux-sandbox` in the log.
 - No network inside the VM (CheerpX networking is not configured).
 - No secrets in the guest: the OpenRouter key stays in the model plugin's worker.
 - The guest sees only its own disks; there is no host filesystem access.
-- `local-workspace` is **not** a sandbox. It is in no default definition; opt in deliberately and
-  guard `run` with `approval-gate`.
+- `local-workspace` is **not** a sandbox: shell commands can reach the whole machine. The `coder`
+  definition pairs it with `policy`; secrets are injected only into commands their grant matches
+  and are redacted from results.
 
 ## Feasibility gate and evidence
 
 | Check | Where |
 | --- | --- |
-| tool semantics: path confinement, edits, diffs (randomized, verified with `patch(1)`), truncation, timeouts, cancellation, repo import | `tests/workspace-tools.test.mjs` |
+| tool semantics: path confinement, edits, diffs (randomized, verified with `patch(1)`), truncation, timeouts, cancellation, repo import | `tests/workspace-tools.test.mjs`, `tests/coding-toolkit.test.mjs` |
 | the VM device (boot, wrapper, watchdog, byte channels, tar batches, serialization, access control) and the plugin's target driving it across a JSON boundary — against a fake CheerpX | `tests/linux-sandbox-target.test.mjs` |
 | the plugin file the browser loads, over the real wire protocol, with the test playing the browser host (publish + `device`) | `tests/linux-sandbox-plugin.test.mjs` |
 | the shared tool layer through a real native session and kernel (`local-workspace`) | `tests/e2e.sh` step 8 |
@@ -186,7 +195,7 @@ blocking the build, and reports each check as an annotation on the job. What it 
 | Question | Answer |
 | --- | --- |
 | Can CheerpX run inside a plugin's Web Worker? | **No** — it references `window`, then `document`. Hence the host device. |
-| Does the page-hosted VM run the plugin's tools end to end? | Yes: boot in seconds, `uname` → `i386`, separate stdout/stderr and exit codes, write/edit/read, `gcc` compile + run, `python3`, `git`, `list_files`. |
+| Does the page-hosted VM run the plugin's tools end to end? | Yes: boot in seconds, `uname` → `i386`, separate stdout/stderr and exit codes, write/edit/read, `gcc` compile + run, `python3`, `git`, `list_files` (the tool names before the coding toolkit). |
 | Do IndexedDB `dir` mounts and `readFileAsBlob` see what the guest just wrote? | Yes (every result above comes back that way). |
 | Does `/workspace` survive a page reload? | Yes. |
 | Does GNU `timeout` work? | **No** (the command ran to completion), hence the watchdog, which does: a 3 s timeout on `sleep 30` returns after 3 s. |
@@ -205,14 +214,15 @@ one config change (`image_type = "bytes"` with an HTTP-range-capable server).
   offline dependencies.
 - No package downloads inside the VM yet. The planned path is a policy-controlled fetch
   capability (an event, so it is logged and can be gated), not open guest networking.
-- No PTY, background processes, or LSP yet; `run` is foreground and non-interactive.
-- A timeout or cancel kills the command's shell; processes *it* started (e.g. `make`'s
-  compilers) cannot be found under CheerpX and run to completion on their own.
-- One shared `/workspace` per browser (named by `workspace`); per-session worktrees would let
-  parallel sub-agents work without collisions.
+- No PTY or LSP. Background processes exist (`process`), but under CheerpX `pgrep -P` sees no
+  children, so `kill` signals the command's own pid (recorded by the wrapper) and never SIGKILLs
+  a process that is waiting on a child; grandchildren a command spawned may run to completion.
+- Child-agent worktrees live under `/workspace/.agentmod/state/worktrees/`, so they share the
+  workspace's IndexedDB disk.
 - No sandbox reset tool yet (`IDBDevice.reset()` on the root overlay); clearing site data resets
   everything.
-- The browser runtime keeps session logs in memory; the workspace outlives them.
+- None of the new tools have been re-run against real CheerpX in this change (see the design
+  doc's known limits); they are exercised against the fake device and the local target.
 
 ## Licensing
 

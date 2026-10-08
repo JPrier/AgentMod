@@ -650,7 +650,7 @@ function sandboxNotice(v) {
   return h('div.notice',
     h('p', h('b', 'Enable the Linux sandbox to let the agent code here. '),
       'It runs an x86 Linux VM in this tab with CheerpX, which needs a cross-origin-isolated page. Enabling installs a small service worker that adds the isolation headers, then reloads the page. ',
-      state.config?.durable ? 'Sessions are stored in this browser (IndexedDB), so this one resumes after the reload.' : 'This browser gives the runtime no durable storage, so this session ends on reload (export logs first to keep it).'),
+      state.config?.durable ? 'Sessions are stored in this browser (IndexedDB), so this one resumes after the reload.' : state.config?.storage_blocked ? `Sessions in this tab are not stored (${state.config.storage_blocked}), so this one ends on reload (export logs first to keep it).` : 'This browser gives the runtime no durable storage, so this session ends on reload (export logs first to keep it).'),
     h('div.row-actions', h('button.btn.primary', { onclick: () => act(() => enableIsolation(v.definition)) }, 'Enable the Linux sandbox')),
     h('p.help', 'Works in current Chrome, Edge, and Firefox. CheerpX is by Leaning Technologies and free for personal and open-source use.'));
 }

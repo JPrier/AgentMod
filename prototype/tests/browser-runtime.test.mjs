@@ -44,6 +44,24 @@ test('IndexedDB store: append, load in order, compilations, clear', { skip: !idb
   assert.equal(await openStore({ idb: undefined }), null, 'no IndexedDB: memory only');
 });
 
+test('one writer per store: a second tab gets no store and a reason', { skip: !idb && 'fake-indexeddb not installed' }, async () => {
+  const { openStore } = await import(pathToFileURL(path.join(stageSite(), 'runtime', 'persist.js')).href);
+  // Minimal Web Locks: exclusive, ifAvailable, held while the callback's promise is pending.
+  const held = new Set();
+  const locks = {
+    async request(name, opts, cb) {
+      if (held.has(name)) return cb(null);
+      held.add(name);
+      return cb({ name });
+    },
+  };
+  const name = `lock-${Date.now()}`;
+  const first = await openStore({ idb, name, locks });
+  assert.ok(first && !first.blocked && first.appendRecords, 'first tab writes');
+  const second = await openStore({ idb, name, locks });
+  assert.match(second.blocked, /another tab/);
+});
+
 test('write-ahead: dispatch and listeners only after the batch is durable, in order', { skip: !idb && 'fake-indexeddb not installed' }, async () => {
   const { BrowserRuntime } = await hostModule();
   const order = [];

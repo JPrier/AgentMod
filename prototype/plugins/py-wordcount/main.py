@@ -31,8 +31,10 @@ Plugin(
         "consumes": [
             {"event": "session-started"},
             {"event": "config-applied"},
-            {"event": "tool-call", "demands": ["call_id", "name", "args"], "mode": "async", "context": False},
+            {"event": "tool-call", "demands": ["call_id", "name", "args"], "mode": "async", "context": False,
+             "keyed": {"key": "name", "values": ["wordcount"]}},
         ],
+        "tools": [{"name": "wordcount", "parameters": TOOL["parameters"]}],
         "emits": [{"event": "tool-result", "supplies": ["call_id", "name", "output"]}],
     },
     {"session-started": offer, "config-applied": offer, "tool-call": tool_call},

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::compiler::{Compilation, Slot};
+use crate::compiler::{Compilation, DISPATCH_FAILED, RouteTable, Slot};
 use crate::context::ContextState;
 use crate::manifest::Capability;
 use crate::record::{Body, Command, DispatchState, Outcome, Record, Settlement};
@@ -215,6 +215,11 @@ struct InvInfo {
     payload: Value,
     outputs: Vec<String>,
     attempt_outputs: usize,
+    /// Provenance bound at dispatch: retries and cancels use this exact
+    /// executor identity even if the session's config changed since.
+    stamp: Stamp,
+    /// Key value of a keyed (owner) dispatch.
+    route: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -507,7 +512,8 @@ impl Kernel {
                 mode,
                 position,
                 payload,
-                ..
+                stamp,
+                route,
             } => {
                 if let Some(n) = invocation_id
                     .rsplit("/i")
@@ -526,12 +532,7 @@ impl Kernel {
                             .get(event_id)
                             .map(|e| e.record.event_name.clone())
                             .unwrap_or_default();
-                        let p = d.pipeline(&name);
-                        p.blocking
-                            .iter()
-                            .chain(&p.asyncs)
-                            .find(|sl| &sl.plugin == plugin)
-                            .map(|sl| sl.context)
+                        d.pipeline(&name).slot_of(plugin).map(|sl| sl.context)
                     })
                     .unwrap_or(true);
                 s.invocations.insert(
@@ -548,6 +549,8 @@ impl Kernel {
                         payload: payload.clone(),
                         outputs: Vec::new(),
                         attempt_outputs: 0,
+                        stamp: stamp.clone(),
+                        route: route.clone(),
                     },
                 );
                 match mode {
@@ -629,12 +632,32 @@ impl Kernel {
         d.pipeline(event_name).blocking.get(index).cloned()
     }
 
-    fn asyncs_for(&self, session: &Session, event_name: &str) -> Vec<Slot> {
+    fn asyncs_for(&self, session: &Session, event_name: &str) -> (Vec<Slot>, Option<RouteTable>) {
         self.configs
             .get(&session.config)
             .and_then(|c| c.definitions.get(&session.definition))
-            .map(|d| d.pipeline(event_name).asyncs.clone())
+            .map(|d| {
+                let p = d.pipeline(event_name);
+                (p.asyncs.clone(), p.routed.clone())
+            })
             .unwrap_or_default()
+    }
+
+    /// The compiled keyed-dispatch tables of a session's current config.
+    #[must_use]
+    pub fn routes(&self, session_id: &str) -> Option<BTreeMap<String, RouteTable>> {
+        let s = self.sessions.get(session_id)?;
+        let d = self
+            .configs
+            .get(&s.config)?
+            .definitions
+            .get(&s.definition)?;
+        Some(
+            d.pipelines
+                .iter()
+                .filter_map(|(e, p)| p.routed.clone().map(|r| (e.clone(), r)))
+                .collect(),
+        )
     }
 
     fn stamp(&self, session: &Session, plugin: &str) -> Stamp {
@@ -666,12 +689,14 @@ impl Kernel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_invocation(
         &mut self,
         sid: &str,
         slot: &Slot,
         event_id: &str,
         payload: Value,
+        route: Option<String>,
         now: u64,
         fx: &mut Vec<Effect>,
     ) {
@@ -689,6 +714,7 @@ impl Kernel {
                 position: slot.position,
                 stamp: stamp.clone(),
                 payload: payload.clone(),
+                route,
             },
             fx,
         );
@@ -760,10 +786,19 @@ impl Kernel {
                 }
                 let name = s.events[&run.event_id].record.event_name.clone();
                 if let Some(slot) = self.slot_for(s, &name, run.next_blocking) {
-                    self.start_invocation(sid, &slot, &run.event_id, run.payload.clone(), now, fx);
+                    self.start_invocation(
+                        sid,
+                        &slot,
+                        &run.event_id,
+                        run.payload.clone(),
+                        None,
+                        now,
+                        fx,
+                    );
                     return;
                 }
-                let asyncs = self.asyncs_for(s, &name);
+                let (asyncs, routed) = self.asyncs_for(s, &name);
+                let depth = s.events[&run.event_id].record.depth;
                 self.emit(
                     sid,
                     now,
@@ -776,7 +811,58 @@ impl Kernel {
                     fx,
                 );
                 for slot in asyncs {
-                    self.start_invocation(sid, &slot, &run.event_id, run.payload.clone(), now, fx);
+                    self.start_invocation(
+                        sid,
+                        &slot,
+                        &run.event_id,
+                        run.payload.clone(),
+                        None,
+                        now,
+                        fx,
+                    );
+                }
+                // Keyed dispatch: exactly the one compiled owner, never a scan.
+                if let Some(table) = routed {
+                    match table.route(&run.payload) {
+                        (Some(value), Some(owner)) => {
+                            let owner = owner.clone();
+                            self.start_invocation(
+                                sid,
+                                &owner,
+                                &run.event_id,
+                                run.payload.clone(),
+                                Some(value),
+                                now,
+                                fx,
+                            );
+                        }
+                        (value, _) => {
+                            let reason = if value.is_some() {
+                                "no-owner"
+                            } else {
+                                "no-key"
+                            };
+                            self.append_event(
+                                sid,
+                                now,
+                                DISPATCH_FAILED,
+                                json!({
+                                    "reason": reason, "event_id": run.event_id, "event_name": name,
+                                    "key": table.key, "value": value, "payload": run.payload,
+                                    "owners": table.entries().into_iter().map(|(v, _)| v).collect::<Vec<_>>(),
+                                }),
+                                None,
+                                Lane::Normal,
+                                Cause::Core {
+                                    reason: DISPATCH_FAILED.into(),
+                                },
+                                Origin::Core,
+                                depth + 1,
+                                None,
+                                fx,
+                            );
+                        }
+                    }
                 }
                 continue;
             }
@@ -1284,6 +1370,35 @@ impl Kernel {
             },
             &mut fx,
         );
+        if let (Some(value), Outcome::Failed { error }) = (&info.route, &outcome) {
+            let ev = &self.sessions[&sid].events[&info.event_id];
+            let (depth, key) = (
+                ev.record.depth,
+                self.asyncs_for(&self.sessions[&sid], &event_name)
+                    .1
+                    .map(|r| r.key)
+                    .unwrap_or_default(),
+            );
+            self.append_event(
+                &sid,
+                now,
+                DISPATCH_FAILED,
+                json!({
+                    "reason": "owner-failed", "event_id": info.event_id, "event_name": event_name,
+                    "key": key, "value": value, "payload": info.payload,
+                    "plugin": info.plugin, "error": error,
+                }),
+                None,
+                Lane::Normal,
+                Cause::Core {
+                    reason: DISPATCH_FAILED.into(),
+                },
+                Origin::Core,
+                depth + 1,
+                None,
+                &mut fx,
+            );
+        }
         if info.mode == Mode::Blocking {
             let settlement = match outcome {
                 Outcome::Veto { reason } => Some(Settlement::Vetoed {
@@ -1355,7 +1470,7 @@ impl Kernel {
         let context = info
             .context
             .then(|| s.context.at(info.start_sequence.saturating_sub(1)).to_vec());
-        let stamp = self.stamp(s, &info.plugin);
+        let stamp = info.stamp.clone();
         fx.push(Effect::Invoke {
             plugin: info.plugin.clone(),
             stamp,
@@ -1427,7 +1542,7 @@ impl Kernel {
                 for inv in open {
                     let s = &self.sessions[session_id];
                     let info = s.invocations[&inv].clone();
-                    let stamp = self.stamp(s, &info.plugin);
+                    let stamp = info.stamp.clone();
                     fx.push(Effect::Cancel {
                         plugin: info.plugin.clone(),
                         stamp,
@@ -1583,6 +1698,15 @@ impl Kernel {
             self.sessions.remove(session_id);
         }
         idle
+    }
+
+    /// An invocation's plugin and whether it is still open (loaded sessions only).
+    #[must_use]
+    pub fn invocation(&self, invocation_id: &str) -> Option<(String, bool)> {
+        let s = self.sessions.get(session_of(invocation_id)?)?;
+        s.invocations
+            .get(invocation_id)
+            .map(|i| (i.plugin.clone(), i.open))
     }
 
     /// Is the session quiescent (no queued or running work)?

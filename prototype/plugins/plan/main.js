@@ -9,7 +9,7 @@
 //   consumes  session-started, config-applied   offer the tool
 //             tool-call (async)                  update_plan
 //   emits     plan-updated (UI hint `plan`), tool-result
-import { definePlugin, offerTools } from '../sdk/agentmod.js';
+import { definePlugin, declareTools, offerTools, ownTools } from '../sdk/agentmod.js';
 
 import { UPDATE_PLAN, validatePlan } from '../sdk/plan.js';
 
@@ -21,8 +21,9 @@ definePlugin({
     consumes: [
       { event: 'session-started' },
       { event: 'config-applied' },
-      { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false },
+      ownTools(['update_plan']),
     ],
+    tools: declareTools([UPDATE_PLAN]),
     emits: [
       { event: 'plan-updated', supplies: ['items'] },
       { event: 'tool-result', supplies: ['call_id', 'name', 'output'] },

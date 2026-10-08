@@ -12,8 +12,9 @@ use agentmod_core::kernel::{
 };
 use agentmod_core::manifest::{Capability, DeploymentConfig, Manifest, PluginConfig};
 use agentmod_core::projection::{context_at, project};
-use agentmod_core::record::{Command, Record};
-use agentmod_core::types::Stamp;
+use agentmod_core::record::{Body, Command, Outcome, Record};
+use agentmod_core::stream::{InFrame, StreamHub, StreamOutput, StreamStatus};
+use agentmod_core::types::{Mode, Stamp};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
@@ -97,6 +98,28 @@ impl Proc {
     }
 }
 
+/// Host-side hot-path counters (kinds only; per-session numbers come from the logs).
+#[derive(Debug, Default, Clone, serde::Serialize)]
+struct HostCounters {
+    records: u64,
+    record_bytes: u64,
+    fsyncs: u64,
+    invocations: u64,
+    blocking_invocations: u64,
+    async_invocations: u64,
+    routed_invocations: u64,
+    record_notifications: u64,
+    stream_messages: u64,
+    stream_frames_in: u64,
+    live_messages_out: u64,
+    resync_requests: u64,
+}
+
+/// Bytes of live frames sent to a watcher per drain, and the stdin backlog
+/// past which delivery waits (the hub bounds what queues meanwhile).
+const LIVE_DRAIN_BYTES: usize = 64 * 1024;
+const LIVE_BACKLOG_LIMIT: usize = 1024 * 1024;
+
 struct PendingApply {
     requester: Option<(u64, Value)>,
     config: DeploymentConfig,
@@ -133,6 +156,12 @@ pub struct Host {
     max_attempts: u32,
     ready: bool,
     buffered: Vec<Msg>,
+    /// Live provider streams: outside the event pipeline and the log.
+    hub: StreamHub,
+    /// Hub client → watcher process.
+    stream_clients: BTreeMap<u64, u64>,
+    poll_at: Option<u64>,
+    counters: HostCounters,
 }
 
 impl Host {
@@ -161,6 +190,10 @@ impl Host {
             max_attempts: opts.config.runtime.max_attempts,
             ready: false,
             buffered: Vec::new(),
+            hub: StreamHub::new(opts.config.runtime.streaming.clone()),
+            stream_clients: BTreeMap::new(),
+            poll_at: None,
+            counters: HostCounters::default(),
         };
         // Handshake every enabled plugin.
         let mut waiting = BTreeSet::new();
@@ -201,6 +234,13 @@ impl Host {
             .reserve_session_ids(host.store.index.next_session);
         host.store
             .journal(now_ms(), "config-loaded", &json!({ "hash": hash }));
+        // Partial streams from before a crash: restored for reconnecting clients
+        // (marked interrupted); the invocation's retry opens a new attempt.
+        for ops in host.store.stream_recovery() {
+            if let Some(state) = StreamHub::replay_recovery(&ops, &opts.config.runtime.streaming) {
+                host.hub.restore(state);
+            }
+        }
         // Recovery: the orphan scan is bounded by the active-set index.
         let active: Vec<String> = host
             .store
@@ -213,6 +253,20 @@ impl Host {
         for sid in active {
             if let Err(e) = host.ensure_loaded(&sid) {
                 eprintln!("agentmod: recovering {sid}: {e}");
+            }
+        }
+        // Streams whose invocation already completed (a crash during
+        // finalization): the canonical response is logged; drop the partials.
+        for st in host.hub.snapshots(None) {
+            if !host
+                .kernel
+                .invocation(&st.stream_id)
+                .is_some_and(|(_, open)| open)
+            {
+                let mut out = StreamOutput::default();
+                host.hub
+                    .finalize(&st.stream_id, StreamStatus::Interrupted, &mut out);
+                host.stream_effects(out);
             }
         }
         host.ready = true;
@@ -380,6 +434,12 @@ impl Host {
             }
             Msg::Exited { proc, status } => self.on_exit(proc, &status),
             Msg::Tick => self.on_tick(),
+            Msg::StreamPoll => {
+                self.poll_at = None;
+                let mut out = StreamOutput::default();
+                self.hub.poll(now_ms(), &mut out);
+                self.stream_effects(out);
+            }
             Msg::Shutdown => {}
         }
     }
@@ -538,6 +598,16 @@ impl Host {
                 return None;
             }
             "publish" => self.req_publish(&plugin, params),
+            "stream" => self.req_stream(&plugin, &params),
+            "stream_resync" => {
+                let client = self
+                    .stream_clients
+                    .iter()
+                    .find(|(_, p)| **p == proc)
+                    .map(|(c, _)| *c);
+                self.counters.resync_requests += 1;
+                Ok(json!({ "streams": client.map(|c| self.hub.resync(c)).unwrap_or_default() }))
+            }
             "start_session" => self.req_start(&plugin, params),
             "query" => self.req_query(&params),
             "command" => {
@@ -550,7 +620,15 @@ impl Host {
             "watch" => {
                 if p.has(Capability::Observe) {
                     self.watchers.insert(proc);
-                    Ok(json!({ "watching": true }))
+                    // Live streams on request (frontends): attach returns the
+                    // snapshots atomically with subscribing.
+                    if params.get("streams").and_then(Value::as_bool) == Some(true) {
+                        let (client, streams) = self.hub.attach(None);
+                        self.stream_clients.insert(client, proc);
+                        Ok(json!({ "watching": true, "streams": streams }))
+                    } else {
+                        Ok(json!({ "watching": true }))
+                    }
                 } else {
                     Err((-32003, format!("`{plugin}` lacks the observe capability")))
                 }
@@ -602,6 +680,79 @@ impl Host {
             return Err((-32001, format!("publish blocked: {reason}")));
         }
         Ok(json!({ "event_id": out.event_id, "duplicate": out.duplicate }))
+    }
+
+    /// Provider frames for an open invocation (a stream is its invocation).
+    /// Notifications for the run; the closing batch is a request whose reply
+    /// carries the stream's statistics for the canonical response.
+    fn req_stream(&mut self, plugin: &str, params: &Value) -> Result<Value, (i64, String)> {
+        let inv = params
+            .get("invocation_id")
+            .and_then(Value::as_str)
+            .ok_or((-32602, "invocation_id required".to_owned()))?
+            .to_owned();
+        match self.kernel.invocation(&inv) {
+            Some((p, true)) if p == plugin => {}
+            Some((p, _)) if p != plugin => {
+                return Err((-32001, format!("`{inv}` was not dispatched to `{plugin}`")));
+            }
+            _ => return Err((-32001, format!("`{inv}` is not an open invocation"))),
+        }
+        let frames: Vec<InFrame> =
+            serde_json::from_value(params.get("frames").cloned().unwrap_or_else(|| json!([])))
+                .map_err(|e| (-32602, format!("invalid frames: {e}")))?;
+        self.counters.stream_messages += 1;
+        self.counters.stream_frames_in += frames.len() as u64;
+        let mut out = StreamOutput::default();
+        let r = self.hub.ingest(&inv, frames, now_ms(), &mut out);
+        self.stream_effects(out);
+        Ok(json!(r))
+    }
+
+    /// Execute hub output: recovery writes, live delivery, the flush timer.
+    fn stream_effects(&mut self, out: StreamOutput) {
+        for op in &out.recovery {
+            if let Err(e) = self.store.stream_op(op) {
+                eprintln!("agentmod: stream recovery write failed: {e}");
+            }
+        }
+        for client in out.ready {
+            self.deliver_live(client);
+        }
+        if let Some(at) = self.hub.next_deadline()
+            && self.poll_at.is_none_or(|p| at < p)
+        {
+            self.poll_at = Some(at);
+            let tx = self.tx.clone();
+            let wait = at.saturating_sub(now_ms());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(wait)).await;
+                let _ = tx.send(Msg::StreamPoll);
+            });
+        }
+    }
+
+    /// Send a watcher its queued live messages unless its stdin is backed up
+    /// (then they wait in the hub's bounded queue; overflow means resync).
+    fn deliver_live(&mut self, client: u64) {
+        let Some(proc) = self.stream_clients.get(&client).copied() else {
+            return;
+        };
+        let Some(p) = self.procs.get(&proc) else {
+            self.hub.detach(client);
+            self.stream_clients.remove(&client);
+            return;
+        };
+        if p.handle.backlog() > LIVE_BACKLOG_LIMIT {
+            return;
+        }
+        let msgs = self.hub.drain(client, LIVE_DRAIN_BYTES);
+        if msgs.is_empty() {
+            return;
+        }
+        self.counters.live_messages_out += msgs.len() as u64;
+        let note = json!({ "jsonrpc": "2.0", "method": "stream", "params": { "messages": msgs } });
+        p.handle.send(note.to_string());
     }
 
     fn req_start(&mut self, plugin: &str, params: Value) -> Result<Value, (i64, String)> {
@@ -711,6 +862,23 @@ impl Host {
                 Ok(json!(context_at(&records, seq)))
             }
             "status" => Ok(json!(self.kernel.status(sid))),
+            "session-metrics" => {
+                let records = self.session_records(sid).map_err(err)?;
+                Ok(agentmod_core::metrics::session_metrics(&records))
+            }
+            "streams" => Ok(json!(self.hub.snapshots(
+                Some(sid).filter(|s| !s.is_empty())
+            ))),
+            "routes" => Ok(json!({
+                "routes": self.kernel.routes(sid),
+                "revision": self.kernel.status(sid).and_then(|st| self.kernel.config(&st.config).and_then(|c| c.definitions.get(&st.definition)).map(|d| d.routes_revision.clone())),
+            })),
+            "metrics" => Ok(json!({
+                "host": self.counters,
+                "streams": self.hub.counters,
+                "open_streams": self.hub.snapshots(None).len(),
+                "stream_clients": self.stream_clients.len(),
+            })),
             "graph" => Ok(json!(self.kernel.active())),
             "services" => Ok(json!(self.kernel.active().map_or_else(Vec::new, |c| {
                 c.manifests
@@ -754,9 +922,15 @@ impl Host {
         for fx in effects {
             match fx {
                 Effect::Append { record } => {
-                    if let Err(e) = self.store.append(&record) {
-                        eprintln!("agentmod: FATAL append failed: {e}");
-                        std::process::exit(2);
+                    match self.store.append(&record) {
+                        Ok(n) => {
+                            self.counters.records += 1;
+                            self.counters.record_bytes += n as u64;
+                        }
+                        Err(e) => {
+                            eprintln!("agentmod: FATAL append failed: {e}");
+                            std::process::exit(2);
+                        }
                     }
                     touched.insert(record.session_id.clone());
                     self.records
@@ -772,6 +946,40 @@ impl Host {
             eprintln!("agentmod: FATAL sync failed: {e}");
             std::process::exit(2);
         }
+        self.counters.fsyncs += 1;
+        // A stream lives exactly as long as its invocation.
+        let mut sout = StreamOutput::default();
+        for r in &appended {
+            match &r.body {
+                Body::InvocationStarted { mode, route, .. } => {
+                    self.counters.invocations += 1;
+                    match mode {
+                        Mode::Blocking => self.counters.blocking_invocations += 1,
+                        Mode::Async => self.counters.async_invocations += 1,
+                    }
+                    if route.is_some() {
+                        self.counters.routed_invocations += 1;
+                    }
+                }
+                Body::InvocationCompleted {
+                    invocation_id,
+                    outcome,
+                    ..
+                } if self.hub.is_open(invocation_id) => {
+                    let status = match outcome {
+                        Outcome::Ok => StreamStatus::Complete,
+                        Outcome::Cancelled { .. } => StreamStatus::Cancelled,
+                        Outcome::Failed { .. } | Outcome::Veto { .. } => StreamStatus::Failed,
+                    };
+                    self.hub.finalize(invocation_id, status, &mut sout);
+                }
+                Body::InvocationRetried { invocation_id, .. } => {
+                    self.hub.interrupt(invocation_id, &mut sout);
+                }
+                _ => {}
+            }
+        }
+        self.stream_effects(sout);
         let mut write_ahead = false;
         for sid in &touched {
             self.last_touch.insert(sid.clone(), Instant::now());
@@ -837,6 +1045,7 @@ impl Host {
         for r in appended {
             let note = json!({ "jsonrpc": "2.0", "method": "record", "params": { "record": r } })
                 .to_string();
+            self.counters.record_notifications += self.watchers.len() as u64;
             for w in &self.watchers {
                 if let Some(p) = self.procs.get(w) {
                     p.handle.send(note.clone());
@@ -882,6 +1091,16 @@ impl Host {
 
     fn on_exit(&mut self, proc: u64, status: &str) {
         self.watchers.remove(&proc);
+        let gone: Vec<u64> = self
+            .stream_clients
+            .iter()
+            .filter(|(_, p)| **p == proc)
+            .map(|(c, _)| *c)
+            .collect();
+        for c in gone {
+            self.hub.detach(c);
+            self.stream_clients.remove(&c);
+        }
         let Some(p) = self.procs.remove(&proc) else {
             return;
         };
@@ -916,6 +1135,16 @@ impl Host {
     }
 
     fn on_tick(&mut self) {
+        // Watchers whose stdin drained: deliver what waited in their queues.
+        let waiting: Vec<u64> = self
+            .stream_clients
+            .keys()
+            .copied()
+            .filter(|c| self.hub.queued(*c) > 0)
+            .collect();
+        for c in waiting {
+            self.deliver_live(c);
+        }
         let now = Instant::now();
         // Invocation timeouts: cancel, record failure, escalate if ignored.
         let expired: Vec<(u64, String)> = self

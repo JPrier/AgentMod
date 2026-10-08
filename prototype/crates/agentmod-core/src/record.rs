@@ -103,6 +103,10 @@ pub enum Body {
         stamp: Stamp,
         /// Input state: the payload as this subscriber saw it.
         payload: Value,
+        /// Keyed dispatch: the key value that selected this plugin as the
+        /// event's one owner (e.g. the tool name). Absent for observers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        route: Option<String>,
     },
     /// An orphaned or crashed invocation was restarted.
     InvocationRetried {

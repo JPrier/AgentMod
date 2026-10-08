@@ -50,6 +50,8 @@ jobs:
         run: cargo build -p agentmod-runtime && ./tests/e2e.sh
       - name: Benchmark self-test (coder vs minimal, mock model)
         run: node bench/run.mjs --selftest
+      - name: Kilo regression benchmark (offline; hot-path guards)
+        run: node bench/kilo.mjs --assert --out target/bench
 
   site:
     name: Browser runtime and site

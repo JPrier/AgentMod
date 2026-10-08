@@ -45,7 +45,9 @@ prototype/
 | History-is-truth recovery: orphan scan bounded by the active-set index | `Kernel::load_session` + `Kernel::recover`; deterministic output ids make re-published outputs idempotent |
 | Live, layered, stamped configuration | `Kernel::apply_config` (global or one session, applied at the next event boundary); every invocation records code + config hashes |
 | Plugins are supervised processes over one JSON-RPC wire protocol | `runtime/src/host.rs` (stdio) and `ui/runtime/browser-host.js` (Web Workers) |
-| Frontends as plugins with UI-hint payloads | `plugins/web-ui` (gateway) and the page itself; vocabulary: text, markdown, stream-chunk, tool, choice, progress, diff, form |
+| Frontends as plugins with UI-hint payloads | `plugins/web-ui` (gateway) and the page itself; vocabulary: text, markdown, tool, choice, progress, diff, form (old logs may also carry `stream-chunk`) |
+| Live model output outside the log | `core/src/stream.rs`: normalized provider frames, coalescing, recovery state, byte-bounded clients; one canonical `model-response` per turn ([hot-paths.md](../docs/design/hot-paths.md)) |
+| Compiled tool ownership | `keyed` consumes → one owner table per keyed event (`core/src/compiler.rs`); the kernel dispatches each tool call to exactly its owner |
 
 The core ships no agent features. Chat shape, tools, memory, approval, titling, sub-agents,
 triggers, and the model itself are all plugins:
@@ -115,7 +117,7 @@ Harness state (checkpoints, processes, full outputs) lives in `<root>/.agentmod/
 cargo run -p agentmod-runtime -- compile            # handshake plugins, print pipelines + diagnostics
 cargo run -p agentmod-runtime -- inspect [s0001]    # replay-as-reading: runs no plugins
 cargo run -p agentmod-runtime -- verify             # replay every log through a fresh kernel
-cargo run -p agentmod-runtime -- metrics [s0001] [--json]   # tokens, cost, tools, context, from the logs
+cargo run -p agentmod-runtime -- metrics [s0001] [--json] [--turns]   # model efficiency + control-plane amplification, from the logs
 cargo run -p agentmod-runtime -- config > ui/runtime/agentmod.config.json   # browser config
 ```
 
@@ -139,17 +141,20 @@ cargo install wasm-bindgen-cli --version 0.2.100 --locked
 ```shell
 cargo test --workspace                 # compiler, kernel scenarios, randomized replay equivalence, store
 (cd tests && npm install)              # fake-indexeddb, ws (test-only)
-node --test tests/*.test.mjs           # coding toolkit, policy, projection, browser runtime, MCP/web, CDP, sandbox (fake CheerpX)
+node --test tests/*.test.mjs           # coding toolkit, policy, projection, browser runtime, streaming, turn ergonomics, MCP/web, CDP, sandbox (fake CheerpX)
 ./tests/e2e.sh                         # native: real runtime + plugin processes, mock OpenRouter
 node tests/browser.mjs                 # headless Chrome against dist/
 node bench/run.mjs --selftest          # benchmark plumbing; real runs need OPENROUTER_API_KEY (see bench/README.md)
+node bench/kilo.mjs --assert           # the Kilo regression benchmark, offline (add --before-ref <ref> to compare builds)
 node tests/sandbox-browser.mjs         # real CheerpX in headless Chrome (needs network)
 ```
 
 `tests/e2e.sh` covers: key enforcement, a tool loop, approval + sub-agent, hot apply and
-whole-config rejection, hard stop mid-stream, a killed plugin being retried while other sessions
-continue, SIGKILL of the runtime mid-stream with recovery from the log (no duplicate or missing
-stream chunks), and a whole coding task through a real session (`local-workspace`): plan,
+whole-config rejection, hard stop mid-stream (the live stream ends with its invocation; no token
+fragment reaches the log), a killed plugin being retried while other sessions continue, SIGKILL of
+the runtime mid-stream (recovery state on disk, a fresh attempt on restart, no concatenated text,
+recovery state dropped once the response is logged), parallel tool calls settling into one model
+request, and a whole coding task through a real session (`local-workspace`): plan,
 search, patch, tests, a background server, rewind, branching, policy approval and revalidation,
 `ask_user`, delegation with adoption, child allowlists, a provider hot swap, a process surviving a
 runtime SIGKILL, `verify` over every log, and metrics. The kernel tests include randomized interleavings of
@@ -162,9 +167,8 @@ These are the choices the prototype made where tickets #5–#13 are still open. 
 experiments to inform those decisions, not resolutions of them.
 
 - **Output visibility (#6).** A pipeline output is recorded and dispatchable as soon as it is
-  published; a later veto vetoes only the event being processed. This is what lets streaming
-  chunks reach frontends while the provider invocation is still open (the provider is an async
-  subscriber, so the session's serial dispatcher is not blocked).
+  published; a later veto vetoes only the event being processed. (Token streaming no longer
+  relies on this: live frames travel outside the pipeline; see docs/design/hot-paths.md.)
 - **Idempotence (#8).** Pipeline output ids are `{invocation}.o{n}`. A restarted invocation that
   re-publishes its n-th output gets the same id and is deduplicated.
 - **Failures.** A failed blocking subscriber settles its event as `failed` (fail-closed). Async

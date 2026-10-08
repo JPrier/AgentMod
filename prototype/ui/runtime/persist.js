@@ -17,7 +17,7 @@
 // (a Web Lock); another tab runs in memory.
 
 const DB = 'agentmod-runtime';
-const VERSION = 1;
+const VERSION = 2;
 
 function req(r) {
   return new Promise((resolve, reject) => {
@@ -60,6 +60,9 @@ export async function openStore({ idb = globalThis.indexedDB, name = DB, locks =
     if (!db.objectStoreNames.contains('records')) db.createObjectStore('records', { keyPath: ['session_id', 'sequence'] });
     if (!db.objectStoreNames.contains('compilations')) db.createObjectStore('compilations', { keyPath: 'hash' });
     if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
+    // Recovery state of streams in flight (segments, then compacted snapshots;
+    // removed once the stream's canonical events are in the log).
+    if (!db.objectStoreNames.contains('stream-ops')) db.createObjectStore('stream-ops', { keyPath: ['stream_id', 'n'] });
   };
   let db;
   try {
@@ -67,6 +70,7 @@ export async function openStore({ idb = globalThis.indexedDB, name = DB, locks =
   } catch {
     return null;
   }
+  const streamN = new Map();
   let persisted = null;
   try {
     persisted = (await globalThis.navigator?.storage?.persist?.()) ?? null;
@@ -81,6 +85,41 @@ export async function openStore({ idb = globalThis.indexedDB, name = DB, locks =
       const st = tx.objectStore('records');
       for (const r of records) st.put(r);
       await done(tx);
+    },
+    /** Apply stream recovery ops in one transaction (see agentmod-core stream.rs). */
+    async streamOps(ops) {
+      if (!ops.length) return;
+      const tx = db.transaction('stream-ops', 'readwrite');
+      const st = tx.objectStore('stream-ops');
+      for (const op of ops) {
+        const id = op.stream_id ?? op.state?.stream_id;
+        const range = IDBKeyRange.bound([id, 0], [id, Number.MAX_SAFE_INTEGER]);
+        if (op.op === 'discard') {
+          st.delete(range);
+          streamN.delete(id);
+          continue;
+        }
+        if (op.op === 'snapshot') {
+          st.delete(range);
+          streamN.set(id, 0);
+        }
+        const n = (streamN.get(id) ?? 0) + 1;
+        streamN.set(id, n);
+        st.put({ stream_id: id, n, op });
+      }
+      await done(tx);
+    },
+    /** Stored recovery ops per stream, in order. */
+    async loadStreams() {
+      const tx = db.transaction('stream-ops', 'readonly');
+      const rows = await req(tx.objectStore('stream-ops').getAll());
+      const out = new Map();
+      for (const r of rows) {
+        if (!out.has(r.stream_id)) out.set(r.stream_id, []);
+        out.get(r.stream_id).push(r);
+        streamN.set(r.stream_id, Math.max(streamN.get(r.stream_id) ?? 0, r.n));
+      }
+      return [...out.values()].map((rs) => rs.sort((a, b) => a.n - b.n).map((r) => r.op));
     },
     async putCompilation(c) {
       const tx = db.transaction('compilations', 'readwrite');
@@ -109,8 +148,8 @@ export async function openStore({ idb = globalThis.indexedDB, name = DB, locks =
       return { compilations, sessions };
     },
     async clear() {
-      const tx = db.transaction(['records', 'compilations', 'meta'], 'readwrite');
-      for (const s of ['records', 'compilations', 'meta']) tx.objectStore(s).clear();
+      const tx = db.transaction(['records', 'compilations', 'meta', 'stream-ops'], 'readwrite');
+      for (const s of ['records', 'compilations', 'meta', 'stream-ops']) tx.objectStore(s).clear();
       await done(tx);
     },
     close() {

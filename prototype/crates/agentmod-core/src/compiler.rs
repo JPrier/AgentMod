@@ -8,15 +8,24 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::manifest::{
-    Capability, DeploymentConfig, Emit, Manifest, PluginConfig, Transform, WILDCARD,
+    Capability, DeploymentConfig, Emit, Keyed, Manifest, PluginConfig, Transform, WILDCARD,
 };
-use crate::types::{Mode, Stamp, hash_json};
+use crate::types::{Mode, Stamp, hash_json, lookup};
 
 /// Core lifecycle events and the keys they supply.
 pub const CORE_EVENTS: &[(&str, &[&str])] = &[
     ("session-started", &["definition"]),
     ("config-applied", &["config"]),
+    // A keyed event found no owner, or its owner's invocation failed (so the
+    // loop that waits on an answer can be told instead of waiting forever).
+    (
+        DISPATCH_FAILED,
+        &["reason", "event_id", "event_name", "key", "payload"],
+    ),
 ];
+
+/// Core event published when keyed dispatch cannot deliver an answerable result.
+pub const DISPATCH_FAILED: &str = "dispatch-failed";
 
 /// The emitter name used for core lifecycle events in the graph.
 pub const CORE: &str = "core";
@@ -62,8 +71,87 @@ pub struct Slot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Pipeline {
     pub blocking: Vec<Slot>,
+    /// Observers: every delivered event reaches all of them.
     #[serde(rename = "async")]
     pub asyncs: Vec<Slot>,
+    /// Keyed owners: each delivered event reaches exactly the one owner its key
+    /// selects (compiled from [`Keyed`] consumers; never a runtime scan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed: Option<RouteTable>,
+}
+
+impl Pipeline {
+    /// The slot a plugin occupies in this pipeline (blocking, observer, or owner).
+    #[must_use]
+    pub fn slot_of(&self, plugin: &str) -> Option<&Slot> {
+        self.blocking
+            .iter()
+            .chain(&self.asyncs)
+            .find(|s| s.plugin == plugin)
+            .or_else(|| self.routed.as_ref().and_then(|r| r.slot_of(plugin)))
+    }
+}
+
+/// A prefix-owned family of key values (`mcp__github__*`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefixRoute {
+    pub prefix: String,
+    pub slot: Slot,
+}
+
+/// Deterministic owner table for one keyed event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RouteTable {
+    /// Payload key whose value selects the owner.
+    pub key: String,
+    pub exact: BTreeMap<String, Slot>,
+    /// Longest prefix wins; overlaps between owners are rejected at compile time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prefixes: Vec<PrefixRoute>,
+}
+
+impl RouteTable {
+    /// The owner of a key value.
+    #[must_use]
+    pub fn owner(&self, value: &str) -> Option<&Slot> {
+        self.exact.get(value).or_else(|| {
+            self.prefixes
+                .iter()
+                .filter(|p| value.starts_with(&p.prefix))
+                .max_by_key(|p| p.prefix.len())
+                .map(|p| &p.slot)
+        })
+    }
+
+    /// The owner selected by an event payload, with the key value.
+    #[must_use]
+    pub fn route<'a>(&'a self, payload: &Value) -> (Option<String>, Option<&'a Slot>) {
+        let value = lookup(payload, &self.key).and_then(Value::as_str);
+        (value.map(str::to_owned), value.and_then(|v| self.owner(v)))
+    }
+
+    fn slot_of(&self, plugin: &str) -> Option<&Slot> {
+        self.exact
+            .values()
+            .chain(self.prefixes.iter().map(|p| &p.slot))
+            .find(|s| s.plugin == plugin)
+    }
+
+    /// Every owned value (prefixes keep their `*`), with its owner.
+    #[must_use]
+    pub fn entries(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = self
+            .exact
+            .iter()
+            .map(|(v, s)| (v.clone(), s.plugin.clone()))
+            .collect();
+        out.extend(
+            self.prefixes
+                .iter()
+                .map(|p| (format!("{}*", p.prefix), p.slot.plugin.clone())),
+        );
+        out
+    }
 }
 
 /// Edge in the compiled graph (for inspection UIs).
@@ -93,6 +181,10 @@ pub struct CompiledDefinition {
     pub edges: Vec<Edge>,
     /// Event cycles (legal; bounded at runtime by max causal depth).
     pub cycles: Vec<Vec<String>>,
+    /// Content hash of every route table: the routing revision this config
+    /// compiled (changes only when ownership changes).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub routes_revision: String,
 }
 
 impl CompiledDefinition {
@@ -254,6 +346,22 @@ pub fn compile(config: &DeploymentConfig, manifests: &BTreeMap<String, Manifest>
                 );
             }
         }
+        check_tools(&mut cx, name, m);
+        if let Some(want) = active[*name].version.as_deref()
+            && m.version != want
+            && !m.version.starts_with(&format!("{want}."))
+        {
+            cx.push(
+                Severity::Error,
+                "plugin-version-unavailable",
+                Some(name),
+                None,
+                format!(
+                    "the config requires `{name}` version {want}, but the running plugin reports {}",
+                    m.version
+                ),
+            );
+        }
         for t in &m.transforms {
             if !m.consumes.iter().any(|c| c.event == t.event) {
                 cx.push(
@@ -384,9 +492,43 @@ pub fn compile(config: &DeploymentConfig, manifests: &BTreeMap<String, Manifest>
         // Build slots per event name.
         let mut wildcard_slots: Vec<Slot> = Vec::new();
         let mut explicit: BTreeMap<String, Vec<Slot>> = BTreeMap::new();
+        let mut keyed: BTreeMap<String, Vec<(Slot, Keyed)>> = BTreeMap::new();
         for (pos, name, m, override_mode) in &members {
             for c in &m.consumes {
                 let mode = override_mode.or(c.mode).unwrap_or_default();
+                if let Some(k) = &c.keyed {
+                    if c.event == WILDCARD || mode != Mode::Async {
+                        cx.push(
+                            Severity::Error,
+                            "keyed-consumer",
+                            Some(name),
+                            Some(&c.event),
+                            "keyed (owner) consumers must name an event and run async: they execute, they do not gate".into(),
+                        );
+                        continue;
+                    }
+                    cd.edges.push(Edge {
+                        from: c.event.clone(),
+                        to: (*name).to_owned(),
+                        kind: "owns".into(),
+                        mode: Some(mode),
+                        deferred: false,
+                        keys: k.values.clone(),
+                    });
+                    keyed.entry(c.event.clone()).or_default().push((
+                        Slot {
+                            plugin: (*name).to_owned(),
+                            mode,
+                            position: *pos,
+                            demands: c.demands.clone(),
+                            context: c.context,
+                            wildcard: false,
+                            transform: None,
+                        },
+                        k.clone(),
+                    ));
+                    continue;
+                }
                 let transform = m.transform(&c.event).cloned();
                 if transform.is_some() && mode == Mode::Async {
                     cx.push(
@@ -431,12 +573,40 @@ pub fn compile(config: &DeploymentConfig, manifests: &BTreeMap<String, Manifest>
             slots.extend(wildcard_slots.iter().cloned());
             slots.sort_by_key(|s| (s.position, s.wildcard));
             let (blocking, asyncs) = slots.into_iter().partition(|s| s.mode == Mode::Blocking);
-            Pipeline { blocking, asyncs }
+            Pipeline {
+                blocking,
+                asyncs,
+                routed: None,
+            }
         };
         cd.fallback = place(Vec::new());
+        let def_owners = &def.route_owners;
+        let mut routes: BTreeMap<String, RouteTable> = BTreeMap::new();
+        for (event, owners) in &keyed {
+            explicit.entry(event.clone()).or_default();
+            let table = build_routes(&mut cx, event, owners, def_owners.get(event));
+            routes.insert(event.clone(), table);
+        }
+        for (event, pins) in def_owners {
+            if !keyed.contains_key(event) {
+                for (value, plugin) in pins {
+                    cx.push(Severity::Error, "stale-route-owner", Some(plugin), Some(event), format!("route_owners pins `{value}` to `{plugin}`, but no member of this definition owns keyed `{event}` events"));
+                }
+            }
+        }
 
         for (event, slots) in explicit {
-            let pipeline = place(slots);
+            let mut pipeline = place(slots);
+            pipeline.routed = routes.remove(&event);
+            if let Some(r) = &pipeline.routed {
+                for s in pipeline.asyncs.iter().filter(|s| !s.wildcard) {
+                    cx.push(Severity::Info, "unkeyed-consumer", Some(&s.plugin), Some(&event), format!("`{}` observes every `{event}` (it is not one of the keyed owners of `{}`); declare `keyed` values if it executes some of them", s.plugin, r.key));
+                }
+            }
+            let owner_slots: Vec<Slot> = keyed
+                .get(&event)
+                .map(|v| v.iter().map(|(s, _)| s.clone()).collect())
+                .unwrap_or_default();
             // Dead listener: an explicit consumer of an event nobody can emit.
             let ems = emitters.get(&event).cloned().unwrap_or_default();
             if ems.is_empty() {
@@ -444,6 +614,7 @@ pub fn compile(config: &DeploymentConfig, manifests: &BTreeMap<String, Manifest>
                     .blocking
                     .iter()
                     .chain(&pipeline.asyncs)
+                    .chain(&owner_slots)
                     .filter(|s| !s.wildcard)
                 {
                     cx.push(Severity::Error, "dead-listener", Some(&s.plugin), Some(&event), format!("`{}` consumes `{event}` but no configured plugin emits it; this pipeline can never fire", s.plugin));
@@ -459,11 +630,19 @@ pub fn compile(config: &DeploymentConfig, manifests: &BTreeMap<String, Manifest>
                         supply = walk_transform(&supply, t);
                     }
                 }
-                for s in &pipeline.asyncs {
+                for s in pipeline.asyncs.iter().chain(&owner_slots) {
                     check_demands(&mut cx, s, &supply, emitter, &event);
                 }
             }
             cd.pipelines.insert(event, pipeline);
+        }
+        let tables: BTreeMap<&String, &RouteTable> = cd
+            .pipelines
+            .iter()
+            .filter_map(|(e, p)| p.routed.as_ref().map(|r| (e, r)))
+            .collect();
+        if !tables.is_empty() {
+            cd.routes_revision = hash_json(&json!(tables))[..12].to_owned();
         }
 
         cd.cycles = find_cycles(&members);
@@ -561,6 +740,177 @@ pub fn compile(config: &DeploymentConfig, manifests: &BTreeMap<String, Manifest>
         diagnostics: cx.diags,
         surface,
     }
+}
+
+/// Validate a plugin's tool declarations against its own consumes.
+fn check_tools(cx: &mut Ctx<'_>, name: &str, m: &Manifest) {
+    let mut seen = BTreeSet::new();
+    for t in &m.tools {
+        if !seen.insert(t.name.as_str()) {
+            cx.push(
+                Severity::Error,
+                "duplicate-tool",
+                Some(name),
+                None,
+                format!("tool `{}` is declared twice", t.name),
+            );
+        }
+        if !(t.parameters.is_null() || t.parameters.is_object()) {
+            cx.push(
+                Severity::Error,
+                "invalid-tool-schema",
+                Some(name),
+                None,
+                format!(
+                    "tool `{}`: parameters must be an object of properties",
+                    t.name
+                ),
+            );
+            continue;
+        }
+        let missing: Vec<&str> = t
+            .required
+            .iter()
+            .filter(|r| t.parameters.get(r.as_str()).is_none())
+            .map(String::as_str)
+            .collect();
+        if !missing.is_empty() {
+            cx.push(
+                Severity::Error,
+                "invalid-tool-schema",
+                Some(name),
+                None,
+                format!(
+                    "tool `{}` requires [{}] which its parameters do not define",
+                    t.name,
+                    missing.join(", ")
+                ),
+            );
+        }
+    }
+    // A plugin that declares tools and owns keyed events must own each tool.
+    let keyed: Vec<&Keyed> = m.consumes.iter().filter_map(|c| c.keyed.as_ref()).collect();
+    if keyed.is_empty() && !m.tools.is_empty() {
+        cx.push(Severity::Error, "missing-route-owner", Some(name), None, format!("`{name}` declares tools ({}) but owns no keyed event, so nothing would route them to it", m.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")));
+    }
+    if let [k] = keyed.as_slice() {
+        for t in &m.tools {
+            if !k.owns(&t.name) && !k.values.contains(&t.name) {
+                cx.push(Severity::Error, "undeclared-tool-route", Some(name), None, format!("tool `{}` is declared but `{name}` does not own it in its keyed consume (values: {})", t.name, k.values.join(", ")));
+            }
+        }
+    }
+}
+
+/// Compile the owner table of one keyed event, rejecting ambiguity.
+fn build_routes(
+    cx: &mut Ctx<'_>,
+    event: &str,
+    owners: &[(Slot, Keyed)],
+    pins: Option<&BTreeMap<String, String>>,
+) -> RouteTable {
+    let key = owners[0].1.key.clone();
+    for (slot, k) in owners.iter().filter(|(_, k)| k.key != key) {
+        cx.push(
+            Severity::Error,
+            "route-key-mismatch",
+            Some(&slot.plugin),
+            Some(event),
+            format!(
+                "`{}` keys `{event}` by `{}` but other owners key it by `{key}`",
+                slot.plugin, k.key
+            ),
+        );
+    }
+    // Every claim: value -> claimants (exact and prefix claims kept apart).
+    let mut exact: BTreeMap<String, Vec<&Slot>> = BTreeMap::new();
+    let mut prefix: BTreeMap<String, Vec<&Slot>> = BTreeMap::new();
+    for (slot, k) in owners {
+        for v in &k.values {
+            match v.strip_suffix('*') {
+                Some(p) => prefix.entry(p.to_owned()).or_default().push(slot),
+                None => exact.entry(v.clone()).or_default().push(slot),
+            }
+        }
+    }
+    let empty = BTreeMap::new();
+    let pins = pins.unwrap_or(&empty);
+    for (value, plugin) in pins {
+        let claimed = exact
+            .get(value)
+            .into_iter()
+            .chain(prefix.get(value.trim_end_matches('*')))
+            .flatten()
+            .any(|s| &s.plugin == plugin)
+            || prefix.iter().any(|(p, ss)| {
+                value.starts_with(p.as_str()) && ss.iter().any(|s| &s.plugin == plugin)
+            });
+        if !claimed {
+            cx.push(Severity::Error, "stale-route-owner", Some(plugin), Some(event), format!("route_owners pins `{event}` `{value}` to `{plugin}`, which does not own it in this definition (stale or disabled plugin?)"));
+        }
+    }
+    let pick = |cx: &mut Ctx<'_>, value: &str, claimants: &[&Slot]| -> Option<Slot> {
+        let mut distinct: Vec<&Slot> = Vec::new();
+        for s in claimants {
+            if !distinct.iter().any(|d| d.plugin == s.plugin) {
+                distinct.push(s);
+            }
+        }
+        if let Some(plugin) = pins.get(value) {
+            return distinct
+                .iter()
+                .find(|s| &s.plugin == plugin)
+                .map(|s| (*s).clone());
+        }
+        if distinct.len() > 1 {
+            let names: Vec<&str> = distinct.iter().map(|s| s.plugin.as_str()).collect();
+            cx.push(Severity::Error, "duplicate-route-owner", Some(names[1]), Some(event), format!("`{event}` `{value}` is owned by more than one plugin ({}); remove one or pin it with route_owners", names.join(", ")));
+            return None;
+        }
+        distinct.first().map(|s| (*s).clone())
+    };
+    let mut table = RouteTable {
+        key,
+        ..Default::default()
+    };
+    for (value, claimants) in &exact {
+        // An exact value also claimed through another plugin's prefix is ambiguous.
+        let mut all: Vec<&Slot> = claimants.clone();
+        for (p, ss) in &prefix {
+            if value.starts_with(p.as_str()) {
+                all.extend(
+                    ss.iter()
+                        .copied()
+                        .filter(|s| !claimants.iter().any(|c| c.plugin == s.plugin)),
+                );
+            }
+        }
+        if let Some(slot) = pick(cx, value, &all) {
+            table.exact.insert(value.clone(), slot);
+        }
+    }
+    let prefixes: Vec<&String> = prefix.keys().collect();
+    for (p, claimants) in &prefix {
+        let mut all: Vec<&Slot> = claimants.clone();
+        for other in prefixes
+            .iter()
+            .filter(|o| **o != p && (o.starts_with(p.as_str()) || p.starts_with(o.as_str())))
+        {
+            all.extend(
+                prefix[*other]
+                    .iter()
+                    .copied()
+                    .filter(|s| !claimants.iter().any(|c| c.plugin == s.plugin)),
+            );
+        }
+        if let Some(slot) = pick(cx, &format!("{p}*"), &all) {
+            table.prefixes.push(PrefixRoute {
+                prefix: p.clone(),
+                slot,
+            });
+        }
+    }
+    table
 }
 
 fn check_demands(
@@ -691,6 +1041,7 @@ mod tests {
             demands: demands.iter().map(|s| (*s).into()).collect(),
             mode: None,
             context: true,
+            keyed: None,
         }
     }
     fn emit(event: &str, supplies: &[&str]) -> Emit {
@@ -728,6 +1079,7 @@ mod tests {
                     timeout_ms: None,
                     binary_hash: None,
                     disabled: false,
+                    version: None,
                 },
             );
         }
@@ -742,6 +1094,7 @@ mod tests {
                         mode: *m,
                     })
                     .collect(),
+                ..Default::default()
             },
         );
         (cfg, ms.into_iter().map(|m| (m.name.clone(), m)).collect())
@@ -912,6 +1265,7 @@ mod tests {
                 demands: vec![],
                 mode: Some(Mode::Async),
                 context: false,
+                keyed: None,
             }],
             vec![],
         );

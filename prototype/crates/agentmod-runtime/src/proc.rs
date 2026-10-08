@@ -2,6 +2,8 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -16,6 +18,8 @@ pub enum Msg {
     Exited { proc: u64, status: String },
     /// Periodic supervision tick.
     Tick,
+    /// A coalesced stream run is due to flush.
+    StreamPoll,
     /// Graceful shutdown request.
     Shutdown,
 }
@@ -25,12 +29,21 @@ pub struct ProcHandle {
     pub tx: mpsc::UnboundedSender<String>,
     pub pid: Option<u32>,
     kill: Option<oneshot::Sender<()>>,
+    /// Bytes handed to the stdin writer and not yet written (backpressure).
+    backlog: Arc<AtomicUsize>,
 }
 
 impl ProcHandle {
     /// Send one JSON line.
     pub fn send(&self, line: String) {
+        self.backlog.fetch_add(line.len() + 1, Ordering::Relaxed);
         let _ = self.tx.send(line);
+    }
+
+    /// Bytes queued for this process's stdin.
+    #[must_use]
+    pub fn backlog(&self) -> usize {
+        self.backlog.load(Ordering::Relaxed)
     }
 
     /// Kill the process (supervisor escalation).
@@ -72,14 +85,18 @@ pub fn spawn(
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let backlog = Arc::new(AtomicUsize::new(0));
+    let pending = backlog.clone();
     tokio::spawn(async move {
         while let Some(line) = rx.recv().await {
+            let n = line.len() + 1;
             if stdin.write_all(line.as_bytes()).await.is_err()
                 || stdin.write_all(b"\n").await.is_err()
             {
                 break;
             }
             let _ = stdin.flush().await;
+            pending.fetch_sub(n, Ordering::Relaxed);
         }
     });
     let out2 = out.clone();
@@ -113,5 +130,6 @@ pub fn spawn(
         tx,
         pid,
         kill: Some(kill_tx),
+        backlog,
     })
 }

@@ -8,10 +8,18 @@
 // Tool results keep compact metadata (exit code, checkpoint, trust) and any
 // attachments (images), so the projection can label and bound them.
 //
-// A tool call that cannot be dispatched — malformed JSON arguments, or a tool
-// no plugin offers — is answered here with an error result, so the loop never
-// waits for an answer that will not come.
+// A tool call that cannot be dispatched — malformed JSON arguments, arguments
+// that do not match the tool's schema, or a tool no plugin offers — is
+// answered here with an actionable error result, so the loop never waits for
+// an answer that will not come. The same holds after dispatch: the kernel
+// routes each call to its one compiled owner, and reports `dispatch-failed`
+// when no owner exists or the owner's invocation failed without answering.
+//
+// Batch settlement: every tool call of one assistant turn is answered before
+// the next model request, which is published exactly once — however many calls
+// there were and in whatever order their results arrive.
 import { definePlugin } from '../sdk/agentmod.js';
+import { checkArgs, suggestTools } from '../sdk/toolargs.js';
 
 const msgs = (ctx) => ctx.context.filter((c) => c.slot === 'messages');
 const META_KEYS = ['exit_code', 'timed_out', 'duration_ms', 'truncated', 'checkpoint', 'process_id', 'state', 'sha256', 'diagnostics', 'read_only', 'secrets_used'];
@@ -26,6 +34,7 @@ definePlugin({
       { event: 'model-response', demands: ['text', 'tool_calls?'] },
       { event: 'tool-result', demands: ['call_id', 'output'] },
       { event: 'context-edit', demands: ['ops'] },
+      { event: 'dispatch-failed', demands: ['reason', 'event_name', 'payload'] },
     ],
     emits: [
       { event: 'model-request', supplies: ['turn'] },
@@ -45,11 +54,12 @@ definePlugin({
       const calls = Array.isArray(ctx.payload.tool_calls) ? ctx.payload.tool_calls : [];
       ctx.add('messages', { role: 'assistant', content: ctx.payload.text, tool_calls: calls.length ? calls.map(({ call_id, name, args }) => ({ call_id, name, args })) : undefined });
       if (calls.length) {
-        const offered = new Set(ctx.slot('tools').map((t) => t?.name));
+        const specs = new Map(ctx.slot('tools').filter((t) => t?.name).map((t) => [t.name, t]));
+        const offered = new Set(specs.keys());
         for (const call of calls) {
-          const reject = call.parse_error ? `Invalid call: ${call.parse_error}. Call the tool again with valid JSON arguments.`
-            : !offered.has(call.name) ? `There is no tool named \`${call.name}\`. Available tools: ${[...offered].sort().join(', ')}${offered.has('tool_search') ? '. Use tool_search to find others.' : '.'}`
-            : null;
+          const reject = call.parse_error ? `Invalid call to \`${call.name}\`: ${call.parse_error}. Call it again with a JSON object of arguments.`
+            : !offered.has(call.name) ? suggestTools(call.name, [...offered])
+            : checkArgs(specs.get(call.name), call.args || {});
           if (reject) {
             await ctx.publish('tool-result', { call_id: call.call_id, name: call.name, output: reject, error: true }, { ui: { v: 1, kind: 'tool', name: call.name, call_id: call.call_id, status: 'error', result: 'rejected' } });
             continue;
@@ -88,6 +98,19 @@ definePlugin({
       if (wanted.every((id) => answered.has(id))) {
         await ctx.publish('model-request', { turn: ctx.event.event_id });
       }
+    },
+    'dispatch-failed': async (ctx) => {
+      const p = ctx.payload;
+      if (p.event_name !== 'tool-call') return;
+      const call = p.payload || {};
+      if (!call.call_id) return;
+      const answered = msgs(ctx).some((m) => m.value.role === 'tool' && m.value.call_id === call.call_id);
+      if (answered) return; // the owner answered before failing
+      const offered = ctx.slot('tools').map((t) => t?.name).filter(Boolean);
+      const output = p.reason === 'owner-failed'
+        ? `The \`${call.name}\` tool failed before returning a result (${p.plugin}: ${String(p.error || 'error').slice(0, 300)}). Retry once if it looks transient; otherwise take another approach.`
+        : suggestTools(call.name, offered, { routed: p.owners });
+      await ctx.publish('tool-result', { call_id: call.call_id, name: call.name, output, error: true, dispatch: p.reason }, { ui: { v: 1, kind: 'tool', name: call.name, call_id: call.call_id, status: 'error', result: p.reason } });
     },
     'context-edit': async (ctx) => {
       // Operator-driven context manipulation (add/replace/remove/clear/restore).

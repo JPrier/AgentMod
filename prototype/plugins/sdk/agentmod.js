@@ -8,6 +8,8 @@
 //
 // A plugin is uncategorized: event in -> contributed context + published events.
 
+import { createStreamWriter } from './stream.js';
+
 export const PROTOCOL = 'agentmod/0.1';
 
 const isNode = typeof process !== 'undefined' && !!process.versions?.node;
@@ -99,6 +101,7 @@ export function slot(context, name) {
  * @param {Function} [spec.validate] async (config, {env}) => void; throw to refuse the handshake
  * @param {Function} [spec.init]   async (plugin) => void, after the handshake
  * @param {Function} [spec.onRecord] (record) => void, for plugins that `watch`
+ * @param {Function} [spec.onStream] (messages) => void, live stream messages for watchers
  */
 export function definePlugin(spec) {
   const plugin = new Plugin(spec);
@@ -113,7 +116,14 @@ class Plugin {
     this.pending = new Map();
     this.aborts = new Map();
     this.config = {};
-    this.name = spec.manifest.name;
+    this.manifest = typeof spec.manifest === 'function' ? null : spec.manifest;
+    this.name = spec.name || this.manifest?.name || 'plugin';
+  }
+
+  /** The manifest for a config (a manifest may depend on it, e.g. declared tools). */
+  manifestFor(config) {
+    const m = typeof this.spec.manifest === 'function' ? this.spec.manifest(config || {}) : this.spec.manifest;
+    return m;
   }
 
   async start() {
@@ -122,6 +132,9 @@ class Plugin {
   }
 
   send(obj) { this.transport.send({ jsonrpc: '2.0', ...obj }); }
+
+  /** A JSON-RPC notification (no reply). */
+  notify(method, params) { this.send({ method, params }); }
 
   request(method, params) {
     const id = this.nextId++;
@@ -145,7 +158,10 @@ class Plugin {
       applyConfig: (config, scope) => this.request('apply_config', { config, scope }),
       /** Call a read-only service another plugin declares (control capability). */
       callService: (plugin, service, args = {}) => this.request('call_service', { plugin, service, args }),
-      watch: () => this.request('watch', {}),
+      /** Tail records; `{ streams: true }` also delivers live stream messages (onStream). */
+      watch: (opts = {}) => this.request('watch', opts),
+      /** After `resync-required`: snapshots of open streams; delivery resumes. */
+      streamResync: () => this.request('stream_resync', {}),
       /** Use a host device the manifest declares (browser runtime; see ui/runtime/devices.js). */
       device: (device, op, args = {}, config = {}) => this.request('device', { device, op, args, config }),
     };
@@ -166,6 +182,8 @@ class Plugin {
         case 'initialize': {
           this.config = params.config || {};
           this.instance = params.plugin;
+          this.manifest = this.manifestFor(this.config);
+          this.name = this.manifest?.name || this.name;
           if (this.spec.validate) {
             // A plugin may refuse to start (e.g. a required secret is missing);
             // the runtime then cannot compile a config that uses it.
@@ -174,13 +192,13 @@ class Plugin {
             } catch (e) {
               // The refusal carries what a frontend needs to help: the settings
               // and services the plugin declares (services stay callable).
-              const m = this.spec.manifest;
+              const m = this.manifest;
               this.send({ id, error: { code: -32010, message: e.message, data: { ...(e.data || {}), description: m.description, settings: m.settings || [], services: m.services || [] } } });
               return;
             }
           }
           this.storage = await createStorage(params.plugin || this.name, this.transport.env);
-          this.send({ id, result: { protocol: PROTOCOL, manifest: this.spec.manifest } });
+          this.send({ id, result: { protocol: PROTOCOL, manifest: this.manifest } });
           if (this.spec.init) {
             Promise.resolve()
               .then(() => this.spec.init(this))
@@ -212,6 +230,11 @@ class Plugin {
         }
         case 'record': {
           this.spec.onRecord?.(params.record, this);
+          return;
+        }
+        case 'stream': {
+          // Live stream messages for watchers (frames, finalization, resync).
+          this.spec.onStream?.(params.messages || [], this);
           return;
         }
         case 'shutdown': {
@@ -270,6 +293,8 @@ class Plugin {
       contribute: (op) => result.contributions.push(op),
       veto: (reason) => { result.veto = reason; },
       transform: (payload) => { result.transform = payload; },
+      /** A provider stream for this invocation (see sdk/stream.js). */
+      stream: (opts) => createStreamWriter(ctx, opts),
     };
     try {
       const ret = await handler(ctx);
@@ -303,14 +328,45 @@ export function toolSpec(name, description, parameters = {}, opts = {}) {
   if (opts.group) spec.group = opts.group;
   if (opts.effects) spec.effects = opts.effects;
   if (opts.trust) spec.trust = opts.trust;
+  // Phrases in a user message that make a deferred tool load by itself.
+  if (opts.intents?.length) spec.intents = opts.intents;
   return spec;
 }
 
 /**
  * Contribute this plugin's tool descriptions unless already present
- * (used on session-started and config-applied).
+ * (used on session-started and config-applied). A tool the plugin's manifest
+ * does not declare is not offered: every offered tool has a compiled owner.
  */
 export function offerTools(ctx, tools) {
   const present = new Set(ctx.slot('tools').map((t) => t?.name));
-  for (const t of tools) if (!present.has(t.name)) ctx.add('tools', t);
+  const declared = ctx.plugin?.manifest?.tools;
+  const owns = (name) => !declared || declared.some((d) => d.name === name || (d.name.endsWith('*') && name.startsWith(d.name.slice(0, -1))));
+  for (const t of tools) {
+    if (present.has(t.name)) continue;
+    if (!owns(t.name)) {
+      ctx.log(`not offering \`${t.name}\`: it is not declared in this plugin's manifest tools`);
+      continue;
+    }
+    ctx.add('tools', t);
+  }
+}
+
+/** Manifest `tools` declarations from tool specs (ownership + schema, compile-time). */
+export function declareTools(specs) {
+  return specs.map((t) => ({
+    name: t.name,
+    ...(t.parameters && Object.keys(t.parameters).length ? { parameters: t.parameters } : {}),
+    ...(t.required?.length ? { required: t.required } : {}),
+    ...(t.tier ? { tier: t.tier } : {}),
+  }));
+}
+
+/**
+ * The consume entry that makes a plugin the compiled owner of these tools: the
+ * kernel routes each `tool-call` to exactly the plugin whose keyed values
+ * contain its name (a value ending in `*` owns a family, e.g. `mcp__github__*`).
+ */
+export function ownTools(names, extra = {}) {
+  return { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false, keyed: { key: 'name', values: [...names] }, ...extra };
 }

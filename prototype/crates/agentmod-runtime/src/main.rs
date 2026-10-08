@@ -5,7 +5,7 @@
 //! agentmod compile [--config agentmod.toml] [--json]
 //! agentmod inspect [--data .agentmod] [SESSION] [--json]
 //! agentmod verify  [--data .agentmod]
-//! agentmod metrics [--data .agentmod] [SESSION] [--json]
+//! agentmod metrics [--data .agentmod] [SESSION] [--json] [--turns]
 //! agentmod config  [--config agentmod.toml]
 //! ```
 
@@ -25,6 +25,7 @@ struct Args {
     config: PathBuf,
     data: PathBuf,
     json: bool,
+    turns: bool,
     positional: Vec<String>,
 }
 
@@ -36,6 +37,7 @@ fn parse() -> Result<Args, String> {
         config: PathBuf::from("agentmod.toml"),
         data: PathBuf::from(".agentmod"),
         json: false,
+        turns: false,
         positional: Vec::new(),
     };
     while let Some(arg) = it.next() {
@@ -43,6 +45,7 @@ fn parse() -> Result<Args, String> {
             "--config" | "-c" => a.config = it.next().ok_or("--config needs a path")?.into(),
             "--data" | "-d" => a.data = it.next().ok_or("--data needs a path")?.into(),
             "--json" => a.json = true,
+            "--turns" => a.turns = true,
             s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
             s => a.positional.push(s.to_owned()),
         }
@@ -57,7 +60,8 @@ USAGE:
   agentmod compile [--config agentmod.toml] [--json]             handshake plugins and validate the graph
   agentmod inspect [--data .agentmod] [SESSION] [--json]         read logs (replay-as-reading; runs no plugins)
   agentmod verify  [--data .agentmod]                            replay every log through a fresh kernel
-  agentmod metrics [--data .agentmod] [SESSION] [--json]         tokens, cost, tools, edits, prompts… derived from the logs
+  agentmod metrics [--data .agentmod] [SESSION] [--json] [--turns]
+                                                                 model efficiency + control-plane amplification, from the logs
   agentmod config  [--config agentmod.toml]                      print the config as JSON (used by the browser runtime)
 ";
 
@@ -83,6 +87,7 @@ async fn main() -> ExitCode {
             &args.data,
             args.positional.first().map(String::as_str),
             args.json,
+            args.turns,
         ),
         "config" => export_config(&args),
         _ => {
@@ -143,6 +148,14 @@ async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
                         b.join(" → "),
                         a.join(", ")
                     );
+                    if let Some(r) = &p.routed {
+                        let owners: Vec<String> = r
+                            .entries()
+                            .into_iter()
+                            .map(|(v, o)| format!("{v}→{o}"))
+                            .collect();
+                        println!("  {:<20} owner by `{}`: {}", "", r.key, owners.join(" "));
+                    }
                 }
             }
             println!(

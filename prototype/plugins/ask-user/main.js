@@ -15,7 +15,7 @@
 //
 // Place it before chat-context in a definition (it is a blocking subscriber on
 // user-message).
-import { definePlugin, offerTools } from '../sdk/agentmod.js';
+import { definePlugin, declareTools, offerTools, ownTools } from '../sdk/agentmod.js';
 
 import { ASK_USER } from '../sdk/ask.js';
 
@@ -33,10 +33,11 @@ definePlugin({
     consumes: [
       { event: 'session-started' },
       { event: 'config-applied' },
-      { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false },
+      ownTools(['ask_user']),
       { event: 'ui-action', demands: ['reply_to', 'action'], mode: 'async', context: false },
       { event: 'user-message', demands: ['text'], mode: 'blocking', context: false },
     ],
+    tools: declareTools([ASK_USER]),
     emits: [
       { event: 'user-input-requested', supplies: ['call_id', 'question'] },
       { event: 'tool-result', supplies: ['call_id', 'name', 'output'] },

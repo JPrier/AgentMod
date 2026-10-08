@@ -133,24 +133,24 @@ export function toolSpecs({ L = DEFAULT_LIMITS, root = '/workspace', lifecycle =
     }, { tier: 'core', group: 'files', effects: 'write' }),
     toolSpec('view_image', 'Look at an image file in the workspace (PNG, JPEG, GIF, WebP), e.g. a screenshot or generated chart. The image is attached for you to see.', {
       path: P('image path'),
-    }, { required: ['path'], tier: 'deferred', group: 'files', effects: 'read' }),
+    }, { required: ['path'], tier: 'deferred', group: 'files', effects: 'read', intents: ['screenshot', '.png', '.jpg', 'image'] }),
     toolSpec('repo_map', 'A compact map of the repository: file counts per directory and top-level symbol signatures per source file (approximate, regex-based). Use it to orient in an unfamiliar codebase.', {
       path: P('directory (default: workspace root)'),
       max_files: P('source files to include (default 200)', 'integer'),
-    }, { tier: 'deferred', group: 'files', effects: 'read' }),
+    }, { tier: 'deferred', group: 'files', effects: 'read', intents: ['explain how', 'how does', 'architecture', 'codebase', 'overview of'] }),
     toolSpec('checkpoints', 'Workspace checkpoints taken automatically before edits and mutating commands. list them, diff one against now (or two against each other), or restore the workspace to one (the current state is checkpointed first, so a restore can be undone).', {
       action: P('list | diff | restore', 'string', { enum: ['list', 'diff', 'restore'] }),
       checkpoint: P('checkpoint id'),
       to: P('diff: second checkpoint (default: the current workspace)'),
       paths: P('diff: limit to these paths', 'array', { items: { type: 'string' } }),
-    }, { required: ['action'], tier: 'deferred', group: 'workspace', effects: 'varies' }),
+    }, { required: ['action'], tier: 'deferred', group: 'workspace', effects: 'varies', intents: ['undo', 'rewind', 'revert', 'checkpoint', 'roll back'] }),
   ];
   if (importRepos) {
     specs.push(toolSpec('import_repo', 'Copy a public GitHub repository into the workspace as a fresh git repository (one commit). Downloads happen outside the workspace, so it works without network access inside it.', {
       repo: P('"owner/name" or https://github.com/owner/name'),
       ref: P('branch, tag, or commit (default: the default branch)'),
       dest: P(`destination directory (default ${root}/<name>)`),
-    }, { required: ['repo'], tier: 'deferred', group: 'workspace', effects: 'write' }));
+    }, { required: ['repo'], tier: 'deferred', group: 'workspace', effects: 'write', intents: ['github.com/', 'github repo', 'import the', 'clone', 'repository'] }));
   }
   if (lifecycle) {
     specs.push(
@@ -198,6 +198,34 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
   const repoMap = makeRepoMap({ runner, search, probe });
   const redactSecrets = makeRedactor(Object.fromEntries(Object.entries(secrets).map(([k, s]) => [k, s?.value])));
   const redact = (t) => redactSecrets(t);
+
+  /**
+   * Errors written so a model can correct the call in one step: what the path
+   * actually is, and the exact call that does what it meant.
+   */
+  async function pathProblem(tool, abs) {
+    const r = await runner.run(`p=${shq(abs)}; if [ -f "$p" ]; then echo file; elif [ -d "$p" ]; then echo dir; elif [ -e "$p" ]; then echo other; else d="$p"; while [ ! -d "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done; echo "none $d"; ls -1p "$d" 2>/dev/null | head -n 40; fi`, { cwd: '/', timeoutMs: 30_000 });
+    const [first, ...rest] = r.stdout.trim().split('\n');
+    const relPath = rel(abs);
+    const slash = relPath.lastIndexOf('/');
+    const dir = slash > 0 ? relPath.slice(0, slash) : '.';
+    const base = relPath.slice(slash + 1);
+    if (first === 'file') {
+      const how = {
+        search_text: `To search inside that file use: path="${dir}", include=["${base}"] (or read it with read_file path="${relPath}").`,
+        search_files: `Search its directory instead: path="${dir}", pattern="${base}".`,
+        list_dir: `Read it with read_file path="${relPath}", or list its directory with list_dir path="${dir}".`,
+        repo_map: `Map its directory instead: repo_map path="${dir}".`,
+      }[tool] || `Use its directory: path="${dir}".`;
+      return `${tool} \`path\` must be a directory; ${relPath} is a file. ${how}`;
+    }
+    if (first?.startsWith('none')) {
+      const parent = rel(first.slice(5) || ROOT);
+      const near = rest.filter((n) => n.toLowerCase().includes(base.toLowerCase().slice(0, 3)) || base.toLowerCase().includes(n.replace(/\/$/, '').toLowerCase())).slice(0, 8);
+      return `${relPath} does not exist. The nearest existing directory is ${parent}/${near.length ? `, which has: ${near.join(', ')}` : rest.length ? ` (${rest.slice(0, 12).join(', ')}${rest.length > 12 ? ', …' : ''})` : ' (empty)'}. Paths are relative to the workspace root ${ROOT}; find files with search_files pattern="**/${base}".`;
+    }
+    return `${relPath} is not a regular directory`;
+  }
   const specs = toolSpecs({ L, root: ROOT, lifecycle: !!target.lifecycle, importRepos });
   const names = new Set(specs.map((s) => s.name));
   const lifecycleNames = new Set(specs.filter((s) => s.group === 'sandbox').map((s) => s.name));
@@ -450,8 +478,8 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
     const wantEnd = args.end_line != null ? clampInt(args.end_line, start, start, Number.MAX_SAFE_INTEGER) : start + L.max_read_lines - 1;
     const end = Math.min(wantEnd, start + L.max_read_lines - 1);
     const r = await runner.run(`bash -c ${shq(READ_SCRIPT)} _ ${shq(abs)} ${start} ${end} ${L.max_read_bytes}`, { cwd: '/', timeoutMs: 60_000 });
-    if (r.exitCode === 3) throw new ToolError(`${rel(abs)} does not exist`);
-    if (r.exitCode === 4) throw new ToolError(`${rel(abs)} is a directory; use list_dir`);
+    if (r.exitCode === 3) throw new ToolError(await pathProblem('read_file', abs));
+    if (r.exitCode === 4) throw new ToolError(`${rel(abs)} is a directory, not a file: list it with list_dir path="${rel(abs)}" or search it with search_text path="${rel(abs)}"`);
     if (r.exitCode === 5) throw new ToolError(`${rel(abs)} is not readable`);
     if (r.exitCode !== 0) throw new ToolError(`reading ${rel(abs)} failed: ${r.stderr.slice(0, 300)}`);
     const nl = r.stdoutBytes.indexOf(10);
@@ -478,7 +506,7 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
     const abs = args.path ? resolveIn(ROOT, String(args.path)) : ROOT;
     const depth = clampInt(args.depth, 1, 1, 5);
     const res = await search.listDir(abs, { root: ROOT, depth, maxEntries: L.max_list_entries, signal });
-    if (!res) throw new ToolError(`${rel(abs)} is not a directory`);
+    if (!res) throw new ToolError(await pathProblem('list_dir', abs));
     const body = res.entries.map((e) => `${e.path}${e.type === 'dir' ? '/' : ''}${e.skipped ? '  (not descended)' : e.type === 'file' ? `  ${kb(e.size)}` : ''}`).join('\n');
     return {
       output: `${rel(abs)}/ (depth ${depth}): ${res.total} entr${res.total === 1 ? 'y' : 'ies'}${res.truncated ? `, first ${res.entries.length} shown (narrow the path or depth)` : ''}\n${body || '(empty)'}`,
@@ -492,7 +520,7 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
     if (!pattern) throw new ToolError('`pattern` is required');
     const abs = args.path ? resolveIn(ROOT, String(args.path)) : ROOT;
     const res = await search.searchFiles(abs, { root: ROOT, pattern, maxResults: L.max_search_results / 2, signal });
-    if (!res) throw new ToolError(`${rel(abs)} is not a directory`);
+    if (!res) throw new ToolError(await pathProblem('search_files', abs));
     const body = res.files.map((f) => `${f.path}  ${kb(f.size)}`).join('\n');
     return { output: `${res.total} file${res.total === 1 ? '' : 's'} match ${JSON.stringify(pattern)}${res.truncated ? ` (first ${res.files.length})` : ''}\n${body}`.trim(), summary: `${res.total} files`, data: { total: res.total, truncated: res.truncated } };
   }
@@ -516,7 +544,7 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
       maxResults: clampInt(args.max_results, L.default_search_results, 1, L.max_search_results),
       signal,
     });
-    if (!res) throw new ToolError(`${rel(abs)} is not a directory`);
+    if (!res) throw new ToolError(await pathProblem('search_text', abs));
     const groups = [];
     let last = null;
     for (const m of res.matches) {
@@ -667,7 +695,7 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
   async function repoMapTool(args, { signal }) {
     const abs = args.path ? resolveIn(ROOT, String(args.path)) : ROOT;
     const res = await repoMap(abs, { root: ROOT, maxFiles: clampInt(args.max_files, 200, 10, 1000), signal });
-    if (!res) throw new ToolError(`${rel(abs)} is not a directory`);
+    if (!res) throw new ToolError(await pathProblem('repo_map', abs));
     return { output: res.text, summary: `${res.sources} sources`, data: { files: res.files, sources: res.sources, shown: res.shown } };
   }
 
@@ -838,6 +866,30 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
     return { root: ROOT, state_dir: STATE, environment: target.identity?.() ?? null, git, repos };
   }
 
+  /**
+   * Static facts about the execution environment, probed once per workspace
+   * and shown to the model, so it does not spend turns rediscovering them.
+   */
+  async function environment() {
+    const tools = ['bash', 'gcc', 'cc', 'clang', 'make', 'cmake', 'git', 'python3', 'pip3', 'node', 'npm', 'cargo', 'go', 'java', 'rg', 'curl'];
+    const r = await runner.run([
+      'printf "os|%s\n" "$( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || uname -s)"',
+      'printf "arch|%s\n" "$(uname -m 2>/dev/null)"',
+      'printf "cpus|%s\n" "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo ?)"',
+      `for t in ${tools.join(' ')}; do if command -v $t >/dev/null 2>&1; then v=$($t --version 2>&1 | head -n 1 | tr -d '\r' | cut -c1-60); printf "tool|%s|%s\n" "$t" "$v"; fi; done`,
+      'true',
+    ].join('\n'), { cwd: ROOT, timeoutMs: 60_000 });
+    const env = { os: null, arch: null, cpus: null, tools: {} };
+    for (const l of r.stdout.split('\n')) {
+      const [k, a, b] = l.split('|');
+      if (k === 'os') env.os = a || null;
+      else if (k === 'arch') env.arch = a || null;
+      else if (k === 'cpus') env.cpus = a || null;
+      else if (k === 'tool' && a) env.tools[a] = (b || '').trim();
+    }
+    return env;
+  }
+
   /** Project instruction files (AGENTS.md, CLAUDE.md, …), bounded. */
   async function instructions({ maxBytes = 16_000 } = {}) {
     const script = INSTRUCTION_FILES.map((f) => `[ -f ${shq(`${ROOT}/${f}`)} ] && { printf '\\n\\0FILE %s\\n' ${shq(f)}; head -c ${maxBytes} ${shq(`${ROOT}/${f}`)}; }`).join('\n') + '\ntrue';
@@ -969,5 +1021,5 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
     }
   }
 
-  return { specs, names, lifecycleNames, root: ROOT, stateDir: STATE, shadowGitDir: shadowGitDir || `${STATE}/shadow.git`, call, info, instructions, workspacePolicy, skills, readSkill, checkpoints: cps, processes: procs, checkpoint, adopt, redact, runner, mutex: (fn) => mutex(ROOT, fn) };
+  return { specs, names, lifecycleNames, root: ROOT, stateDir: STATE, shadowGitDir: shadowGitDir || `${STATE}/shadow.git`, call, info, environment, instructions, workspacePolicy, skills, readSkill, checkpoints: cps, processes: procs, checkpoint, adopt, redact, runner, mutex: (fn) => mutex(ROOT, fn) };
 }

@@ -15,7 +15,7 @@
 //
 // Config: { servers: { <name>: { command: [...], env: {}, cwd } | { url, headers } , tier? },
 //           timeout_seconds: 120, max_output_bytes: 20000 }
-import { definePlugin, offerTools } from '../sdk/agentmod.js';
+import { definePlugin, offerTools, ownTools } from '../sdk/agentmod.js';
 import { connectStdio, connectHttp, toSpec, flattenResult } from '../sdk/mcp.js';
 
 const servers = new Map(); // name -> { client, specs, error }
@@ -44,20 +44,26 @@ async function offer(ctx) {
   offerTools(ctx, allSpecs());
 }
 
+// Each configured server owns the family `mcp__<server>__*`: ownership is
+// known from config at compile time even though the tool list arrives later.
+const families = (cfg) => Object.keys(cfg.servers || {}).map((n) => `mcp__${n}__*`);
+
 definePlugin({
-  manifest: {
+  name: 'mcp-bridge',
+  manifest: (cfg) => ({
     name: 'mcp-bridge',
     version: '0.1.0',
     description: 'MCP servers (stdio / streamable HTTP) as deferred, policy-gated, untrusted tools.',
     consumes: [
       { event: 'session-started' },
       { event: 'config-applied' },
-      { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false },
+      ownTools(families(cfg)),
     ],
     emits: [{ event: 'tool-result', supplies: ['call_id', 'name', 'output'] }],
     services: [{ name: 'servers', description: 'Connected MCP servers, their tools, and connection errors' }],
+    tools: families(cfg).map((name) => ({ name, tier: 'deferred' })),
     config_schema: { servers: {}, timeout_seconds: 120, max_output_bytes: 20000 },
-  },
+  }),
   init: (p) => start(p.config || {}),
   shutdown: async () => {
     for (const s of servers.values()) await s.client?.close().catch(() => {});

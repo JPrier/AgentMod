@@ -20,7 +20,7 @@ test('projection: core tools only, deterministic order, deferred listed in tool_
   const p = project(ctx);
   const names = p.tools.map((t) => t.name);
   assert.deepEqual(names, ['shell', 'process', 'read_file', 'list_dir', 'search_files', 'search_text', 'apply_patch', 'update_plan', 'tool_search', 'clock']);
-  assert.match(p.tools.find((t) => t.name === 'tool_search').description, /Tools available on request: checkpoints, import_repo, repo_map, sandbox_logs/);
+  assert.ok(p.tools.find((t) => t.name === 'tool_search').description.includes('Tools available on request (call directly, or search for full descriptions): checkpoints(action, checkpoint?, to?, paths?), import_repo(repo, ref?, dest?), repo_map('));
   assert.equal(p.metrics.tools_deferred, 8);
   assert.ok(p.metrics.tool_schema_tokens > 500 && p.metrics.tool_schema_tokens < 4000, p.metrics.tool_schema_tokens);
   // Byte-stable for the same context regardless of contribution order.

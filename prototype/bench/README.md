@@ -21,6 +21,27 @@ node bench/run.mjs --external claude-code,aider                     # add extern
 node bench/run.mjs --selftest                                       # plumbing check with the test-only mock
 ```
 
+## The Kilo regression benchmark
+
+`bench/kilo.mjs` runs one fixed task — *Import the GitHub repo antirez/kilo,
+build it with make, and explain how it draws the screen* — offline: a fake
+GitHub serves a vendored snapshot (`tasks/kilo-explain/github/`), the model is
+a script (`kilo-world.mjs`), and the tools and `make` are real.
+
+```shell
+node bench/kilo.mjs                         # the working tree: coder (fixed, adaptive) and minimal
+node bench/kilo.mjs --before-ref origin/main   # also build a ref in a worktree and compare
+node bench/kilo.mjs --assert                # CI: fail on hot-path regressions
+node bench/kilo.mjs --real --model <id>     # a real model (OPENROUTER_API_KEY, GitHub access)
+node bench/turns.mjs --data <dir> [SESSION] # why each model request happened
+node bench/turns.mjs export.json            # …for a browser "Export logs" file
+```
+
+`fixed` follows the same trajectory on every build (it measures the harness's
+own cost); `adaptive` takes shortcuts only when the harness exposes them (a
+simulated model, not a measurement). Results and methodology:
+[docs/design/hot-paths.md](../../docs/design/hot-paths.md#8-benchmark-the-kilo-task).
+
 ## What is measured
 
 | Metric | Source |

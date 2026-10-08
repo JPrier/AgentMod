@@ -76,7 +76,7 @@ fn preserve_all() -> Vec<String> {
 }
 
 /// Everything a plugin declares at handshake.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Manifest {
     pub name: String,
     pub version: String,
@@ -93,6 +93,21 @@ pub struct Manifest {
     /// Free-form description of accepted configuration (documentation only).
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub config_schema: Value,
+    /// Read-only services a host may route to this plugin for frontends
+    /// (`[{ name, description }]`, e.g. a provider's `model-catalog`). Service
+    /// calls are not invocations: they are not recorded and change no state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<Value>,
+    /// Settings a frontend may present to configure this plugin
+    /// (`[{ key, label, secret?, required?, type? }]`); documentation for UIs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub settings: Vec<Value>,
+    /// Roles the plugin fills, for frontends (e.g. `["model"]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provides: Vec<String>,
+    /// Host devices the plugin uses (browser runtime; enforced by that host).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<String>,
 }
 
 impl Manifest {
@@ -109,6 +124,14 @@ impl Manifest {
     #[must_use]
     pub fn transform(&self, event: &str) -> Option<&Transform> {
         self.transforms.iter().find(|t| t.event == event)
+    }
+
+    /// Does the manifest declare this service?
+    #[must_use]
+    pub fn has_service(&self, name: &str) -> bool {
+        self.services
+            .iter()
+            .any(|s| s.get("name").and_then(Value::as_str) == Some(name))
     }
 }
 

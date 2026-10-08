@@ -68,6 +68,9 @@ async function route(req, res) {
     return send(res, 200, await plugin.host.startSession({ definition: b.definition || 'chat', initial, forkFrom: b.fork_from }));
   }
   if (p === '/api/graph') return send(res, 200, await q('graph'));
+  if (p === '/api/services' && req.method === 'GET') return send(res, 200, await q('services'));
+  const sm = p.match(/^\/api\/services\/([^/]+)\/([^/]+)$/);
+  if (sm && req.method === 'POST') return send(res, 200, await plugin.host.callService(decodeURIComponent(sm[1]), decodeURIComponent(sm[2]), await readBody(req)));
   if (p === '/api/config' && req.method === 'GET') return send(res, 200, await q('config'));
   if (p === '/api/config/apply' && req.method === 'POST') {
     const b = await readBody(req);

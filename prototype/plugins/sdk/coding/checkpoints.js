@@ -17,7 +17,7 @@
 
 import { shq } from './paths.js';
 
-const EXCLUDES = ['/.agentmod/', 'node_modules/', 'target/', '.venv/', 'venv/', '__pycache__/', '*.pyc', '.DS_Store'];
+const EXCLUDES = ['/.agentmod/state/', 'node_modules/', 'target/', '.venv/', 'venv/', '__pycache__/', '*.pyc', '.DS_Store'];
 
 function gitEnv(stateDir, root, gitDir = `${stateDir}/shadow.git`) {
   return [

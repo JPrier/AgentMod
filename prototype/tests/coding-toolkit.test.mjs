@@ -278,7 +278,7 @@ test('checkpoints: dedupe, restore (reversible), nested repositories', async () 
   // Checkpoints never touch the project's own git state.
   assert.ok(!fs.existsSync(path.join(root, '.git')));
   // The state dir hides itself from git.
-  assert.equal(fs.readFileSync(path.join(root, '.agentmod', '.gitignore'), 'utf8'), '*\n');
+  assert.equal(fs.readFileSync(path.join(root, '.agentmod', 'state', '.gitignore'), 'utf8'), '*\n');
 });
 
 test('shell: exit codes, cwd, timeout, diagnostics, truncation, checkpoints', async () => {
@@ -382,7 +382,7 @@ test('processes: start, read, wait, stdin, kill, reconcile across restarts', asy
   assert.match(r.output, /exited with code 7/);
   r = await call('process', { action: 'start', command: 'sleep 60' }, { call_id: 'start-4' });
   const id4 = r.data.process_id;
-  const pid = Number(fs.readFileSync(path.join(root, '.agentmod', 'procs', id4, 'pid'), 'utf8'));
+  const pid = Number(fs.readFileSync(path.join(root, '.agentmod', 'state', 'procs', id4, 'pid'), 'utf8'));
   for (const c of execFileSync('pgrep', ['-P', String(pid)]).toString().trim().split('\n')) process.kill(Number(c), 'SIGKILL');
   process.kill(pid, 'SIGKILL');
   await new Promise((res) => setTimeout(res, 300));
@@ -396,7 +396,7 @@ test('large output from a process prefers the newest bytes', async () => {
   const { call } = setup({ toolkit: { limits: { max_process_read_bytes: 1000 } } });
   const r = await call('process', { action: 'start', command: 'seq 1 50000; echo END' }, { call_id: 'big' });
   assert.match(r.output, /END/);
-  assert.match(r.output, /of earlier stdout skipped; full log: \.agentmod\/procs\/p[0-9a-f]+\/stdout/);
+  assert.match(r.output, /of earlier stdout skipped; full log: \.agentmod\/state\/procs\/p[0-9a-f]+\/stdout/);
 });
 
 test('command classification', () => {

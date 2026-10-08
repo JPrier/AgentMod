@@ -33,17 +33,73 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     Ok(Loaded { config, base_dir })
 }
 
-/// Fill `binary_hash` for every plugin from the files its command references.
+/// Relative module specifiers a JavaScript file imports statically
+/// (`import … from './x.js'`, `export … from '../y.js'`, `import('./z.js')`).
+fn js_imports(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for marker in ["from '", "from \"", "import('", "import(\"", "import '", "import \""] {
+        let quote = marker.chars().last().unwrap_or('\'');
+        let mut rest = text;
+        while let Some(i) = rest.find(marker) {
+            rest = &rest[i + marker.len()..];
+            if let Some(end) = rest.find(quote) {
+                let spec = &rest[..end];
+                if spec.starts_with("./") || spec.starts_with("../") {
+                    out.push(spec.to_owned());
+                }
+                rest = &rest[end..];
+            }
+        }
+    }
+    out
+}
+
+/// The entry file plus every file it imports relatively, transitively (sorted).
+/// A plugin's identity must change when any of its code changes, including
+/// shared SDK modules it imports.
+fn code_closure(entry: &Path) -> Vec<PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut stack = vec![entry.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(canon) = p.canonicalize() else { continue };
+        if !seen.insert(canon.clone()) {
+            continue;
+        }
+        let is_js = canon
+            .extension()
+            .is_some_and(|e| e == "js" || e == "mjs");
+        if !is_js {
+            continue;
+        }
+        if let Ok(text) = std::fs::read_to_string(&canon) {
+            let dir = canon.parent().map(Path::to_path_buf).unwrap_or_default();
+            for spec in js_imports(&text) {
+                stack.push(dir.join(spec));
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Fill `binary_hash` for every plugin from the files its command references
+/// (and, for JavaScript, the modules they import).
 pub fn stamp_binaries(config: &mut DeploymentConfig, base_dir: &Path) {
     for plugin in config.plugins.values_mut() {
         let mut h = Sha256::new();
         let mut any = false;
         for arg in plugin.command.iter().skip(1) {
             let p = base_dir.join(arg);
-            if let Ok(bytes) = std::fs::read(&p) {
-                h.update(arg.as_bytes());
-                h.update(&bytes);
-                any = true;
+            if !p.is_file() {
+                continue;
+            }
+            let root = base_dir.canonicalize().unwrap_or_else(|_| base_dir.to_path_buf());
+            for file in code_closure(&p) {
+                if let Ok(bytes) = std::fs::read(&file) {
+                    let rel = file.strip_prefix(&root).unwrap_or(&file);
+                    h.update(rel.to_string_lossy().as_bytes());
+                    h.update(&bytes);
+                    any = true;
+                }
             }
         }
         if !any {
@@ -88,5 +144,25 @@ mod tests {
         assert!(!config.plugins["both"].disabled);
         assert!(!config.plugins["native"].disabled);
         assert!(config.plugins["worker"].disabled);
+    }
+
+    #[test]
+    fn stamps_cover_imported_modules() {
+        let dir = std::env::temp_dir().join(format!("agentmod-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("p")).unwrap();
+        std::fs::create_dir_all(dir.join("sdk")).unwrap();
+        std::fs::write(dir.join("p/main.js"), "import { x } from '../sdk/a.js';\n").unwrap();
+        std::fs::write(dir.join("sdk/a.js"), "export const x = 1; import('./b.js');\n").unwrap();
+        std::fs::write(dir.join("sdk/b.js"), "export const y = 1;\n").unwrap();
+        let mk = || -> DeploymentConfig {
+            toml::from_str("[plugins.p]\ncommand = [\"node\", \"p/main.js\"]\n").unwrap()
+        };
+        let mut a = mk();
+        stamp_binaries(&mut a, &dir);
+        std::fs::write(dir.join("sdk/b.js"), "export const y = 2;\n").unwrap();
+        let mut b = mk();
+        stamp_binaries(&mut b, &dir);
+        assert_ne!(a.plugins["p"].binary_hash, b.plugins["p"].binary_hash, "a transitive import changed the stamp");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

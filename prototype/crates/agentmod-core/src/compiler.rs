@@ -678,6 +678,7 @@ mod tests {
             transforms: vec![],
             capabilities: vec![],
             config_schema: Value::Null,
+            ..Default::default()
         }
     }
     fn setup(

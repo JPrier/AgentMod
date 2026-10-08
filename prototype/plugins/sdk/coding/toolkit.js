@@ -46,6 +46,7 @@ export const DEFAULT_LIMITS = Object.freeze({
 });
 
 const INSTRUCTION_FILES = ['AGENTS.md', 'CLAUDE.md', '.agentmod/instructions.md', '.github/copilot-instructions.md'];
+const POLICY_FILE = '.agentmod/policy.json';
 
 /** Serialize work per key (one workspace's mutations never interleave). */
 function keyedMutex() {
@@ -171,7 +172,7 @@ export function toolSpecs({ L = DEFAULT_LIMITS, root = '/workspace', lifecycle =
  * @param {object} o
  * @param {object} o.target
  * @param {string} o.root                 absolute workspace root in the target
- * @param {string} [o.stateDir]           default `<root>/.agentmod`
+ * @param {string} [o.stateDir]           default `<root>/.agentmod/state` (repository config may live in .agentmod/)
  * @param {object} [o.limits]
  * @param {boolean} [o.importRepos]
  * @param {Function} [o.fetch]
@@ -184,7 +185,7 @@ export function toolSpecs({ L = DEFAULT_LIMITS, root = '/workspace', lifecycle =
 export function codingToolkit({ target, root, stateDir, limits = {}, importRepos = true, fetch: fetchImpl = globalThis.fetch, env = {}, secrets = {}, diagnostics = {}, checkpoints: useCheckpoints = true, shadowGitDir }) {
   const L = { ...DEFAULT_LIMITS, ...limits };
   const ROOT = normalizePath(root);
-  const STATE = normalizePath(stateDir || `${ROOT}/.agentmod`);
+  const STATE = normalizePath(stateDir || `${ROOT}/.agentmod/state`);
   const runner = makeRunner({ target, stateDir: STATE });
   const cps = makeCheckpoints({ runner, root: ROOT, stateDir: STATE, gitDir: shadowGitDir });
   const procs = makeProcesses({ runner, target, stateDir: STATE });
@@ -851,6 +852,18 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
     return out;
   }
 
+  /** The repository's own policy file (workspace scope: it may only restrict). */
+  async function workspacePolicy() {
+    const r = await runner.run(`[ -f ${shq(`${ROOT}/${POLICY_FILE}`)} ] && head -c 65536 ${shq(`${ROOT}/${POLICY_FILE}`)}`, { cwd: '/', timeoutMs: 30_000 });
+    if (r.exitCode !== 0 || !r.stdout.trim()) return null;
+    try {
+      const json = JSON.parse(r.stdout);
+      return { path: POLICY_FILE, sha256: await sha256(r.stdout), rules: Array.isArray(json.rules) ? json.rules : [] };
+    } catch (e) {
+      return { path: POLICY_FILE, error: `invalid JSON: ${e.message}`, rules: [] };
+    }
+  }
+
   /**
    * Adopt changes made in another workspace (an isolated child or branch
    * worktree sharing this workspace's checkpoint store). A file is applied only
@@ -927,5 +940,5 @@ export function codingToolkit({ target, root, stateDir, limits = {}, importRepos
     }
   }
 
-  return { specs, names, lifecycleNames, root: ROOT, stateDir: STATE, shadowGitDir: shadowGitDir || `${STATE}/shadow.git`, call, info, instructions, checkpoints: cps, processes: procs, checkpoint, adopt, redact, runner, mutex: (fn) => mutex(ROOT, fn) };
+  return { specs, names, lifecycleNames, root: ROOT, stateDir: STATE, shadowGitDir: shadowGitDir || `${STATE}/shadow.git`, call, info, instructions, workspacePolicy, checkpoints: cps, processes: procs, checkpoint, adopt, redact, runner, mutex: (fn) => mutex(ROOT, fn) };
 }

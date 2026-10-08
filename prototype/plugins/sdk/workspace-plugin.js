@@ -76,7 +76,7 @@ export function defineWorkspacePlugin(spec) {
   const defaultRoot = (ctx) => normalizePath(spec.root(ctx.config ?? {}));
 
   /** Where checkpoint state lives for a root (worktrees share their parent's store). */
-  const storeOf = (root) => `${root}/.agentmod/shadow.git`;
+  const storeOf = (root) => `${root}/.agentmod/state/shadow.git`;
 
   /** The tree a session's workspace was in at log position `sequence`. */
   async function treeAt(ctx, sessionId, sequence, root) {
@@ -97,14 +97,14 @@ export function defineWorkspacePlugin(spec) {
   }
 
   async function isolate(ctx, sessionId, parentRoot, baseTree, from) {
-    const dir = `${parentRoot}/.agentmod/worktrees/${sessionId}`;
+    const dir = `${parentRoot}/.agentmod/state/worktrees/${sessionId}`;
     const parentKit = kit(ctx, parentRoot);
-    const exists = await parentKit.runner.run(`[ -f ${shq(`${dir}/.agentmod/base`)} ] && cat ${shq(`${dir}/.agentmod/base`)}`, { cwd: '/', timeoutMs: 30_000 });
+    const exists = await parentKit.runner.run(`[ -f ${shq(`${dir}/.agentmod/state/base`)} ] && cat ${shq(`${dir}/.agentmod/state/base`)}`, { cwd: '/', timeoutMs: 30_000 });
     if (exists.exitCode === 0 && exists.stdout.trim()) {
       return { root: dir, mode: 'isolated', base: { ...from, tree: exists.stdout.trim() }, gitDir: storeOf(parentRoot) };
     }
     await parentKit.checkpoints.materialize(baseTree, dir);
-    await parentKit.runner.must(`mkdir -p ${shq(`${dir}/.agentmod`)} && printf '*\\n' > ${shq(`${dir}/.agentmod/.gitignore`)} && printf '%s\\n' ${shq(baseTree)} > ${shq(`${dir}/.agentmod/base`)}`, { cwd: '/', timeoutMs: 30_000, what: 'worktree' });
+    await parentKit.runner.must(`mkdir -p ${shq(`${dir}/.agentmod/state`)} && printf '*\\n' > ${shq(`${dir}/.agentmod/state/.gitignore`)} && printf '%s\\n' ${shq(baseTree)} > ${shq(`${dir}/.agentmod/state/base`)}`, { cwd: '/', timeoutMs: 30_000, what: 'worktree' });
     return { root: dir, mode: 'isolated', base: { ...from, tree: baseTree }, gitDir: storeOf(parentRoot) };
   }
 
@@ -163,6 +163,8 @@ export function defineWorkspacePlugin(spec) {
     try {
       const info = await tk.info();
       await ctx.publish('workspace-info', { ...info, mode: ws.mode, base: ws.base }, { ui: { v: 1, kind: 'progress', label: `Workspace ${info.root}${ws.mode !== 'primary' ? ` (${ws.mode})` : ''}${info.git?.branch ? ` · git ${info.git.branch}@${(info.git.head || '').slice(0, 8)}${info.git.dirty ? ` (${info.git.dirty} changed)` : ''}` : ''}` } });
+      const wsPolicy = await tk.workspacePolicy();
+      if (wsPolicy) ctx.add('workspace-policy', { root: ws.root, ...wsPolicy });
       const have = new Set(ctx.slot('instructions').map((i) => `${i?.root}|${i?.path}|${i?.sha256}`));
       for (const ins of await tk.instructions()) {
         const item = { root: ws.root, path: ins.path, sha256: ins.sha256, text: ins.text, authority: 'workspace' };

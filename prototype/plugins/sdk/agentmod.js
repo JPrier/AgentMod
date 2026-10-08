@@ -328,6 +328,8 @@ export function toolSpec(name, description, parameters = {}, opts = {}) {
   if (opts.group) spec.group = opts.group;
   if (opts.effects) spec.effects = opts.effects;
   if (opts.trust) spec.trust = opts.trust;
+  // Phrases in a user message that make a deferred tool load by itself.
+  if (opts.intents?.length) spec.intents = opts.intents;
   return spec;
 }
 

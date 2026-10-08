@@ -34,6 +34,7 @@ defineWorkspacePlugin({
     await localTarget.check(cfg.shell || '/bin/bash');
   },
   root: rootOf,
+  network: () => "the host machine's network (policy may ask before network commands)",
   createTarget: (cfg) => localTarget({ root: rootOf(cfg), shell: cfg.shell || '/bin/bash', passEnv: cfg.pass_env || [], env: cfg.env || {} }),
   secrets: (cfg) => Object.fromEntries(Object.entries(cfg.secrets || {}).map(([name, s]) => [name, { value: process.env[s.env || name], env: s.as || name, commands: s.commands || [] }]).filter(([, s]) => typeof s.value === 'string')),
   describe: (cfg) =>

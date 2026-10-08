@@ -132,7 +132,8 @@ wait_for $T "assert any(e['event_name']=='workspace-restored' for e in d['events
 grep -q "return a - b;" "$DATA/ws/calc.js" || fail "restore did not rewind the file"
 PREV=$(ev $T "print([e['payload']['previous'] for e in d['events'] if e['event_name']=='workspace-restored'][0])")
 curl -s -XPOST $B/sessions/$T/messages -d "$(msg 'tool tool_search {"query":"select:checkpoints"}')" >/dev/null
-wait_for $T "assert any(e['event_name']=='tool-result' and e['payload']['name']=='tool_search' and 'Loaded checkpoints' in e['payload']['output'] for e in d['events'])" 100
+# The message names checkpoints, so the intent already loaded the tool.
+wait_for $T "assert any(e['event_name']=='tool-result' and e['payload']['name']=='tool_search' and ('Loaded checkpoints' in e['payload']['output'] or 'Already available' in e['payload']['output']) for e in d['events'])" 100
 sleep 1
 curl -s -XPOST $B/sessions/$T/messages -d "$(msg "tool checkpoints {\"action\":\"restore\",\"checkpoint\":\"$PREV\"}")" >/dev/null
 wait_for $T "assert len([e for e in d['events'] if e['event_name']=='workspace-restored'])>=2" 100
@@ -227,6 +228,33 @@ for df in c['definitions'].values():
     df['subscribers']=[{'plugin':'openrouter-model'} if s['plugin']=='openai-model' else s for s in df['subscribers']]
 print(json.dumps({'config':c}))")
 curl -s -XPOST $B/config/apply -d "$BACK" | py "assert d['ok']" || fail "swap back"
+
+echo "16b. parallel tool calls settle into one model request (out of order, a failure, an approval)"
+PB=$(newsess coder 'script:batch')
+wait_for $PB "assert any(e['event_name']=='approval-requested' for e in d['events'])" 150
+sleep 2
+# Three results are in, one call awaits approval: no model request yet.
+ev $PB "
+assert sum(1 for e in d['events'] if e['event_name']=='model-request')==1, 'asked the model before the batch settled'
+r=[e['payload'] for e in d['events'] if e['event_name']=='tool-result']
+assert len(r)==3, [x['name'] for x in r]
+s=[x for x in r if x['name']=='search_text'][0]
+assert s['error'] and 'is a file' in s['output'] and 'include=[\\\"calc.js\\\"]' in s['output'], s['output']" || fail "batch held"
+AR=$(ev $PB "print([e['event_id'] for e in d['events'] if e['event_name']=='approval-requested'][-1])")
+curl -s -XPOST $B/sessions/$PB/actions -d "{\"reply_to\":\"$AR\",\"action\":\"approve\"}" >/dev/null
+wait_for $PB "assert any(e['event_name']=='assistant-message' and 'batch done: 4 results' in e['payload']['text'] for e in d['events'])" 150
+ev $PB "
+assert sum(1 for e in d['events'] if e['event_name']=='model-request')==2
+calls=[e for e in d['events'] if e['event_name']=='tool-call']  # incl. the approved re-publish
+owners=[i['plugin'] for e in calls for i in e['invocations'] if i.get('route')]
+assert owners==['local-workspace']*4, owners
+assert all(len([i for i in e['invocations'] if i['mode']=='async'])<=1 for e in calls), 'unrelated plugins invoked'" || fail "batch settlement"
+curl -s "$B/sessions/$PB/context" | py "assert any(c['slot']=='environment' and 'bash' in c['value']['tools'] for c in d)" || fail "environment facts"
+SB=$(newsess coder 'script:slowbatch')
+wait_for $SB "assert sum(1 for e in d['events'] if e['event_name']=='tool-result')>=1" 100
+curl -s -XPOST $B/sessions/$SB/commands -d '{"command":"hard-stop"}' | py "assert d['status']['state']=='halted'" || fail "stop during batch"
+sleep 1
+ev $SB "assert sum(1 for e in d['events'] if e['event_name']=='model-request')==1" || fail "model asked after cancelled batch"
 
 echo "17. a running process survives a runtime SIGKILL and is reconciled"
 L=$(newsess coder 'script:long')

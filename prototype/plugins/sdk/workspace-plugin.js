@@ -38,6 +38,7 @@ const WORKSPACE_EVENTS = ['workspace-info', 'workspace-change', 'checkpoint-crea
  * @param {(config) => object} [spec.secrets]      resolve configured secrets to { NAME: { value, env, commands } }
  * @param {Function} [spec.validate]  handshake validation (throw to refuse)
  * @param {boolean} [spec.lifecycle]   the target is a machine with sandbox_* lifecycle tools
+ * @param {(config) => string} [spec.network]  how commands reach the network (for the model)
  */
 export function defineWorkspacePlugin(spec) {
   let state = null; // { key, target } for the current plugin config
@@ -162,6 +163,16 @@ export function defineWorkspacePlugin(spec) {
       ctx.add('workspace', { session: ctx.sessionId, root: ws.root, mode: ws.mode, base: ws.base, git_dir: ws.gitDir || storeOf(ws.root) });
     }
     try {
+      // Environment facts once per session (OS, architecture, installed
+      // tools): the model should not spend turns probing for them.
+      if (!ctx.slot('environment').some((e) => e?.root === ws.root)) {
+        try {
+          const env = await tk.environment();
+          ctx.add('environment', { root: ws.root, ...env, network: spec.network?.(ctx.config ?? {}) ?? null });
+        } catch (e) {
+          ctx.log('environment probe failed:', e.message);
+        }
+      }
       const info = await tk.info();
       await ctx.publish('workspace-info', { ...info, mode: ws.mode, base: ws.base }, { ui: { v: 1, kind: 'progress', label: `Workspace ${info.root}${ws.mode !== 'primary' ? ` (${ws.mode})` : ''}${info.git?.branch ? ` · git ${info.git.branch}@${(info.git.head || '').slice(0, 8)}${info.git.dirty ? ` (${info.git.dirty} changed)` : ''}` : ''}` } });
       const skills = await tk.skills((ctx.config?.skill_dirs || []).map((d) => (typeof d === 'string' ? { dir: d, authority: 'user' } : d)));

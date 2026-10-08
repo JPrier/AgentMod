@@ -3,7 +3,7 @@ import { toolSpec } from './agentmod.js';
 
 export const STATUSES = ['pending', 'in_progress', 'completed', 'blocked'];
 
-export const UPDATE_PLAN = toolSpec('update_plan', 'Record or revise your plan for multi-step work: the full list of steps, each pending, in_progress, completed, or blocked. Keep one step in_progress at a time; send the whole list each time.', {
+export const UPDATE_PLAN = toolSpec('update_plan', 'Record or revise your plan for multi-step work: the full list of steps, each pending, in_progress, completed, or blocked. Keep one step in_progress at a time; send the whole list each time. Keep steps coarse, and send updates alongside your other tool calls rather than as a turn of their own.', {
   items: { type: 'array', description: 'the plan: [{ text, status }] in order', items: { type: 'object', properties: { text: { type: 'string' }, status: { type: 'string', enum: STATUSES } }, required: ['text', 'status'] } },
   note: { type: 'string', description: 'optional one-line note on what changed' },
 }, { required: ['items'], tier: 'core', group: 'planning', effects: 'read' });

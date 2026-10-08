@@ -42,6 +42,15 @@ const SCRIPTS = {
   // Start a long process (for restart reconciliation).
   long: (step, outs) => [() => ({ calls: [['process', { action: 'start', name: 'ticker', command: 'while true; do echo tick; sleep 1; done' }]] }), () => ({ text: `started ${(lastOut(outs).match(/p[0-9a-f]{10}/) || [])[0]}` })][step]?.(),
   procs: (step) => [() => ({ calls: [['process', { action: 'list' }]] }), () => ({ text: 'listed' })][step]?.(),
+  // One assistant turn, four parallel calls: a read, a slow command, a search
+  // with a file as its path (actionable error), and a network command that
+  // needs approval. Results arrive in any order; the loop asks again once.
+  batch: (step, outs) => [
+    () => ({ calls: [['read_file', { path: 'calc.js' }], ['shell', { command: 'sleep 1; echo slow-done' }], ['search_text', { query: 'add', path: 'calc.js' }], ['shell', { command: 'wget -q -T 1 http://127.0.0.1:9/ || echo wget-ran' }]] }),
+    () => ({ text: `batch done: ${outs.length} results` }),
+  ][step]?.(),
+  // Parallel calls still running when the user hard-stops the session.
+  slowbatch: (step) => [() => ({ calls: [['shell', { command: 'sleep 20' }], ['read_file', { path: 'calc.js' }]] }), () => ({ text: 'should not happen' })][step]?.(),
   // A tool call with malformed JSON arguments and an unknown tool.
   bad: (step) => [() => ({ calls: [['no_such_tool', {}]] }), () => ({ text: 'recovered' })][step]?.(),
 };

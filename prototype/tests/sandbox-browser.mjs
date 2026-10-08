@@ -95,7 +95,7 @@ async function tool(name, args, expect, ms = 180000) {
 
 let failed = false;
 try {
-  await page.goto('http://localhost:8098/?host=browser&openrouter_base=http://127.0.0.1:8765/api/v1');
+  await page.goto('http://localhost:8098/?host=browser&set=openrouter-model.base_url=http://127.0.0.1:8765/api/v1');
   await page.waitForSelector('.gate-card input[type=password]', { timeout: 30000 });
   await page.waitForFunction(() => document.querySelectorAll('.gate-card datalist option').length >= 2, { timeout: 15000 });
   const modelInput = '.gate-card input[aria-label="Model"]';

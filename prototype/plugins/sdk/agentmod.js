@@ -143,6 +143,8 @@ class Plugin {
         this.request('publish', { event_name, payload, cite: opts.cite, ui: opts.ui, lane: opts.lane, target_session: opts.targetSession }),
       command: (session_id, command) => this.request('command', { session_id, command }),
       applyConfig: (config, scope) => this.request('apply_config', { config, scope }),
+      /** Call a read-only service another plugin declares (control capability). */
+      callService: (plugin, service, args = {}) => this.request('call_service', { plugin, service, args }),
       watch: () => this.request('watch', {}),
       /** Use a host device the manifest declares (browser runtime; see ui/runtime/devices.js). */
       device: (device, op, args = {}, config = {}) => this.request('device', { device, op, args, config }),
@@ -170,7 +172,10 @@ class Plugin {
             try {
               await this.spec.validate(this.config, { env: this.transport.env });
             } catch (e) {
-              this.send({ id, error: { code: -32010, message: e.message } });
+              // The refusal carries what a frontend needs to help: the settings
+              // and services the plugin declares (services stay callable).
+              const m = this.spec.manifest;
+              this.send({ id, error: { code: -32010, message: e.message, data: { ...(e.data || {}), description: m.description, settings: m.settings || [], services: m.services || [] } } });
               return;
             }
           }
@@ -186,6 +191,19 @@ class Plugin {
         case 'invoke': {
           const result = await this.invoke(params);
           this.send({ id, result });
+          return;
+        }
+        case 'service': {
+          // Read-only services a manifest declares (e.g. a provider's model
+          // catalog). Not invocations: they are not recorded and must not
+          // change state.
+          const fn = this.spec.services?.[params?.service];
+          if (!fn) {
+            this.send({ id, error: { code: -32601, message: `\`${this.name}\` has no service \`${params?.service}\`` } });
+            return;
+          }
+          const result = await fn(params.args || {}, { config: this.config, env: this.transport.env, plugin: this });
+          this.send({ id, result: result ?? null });
           return;
         }
         case 'cancel': {
@@ -270,9 +288,22 @@ class Plugin {
   }
 }
 
-/** Standard tool description contributed to the `tools` context slot. */
-export function toolSpec(name, description, parameters = {}) {
-  return { name, description, parameters };
+/**
+ * Standard tool description contributed to the `tools` context slot.
+ *
+ * `opts.tier` is `core` (sent to the model every turn) or `deferred` (found
+ * through tool_search; see sdk/projection.js). `group` names a capability
+ * family for discovery and policy, `effects` is read | write | varies, and
+ * `required` lists required parameters.
+ */
+export function toolSpec(name, description, parameters = {}, opts = {}) {
+  const spec = { name, description, parameters };
+  if (opts.required?.length) spec.required = opts.required;
+  if (opts.tier) spec.tier = opts.tier;
+  if (opts.group) spec.group = opts.group;
+  if (opts.effects) spec.effects = opts.effects;
+  if (opts.trust) spec.trust = opts.trust;
+  return spec;
 }
 
 /**

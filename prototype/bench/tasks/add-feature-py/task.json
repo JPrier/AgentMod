@@ -1,0 +1,8 @@
+{
+  "title": "Implement a function with tests (Python)",
+  "prompt": "Implement `slugify(text)` in textutil.py: lowercase, ASCII letters/digits kept, everything else collapsed to single hyphens, no leading/trailing hyphens. Add unit tests for it next to the existing ones and make sure `python3 -m unittest -q` passes.",
+  "check": "python3 -m unittest -q && python3 -I hidden_check.py",
+  "regressions": "python3 -m unittest -q test_existing",
+  "hidden": { "hidden_check.py": "import sys\nsys.path.insert(0, '.')\nfrom textutil import slugify\ncases = {'Hello, World!': 'hello-world', '  Many   spaces ': 'many-spaces', 'a--b__c': 'a-b-c', 'Ünïcode 2026': 'n-code-2026', '': ''}\nbad = {k: (slugify(k), v) for k, v in cases.items() if slugify(k) != v}\nprint(bad or 'hidden ok'); sys.exit(1 if bad else 0)\n" },
+  "timeout_seconds": 600
+}

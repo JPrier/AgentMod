@@ -2,6 +2,12 @@
   "name": "agentmod-prototype-tests",
   "private": true,
   "type": "module",
-  "scripts": { "browser": "node browser.mjs" },
-  "devDependencies": { "puppeteer-core": "^25.0.0" }
+  "scripts": {
+    "browser": "node browser.mjs"
+  },
+  "devDependencies": {
+    "fake-indexeddb": "^6.2.5",
+    "puppeteer-core": "^25.0.0",
+    "ws": "^8.22.0"
+  }
 }

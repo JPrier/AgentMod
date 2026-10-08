@@ -39,7 +39,7 @@ page.on('pageerror', (e) => errors.push('pageerror: ' + e.message));
 const shot = (n) => page.screenshot({ path: path.join(SHOTS, `${n}.png`) });
 const waitText = async (t, ms = 20000) => page.waitForFunction((t) => document.body.innerText.includes(t), { timeout: ms }, t);
 try {
-  await page.goto(URLARG || 'http://localhost:8099/?host=browser&openrouter_base=http://127.0.0.1:8765/api/v1');
+  await page.goto(URLARG || 'http://localhost:8099/?host=browser&set=openrouter-model.base_url=http://127.0.0.1:8765/api/v1&set=openrouter-minimal.base_url=http://127.0.0.1:8765/api/v1');
   if (!URLARG) {
     await page.waitForSelector('.gate-card input[type=password]', { timeout: 15000 });
     // The model list comes from the provider's /models endpoint, not the page.
@@ -49,18 +49,18 @@ try {
     await page.click('.gate-card .inline-check input');
     await page.waitForFunction(() => document.querySelectorAll('.gate-card datalist option').length === 3);
     await shot('00-gate');
-    const modelInput = '.gate-card input[aria-label="OpenRouter model"]';
+    const modelInput = '.gate-card input[aria-label="Model"]';
     await page.$eval(modelInput, (el) => { el.value = ''; });
     await page.type(modelInput, 'nobody/not-a-model');
     await page.type('.gate-card input[type=password]', 'test-key');
     await page.click('.gate-card button.btn.primary');
-    await waitText('not in OpenRouter');
+    await waitText('not in openrouter-model');
     await page.waitForFunction(() => document.querySelectorAll('.gate-card datalist option').length >= 2);
     await page.$eval(modelInput, (el) => { el.value = ''; });
     await page.type(modelInput, 'mock/tool-model');
     await page.type('.gate-card input[type=password]', 'wrong-key');
     await page.click('.gate-card button.btn.primary');
-    await waitText('rejected that key');
+    await waitText('rejected these credentials');
     await page.$eval(modelInput, (el) => { el.value = 'mock/tool-model'; });
     await page.type('.gate-card input[type=password]', 'test-key');
     await page.click('.gate-card button.btn.primary');

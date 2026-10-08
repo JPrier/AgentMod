@@ -6,7 +6,7 @@
 
 import { markdown } from './runtime/markdown.js';
 import { LiveClient } from './runtime/live-client.js';
-import { listModels, describe } from './runtime/models.js';
+import { harnessSummary } from './runtime/harness-view.js';
 import { isolated, isolationSupported, ensureIsolation, enableIsolation, disableIsolation, takeAfterReload } from './runtime/isolation.js';
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -58,198 +58,189 @@ const state = {
 };
 
 // ---------------------------------------------------------------------------
-// Model providers are plugins; choosing one is a config change.
+// Plugins that need settings, and model providers, through generic interfaces.
+//
+// Nothing here knows a provider. Plugins declare `settings` (with `secret`
+// fields) and read-only `services` (e.g. `model-catalog`) in their manifests;
+// a plugin that refuses to start reports them, and this page renders a form
+// from that declaration. Model catalogs come from the provider plugin's
+// service; choosing a model is a recorded config apply.
 // ---------------------------------------------------------------------------
 
-const MODEL_PLUGINS = ['openrouter-model', 'openai-model'];
-const KEY_STORE = 'agentmod.openrouter.key';
-const MODEL_STORE = 'agentmod.openrouter.model';
-const BASE_STORE = 'agentmod.openrouter.base';
-const OPENROUTER_BASE = 'https://openrouter.ai/api/v1';
+const SETTINGS = 'agentmod.settings';
+const loadSettings = () => { try { return JSON.parse(localStorage.getItem(SETTINGS) || '{}'); } catch { return {}; } };
+const saveSettings = (all) => localStorage.setItem(SETTINGS, JSON.stringify(all));
+// Test/dev overrides for this tab only: ?set=<plugin>.<key>=<value> (repeatable).
+const overrides = () => { try { return JSON.parse(sessionStorage.getItem(`${SETTINGS}.override`) || '{}'); } catch { return {}; } };
+(function migrateStorage() {
+  // Earlier builds stored one provider's key under its own names.
+  const k = localStorage.getItem('agentmod.openrouter.key');
+  if (!k) return;
+  const all = loadSettings();
+  all['openrouter-model'] = { ...(all['openrouter-model'] || {}), api_key: k, ...(localStorage.getItem('agentmod.openrouter.model') ? { model: localStorage.getItem('agentmod.openrouter.model') } : {}) };
+  saveSettings(all);
+  localStorage.removeItem('agentmod.openrouter.key');
+  localStorage.removeItem('agentmod.openrouter.model');
+})();
 
-/** The deployment's configured default model (agentmod.toml), not a UI constant. */
-function configuredModel(config) {
-  return config?.plugins?.['openrouter-model']?.config?.model || '';
-}
-
-function openrouterBase(config) {
-  return sessionStorage.getItem(BASE_STORE) || config?.plugins?.['openrouter-model']?.config?.base_url || OPENROUTER_BASE;
-}
-
-// ---------------------------------------------------------------------------
-// Model picker: the catalog comes live from the provider's /models endpoint.
-// ---------------------------------------------------------------------------
-
-const modelCache = new Map(); // base -> ModelInfo[] | Error
-let showAllModels = false;
-let pickerSeq = 0;
-
-function fillModelOptions(list, models) {
-  list.replaceChildren(...models.filter((m) => showAllModels || m.tools).map((m) => h('option', { value: m.id }, describe(m))));
-}
-
-function modelStatus(status, base, value) {
-  const got = modelCache.get(base);
-  status.replaceChildren();
-  if (got instanceof Error) {
-    status.append(`Couldn't load the model list (${got.message}). Enter any model id OpenRouter accepts.`);
-    return;
-  }
-  if (!got) {
-    status.append('Loading models from OpenRouter…');
-    return;
-  }
-  const shown = got.filter((m) => showAllModels || m.tools).length;
-  const match = got.find((m) => m.id === value.trim());
-  status.append(
-    `${shown} of ${got.length} models${showAllModels ? '' : ' (tool-capable only)'}. `,
-    match ? describe(match) || match.name : value.trim() ? 'Not in OpenRouter’s catalog.' : '',
-  );
-}
-
-/** Input + live datalist for choosing an OpenRouter model. */
-function modelPicker({ value, base, keyInput, label = 'Model' }) {
-  const listId = `or-models-${++pickerSeq}`;
-  const list = h(`datalist#${listId}`);
-  const input = h('input', { value, list: listId, 'aria-label': 'OpenRouter model', autocomplete: 'off', spellcheck: 'false', placeholder: 'provider/model' });
-  const status = h('span.help.model-status');
-  const toggle = h('input', { type: 'checkbox', checked: showAllModels });
-  const refresh = () => {
-    const got = modelCache.get(base);
-    if (Array.isArray(got)) fillModelOptions(list, got);
-    modelStatus(status, base, input.value);
-  };
-  toggle.addEventListener('change', () => {
-    showAllModels = toggle.checked;
-    refresh();
-  });
-  input.addEventListener('input', refresh);
-  const load = () => {
-    const key = keyInput?.value.trim() || localStorage.getItem(KEY_STORE) || '';
-    listModels(base, key).then(
-      (models) => modelCache.set(base, models),
-      (e) => modelCache.set(base, e instanceof Error ? e : new Error(String(e))),
-    ).then(refresh);
-  };
-  refresh();
-  if (!Array.isArray(modelCache.get(base))) load();
-  // If the list needed a key we did not have yet, retry once one is entered.
-  keyInput?.addEventListener('change', () => {
-    if (!Array.isArray(modelCache.get(base))) {
-      modelCache.delete(base);
-      refresh();
-      load();
-    }
-  });
-  const field = h('div.model-field',
-    h('label', label, input),
-    list,
-    status,
-    h('label.inline-check', toggle, 'Include models without tool calling'));
-  return { field, input, validate: () => validateModel(base, input.value.trim()) };
-}
-
-/** Returns an error message, or null when the model can be used. */
-function validateModel(base, id) {
-  if (!id) return 'Choose a model.';
-  const got = modelCache.get(base);
-  if (Array.isArray(got) && !got.some((m) => m.id === id)) return `“${id}” is not in OpenRouter’s model catalog.`;
-  return null;
-}
-
-function withProvider(config, provider, extra) {
+/** The deployment config with this browser's saved plugin settings merged in. */
+function withSettings(config) {
   const cfg = structuredClone(config);
-  for (const def of Object.values(cfg.definitions || {})) {
-    def.subscribers = def.subscribers.map((s) => (MODEL_PLUGINS.includes(s.plugin) ? { ...s, plugin: provider } : s));
+  for (const src of [loadSettings(), overrides()]) {
+    for (const [plugin, values] of Object.entries(src)) {
+      if (cfg.plugins?.[plugin]) cfg.plugins[plugin].config = { ...(cfg.plugins[plugin].config || {}), ...values };
+    }
   }
-  if (extra && cfg.plugins[provider]) cfg.plugins[provider].config = { ...(cfg.plugins[provider].config || {}), ...extra };
   return cfg;
 }
 
-function currentProvider(cfg) {
-  const subs = cfg?.definitions?.chat?.subscribers || Object.values(cfg?.definitions || {})[0]?.subscribers || [];
-  return subs.find((s) => MODEL_PLUGINS.includes(s.plugin))?.plugin;
+const modelProviders = () => (state.services || []).filter((s) => s.provides?.includes('model'));
+
+/** The provider a definition uses (the first subscriber that provides a model). */
+function providerOf(cfg, definition) {
+  const names = new Set(modelProviders().map((s) => s.plugin));
+  const def = cfg?.definitions?.[definition] || Object.values(cfg?.definitions || {}).find((d) => d.subscribers.some((x) => names.has(x.plugin)));
+  return def?.subscribers.find((x) => names.has(x.plugin))?.plugin;
 }
 
-/** The browser runtime always runs a real LLM: the OpenRouter key is required to boot. */
-function browserBootConfig(config, key) {
-  const extra = { api_key: key, model: localStorage.getItem(MODEL_STORE) || configuredModel(config) };
-  const base = sessionStorage.getItem(BASE_STORE);
-  if (base) extra.base_url = base;
-  return withProvider(config, 'openrouter-model', extra);
+const describeModel = (m) => {
+  const price = (v) => `$${(v * 1e6).toFixed(v * 1e6 < 1 ? 2 : 1)}`;
+  const cost = m.prompt_price == null || m.completion_price == null ? null : m.prompt_price === 0 && m.completion_price === 0 ? 'free' : `${price(m.prompt_price)} in / ${price(m.completion_price)} out per M`;
+  return [m.name !== m.id ? m.name : null, m.context ? `${Math.round(m.context / 1000)}k ctx` : null, cost, m.tools === false ? 'no tool calling' : null, m.vision ? 'images' : null].filter(Boolean).join(' · ');
+};
+
+const catalogs = new Map(); // plugin -> models[] | Error
+let showAllModels = false;
+let pickerSeq = 0;
+
+/** A model field whose options come from the plugin's `model-catalog` service. */
+function modelPicker({ plugin, value, call }) {
+  const listId = `models-${++pickerSeq}`;
+  const list = h(`datalist#${listId}`);
+  const input = h('input', { value: value || '', list: listId, 'aria-label': 'Model', autocomplete: 'off', spellcheck: 'false', placeholder: 'model id' });
+  const status = h('span.help.model-status');
+  const toggle = h('input', { type: 'checkbox', checked: showAllModels });
+  const refresh = () => {
+    const got = catalogs.get(plugin);
+    status.replaceChildren();
+    if (Array.isArray(got)) {
+      list.replaceChildren(...got.filter((m) => showAllModels || m.tools !== false).map((m) => h('option', { value: m.id }, describeModel(m))));
+      const shown = got.filter((m) => showAllModels || m.tools !== false).length;
+      const match = got.find((m) => m.id === input.value.trim());
+      status.append(`${shown} of ${got.length} models${showAllModels ? '' : ' (tool-capable only)'}. `, match ? describeModel(match) || match.name : input.value.trim() ? `Not in ${plugin}'s catalog.` : '');
+    } else if (got instanceof Error) {
+      status.append(`Couldn't load the model list (${got.message}). Enter any model id the provider accepts.`);
+    } else status.append(`Loading models from ${plugin}…`);
+  };
+  toggle.addEventListener('change', () => { showAllModels = toggle.checked; refresh(); });
+  input.addEventListener('input', refresh);
+  const load = () => call(plugin, 'model-catalog', {}).then((r) => catalogs.set(plugin, r?.models || []), (e) => catalogs.set(plugin, e instanceof Error ? e : new Error(String(e)))).then(refresh);
+  refresh();
+  if (!Array.isArray(catalogs.get(plugin))) load();
+  const field = h('div.model-field', h('label', 'Model', input), list, status, h('label.inline-check', toggle, 'Include models without tool calling'));
+  const validate = () => {
+    const id = input.value.trim();
+    if (!id) return 'Choose a model.';
+    const got = catalogs.get(plugin);
+    if (Array.isArray(got) && !got.some((m) => m.id === id)) return `“${id}” is not in ${plugin}'s model catalog.`;
+    return null;
+  };
+  return { field, input, validate, reload: () => { catalogs.delete(plugin); refresh(); load(); } };
 }
 
-async function updateOpenRouter({ key, model }) {
-  const active = state.config?.config;
-  if (!active) return;
-  const extra = { model };
-  if (state.host === 'browser') {
-    if (!key) return toast('An OpenRouter API key is required.', true);
-    extra.api_key = key;
-    localStorage.setItem(KEY_STORE, key);
+/** Form fields for one plugin's declared settings. */
+function settingsFields({ plugin, settings, current, call, browser }) {
+  const fields = [];
+  const inputs = {};
+  let picker = null;
+  for (const s of settings || []) {
+    if (s.browser_only && !browser) continue;
+    if (s.type === 'model') {
+      picker = modelPicker({ plugin, value: current[s.key], call });
+      inputs[s.key] = picker.input;
+      fields.push(picker.field);
+      continue;
+    }
+    const input = h('input', { type: s.secret ? 'password' : 'text', value: current[s.key] ?? '', autocomplete: 'off', 'aria-label': s.label || s.key, required: s.required ? true : null });
+    inputs[s.key] = input;
+    fields.push(h('label', s.label || s.key, input), s.help && h('span.help', s.help, s.link ? [' ', h('a', { href: s.link, target: '_blank', rel: 'noopener' }, s.link.replace(/^https?:\/\//, ''))] : null));
   }
-  localStorage.setItem(MODEL_STORE, extra.model);
-  const r = await act(() => state.client.applyConfig(withProvider(active, 'openrouter-model', extra), { kind: 'global' }));
-  if (!r) return;
-  if (!r.ok) return toast(`Rejected: ${(r.diagnostics || []).filter((d) => d.severity === 'error').map((d) => d.message).join('; ')}`, true);
-  state.showProvider = false;
-  toast(`Sessions now use ${extra.model} from their next event. Nothing restarted.`);
-  await refreshAll();
-  render();
+  const values = () => Object.fromEntries(Object.entries(inputs).map(([k, el]) => [k, el.value.trim()]).filter(([, v]) => v !== ''));
+  const validate = () => {
+    for (const s of settings || []) if (s.required && !(s.browser_only && !browser) && !inputs[s.key]?.value.trim()) return `${s.label || s.key} is required.`;
+    return picker?.validate() || null;
+  };
+  // A secret entered after the catalog failed may unlock it.
+  for (const s of settings || []) if (s.secret && inputs[s.key] && picker) inputs[s.key].addEventListener('change', () => { if (!Array.isArray(catalogs.get(plugin))) picker.reload(); });
+  return { fields, values, validate };
 }
 
-async function keyGate(error) {
-  let base = OPENROUTER_BASE;
-  let fallback = '';
-  try {
-    const config = await (await fetch('runtime/agentmod.config.json')).json();
-    base = openrouterBase(config);
-    fallback = configuredModel(config);
-  } catch { /* the runtime boot will report a missing config */ }
+/** Plugins refused to start (e.g. a missing credential): ask for their settings. */
+function settingsGate(runtime, refusals, error) {
   const app = $('#app');
   app.innerHTML = '';
-  const key = h('input', { type: 'password', placeholder: 'sk-or-v1-…', autocomplete: 'off', required: true, 'aria-label': 'OpenRouter API key' });
-  const picker = modelPicker({ value: localStorage.getItem(MODEL_STORE) || fallback, base, keyInput: key });
+  const saved = loadSettings();
+  const forms = refusals.map((r) => ({ r, f: settingsFields({ plugin: r.plugin, settings: r.settings, current: saved[r.plugin] || {}, call: (p, svc, a) => runtime.callService(p, svc, a), browser: true }) }));
   app.append(
     h('div.boot.gate',
       h('div.gate-card',
         h('div.brand', h('span.brand-mark', { 'aria-hidden': 'true' }), 'AgentMod'),
-        h('p', 'This prototype runs the AgentMod kernel in your browser. The agent is a real model reached through the OpenRouter plugin, so it needs your OpenRouter API key.'),
+        h('p', 'This prototype runs the AgentMod kernel in your browser. Some plugins need settings before the runtime can start:'),
         error && h('p.gate-err', error),
         h('form', { onsubmit: async (e) => {
           e.preventDefault();
-          const k = key.value.trim();
-          const m = picker.input.value.trim();
-          const badModel = picker.validate();
-          if (badModel) return keyGate(badModel);
+          for (const { r, f } of forms) {
+            const bad = f.validate();
+            if (bad) return settingsGate(runtime, refusals, `${r.plugin}: ${bad}`);
+          }
           const btn = e.target.querySelector('button[type=submit]');
           btn.disabled = true;
-          btn.textContent = 'Checking the key…';
-          const problem = await checkKey(k, base);
-          if (problem) return keyGate(problem);
-          localStorage.setItem(KEY_STORE, k);
-          localStorage.setItem(MODEL_STORE, m);
+          btn.textContent = 'Checking…';
+          const all = loadSettings();
+          for (const { r, f } of forms) {
+            const values = f.values();
+            if ((r.services || []).some((x) => x.name === 'check-credentials')) {
+              try {
+                const ok = await runtime.callService(r.plugin, 'check-credentials', values);
+                if (ok && ok.ok === false && (ok.status === 401 || ok.status === 403)) return settingsGate(runtime, refusals, `${r.plugin} rejected these credentials. Check them and try again.`);
+              } catch { /* offline: let the plugin report errors on first use */ }
+            }
+            all[r.plugin] = { ...(all[r.plugin] || {}), ...values };
+          }
+          saveSettings(all);
           connect('browser');
         } },
-          h('label', 'OpenRouter API key', key),
-          picker.field,
+          ...forms.map(({ r, f }) => h('fieldset', h('legend', r.plugin), h('p.help', r.message), ...f.fields)),
           h('button.btn.primary', { type: 'submit' }, 'Start the runtime')),
-        h('p.help', 'The key is kept in this browser (localStorage) and sent only to openrouter.ai by the openrouter-model plugin worker. Exported logs omit it. Get a key at ', h('a', { href: 'https://openrouter.ai/keys', target: '_blank', rel: 'noopener' }, 'openrouter.ai/keys'), '.'),
-        h('p.help', 'Or ', h('button.linkish', { type: 'button', onclick: () => promptLive() }, 'attach to a local runtime'), ' started with ', h('code', 'OPENROUTER_API_KEY=… agentmod serve'), '.'))),
+        h('p.help', 'Settings are kept in this browser (localStorage) and handed only to the plugin that declared them. Secret settings are omitted from exported logs.'),
+        h('p.help', 'Or ', h('button.linkish', { type: 'button', onclick: () => promptLive() }, 'attach to a local runtime'), ' started with ', h('code', 'agentmod serve'), '.'))),
   );
-  key.focus();
+  app.querySelector('input')?.focus();
 }
 
-/** Ask OpenRouter whether the key is valid. Returns an error message, or null. */
-async function checkKey(key, base) {
-  if (!key) return 'Enter your OpenRouter API key.';
-  try {
-    const r = await fetch(`${base}/key`, { headers: { authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(8000) });
-    if (r.status === 401 || r.status === 403) return 'OpenRouter rejected that key. Check it and try again.';
-    return null;
-  } catch {
-    return null; // Offline or blocked: let the plugin report errors on first use.
+/** Apply a provider choice and its settings as a live config change. */
+async function applyProvider({ provider, values }) {
+  const active = state.config?.config;
+  if (!active) return;
+  const cfg = structuredClone(active);
+  const providers = new Set(modelProviders().map((s) => s.plugin));
+  const current = providerOf(cfg, state.view?.definition);
+  if (current && provider !== current) {
+    for (const def of Object.values(cfg.definitions || {})) def.subscribers = def.subscribers.map((x) => (x.plugin === current && providers.has(provider) ? { ...x, plugin: provider } : x));
   }
+  cfg.plugins[provider].config = { ...(cfg.plugins[provider].config || {}), ...values };
+  if (state.host === 'browser') {
+    const all = loadSettings();
+    all[provider] = { ...(all[provider] || {}), ...values };
+    saveSettings(all);
+  }
+  const r = await act(() => state.client.applyConfig(cfg, { kind: 'global' }));
+  if (!r) return;
+  if (!r.ok) return toast(`Rejected: ${(r.diagnostics || []).filter((d) => d.severity === 'error').map((d) => d.message).join('; ')}`, true);
+  state.showProvider = false;
+  toast(`Sessions now use ${provider}${values.model ? ` · ${values.model}` : ''} from their next event. Nothing restarted.`);
+  await refreshAll();
+  render();
 }
 
 // ---------------------------------------------------------------------------
@@ -272,14 +263,17 @@ async function connect(host) {
       state.client = c;
     } else {
       const { BrowserRuntime } = await import('./runtime/browser-host.js');
-      const key = localStorage.getItem(KEY_STORE);
-      if (!key) {
-        keyGate();
-        return;
-      }
       const c = new BrowserRuntime({ log: (m) => console.info('[agentmod]', m) });
       const base = await (await fetch('runtime/agentmod.config.json')).json();
-      await c.boot(browserBootConfig(base, key));
+      try {
+        await c.boot(withSettings(base));
+      } catch (e) {
+        if (e.refusals?.length) {
+          settingsGate(c, e.refusals);
+          return;
+        }
+        throw e;
+      }
       state.client = c;
     }
   } catch (e) {
@@ -329,7 +323,8 @@ function promptLive() {
 }
 
 async function refreshAll() {
-  const [sessions, graph, config] = await Promise.all([state.client.listSessions(), state.client.getGraph(), state.client.getConfig()]);
+  const [sessions, graph, config, services] = await Promise.all([state.client.listSessions(), state.client.getGraph(), state.client.getConfig(), state.client.listServices().catch(() => [])]);
+  state.services = services;
   state.sessions = sessions.sort((a, b) => a.session_id.localeCompare(b.session_id));
   state.graph = graph;
   state.config = config;
@@ -516,9 +511,10 @@ function topbar() {
 }
 
 function providerButton() {
-  const p = currentProvider(state.config?.config);
-  const model = state.config?.config?.plugins?.[p]?.config?.model;
-  const label = p === 'openrouter-model' ? `OpenRouter · ${model}` : p ? `${p} · ${model || ''}` : 'No model';
+  const cfg = state.config?.config;
+  const p = providerOf(cfg, state.view?.definition);
+  const model = cfg?.plugins?.[p]?.config?.model;
+  const label = p ? `${p}${model ? ` · ${model}` : ''}` : 'No model';
   return h('div.provider',
     h('button.btn', { onclick: () => { state.showProvider = !state.showProvider; render(); }, 'aria-expanded': String(!!state.showProvider), title: 'The model is a plugin; changing it is a live config apply' }, label),
     state.showProvider && providerPanel());
@@ -526,23 +522,25 @@ function providerButton() {
 
 function providerPanel() {
   const browser = state.host === 'browser';
-  const key = h('input', { type: 'password', value: localStorage.getItem(KEY_STORE) || '', autocomplete: 'off', 'aria-label': 'OpenRouter API key' });
   const cfg = state.config?.config;
-  const picker = modelPicker({ value: configuredModel(cfg), base: openrouterBase(cfg), keyInput: browser ? key : undefined });
+  const providers = modelProviders().filter((x) => cfg?.plugins?.[x.plugin] && !cfg.plugins[x.plugin].disabled);
+  const chosen = state.panelProvider && providers.some((x) => x.plugin === state.panelProvider) ? state.panelProvider : providerOf(cfg, state.view?.definition) || providers[0]?.plugin;
+  const decl = providers.find((x) => x.plugin === chosen);
+  const current = { ...(cfg?.plugins?.[chosen]?.config || {}), ...(browser ? loadSettings()[chosen] || {} : {}) };
+  const form = decl ? settingsFields({ plugin: chosen, settings: decl.settings, current, call: (p, svc, a) => state.client.callService(p, svc, a), browser }) : null;
   return h('div.provider-panel', { role: 'dialog', 'aria-label': 'Model provider' },
-    h('h3', 'OpenRouter'),
-    browser
-      ? h('p.help', 'The key stays in this browser and is sent only to openrouter.ai. Exported logs omit it.')
-      : h('p.help', 'The native runtime reads the key from OPENROUTER_API_KEY on the machine running agentmod serve.'),
-    browser && h('label', 'API key', key),
-    picker.field,
-    h('div.row-actions',
+    h('h3', 'Model provider'),
+    providers.length > 1 && h('label', 'Provider plugin', h('select', { onchange: (e) => { state.panelProvider = e.target.value; render(); } }, providers.map((x) => h('option', { value: x.plugin, selected: x.plugin === chosen }, `${x.plugin} — ${x.description || ''}`)))),
+    decl ? h('p.help', decl.description) : h('p.help', 'No plugin in this deployment declares that it provides a model.'),
+    !browser && h('p.help', 'Secret settings (keys) are read by the plugin on the machine running agentmod serve.'),
+    form?.fields,
+    form && h('div.row-actions',
       h('button.btn.primary', { onclick: () => {
-        const bad = picker.validate();
+        const bad = form.validate();
         if (bad) return toast(bad, true);
-        updateOpenRouter({ key: key.value.trim(), model: picker.input.value.trim() });
+        applyProvider({ provider: chosen, values: form.values() });
       } }, 'Apply'),
-      browser && h('button.btn.ghost', { onclick: () => { localStorage.removeItem(KEY_STORE); location.reload(); } }, 'Forget key')),
+      browser && h('button.btn.ghost', { onclick: () => { const all = loadSettings(); delete all[chosen]; saveSettings(all); location.reload(); } }, 'Forget settings')),
     h('p.help', 'Applying is a live config apply: sessions pick up the change at their next event boundary.'));
 }
 
@@ -593,6 +591,7 @@ function chat() {
     h('span.sub', `${v.session_id} · ${v.definition} · config ${v.config.slice(0, 8)}`),
     h('span.state.' + st, st),
     v.status && (v.status.queued_priority + v.status.queued_normal) > 0 && h('span.sub', `${v.status.queued_normal + v.status.queued_priority} queued`),
+    modeControl(v),
     h('div.controls',
       h('button.btn.small', { onclick: () => command('soft-stop'), disabled: !['running', 'idle'].includes(st), title: 'Finish the running pipeline, then park' }, 'Soft stop'),
       h('button.btn.small.danger', { onclick: () => command('hard-stop'), disabled: st === 'halted', title: 'Cancel in-flight invocations now' }, 'Hard stop'),
@@ -603,6 +602,28 @@ function chat() {
   const thread = h('div.thread', { 'aria-live': 'polite' },
     h('div.thread-inner', sandboxNotice(v), items, empty && v.definition !== 'heartbeat' && suggestions(v)));
   return h('main.chat', head, thread, composer(v));
+}
+
+// ---- permission mode (policy plugin), per session ---------------------------------
+
+const MODES = [['auto', 'Auto: allow unless a rule denies/asks'], ['default', 'Default: edits allowed; network, destructive, publish ask'], ['ask', 'Ask: approve every change'], ['read-only', 'Read-only: no changes (plan mode)']];
+
+function modeControl(v) {
+  const cfg = state.config?.config;
+  const subs = cfg?.definitions?.[v.definition]?.subscribers || [];
+  if (!subs.some((s) => s.plugin === 'policy') || !cfg?.plugins?.policy) return null;
+  const pc = cfg.plugins.policy.config || {};
+  const current = pc.session_mode || pc.mode || 'default';
+  return h('label.mode', { title: 'Permission mode for this session: a session-scoped config apply, recorded in its log' }, 'Mode ',
+    h('select', { onchange: (e) => setMode(v.session_id, e.target.value) }, MODES.map(([m, label]) => h('option', { value: m, selected: m === current, title: label }, m))));
+}
+
+async function setMode(sid, mode) {
+  const cfg = structuredClone(state.config.config);
+  cfg.plugins.policy.config = { ...(cfg.plugins.policy.config || {}), session_mode: mode };
+  const r = await act(() => state.client.applyConfig(cfg, { kind: 'session', session_id: sid }));
+  if (r?.ok) toast(`${sid} now runs in ${mode} mode from its next event (this session only). The policy's runtime rules still apply; a mode can never loosen a deny.`);
+  else if (r) toast(`Rejected: ${(r.diagnostics || []).filter((d) => d.severity === 'error').map((d) => d.message).join('; ')}`, true);
 }
 
 // ---- the Linux sandbox (linux-sandbox plugin) -----------------------------------
@@ -629,7 +650,7 @@ function sandboxNotice(v) {
   return h('div.notice',
     h('p', h('b', 'Enable the Linux sandbox to let the agent code here. '),
       'It runs an x86 Linux VM in this tab with CheerpX, which needs a cross-origin-isolated page. Enabling installs a small service worker that adds the isolation headers, then reloads the page. ',
-      'In-browser sessions live in memory, so this one ends on reload (export logs first to keep it).'),
+      state.config?.durable ? 'Sessions are stored in this browser (IndexedDB), so this one resumes after the reload.' : state.config?.storage_blocked ? `Sessions in this tab are not stored (${state.config.storage_blocked}), so this one ends on reload (export logs first to keep it).` : 'This browser gives the runtime no durable storage, so this session ends on reload (export logs first to keep it).'),
     h('div.row-actions', h('button.btn.primary', { onclick: () => act(() => enableIsolation(v.definition)) }, 'Enable the Linux sandbox')),
     h('p.help', 'Works in current Chrome, Edge, and Firefox. CheerpX is by Leaning Technologies and free for personal and open-source use.'));
 }
@@ -646,7 +667,7 @@ function suggestions(v) {
       h('div.suggest', s.map((t) => h('button', { onclick: () => send(t) }, t))));
   }
   const s = ['What time is it?', 'Calculate (12+30)*7', 'Remember that the deploy is on Friday', 'Delegate: summarize the launch plan', 'my token: sk-test1234567890abcdef please keep it safe'];
-  return h('div.empty', h('h2', 'Talk to the agent'), h('p', 'Every reply is produced by plugins: an OpenRouter model, tools, memory, an approval gate, and sub-agents. Watch the pipeline on the right as it runs.'),
+  return h('div.empty', h('h2', 'Talk to the agent'), h('p', 'Every reply is produced by plugins: a model provider, tools, memory, an approval gate, and sub-agents. Watch the pipeline on the right as it runs.'),
     h('div.suggest', s.map((t) => h('button', { onclick: () => send(t) }, t))));
 }
 
@@ -674,7 +695,12 @@ function threadItems(v) {
   const streams = new Map();
   const tools = new Map();
   const answered = new Map();
-  for (const e of v.events) if (e.event_name === 'ui-action') answered.set(e.payload.reply_to, e.payload.action);
+  answeredText.clear();
+  for (const e of v.events) {
+    if (e.event_name !== 'ui-action') continue;
+    answered.set(e.payload.reply_to, e.payload.action);
+    if (e.payload.values?.text) answeredText.set(e.payload.reply_to, e.payload.values.text);
+  }
   const finalized = new Set(v.events.filter((e) => e.event_name === 'model-response').map((e) => e.payload.stream_id));
   // A stream also ends when its invocation closes (completed, failed, or cancelled by a hard stop).
   for (const e of v.events) for (const i of e.invocations) if (i.outcome) finalized.add(i.invocation_id);
@@ -702,6 +728,7 @@ function threadItems(v) {
       const p = settledPayload(e);
       const changed = p.text !== e.payload.text;
       out.push(h('div.msg.user', { title: `${e.event_id} · ${e.status}` }, p.text,
+        h('button.linkish.branch', { title: 'Start a new session from the context just before this message (its own log; with an isolated workspace for coding sessions)', onclick: () => branchFrom(e.sequence - 1) }, 'branch here'),
         changed && h('span.note', 'Redacted by a transformer before any later plugin saw it'),
         e.status === 'vetoed' && h('span.note', `Vetoed: ${e.settlement.reason}`),
         e.lane === 'priority' && h('span.note', 'Sent on the priority lane')));
@@ -756,7 +783,7 @@ function threadItems(v) {
     if (name === 'tool-result') {
       const t = tools.get(e.payload.call_id);
       if (t) {
-        setPill(t.status, e.payload.error ? 'failed' : 'done', e.payload.error ? 'bad' : 'ok');
+        setPill(t.status, e.payload.policy?.effect === 'deny' ? 'denied by policy' : e.payload.error ? 'failed' : 'done', e.payload.error ? 'bad' : 'ok');
         t.res.textContent = String(e.payload.output);
         t.res.title = String(e.payload.output);
       }
@@ -781,6 +808,23 @@ function threadItems(v) {
   return out;
 }
 
+const answeredText = new Map();
+
+/** New session from the context as of `sequence` (an auditable branch; the parent is untouched). */
+async function branchFrom(sequence) {
+  const v = state.view;
+  if (!v) return;
+  await newSession(v.definition, undefined, { session_id: v.session_id, sequence: Math.max(0, sequence) });
+  toast(`Branched from ${v.session_id} at record #${sequence}. The original session and its history are unchanged.`);
+}
+
+/** Restore files to a checkpoint and rewind the conversation to just before it. */
+async function rewindBoth(e) {
+  const sid = state.selected;
+  await act(() => state.client.uiAction(sid, e.event_id, 'restore'));
+  await act(() => state.client.contextEdit(sid, [{ op: 'restore', to_sequence: Math.max(0, e.sequence - 1) }]), 'Rewound the files and the conversation. Both are new records; nothing was deleted.');
+}
+
 function setPill(el, text, kind) {
   el.textContent = text;
   el.className = 'pill ' + (kind || '');
@@ -798,11 +842,30 @@ function renderHint(ui, e, answered) {
       return h('div.progress-line', ui.label, ui.value != null && h('span.bar', h('i', { style: `width:${Math.round(ui.value * 100)}%` })));
     case 'choice': {
       const done = answered.get(e.event_id);
+      const label = (a) => (a === 'approve' ? 'Approved' : a === 'approve-session' ? 'Allowed for this session' : a === 'deny' ? 'Denied' : `Answered: ${a}`);
+      const free = ui.free_text && !done && h('form.free', { onsubmit: (ev) => { ev.preventDefault(); const t = ev.target.elements.answer.value.trim(); if (t) act(() => state.client.uiAction(sid, e.event_id, 'answer', { text: t })); } },
+        h('input', { name: 'answer', placeholder: 'Type an answer', 'aria-label': 'Answer' }), h('button.btn', { type: 'submit' }, 'Answer'));
       return h('div.choice' + (done ? '.answered' : ''),
         h('div.q', ui.prompt), ui.detail && h('div.d', ui.detail),
-        done ? h('span.pill.' + (done === 'approve' ? 'ok' : 'bad'), done === 'approve' ? 'Approved' : 'Denied')
-          : h('div.opts', (ui.options || []).map((o) => h('button.btn' + (o.style === 'primary' ? '.primary' : o.style === 'danger' ? '.danger' : ''), { onclick: () => act(() => state.client.uiAction(sid, e.event_id, o.id)) }, o.label))));
+        done ? h('span.pill.' + (done === 'deny' ? 'bad' : 'ok'), label(answeredText.get(e.event_id) || done))
+          : [h('div.opts', (ui.options || []).map((o) => h('button.btn' + (o.style === 'primary' ? '.primary' : o.style === 'danger' ? '.danger' : ''), { onclick: () => act(() => state.client.uiAction(sid, e.event_id, o.id)) }, o.label))), free]);
     }
+    case 'plan': {
+      const mark = { completed: '✓', in_progress: '▸', blocked: '!', pending: '○' };
+      return h('div.plan', h('b', 'Plan'), ui.note && h('span.help', ` — ${ui.note}`), h('ul', (ui.items || []).map((i) => h('li.' + i.status, h('span.mark', mark[i.status] || '○'), i.text))));
+    }
+    case 'checkpoint': {
+      if (ui.reason === 'restored') return h('div.sys', `Workspace restored to checkpoint ${String(ui.checkpoint).slice(0, 12)}.`);
+      return h('div.checkpoint', h('span.cp', `checkpoint ${String(ui.checkpoint).slice(0, 10)}`), h('span.why', ui.reason),
+        h('button.linkish', { title: 'Restore the files to this checkpoint (the current state is checkpointed first, so this can be undone)', onclick: () => act(() => state.client.uiAction(sid, e.event_id, 'restore'), 'Restoring files…') }, 'restore files'),
+        h('button.linkish', { title: 'Restore the files and rewind the conversation to this point (both recorded as new history)', onclick: () => rewindBoth(e) }, 'rewind both'),
+        h('button.linkish', { title: 'Start a branch session from here with its own copy of the workspace at this point', onclick: () => branchFrom(e.sequence - 1) }, 'branch'));
+    }
+    case 'diagnostics':
+      return h('div.diagnostics', h('b', `${(ui.items || []).length} diagnostic(s)`), h('ul', (ui.items || []).slice(0, 8).map((d) => h('li.' + d.severity, `${d.file}${d.line ? `:${d.line}` : ''}${d.col ? `:${d.col}` : ''} ${d.severity}: ${d.message}`))));
+    case 'process':
+      return h('div.sys', `Process ${ui.id}${ui.name ? ` [${ui.name}]` : ''}: ${ui.state}${ui.exit_code != null ? ` (exit ${ui.exit_code})` : ''}${ui.command ? ` — ${ui.command}` : ''}`,
+        ui.state === 'running' && h('button.linkish', { onclick: () => act(() => state.client.uiAction(sid, e.event_id, 'kill'), 'Stopping the process…') }, 'stop'));
     case 'diff': {
       const lines = ui.unified
         ? ui.unified.split('\n')
@@ -831,6 +894,7 @@ function renderHint(ui, e, answered) {
 
 function inspector() {
   const tabs = [
+    ['harness', 'Harness'],
     ['pipeline', 'Pipeline'],
     ['context', 'Context'],
     ['graph', 'Graph'],
@@ -839,7 +903,7 @@ function inspector() {
   ];
   let pane;
   try {
-    pane = { pipeline: pipelinePane, context: contextPane, graph: graphPane, config: configPane, log: logPane }[state.tab]();
+    pane = { harness: harnessPane, pipeline: pipelinePane, context: contextPane, graph: graphPane, config: configPane, log: logPane }[state.tab]();
   } catch (e) {
     console.error(e);
     pane = h('p.help', `This view failed to render: ${e.message}`);
@@ -847,6 +911,42 @@ function inspector() {
   return h('section.inspector', { 'aria-label': 'Inspector' },
     h('div.tabs', { role: 'tablist' }, tabs.map(([id, label]) => h('button', { role: 'tab', 'aria-selected': String(state.tab === id), onclick: () => { state.tab = id; state.resetPane = true; render(); } }, label))),
     h('div.pane', { role: 'tabpanel' }, pane));
+}
+
+function harnessPane() {
+  const v = state.view;
+  if (!v) return h('p.help', 'Select a session.');
+  const x = harnessSummary(v, state.sessions);
+  const sid = state.selected;
+  const row = (k, val) => val == null || val === '' ? null : h('div.kv', h('span.k', k), h('span.v', val));
+  const n = (v2) => (v2 || 0).toLocaleString();
+  return h('div.harness',
+    h('section', h('h4', 'Model'),
+      row('provider · model', x.model ? `${x.model.provider || '?'} · ${x.model.model}` : 'no model call yet'),
+      row('model requests', n(x.usage.model_requests)),
+      row('tokens in / out', `${n(x.usage.input_tokens)} / ${n(x.usage.output_tokens)}`),
+      row('cached input', x.usage.input_tokens ? `${n(x.usage.cached_tokens)} (${Math.round((100 * x.usage.cached_tokens) / x.usage.input_tokens)}%)` : n(x.usage.cached_tokens)),
+      row('cost', x.usage.cost ? `$${x.usage.cost.toFixed(4)}` : null),
+      x.context && row('last context', `≈${n(x.context.tokens)} tokens; ${x.context.tools_sent} tools sent (${n(x.context.tool_schema_tokens)} schema tokens), ${x.context.tools_deferred} on request`),
+      (x.usage.elided || x.usage.dropped) ? row('compaction', `${x.usage.elided} old outputs elided, ${x.usage.dropped} messages summarized (projection only; the log is complete)`) : null,
+      x.usage.retries ? row('provider retries', x.usage.retries) : null,
+      x.recovery ? row('recovered invocations', x.recovery) : null),
+    x.workspace && h('section', h('h4', 'Workspace'),
+      row('root', x.workspace.root), row('mode', x.workspace.mode), row('environment', x.workspace.environment ? `${x.workspace.environment.kind} (${x.workspace.environment.id})` : null),
+      row('git', x.workspace.git ? `${x.workspace.git.branch}@${(x.workspace.git.head || '').slice(0, 10)}${x.workspace.git.dirty ? `, ${x.workspace.git.dirty} changed` : ''}` : null),
+      x.workspace.repos?.length ? row('repositories', x.workspace.repos.map((r) => `${r.path} (${r.branch || '?'})`).join(', ')) : null,
+      x.files_changed.length ? row('files changed', x.files_changed.join(', ')) : null),
+    x.plan && h('section', h('h4', 'Plan'), h('ul.plan-list', x.plan.map((i) => h('li.' + i.status, `${i.status === 'completed' ? '✓' : i.status === 'in_progress' ? '▸' : i.status === 'blocked' ? '!' : '○'} ${i.text}`)))),
+    h('section', h('h4', 'Activity'), row('tool calls', `${x.tool_calls} (${x.tool_errors} errors)`), x.pending_calls.length ? row('waiting on', x.pending_calls.join(', ')) : null,
+      x.approvals.filter((a) => !a.answered).map((a) => row('approval pending', `${a.tool}: ${a.reason}`)), x.budget_exhausted && row('budget', 'exhausted')),
+    x.processes.length > 0 && h('section', h('h4', 'Processes'), x.processes.map((p) => h('div.kv', h('span.k', `${p.id}${p.name ? ` [${p.name}]` : ''}`), h('span.v', `${p.state}${p.exit_code != null ? ` (exit ${p.exit_code})` : ''} `, p.state === 'running' && h('button.linkish', { onclick: () => act(() => state.client.uiAction(sid, p.event_id, 'kill'), 'Stopping…') }, 'stop'))))),
+    x.children.length > 0 && h('section', h('h4', 'Child agents'), x.children.map((c) => h('div.kv', h('button.linkish', { onclick: () => select(c.session_id) }, c.session_id), h('span.v', `${c.finished ? (c.error ? 'failed/cancelled' : 'finished') : c.activity} · ${c.workspace} workspace${c.title ? ` · ${c.title}` : ''}`)))),
+    x.checkpoints.length > 0 && h('section', h('h4', 'Checkpoints (newest first)'), [...x.checkpoints].reverse().slice(0, 15).map((c) => h('div.kv', h('span.k', String(c.checkpoint).slice(0, 10)), h('span.v', `${c.reason} `,
+      h('button.linkish', { onclick: () => act(() => state.client.uiAction(sid, c.event_id, 'restore'), 'Restoring files…') }, 'restore'), ' ',
+      h('button.linkish', { onclick: () => branchFrom(c.sequence - 1) }, 'branch'))))),
+    x.diagnostics.length > 0 && h('section', h('h4', 'Latest diagnostics'), h('ul', x.diagnostics.slice(0, 10).map((d) => h('li', `${d.file}${d.line ? `:${d.line}` : ''} ${d.severity}: ${d.message}`)))),
+    x.decisions.length > 0 && h('section', h('h4', 'Recent policy decisions'), x.decisions.map((d) => h('div.kv', h('span.k', `${d.effect} ${d.tool}`), h('span.v', d.explanation || d.reason)))),
+  );
 }
 
 function outcomeClass(inv) {
@@ -1110,8 +1210,16 @@ async function start() {
   if (await ensureIsolation()) return;
   const params = new URLSearchParams(location.search);
   const runtime = params.get('runtime');
-  // Test hook: point the OpenRouter plugin at another OpenAI-compatible endpoint.
-  if (params.get('openrouter_base')) sessionStorage.setItem(BASE_STORE, params.get('openrouter_base'));
+  // Dev/test hook: per-tab plugin settings, ?set=<plugin>.<key>=<value> (repeatable).
+  const sets = params.getAll('set');
+  if (sets.length) {
+    const o = {};
+    for (const kv of sets) {
+      const m = kv.match(/^([\w-]+)\.([\w-]+)=(.*)$/);
+      if (m) (o[m[1]] ||= {})[m[2]] = m[3];
+    }
+    sessionStorage.setItem(`${SETTINGS}.override`, JSON.stringify(o));
+  }
   if (params.get('host') === 'browser') return connect('browser');
   if (runtime) {
     state.liveUrl = runtime;

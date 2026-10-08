@@ -1,0 +1,8 @@
+{
+  "title": "Diagnose a failing test (Python)",
+  "prompt": "`python3 -m unittest -q` fails in this repository. Diagnose why and fix the code (not the tests).",
+  "check": "python3 -m unittest -q && git diff --quiet HEAD -- test_parse.py",
+  "regressions": "python3 -m unittest -q",
+  "git": true,
+  "timeout_seconds": 600
+}

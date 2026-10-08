@@ -1,0 +1,8 @@
+{
+  "title": "Fix a failing test (JavaScript)",
+  "prompt": "The test suite in this repository fails. Find the bug, fix it, and make sure `node test.js` passes.",
+  "check": "node test.js && node hidden.test.js",
+  "regressions": "node test.js",
+  "hidden": { "hidden.test.js": "const { add, mul } = require('./calc');\nif (add(-2, 7) !== 5 || add(0.5, 0.25) !== 0.75) { console.error('add'); process.exit(1); }\nif (mul(3, 4) !== 12) { console.error('mul'); process.exit(1); }\nconsole.log('hidden ok');\n" },
+  "timeout_seconds": 600
+}

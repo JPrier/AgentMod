@@ -1,5 +1,6 @@
-// linux-sandbox: lets the agent code in the browser. The coding tools (run,
-// read_file, write_file, edit_file, list_files, import_repo) execute inside an
+// linux-sandbox: lets the agent code in the browser. The coding tools (shell,
+// process, read_file, list_dir, search_files, search_text, apply_patch, and the
+// deferred extras; see ../sdk/coding/toolkit.js) execute inside an
 // x86 Linux VM that CheerpX runs in this browser tab — on the user's CPU and
 // RAM, with nothing executed on a server. Browser runtime only (it has a
 // `module` and no `command`, so the native runtime disables it).
@@ -9,7 +10,7 @@
 // about what a tool does is made here, in the plugin.
 //
 // It is an ordinary tool plugin: a tool call is an event, and this plugin
-// answers the ones it owns. Policy (approval-gate), the loop (chat-context),
+// answers the ones it owns. Policy (policy / approval-gate), the loop (chat-context),
 // the model, and rendering (web-ui) are other plugins; see README.md.
 //
 // Config (all optional):
@@ -32,7 +33,7 @@ import { linuxVmTarget, DEVICE } from './target.js';
 defineWorkspacePlugin({
   manifest: {
     name: 'linux-sandbox',
-    version: '0.1.0',
+    version: '0.2.0',
     description: 'Coding tools in an x86 Linux VM running in the browser (CheerpX). Browser runtime only.',
     // Host devices this plugin uses (enforced by the browser host).
     devices: [DEVICE],
@@ -45,19 +46,17 @@ defineWorkspacePlugin({
       uid: 0,
       gid: 0,
       import_repos: true,
+      fork_workspace: 'isolated',
       limits: {},
     },
   },
   root: (cfg) => cfg.workspace_path || '/workspace',
   createTarget: (cfg, { host }) => linuxVmTarget({ host, config: cfg }),
   describe: (cfg) =>
-    'You can write and run code with the run, read_file, write_file, edit_file, list_files and import_repo tools. ' +
-    'They act on a Linux sandbox: a 32-bit x86 Debian VM (CheerpX) running inside the user\'s browser, on their own machine. ' +
-    `Work in ${cfg.workspace_path || '/workspace'}, which persists across page reloads. ` +
+    'Your workspace is a Linux sandbox: a 32-bit x86 Debian VM (CheerpX) running inside the user\'s browser, on their own machine. ' +
+    `Work in ${cfg.workspace_path || '/workspace'}, which persists across page reloads (processes do not). ` +
     'The VM has no network access, so apt, pip, npm and cargo cannot download anything; ' +
-    'use what is installed (check with `run`) and use import_repo to bring in public GitHub repositories. ' +
+    'use what is installed (check with shell) and bring in public GitHub repositories with import_repo (find it with tool_search). ' +
     'Emulation is slower than native hardware: prefer small, incremental builds and tests. ' +
-    'Do not claim something works until you have run it. ' +
-    'You also control the VM itself: sandbox_status, sandbox_logs (its journal, which survives a crash), sandbox_restart (a fresh VM; the workspace is kept) and sandbox_stop. ' +
-    'If tools report that the sandbox stopped responding, read sandbox_logs to see why, then sandbox_restart and carry on.',
+    'If tools report that the sandbox stopped responding, use the sandbox tools (tool_search "sandbox") to read its logs and restart it.',
 });

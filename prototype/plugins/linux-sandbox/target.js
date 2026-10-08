@@ -18,6 +18,13 @@ export function linuxVmTarget({ host, config = {} }) {
   const readyMessage = (info) => `Linux sandbox ready — ${info.os} (${info.kernel}); tools: ${info.tools.join(' ') || 'none found'}. Work persists in this browser.`;
 
   return {
+    identity: () => ({ kind: 'linux-vm', id: `cheerpx:${config.workspace || 'default'}`, root: config.workspace_path || '/workspace' }),
+
+    /** Is the VM up right now (without booting it)? */
+    async isReady() {
+      try { return !!(await call('state')).booted; } catch { return false; }
+    },
+
     /**
      * Before each coding tool: make sure a VM is running. A stopped VM (never
      * started, or stopped by the agent) boots; a crashed one is reported, and

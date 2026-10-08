@@ -26,6 +26,9 @@ pub struct IndexEntry {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// The session and sequence this session was branched from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_of: Option<agentmod_core::types::LogRef>,
     /// Has unfinished work (bounds the orphan scan after a crash).
     pub active: bool,
     #[serde(default)]
@@ -268,11 +271,15 @@ fn observe(e: &mut IndexEntry, r: &Record) {
     e.updated_at = r.at;
     match &r.body {
         Body::SessionCreated {
-            definition, cause, ..
+            definition,
+            cause,
+            fork_of,
+            ..
         } => {
             e.session_id.clone_from(&r.session_id);
             e.definition.clone_from(definition);
             e.created_at = r.at;
+            e.fork_of.clone_from(fork_of);
             if let Cause::Invocation { invocation_id } = cause {
                 e.parent = invocation_id.split('/').next().map(str::to_owned);
             }

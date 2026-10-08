@@ -59,6 +59,7 @@ fn m(name: &str, consumes: Vec<Consume>, emits: Vec<Emit>, caps: Vec<Capability>
         transforms: vec![],
         capabilities: caps,
         config_schema: Value::Null,
+        ..Default::default()
     }
 }
 

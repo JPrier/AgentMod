@@ -5,6 +5,7 @@
 //! agentmod compile [--config agentmod.toml] [--json]
 //! agentmod inspect [--data .agentmod] [SESSION] [--json]
 //! agentmod verify  [--data .agentmod]
+//! agentmod metrics [--data .agentmod] [SESSION] [--json]
 //! agentmod config  [--config agentmod.toml]
 //! ```
 
@@ -56,6 +57,7 @@ USAGE:
   agentmod compile [--config agentmod.toml] [--json]             handshake plugins and validate the graph
   agentmod inspect [--data .agentmod] [SESSION] [--json]         read logs (replay-as-reading; runs no plugins)
   agentmod verify  [--data .agentmod]                            replay every log through a fresh kernel
+  agentmod metrics [--data .agentmod] [SESSION] [--json]         tokens, cost, tools, edits, prompts… derived from the logs
   agentmod config  [--config agentmod.toml]                      print the config as JSON (used by the browser runtime)
 ";
 
@@ -77,6 +79,11 @@ async fn main() -> ExitCode {
             args.json,
         ),
         "verify" => inspect::verify(&args.data),
+        "metrics" => inspect::metrics(
+            &args.data,
+            args.positional.first().map(String::as_str),
+            args.json,
+        ),
         "config" => export_config(&args),
         _ => {
             print!("{HELP}");

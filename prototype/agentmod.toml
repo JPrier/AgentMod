@@ -5,8 +5,9 @@
 # subscribers run in this order). Plugin commands run from this directory.
 
 [runtime]
-max_causal_depth = 256         # runtime bound for cyclic graphs (agent loops; a coding
-                               # task's tool loop is ~4 events per round)
+max_causal_depth = 2048        # runtime bound for cyclic graphs (agent loops; a coding
+                               # task's tool loop is ~4 events per round, so ~500 rounds
+                               # per user message; budgets bound runaway agents sooner)
 spill_threshold_bytes = 16384  # larger payloads spill to content-addressed files
 max_attempts = 3               # orphan restarts before an invocation is failed
 
@@ -25,6 +26,27 @@ command = ["node", "plugins/approval-gate/main.js"]
 module = "plugins/approval-gate/main.js"
 config = { require = ["delegate"] }
 
+# Layered tool policy for coding sessions: deny > ask > allow across scopes,
+# explained decisions, digest-bound approvals re-validated before execution,
+# and tool visibility. Modes: auto | default | ask | read-only. In `default`,
+# workspace reads and edits run; network, destructive, publishing, secret, and
+# credential-file actions ask. See plugins/sdk/policy.js.
+[plugins.policy]
+command = ["node", "plugins/policy/main.js"]
+module = "plugins/policy/main.js"
+config = { mode = "default", approvers = ["web-ui"] }
+
+# Questions to the user as event continuations (ask_user).
+[plugins.ask-user]
+command = ["node", "plugins/ask-user/main.js"]
+module = "plugins/ask-user/main.js"
+
+# Hard bounds for child agents (model requests, tool calls, tokens, wall time).
+[plugins.budget]
+command = ["node", "plugins/budget/main.js"]
+module = "plugins/budget/main.js"
+config = { max_model_requests = 40, max_wall_seconds = 1800 }
+
 # --- context + loop ----------------------------------------------------------
 [plugins.chat-context]
 command = ["node", "plugins/chat-context/main.js"]
@@ -33,6 +55,17 @@ module = "plugins/chat-context/main.js"
 [plugins.titler]
 command = ["node", "plugins/titler/main.js"]
 module = "plugins/titler/main.js"
+
+# update_plan: a tiny durable task list in session context.
+[plugins.plan]
+command = ["node", "plugins/plan/main.js"]
+module = "plugins/plan/main.js"
+
+# tool_search: deferred tools are found and loaded on demand, so their schemas
+# do not ride along on every model request.
+[plugins.tool-discovery]
+command = ["node", "plugins/tool-discovery/main.js"]
+module = "plugins/tool-discovery/main.js"
 
 [plugins.memory]
 command = ["node", "plugins/memory/main.js"]
@@ -68,16 +101,19 @@ command = ["python3", "plugins/py-wordcount/main.py"]
 [plugins.subagent]
 command = ["node", "plugins/subagent/main.js"]
 module = "plugins/subagent/main.js"
+config = { definition = "worker", max_steps = 30, max_children = 8 }
 
 [plugins.subagent-reporter]
 command = ["node", "plugins/subagent-reporter/main.js"]
 module = "plugins/subagent-reporter/main.js"
 
 # --- coding: execution targets ---------------------------------------------------
-# The coding tools (run, read_file, write_file, edit_file, list_files,
-# import_repo) are answered by whichever execution-target plugin a definition
-# lists, the way a definition picks its model provider. Both share
-# plugins/sdk/workspace-tools.js. See plugins/linux-sandbox/README.md.
+# The coding tools (shell, process, read_file, list_dir, search_files,
+# search_text, apply_patch, and deferred extras) are answered by whichever
+# execution-target plugin a definition lists, the way a definition picks its
+# model provider. Both share plugins/sdk/coding/. A definition may list both:
+# each host disables the one it cannot run (the browser has no `command`
+# plugins, the native runtime no `module`-only ones).
 #
 # linux-sandbox: an x86 Linux VM running inside the browser (CheerpX), on the
 # user's own CPU and RAM. Browser runtime only — it has a `module` and no
@@ -88,12 +124,46 @@ timeout_ms = 1200000           # first boot streams the disk image; commands may
 config = { workspace = "default" }
 
 # local-workspace: the same tools in a local directory, native runtime only.
-# It is NOT a sandbox (commands run as you), so no definition uses it by
-# default. To opt in, add it to a definition and guard `run` with approval-gate.
+# It is NOT a sandbox: commands run as you (with an allowlisted environment and
+# no runtime secrets). The coder definitions pair it with `policy`.
 [plugins.local-workspace]
 command = ["node", "plugins/local-workspace/main.js"]
-timeout_ms = 1200000
+timeout_ms = 1900000
 config = { root = ".agentmod/workspace" }
+
+# Baseline for benchmarks: one shell tool, nothing else (see bench/).
+[plugins.minimal-shell]
+command = ["node", "plugins/minimal-shell/main.js"]
+timeout_ms = 1900000
+config = { root = ".agentmod/workspace" }
+
+# The same provider, configured as a bare loop (no harness preamble, all
+# tools every turn, no projection-side compaction) for the baseline.
+[plugins.openrouter-minimal]
+command = ["node", "plugins/openrouter-model/main.js"]
+config = { model = "openai/gpt-4o-mini", api_key_env = "OPENROUTER_API_KEY", max_tokens = 4096, minimal = true }
+
+# --- external capabilities (deferred tools, found through tool_search) ------------
+# Network access: policy-gated (asks in default mode unless a rule allows the
+# domain), output untrusted, private addresses refused.
+[plugins.web-fetch]
+command = ["node", "plugins/web-fetch/main.js"]
+module = "plugins/web-fetch/main.js"
+config = { max_bytes = 40000, timeout_seconds = 20 }
+
+# MCP servers as tools (native). Add servers here, e.g.
+#   [plugins.mcp-bridge.config.servers.github]
+#   command = ["npx", "-y", "@modelcontextprotocol/server-github"]
+#   env = { GITHUB_PERSONAL_ACCESS_TOKEN = "…" }
+[plugins.mcp-bridge]
+command = ["node", "plugins/mcp-bridge/main.js"]
+timeout_ms = 600000
+config = { servers = {} }
+
+# Headless Chrome for validating web apps (native; needs Chrome or Chromium).
+[plugins.browser-control]
+command = ["node", "plugins/browser-control/main.js"]
+timeout_ms = 120000
 
 # --- triggers -------------------------------------------------------------------
 [plugins.heartbeat]
@@ -119,26 +189,56 @@ subscribers = [
 ]
 
 [definitions.worker]
-description = "Sub-agent session started by `delegate`; reports back to its parent"
+description = "Child agent started by `delegate`: scoped tools, budget, isolated workspace; reports back to its parent"
 subscribers = [
   { plugin = "web-ui" },
+  { plugin = "policy" },
+  { plugin = "budget" },
   { plugin = "chat-context" },
   { plugin = "openrouter-model" },
+  { plugin = "plan" },
+  { plugin = "tool-discovery" },
+  { plugin = "linux-sandbox" },
+  { plugin = "local-workspace" },
   { plugin = "tool-clock" },
   { plugin = "tool-calc" },
   { plugin = "subagent-reporter" },
 ]
 
+# The coding harness. In the browser the tools run in the Linux VM
+# (linux-sandbox); natively they run in local-workspace's directory. Blocking
+# order matters: redactor rewrites user text, ask-user takes answers to open
+# questions, policy decides tool calls and tool visibility, chat-context runs
+# the loop.
 [definitions.coder]
-description = "Coding agent: writes, builds, and runs code in a Linux sandbox inside your browser"
+description = "Coding agent: plans, searches, edits with patches, runs builds/tests/servers, delegates, and can be rewound"
 subscribers = [
   { plugin = "web-ui" },
   { plugin = "redactor" },
-  { plugin = "approval-gate" },
+  { plugin = "ask-user" },
+  { plugin = "policy" },
   { plugin = "chat-context" },
   { plugin = "openrouter-model" },
   { plugin = "titler" },
+  { plugin = "plan" },
+  { plugin = "tool-discovery" },
   { plugin = "linux-sandbox" },
+  { plugin = "local-workspace" },
+  { plugin = "subagent" },
+  { plugin = "memory" },
+  { plugin = "web-fetch" },
+  { plugin = "mcp-bridge" },
+  { plugin = "browser-control" },
+]
+
+# Benchmark baseline: model → shell → result → model, nothing else.
+[definitions.minimal]
+description = "Baseline loop for benchmarks: a provider, the chat loop, and one shell tool"
+subscribers = [
+  { plugin = "web-ui" },
+  { plugin = "chat-context" },
+  { plugin = "openrouter-minimal" },
+  { plugin = "minimal-shell" },
 ]
 
 [definitions.heartbeat]

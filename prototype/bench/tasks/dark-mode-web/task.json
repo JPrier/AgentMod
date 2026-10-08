@@ -1,0 +1,8 @@
+{
+  "title": "Add dark mode to a web app (the specification's example)",
+  "prompt": "Add dark mode to this web application and make sure the tests still pass. Users should be able to toggle it with a button, the choice should persist across reloads, and the OS preference should be the default.",
+  "check": "node test/app.test.js && node hidden.test.js",
+  "regressions": "node test/app.test.js",
+  "hidden": { "hidden.test.js": "const fs = require('fs');\nconst html = fs.readFileSync('index.html', 'utf8');\nconst css = fs.readFileSync('styles.css', 'utf8');\nconst js = fs.readFileSync('app.js', 'utf8');\nconst fail = (m) => { console.error('FAIL', m); process.exit(1); };\nif (!/<button[^>]*(id|data-[a-z-]*)=\"[^\"]*(theme|dark|mode)[^\"]*\"/i.test(html) && !/(theme|dark)/i.test((html.match(/<button[\\s\\S]*?<\\/button>/gi) || []).join(''))) fail('no toggle button');\nif (!/prefers-color-scheme\\s*:\\s*dark/.test(css + js)) fail('OS preference not respected');\nif (!/localStorage/.test(js)) fail('choice not persisted');\nif (!/(\\.dark|\\[data-theme|data-color-scheme|color-scheme)/.test(css)) fail('no dark styles');\nconsole.log('hidden ok');\n" },
+  "timeout_seconds": 900
+}

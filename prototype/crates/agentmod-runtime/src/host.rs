@@ -41,6 +41,11 @@ fn now_ms() -> u64 {
 enum Pending {
     Initialize,
     Invoke(String),
+    /// A read-only service call routed for another process (`from`, its request id).
+    Service {
+        from: u64,
+        id: Value,
+    },
     Shutdown,
 }
 
@@ -446,8 +451,73 @@ impl Host {
                 let fx = self.kernel.complete(&inv, &result, now_ms());
                 self.execute(fx);
             }
+            Pending::Service { from, id } => {
+                let result = match (v.get("result"), v.get("error")) {
+                    (_, Some(err)) => Err((
+                        err.get("code").and_then(Value::as_i64).unwrap_or(-32000),
+                        err.get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("service error")
+                            .to_owned(),
+                    )),
+                    (Some(r), None) => Ok(r.clone()),
+                    (None, None) => Ok(Value::Null),
+                };
+                if let Some(req) = self.procs.get(&from) {
+                    req.reply(&id, result);
+                }
+            }
             Pending::Shutdown => {}
         }
+    }
+
+    /// Route a read-only service call to a plugin of the active config.
+    fn req_service(
+        &mut self,
+        from: u64,
+        params: &Value,
+        id: Option<Value>,
+    ) -> Result<(), (i64, String)> {
+        let id = id.ok_or((-32600, "call_service needs a request id".to_owned()))?;
+        let plugin = params
+            .get("plugin")
+            .and_then(Value::as_str)
+            .ok_or((-32602, "plugin required".to_owned()))?
+            .to_owned();
+        let service = params
+            .get("service")
+            .and_then(Value::as_str)
+            .ok_or((-32602, "service required".to_owned()))?
+            .to_owned();
+        let active = self
+            .kernel
+            .active()
+            .ok_or((-32001, "no active config".to_owned()))?;
+        let stamp = active
+            .stamps
+            .get(&plugin)
+            .cloned()
+            .ok_or((-32001, format!("`{plugin}` is not in the active config")))?;
+        if !active
+            .manifest(&plugin)
+            .is_some_and(|m| m.has_service(&service))
+        {
+            return Err((
+                -32601,
+                format!("`{plugin}` declares no service `{service}`"),
+            ));
+        }
+        let target = self.ensure_proc(&plugin, &stamp).map_err(|e| (-32001, e))?;
+        let p = self
+            .procs
+            .get_mut(&target)
+            .ok_or((-32001, "plugin process gone".to_owned()))?;
+        p.send(
+            "service",
+            &json!({ "service": service, "args": params.get("args").cloned().unwrap_or(json!({})) }),
+            Some(Pending::Service { from, id }),
+        );
+        Ok(())
     }
 
     fn on_request(
@@ -483,6 +553,16 @@ impl Host {
                     Ok(json!({ "watching": true }))
                 } else {
                     Err((-32003, format!("`{plugin}` lacks the observe capability")))
+                }
+            }
+            "call_service" => {
+                if !p.has(Capability::Control) {
+                    Err((-32003, format!("`{plugin}` lacks the control capability")))
+                } else {
+                    match self.req_service(proc, &params, id.clone()) {
+                        Ok(()) => return None, // answered when the service replies
+                        Err(e) => Err(e),
+                    }
                 }
             }
             "apply_config" => {
@@ -589,7 +669,7 @@ impl Host {
                         json!({
                             "session_id": e.session_id, "definition": e.definition, "title": e.title,
                             "created_at": e.created_at, "updated_at": e.updated_at, "last_sequence": e.last_sequence,
-                            "parent": e.parent, "loaded": status.is_some(),
+                            "parent": e.parent, "fork_of": e.fork_of, "loaded": status.is_some(),
                             "activity": status.as_ref().map_or_else(|| if e.state.is_empty() { "idle".to_owned() } else { e.state.clone() }, |s| s.activity.clone()),
                         })
                     })
@@ -632,6 +712,13 @@ impl Host {
             }
             "status" => Ok(json!(self.kernel.status(sid))),
             "graph" => Ok(json!(self.kernel.active())),
+            "services" => Ok(json!(self.kernel.active().map_or_else(Vec::new, |c| {
+                c.manifests
+                    .iter()
+                    .filter(|(_, m)| !m.services.is_empty() || !m.settings.is_empty() || !m.provides.is_empty())
+                    .map(|(name, m)| json!({ "plugin": name, "description": m.description, "services": m.services, "settings": m.settings, "provides": m.provides, "version": m.version }))
+                    .collect::<Vec<_>>()
+            }))),
             "config" => Ok(json!({
                 "hash": self.kernel.active_hash(),
                 "config": self.kernel.active().map(|c| &c.config),
@@ -801,6 +888,13 @@ impl Host {
         if p.draining {
             eprintln!("agentmod: plugin `{}` drained and stopped", p.name);
             return;
+        }
+        for pending in p.pending.values() {
+            if let Pending::Service { from, id } = pending
+                && let Some(req) = self.procs.get(from)
+            {
+                req.reply(id, Err((-32001, format!("`{}` exited: {status}", p.name))));
+            }
         }
         eprintln!("agentmod: plugin `{}` exited: {status}", p.name);
         self.crashes

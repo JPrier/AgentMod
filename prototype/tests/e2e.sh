@@ -189,7 +189,33 @@ B2=$(newsess coder 'script:bad')
 wait_for $B2 "assert any(e['event_name']=='assistant-message' and 'recovered' in e['payload']['text'] for e in d['events'])" 100
 ev $B2 "assert any(e['event_name']=='tool-result' and 'There is no tool named' in e['payload']['output'] for e in d['events'])" || fail "unknown tool"
 
-echo "16. a running process survives a runtime SIGKILL and is reconciled"
+echo "16. provider hot swap mid-session: the next model request uses the new provider"
+H=$(newsess coder 'first turn on the original provider')
+wait_for $H "assert any(e['event_name']=='assistant-message' for e in d['events'])" 100
+SWAP=$(curl -s $B/config | py "
+c=d['config']
+for df in c['definitions'].values():
+    df['subscribers']=[{'plugin':'openai-model'} if s['plugin']=='openrouter-model' else s for s in df['subscribers']]
+c['plugins']['openai-model']['config']={'base_url':'http://127.0.0.1:8766/api/v1','api_key':'test-key','model':'mock/swapped'}
+print(json.dumps({'config':c}))")
+curl -s -XPOST $B/config/apply -d "$SWAP" | py "assert d['ok'], d" || fail "provider swap apply"
+curl -s -XPOST $B/sessions/$H/messages -d "$(msg 'second turn after the swap')" >/dev/null
+wait_for $H "assert len([e for e in d['events'] if e['event_name']=='assistant-message'])>=2" 100
+ev $H "
+inv=[i['plugin'] for e in d['events'] if e['event_name']=='model-request' for i in e['invocations'] if i['plugin'].endswith('-model')]
+assert inv[0]=='openrouter-model' and inv[-1]=='openai-model', inv
+assert any(c['kind']=='config-applied' for c in d['control'])
+r=[e['payload'] for e in d['events'] if e['event_name']=='model-response']
+assert r[-1]['model']=='mock/swapped' and r[-1]['provider']=='openai-compatible', r[-1]" || fail "provider hot swap"
+# Swap back so later steps run on the original provider.
+BACK=$(curl -s $B/config | py "
+c=d['config']
+for df in c['definitions'].values():
+    df['subscribers']=[{'plugin':'openrouter-model'} if s['plugin']=='openai-model' else s for s in df['subscribers']]
+print(json.dumps({'config':c}))")
+curl -s -XPOST $B/config/apply -d "$BACK" | py "assert d['ok']" || fail "swap back"
+
+echo "17. a running process survives a runtime SIGKILL and is reconciled"
 L=$(newsess coder 'script:long')
 wait_for $L "assert any(e['event_name']=='assistant-message' and 'started p' in e['payload']['text'] for e in d['events'])" 100
 kill -9 $RT; wait $RT 2>/dev/null || true
@@ -199,9 +225,9 @@ wait_for $L "assert any(e['event_name']=='tool-result' and e['payload']['name']=
 PIDF=$(ls "$DATA"/ws/.agentmod/state/procs/*/pid | head -1); kill -- -$(cat "$PIDF") 2>/dev/null || pkill -P "$(cat "$PIDF")" || true
 kill $RT; wait $RT 2>/dev/null || true
 
-echo "17. every log replays through a fresh kernel"
+echo "18. every log replays through a fresh kernel"
 "$BIN" verify --data "$DATA"
-echo "18. metrics derive from the logs alone"
+echo "19. metrics derive from the logs alone"
 "$BIN" metrics --data "$DATA" "$T" --json | py "
 m=d['$T']
 assert m['model_requests']>=8 and m['edits']>=1 and m['cached_tokens']>0 and m['tool_calls']>=8, m

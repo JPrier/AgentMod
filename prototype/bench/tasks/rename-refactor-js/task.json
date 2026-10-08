@@ -1,0 +1,7 @@
+{
+  "title": "Cross-file refactor (JavaScript)",
+  "prompt": "Rename the function `getUsr` to `getUser` everywhere in this project (definition, all call sites, and exports) without changing behavior. Run the tests to confirm.",
+  "check": "node src/test.js && ! grep -rn 'getUsr' src && node -e \"const m=require('./src/users'); if (typeof m.getUser!=='function') process.exit(1)\"",
+  "regressions": "node src/test.js",
+  "timeout_seconds": 600
+}

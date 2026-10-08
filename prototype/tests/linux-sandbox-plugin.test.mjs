@@ -63,7 +63,7 @@ test('linux-sandbox speaks the plugin protocol and answers its tools', async () 
 
     const started = await p.call('invoke', { invocation_id: 'i1', attempt: 1, mode: 'blocking', event: event('session-started', {}, 1) });
     const adds = started.result.contributions;
-    assert.deepEqual(adds.filter((c) => c.slot === 'tools').map((c) => c.value.name), ['run', 'read_file', 'write_file', 'edit_file', 'list_files', 'import_repo']);
+    assert.deepEqual(adds.filter((c) => c.slot === 'tools').map((c) => c.value.name), ['run', 'read_file', 'write_file', 'edit_file', 'list_files', 'import_repo', 'sandbox_status', 'sandbox_logs', 'sandbox_restart', 'sandbox_stop']);
     assert.match(adds.find((c) => c.slot === 'system').value, new RegExp(`Work in ${ws}`));
 
     const run = await p.call('invoke', { invocation_id: 'i2', attempt: 1, mode: 'async', event: event('tool-call', { call_id: 'c1', name: 'run', args: { command: 'echo hi from the vm' } }, 2) });

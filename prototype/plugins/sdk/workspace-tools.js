@@ -17,6 +17,9 @@
 //   readFile(path) -> Uint8Array | null          null when the path does not exist
 //   writeFile(path, bytes) -> void               creates parent directories
 //   writeFiles([{ path, bytes, executable }])    optional batch form (repo import)
+//   lifecycle { status, logs, restart, stop }    optional: a target that runs a
+//       machine (a VM) can let the agent inspect, restart and stop it; the
+//       `sandbox_*` tools appear only for such targets
 //
 // Everything else — path confinement, output limits, edit semantics, diffs,
 // repository import — is shared logic, so every target behaves the same.
@@ -276,6 +279,19 @@ export function workspaceTools({ target, root, limits = {}, importRepos = true, 
       dest: { type: 'string', description: `destination directory (default ${ROOT}/<name>)` },
     }));
   }
+  // Machine lifecycle tools, for targets that run a machine (see the header).
+  const lifecycle = target.lifecycle || null;
+  const lifecycleNames = new Set();
+  if (lifecycle) {
+    const add = (spec) => { specs.push(spec); lifecycleNames.add(spec.name); };
+    add(toolSpec('sandbox_status', 'Show the sandbox VM\'s state (running, busy, stopped, crashed), what it is running now, uptime, operation counts, and the browser it runs in.', {}));
+    add(toolSpec('sandbox_logs', 'Read the sandbox VM\'s own journal, kept outside the VM so it survives a crash: boots, every command with exit code and duration, timeouts, stalls, page errors (e.g. a CheerpX crash), and the VM console. Use it when commands fail strangely or the sandbox stops responding.', {
+      limit: { type: 'integer', description: 'most recent entries to show (default 60, max 500)' },
+      kinds: { type: 'array', items: { type: 'string' }, description: 'only these kinds: boot-start, boot-ok, boot-failed, op, op-error, stalled, page-error, interrupt, restart, stopped, note' },
+    }));
+    add(toolSpec('sandbox_restart', 'Throw away the current VM, crashed or not, and boot a fresh one. Files in the workspace are kept; running processes and anything outside the workspace that was not saved are lost.', {}));
+    add(toolSpec('sandbox_stop', 'Stop the sandbox VM to free the browser\'s CPU and memory. Files in the workspace are kept; the next coding tool starts the VM again.', {}));
+  }
   const names = new Set(specs.map((s) => s.name));
 
   const text = (bytes) => dec.decode(bytes);
@@ -418,6 +434,49 @@ export function workspaceTools({ target, root, limits = {}, importRepos = true, 
     return { output: lines.join('\n'), summary: `${files.length} files` };
   }
 
+  const fmtTime = (t) => new Date(t).toISOString().slice(11, 23);
+  function formatEntry(e) {
+    const { at, kind, ...rest } = e;
+    const parts = Object.entries(rest).map(([k, v]) => `${k}=${typeof v === 'string' ? JSON.stringify(v) : JSON.stringify(v)}`);
+    return `${fmtTime(at)} ${kind}${parts.length ? ' ' + parts.join(' ') : ''}`;
+  }
+
+  async function sandbox(name, args, progress) {
+    if (name === 'sandbox_status') {
+      const st = await lifecycle.status();
+      const lines = [
+        `state: ${st.state}${st.broken ? ` — ${st.broken}` : ''}`,
+        st.info ? `system: ${st.info.os} (${st.info.kernel}); tools: ${(st.info.tools || []).join(' ')}` : null,
+        st.uptime_s != null ? `uptime: ${st.uptime_s}s` : null,
+        st.running ? `running now: operation #${st.running.op} for ${st.running.for_s}s: ${st.running.command}` : null,
+        `operations: ${st.stats.ops} (${st.stats.failed} non-zero exits, ${st.stats.timedOut} timeouts); boots: ${st.stats.boots}; processes created: ${st.stats.processes_created}`,
+        `image: ${st.config.image} (${st.config.image_type}); CheerpX ${st.config.cheerpx}; workspace "${st.config.workspace}" at ${st.config.workspace_path}`,
+        `browser: ${st.page.user_agent || 'unknown'}; cores ${st.page.cores ?? '?'}; memory ${st.page.memory_gb ?? '?'} GB${st.page.js_heap_mb != null ? `; JS heap ${st.page.js_heap_mb} MB` : ''}; cross-origin isolated: ${st.page.cross_origin_isolated}`,
+        st.unavailable && !st.broken ? `unavailable: ${st.unavailable}` : null,
+      ].filter(Boolean);
+      return { output: lines.join('\n'), summary: st.state };
+    }
+    if (name === 'sandbox_logs') {
+      const limit = clampInt(args.limit, 60, 1, 500);
+      const kinds = Array.isArray(args.kinds) ? args.kinds.map(String) : undefined;
+      const { entries, total, console_tail: tail } = await lifecycle.logs({ limit, kinds });
+      const head = `VM journal: ${entries.length} of ${total} entr${total === 1 ? 'y' : 'ies'}${kinds ? ` (kinds: ${kinds.join(', ')})` : ''}, oldest first`;
+      const body = entries.map(formatEntry).join('\n') || '(empty: the VM has not been started in this page)';
+      const con = tail ? `\n--- VM console (last ${tail.length} chars) ---\n${tail}` : '';
+      return { output: truncate(`${head}\n${body}${con}`, L.max_output_bytes), summary: `${entries.length} entries` };
+    }
+    if (name === 'sandbox_restart') {
+      const t0 = Date.now();
+      const info = await lifecycle.restart({ status: progress ? (_s, m) => progress(m) : undefined });
+      return { output: `Restarted the Linux sandbox in ${((Date.now() - t0) / 1000).toFixed(1)}s: ${info.os} (${info.kernel}). The workspace is intact; re-run anything that was in progress.`, summary: 'restarted' };
+    }
+    if (name === 'sandbox_stop') {
+      await lifecycle.stop();
+      return { output: 'Stopped the Linux sandbox. The workspace is kept; the next coding tool starts it again.', summary: 'stopped' };
+    }
+    throw new ToolError(`unknown tool ${name}`);
+  }
+
   /**
    * Run one tool. Returns { output, error, summary, diff? } — never throws for
    * tool-level failures; those come back as `error: true` with a message.
@@ -431,7 +490,9 @@ export function workspaceTools({ target, root, limits = {}, importRepos = true, 
         case 'edit_file': return await editFile(args);
         case 'list_files': return await listFiles(args, signal);
         case 'import_repo': return await importRepo(args, signal, progress);
-        default: throw new ToolError(`unknown tool ${name}`);
+        default:
+          if (lifecycleNames.has(name)) return await sandbox(name, args, progress);
+          throw new ToolError(`unknown tool ${name}`);
       }
     } catch (e) {
       if (signal?.aborted) throw e;
@@ -439,5 +500,5 @@ export function workspaceTools({ target, root, limits = {}, importRepos = true, 
     }
   }
 
-  return { specs, names, root: ROOT, call };
+  return { specs, names, lifecycleNames, root: ROOT, call };
 }

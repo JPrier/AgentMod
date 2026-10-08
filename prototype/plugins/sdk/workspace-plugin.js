@@ -6,6 +6,9 @@
 // Which one a session uses is decided by its definition — config, not code.
 //
 // Events:
+// Targets that run a machine also get sandbox_status / sandbox_logs /
+// sandbox_restart / sandbox_stop (see workspace-tools.js).
+//
 //   consumes  session-started, config-applied   offer tools + describe the target
 //             tool-call (async)                  answer calls for our tool names
 //   emits     tool-result                        what the model sees
@@ -78,7 +81,8 @@ export function defineWorkspacePlugin(spec) {
           ctx.publish('workspace-status', { state: st, message, call_id }, { ui: { v: 1, kind: 'progress', label: message } });
         let result;
         try {
-          if (target.ensureReady) await target.ensureReady({ status, signal: ctx.signal });
+          // Lifecycle tools manage the machine themselves; everything else needs it up.
+          if (target.ensureReady && !tools.lifecycleNames.has(name)) await target.ensureReady({ status, signal: ctx.signal });
           result = await tools.call(name, args || {}, { signal: ctx.signal, progress: (m) => status('working', m) });
         } catch (e) {
           if (ctx.signal.aborted) throw e;

@@ -142,6 +142,21 @@ try {
   check('workspace persists across reload', r.ok, r.out);
   await shot('04-after-reload');
 
+  // VM control, as the agent uses it.
+  r = await tool('sandbox_status', {}, /^done state: running[\s\S]*cross-origin isolated: true/m);
+  check('sandbox_status', r.ok, r.out);
+  r = await tool('sandbox_logs', {}, /boot-ok[\s\S]* op op=/);
+  check('sandbox_logs shows boots and commands', r.ok, r.out.slice(0, 300));
+  const tr = Date.now();
+  r = await tool('sandbox_restart', {}, /Restarted the Linux sandbox/, BOOT_MS);
+  check('sandbox_restart boots a fresh VM in the same page', r.ok, `${Math.round((Date.now() - tr) / 1000)}s; ${r.out}`);
+  r = await tool('read_file', { path: 'hello.c' }, /hi from gcc in the browser/, BOOT_MS);
+  check('workspace survives sandbox_restart', r.ok, r.out);
+  r = await tool('sandbox_stop', {}, /Stopped the Linux sandbox/);
+  check('sandbox_stop', r.ok, r.out);
+  r = await tool('run', { command: 'echo back-after-stop' }, /back-after-stop/, BOOT_MS);
+  check('the next command restarts a stopped VM', r.ok, r.out);
+
   // Last: process control (a VM crash here must not hide the results above).
   // Diagnostics: how signals behave in the guest (each line: what, exit code, seconds waited).
   r = await tool('run', { command: [

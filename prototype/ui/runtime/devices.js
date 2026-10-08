@@ -35,6 +35,10 @@ export function linuxVmOps(vm) {
     },
     writeFiles: (a) => vm.writeFiles({ files: (a.files || []).map((f) => ({ path: f.path, bytes: fromB64(f.data), executable: !!f.executable })) }),
     interrupt: () => vm.interrupt(),
+    status: () => vm.status(),
+    logs: (a) => vm.logs(a),
+    restart: () => vm.restart(),
+    stop: () => vm.stop(),
     dispose: () => vm.dispose(),
   };
 }
@@ -42,7 +46,7 @@ export function linuxVmOps(vm) {
 const KINDS = {
   'linux-vm': {
     create: async (config) => linuxVmOps((await import('./devices/cheerpx-vm.js')).createCheerpxVm(config)),
-    ops: new Set(['state', 'boot', 'exec', 'readFile', 'writeFiles', 'interrupt']),
+    ops: new Set(['state', 'boot', 'exec', 'readFile', 'writeFiles', 'interrupt', 'status', 'logs', 'restart', 'stop']),
   },
 };
 

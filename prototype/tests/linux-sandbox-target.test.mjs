@@ -101,3 +101,68 @@ test('boots once, runs commands, and moves files both ways', async () => {
   await devices.dispose();
   assert.equal(fake.Linux.last.deleted, true);
 });
+
+test('the agent can inspect, restart, and stop a crashed VM', async () => {
+  globalThis.crossOriginIsolated = true;
+  globalThis.indexedDB ??= {};
+  const config = { ...fakeVmConfig(), stall_grace_seconds: 1 };
+  const ws = config.workspace_path;
+  const devices = await hostDevices();
+  const target = linuxVmTarget({ host: jsonHost(devices), config });
+  const tools = workspaceTools({ target, root: ws, importRepos: false });
+  assert.deepEqual([...tools.lifecycleNames], ['sandbox_status', 'sandbox_logs', 'sandbox_restart', 'sandbox_stop']);
+  const ready = () => target.ensureReady({ status: () => {} });
+
+  // Before anything runs, status says stopped and the journal is empty.
+  let r = await tools.call('sandbox_status', {});
+  assert.match(r.output, /^state: stopped/);
+  r = await tools.call('sandbox_logs', {});
+  assert.match(r.output, /0 of 0 entries/);
+
+  await ready();
+  r = await tools.call('write_file', { path: 'keep.txt', content: 'survives\n' });
+  assert.equal(r.error, undefined, r.output);
+  r = await tools.call('sandbox_status', {});
+  assert.match(r.output, /^state: running/);
+  assert.match(r.output, /operations: \d+/);
+
+  // The VM dies mid-command: the call fails after timeout + grace, and so do later ones.
+  r = await tools.call('run', { command: 'echo FAKE_CRASH', timeout_seconds: 1 });
+  assert.equal(r.error, true);
+  assert.match(r.output, /stopped responding during operation #\d+/);
+  assert.match(r.output, /sandbox_restart/);
+  await assert.rejects(ready(), /stopped responding/);
+  r = await tools.call('sandbox_status', {});
+  assert.match(r.output, /^state: crashed/);
+  r = await tools.call('sandbox_logs', { kinds: ['stalled'] });
+  assert.match(r.output, /stalled op=\d+ command="echo FAKE_CRASH"/);
+  r = await tools.call('sandbox_logs', {});
+  assert.match(r.output, /boot-ok/);
+  assert.match(r.output, / op op=\d+ command=/);
+
+  // Restart: a fresh VM, the workspace intact, commands work again.
+  const fake = await import(FAKE_CHEERPX);
+  const before = fake.Linux.last;
+  r = await tools.call('sandbox_restart', {});
+  assert.equal(r.error, undefined, r.output);
+  assert.match(r.output, /Restarted the Linux sandbox/);
+  assert.notEqual(fake.Linux.last, before, 'a new VM');
+  assert.equal(before.deleted, true, 'the crashed VM was deleted');
+  await ready();
+  r = await tools.call('read_file', { path: 'keep.txt' });
+  assert.match(r.output, /survives/);
+  r = await tools.call('sandbox_logs', { kinds: ['restart', 'stopped', 'boot-ok'] });
+  assert.match(r.output, /stopped reason="restart"[\s\S]*restart[\s\S]*boot-ok/);
+
+  // Stop frees the VM; the next coding tool boots it again on its own.
+  r = await tools.call('sandbox_stop', {});
+  assert.match(r.output, /Stopped/);
+  r = await tools.call('sandbox_status', {});
+  assert.match(r.output, /^state: stopped/);
+  const statuses = [];
+  await target.ensureReady({ status: (s) => statuses.push(s) });
+  assert.deepEqual(statuses, ['booting', 'ready']);
+  r = await tools.call('run', { command: 'cat keep.txt' });
+  assert.match(r.output, /survives/);
+  await devices.dispose();
+});

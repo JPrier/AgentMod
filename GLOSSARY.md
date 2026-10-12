@@ -36,8 +36,11 @@ _Avoid_: schema, type
 The fixed metadata every delivered event carries, whatever the subscriber declared.
 
 **Event family**:
-A group of event names `family/member` whose members are chosen at runtime, such as `tool-call/read_file`.
-_Avoid_: keyed owner, routed subscription
+A declared group of event names `family/member`, such as `tool-call/*`, that the compiler resolves into the concrete members a definition's subscribers name.
+_Avoid_: keyed owner, routed subscription, handler
+
+**Resolved emit set**:
+The concrete events a plugin may emit under one revision, after its family emits are resolved.
 
 **Unlisted keys**:
 The keys of an event a subscriber did not declare, received untyped only if the subscriber opts in.
@@ -61,9 +64,19 @@ A subscriber that runs concurrently once the blocking chain has settled. It cann
 A named position in blocking order, declared by a session definition. It has no meaning to the runtime beyond its order.
 _Avoid_: priority, stage
 
+**Lane**:
+The queue an event waits in: normal or interrupt. The publisher chooses it per publish, from the lanes its emit declares.
+_Avoid_: priority
+
 **Interrupt event**:
-An event on the interrupt lane, which is dispatched before ordinary queued work at the next pipeline boundary.
+An event published on the interrupt lane, which is dispatched before ordinary queued work at the next pipeline boundary.
 _Avoid_: priority event
+
+**Steer / queue**:
+The same user message published on the interrupt lane (steer) or the normal lane (queue).
+
+**Watcher**:
+A reader of a session's records from outside the bus. It is not a node in the compiled graph.
 
 **Slot**:
 A named, typed item of session state that plugins read and write through their declarations. Context is the default slot.

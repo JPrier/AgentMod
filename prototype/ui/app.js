@@ -813,6 +813,8 @@ function threadItems(v) {
   // A stream also ends when its invocation closes (completed, failed, or cancelled by a hard stop).
   for (const e of v.events) for (const i of e.invocations) if (i.outcome) finalized.add(i.invocation_id);
   const chunked = new Set(v.events.filter((e) => e.event_name === 'stream-chunk').map((e) => e.payload.stream_id));
+  // A response the loop re-publishes as an assistant message renders once, from that message.
+  const replaced = new Set(v.events.filter((e) => e.event_name === 'assistant-message' && e.ui?.replaces_stream).map((e) => e.ui.replaces_stream));
   const controls = (v.control || []).filter((c) => c.kind === 'hard-stop' || c.kind === 'soft-stop' || c.kind === 'config-applied');
   let ci = 0;
   const controlNote = (c) =>
@@ -864,7 +866,7 @@ function threadItems(v) {
     if (name === 'model-response') {
       const s = streams.get(e.payload.stream_id);
       if (s) s.el.classList.remove('streaming');
-      else if (e.payload.text) out.push(h('div.msg.assistant', { html: markdown(e.payload.text) }));
+      else if (e.payload.text && !replaced.has(e.payload.stream_id)) out.push(h('div.msg.assistant', { html: markdown(e.payload.text) }));
       continue;
     }
     if (name === 'assistant-message') {
@@ -1245,7 +1247,7 @@ function graphPane() {
     const parts = [];
     const out = routes.filter((x) => x.class === cls && x.from === p);
     if (out.length) {
-      const e = out.map((x) => [...x.blocking, ...x.asyncs, ...(x.handler != null ? [x.handler] : [])].map((i) => edges[i])).flat()[0];
+      const e = out.map((x) => [...(x.blocking || []), ...(x.asyncs || []), ...(x.handler != null ? [x.handler] : [])].map((i) => edges[i])).flat()[0];
       const label = `E${e?.deferred ? '*' : ''}${e?.lane === 'interrupt' ? '!' : ''}`;
       parts.push(h('span.cell-e', { title: `emits ${cls}${e?.deferred ? ' (deferred allowed)' : ''}${e?.lane === 'interrupt' ? ' on the interrupt lane' : ''}; keys: ${Object.keys(e?.supply || {}).join(', ') || 'none'}` }, label));
     }

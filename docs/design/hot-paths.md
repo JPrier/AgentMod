@@ -176,6 +176,8 @@ canonical events once those arrive.
 
 ## 4. Compiled tool routing: the `tool-call/*` family
 
+> **The design has moved on; this section describes the prototype as implemented.** [compiler.md §3.4](compiler.md#34-tool-calls) is the current design for tool calls: the `tool-call/*` family is *resolved* into concrete members at compile time; a member's subscribers are ordinary subscribers (no `exactly_one_handler`, no handler picks); the emitter checks the model's tool name against its resolved emit set and answers unknown names itself; and failures surface as `invocation-failed`, not `dispatch-failed`. This section will be rewritten when the prototype is updated.
+
 Tool calls are an **event family** ([compiler.md](compiler.md) §3.3). The
 loop plugin (`chat-context`) emits `tool-call/<name>` for each call the model
 makes, declaring the family once with `exactly_one_handler`:

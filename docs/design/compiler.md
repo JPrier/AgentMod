@@ -17,7 +17,7 @@ Compilation proves that **declarations are consistent with each other**. The run
 ## 2. Inputs
 
 - **Plugin manifests.** Each plugin hands the runtime its manifest at handshake ([§3](#3-the-manifest)).
-- **The core manifest.** This is a built-in manifest, versioned with the runtime, that declares every event the runtime itself emits: `session-started`, the stop and lifecycle events, `dispatch-failed`, and inbound cross-session events. The compiler treats it exactly like a plugin's manifest. The runtime is the graph's **boundary node**.
+- **The core manifest.** This is a built-in manifest, versioned with the runtime, that declares every event the runtime itself emits: `session-started`, the stop and lifecycle events, `invocation-failed`, `session-start-failed`, and inbound cross-session events. The compiler treats it exactly like a plugin's manifest. The runtime is the graph's **boundary node**.
 - **One flattened session definition.** Definitions may be composed from reusable fragments. That composition is the session-definitions subdesign's job. The compiler always sees the fully expanded result, and every diagnostic traces back to the fragment and line that produced it. A definition names the runtime version it targets, and that version selects which core manifest the compiler loads.
 
 ## 3. The manifest
@@ -45,8 +45,8 @@ unlisted_keys = false                 # true → also receive every undeclared k
   [subscribe.receives]                # what it needs: the demand
   model    = { shape = "string" }
   messages = { shape = "array<object>" }
-  [subscribe.receives.slots]
-  context  = { shape = "object" }     # session slots are requested like keys
+  [subscribe.slots]                   # session slots, requested like keys (a sibling of receives, so no key name is reserved)
+  context  = { shape = "object" }
   [subscribe.returns]                 # blocking only: what it hands back to the chain
   temperature = { shape = "number" }
   messages    = { shape = "array<object>", optional = true }
@@ -57,29 +57,53 @@ unlisted_keys = false                 # true → also receive every undeclared k
 - **Async subscribers** have no `returns` and cannot veto.
 - **`actions`.** These are runtime calls scoped to one event's pipeline. `veto` and `contribute-context` are placeholder names: their naming and semantics are open and belong to other subdesigns.
 
-### 3.3 Emits and event families
+### 3.3 Emits, lanes and event families
 
 ```toml
 [[emit]]
 event = "context-trimmed"
-lane  = "normal"                      # "interrupt" requires the interrupt capability
 deferred = false                      # may be published without an open invocation
   [emit.keys]
   removed = { shape = "integer" }
 
 [[emit]]
-event = "tool-call/*"                 # a family: members are chosen at runtime
-exactly_one_handler = true
+event = "user-message"
+lanes = ["normal", "interrupt"]       # each publish picks one; "interrupt" requires the interrupt capability
+deferred = true
+  [emit.keys]
+  text = { shape = "string" }
+
+[[emit]]
+event = "tool-call/*"                 # a family: resolved by the compiler into concrete events
   [emit.keys]
   call_id = { shape = "string" }
   args    = { shape = "object" }
 ```
 
-Event names may be structured as `family/member`. An emitter may declare a **family** when the member names are chosen at runtime, as with tool calls named by the model. Subscribers may subscribe to a single member (`tool-call/read_file`) or to the whole family (`tool-call/*`). A family marked `exactly_one_handler` must have exactly one subscriber that handles each member. Ordinary family observers, such as a policy gate, a frontend or telemetry, still receive every member. Sub-families nest (`tool-call/mcp__github__*`).
+**Lanes are chosen per publish.** An emit declares the lanes it may use (`lanes`, default `["normal"]`), and each publish picks one. Subscribers handle an event identically whichever lane it arrived on; the lane is visible in the envelope, but nothing needs to branch on it. For example, `user-message` is one event: published on the interrupt lane it **steers** (it runs before already-queued work, at the next pipeline boundary), published on the normal lane it **queues** (it waits its turn). The frontend decides which, and the plugins that handle user messages don't need to know.
+
+**Event families.** Event names may be structured as `family/member`. A plugin declares a family emit when it is written before the members can be known. `chat-context` cannot know which tools a definition will include, so it declares `tool-call/*`. The family is a placeholder, not an open permission: at compile time the compiler **resolves** it into the concrete members that the definition's subscribers name (§3.4). The compiled graph contains only concrete events, so the set of events that can fire is always known at compile time, even though *which one* fires is decided at runtime. Subscribers may subscribe to one member (`tool-call/read_file`), a sub-family (`tool-call/mcp__github__*`) or the whole family (`tool-call/*`). Only subscriptions to a concrete member define members; subscribing to a family or sub-family is how observers and gates see every member, and it never adds one.
+
+A subscriber of a member is just a subscriber. There is no special "handler" role and no exactly-one rule: if a definition includes two plugins that both answer `tool-call/read_file`, both run, and that is the definition author's choice.
+
+### 3.4 Tool calls
+
+Tool calls are ordinary events, using a family:
+
+1. **Tools exist because plugins subscribe to them.** A tool plugin subscribes to the members it implements, such as `tool-call/read_file`, and declares the call's arguments in `receives`. Manifests are given at handshake, so an MCP bridge first connects to its server and then declares one subscription per tool the server offers (`tool-call/mcp__github__create_issue`, …). Observers may still subscribe to the sub-family `tool-call/mcp__github__*`, but that only watches; it adds no tools. The set of tools in a session is therefore exactly the set of `tool-call/<name>` members that its definition's plugins subscribe to.
+2. **The compiler resolves the family.** `chat-context` (or whichever plugin turns model output into calls) emits `tool-call/*`. The compiler replaces that with the concrete members resolved in step 1. A definition with no tool plugins resolves the family to nothing.
+3. **The model is offered exactly those tools.** A tool's name is its member name, and its argument schema is its subscriber's `receives` shape, so the tool list sent to the model is generated from the compiled graph rather than declared separately.
+4. **Each plugin receives its resolved emit set.** For every revision, the runtime tells each plugin the concrete events it may emit. Before publishing a call, `chat-context` checks the name the model wrote against that set. If the model invents a name, `chat-context` does not publish; it answers the model itself with an error result ("no such tool"). Unknown tool names are blocked at the point where model output enters the system.
+5. **Publishing outside the resolved set is an undeclared emit,** which is a hard failure like any other (§7). There is no separate rejection path for tools.
+6. **A call runs through an ordinary pipeline.** Gates (policy, approval) subscribe to `tool-call/*` as blocking subscribers. The tool's own subscriber does the work and publishes `tool-result`. Observers such as telemetry subscribe as async subscribers. The model sees the result only once the `tool-result` pipeline has completed and its contribution is in context.
+7. **Failures are reported by the core.** If any plugin invocation fails, for example a tool crashes, the core emits `invocation-failed` with the failed event, the plugin and the error. `chat-context` subscribes to it and turns it into an error result for the model, so a call never leaves the model waiting.
+
+### 3.5 Plugin-wide declarations
 
 ### 3.4 Plugin-wide declarations
 
-- **`capabilities`** lists plugin-wide runtime powers: `deferred-publish`, `start-session`, `cross-session`, `interrupt`, the queue methods (list pending, cancel), and the session directory (`sessions.find`, possibly `sessions.read`). Any call that isn't declared is declined and recorded.
+- **`capabilities`** lists plugin-wide runtime powers: `deferred-publish`, `start-session`, `cross-session`, `interrupt`, `control` (dispatcher commands: soft stop, hard stop, resume), `observe` (read a session's records from outside the bus, as a watcher), the queue methods (list pending, cancel), and the session directory (`sessions.find`, possibly `sessions.read`, which overlaps with `observe`). Any call that isn't declared is declined and recorded.
+- **Watchers.** A frontend usually reads a session through `observe` rather than by subscribing to everything. That keeps it off the per-event path, like the live stream. Watching is reading, not participating: a watcher is not a node in the compiled graph.
 - **`outbound`** lists cross-session events the plugin may send, with their shapes. It requires `cross-session`.
 - **`sink = true`** marks a plugin whose effect lies outside the bus, such as a frontend or a log exporter. Such a plugin is exempt from the no-effect warning.
 
@@ -87,8 +111,7 @@ Event names may be structured as `family/member`. An emitter may declare a **fam
 
 - **Plugins.** The definition lists the plugins it runs and their config. It never lists edges or pipelines; those are compiler output.
 - **Phases.** The definition gives an ordered list of phase names and assigns every blocking subscriber a phase, either per plugin or overridden per event. A phase is only a name and has no meaning to the runtime.
-- **Tie-breaks.** For each event, a definition may give an explicit order inside a phase. It must do so wherever the compiler reports an observable tie ([§6](#6-checks)).
-- **Handler picks.** Where two plugins could handle the same member of an `exactly_one_handler` family, the definition names the winner.
+- **Tie-breaks.** For each event, a definition may give an explicit order inside a phase. It must do so wherever the compiler reports an observable tie ([§6](#6-checks)). A tie-break keyed by a family name (`order.tool-call.guard`) applies to every member of that family.
 - **`inbound`.** These are the events the session accepts from other sessions, with their shapes. They reach the session as emits of the core boundary node.
 - **Slots.** These are named, typed items of session state that plugins read through `receives` and write through `returns`. `context` is a default slot that a definition may replace. An embedded workflow gets its own namespaced slots unless the definition maps them to the parent's. How slot writes combine (append or replace, and how context is assembled) is decided elsewhere.
 - **Embedded workflows.** A definition with a declared receive/emit interface may be used as a plugin inside another definition. The compiler inlines it under a namespace (`research/model-request`), derives its manifest, and checks its interface like any other plugin's.
@@ -109,7 +132,7 @@ The graph is **not a DAG**: agent loops are cycles. Fan-out to several async des
 
 ### 5.1 How it is built
 
-1. **Resolve.** Load the core manifest for the target runtime version and the manifests of every plugin listed, and inline any embedded workflows.
+1. **Resolve.** Load the core manifest for the target runtime version and the manifests of every plugin listed, and inline any embedded workflows. Resolve every family emit into the concrete members the definition's subscribers name (§3.4).
 2. **Expand.** Expand wildcard and family subscriptions against the actual emitters, taking the emitter into account:
    - A wildcard subscriber never receives its own plugin's emits.
    - A wildcard subscriber never receives events emitted by any wildcard subscriber.
@@ -129,20 +152,19 @@ The graph is **not a DAG**: agent loops are cycles. Fan-out to several async des
 | A blocking subscriber has no phase. | Error |
 | An observable tie inside a phase: one subscriber returns a key the other receives or returns, both contribute context, or either can veto. | Error, naming the pair, the event and the reason |
 | Two fragments supply conflicting phase lists. | Error |
-| A member of an `exactly_one_handler` family has two possible handlers and the definition picks none. | Error |
 | A `returns` adds a key that some emitter of that event already supplies with a different shape. | Error |
-| An action or capability is used without being declared, an interrupt-lane emit lacks `interrupt`, or an outbound event lacks `cross-session`. | Error |
+| An action or capability is used without being declared, an emit allowing the interrupt lane lacks `interrupt`, or an outbound event lacks `cross-session`. | Error |
 | A plugin never fires (none of its subscriptions is fed). | Error |
 | An unfed subscription (an individual event that no plugin emits). | Warning |
 | A plugin has no effect: no consumed emits, no `returns`, no actions, and not a `sink`. | Warning |
 | An unreachable island: plugins feed each other, but no root can reach them. | Warning |
 | A cycle consisting only of interrupt edges (a starvation risk). | Warning |
 | An unconsumed emit, or keys supplied that nobody requests. | Not reported (the log is the universal subscriber) |
-| Cycles, capability holders, the interrupt section, `unlisted_keys` users, and the external surface. | Info |
+| Cycles, split into **internal** cycles and cycles that pass through **external input** (a deferred publish, such as a frontend's user message); only internal cycles can run away on their own. Also: capability holders, the interrupt section, `unlisted_keys` users, resolved families, and the external surface. | Info |
 
 **Roots**, for reachability, are:
 
-- core lifecycle events and `start-session` initial events
+- core events, including `session-started`
 - `inbound` events
 - emits flagged `deferred`
 
@@ -161,7 +183,7 @@ The runtime checks every invocation against the compiled declarations, under one
   - a call to an undeclared action or capability
 - **Silence passes.** Extra undeclared keys travel untyped, and only `unlisted_keys` subscribers see them.
 - **Cross-session publishes.** These are paired at runtime, against the target's compiled `inbound` declaration. A mismatch, or a target that doesn't accept the event, fails the publish with a recorded error returned to the sender. It does not stop the sender's session, because choosing the wrong target is a legitimate runtime outcome.
-- **Unhandled family members.** A member of an `exactly_one_handler` family that nothing handles, or whose handler fails without answering, becomes the core `dispatch-failed` event.
+- **Failed invocations.** When any plugin invocation fails, the core emits `invocation-failed` (the failed event, the plugin, the error), so plugins can react, for example by telling the model a tool crashed.
 - **Records.** Every runtime failure is recorded with: the session, the revision, the event and invocation ids, the plugin and its stamp (binary and config hash), **the exact compiled declaration it violated**, and the value actually observed. What the runtime then *does*, whether pausing, alerting or something else, is control-plane design.
 
 ## 8. Cycles and termination
@@ -170,7 +192,7 @@ Cycles are legal and are reported as information. The no-self-subscription rule 
 
 ## 9. Revisions and apply
 
-- **Every start compiles.** Each `start-session` compiles its definition immediately before running. A failed compile means the session is never created, and the diagnostics are returned to the caller as an event, so an orchestrating agent can read and fix them.
+- **Starting a session is a runtime API call.** `start-session` requires the capability and takes a definition and an initial input. The runtime compiles the definition immediately; on failure no session is created, and the diagnostics are returned to the caller in the call's error and as a `session-start-failed` event, so an orchestrating agent can read and fix them. On success the runtime creates the session and emits `session-started` into it, with the input in a fixed shape declared by the core manifest. Nothing but the core ever emits `session-started`, so it is always a clean starting point in the graph, and each definition handles it with an ordinary subscriber (for example `chat-context` turning the input into the first model request). Users starting chats, plugins starting detached sessions, and orchestrators starting sessions from definitions they wrote all use the same call.
 - **Applying a change.** An apply targets specific running sessions. The definition file may be shared, but revisions belong to each session. The compiler builds the candidate from scratch. Any error rejects the whole apply, and those sessions keep their current revision. Success records the new revision in each session's log, and from then on every invocation stamps the revision it ran under.
 - **Caching.** Identical inputs produce an identical revision, so a cached result may be reused. This is an optimisation only and never changes behaviour.
 - **Timing.** When a new revision takes effect for events that are already queued or in flight belongs to the control-plane subdesign.
@@ -186,7 +208,7 @@ Each property is assigned to the party that is responsible for it. The rubric ID
 | Blocking order is fully determined wherever it is observable | ✔ | ✔ the order is executed exactly | | | C2 |
 | A plugin can do only what it declared (actions, capabilities, emits, returns) | ✔ capabilities granted | ✔ every call checked | | | C8 |
 | No plugin consumes its own emits; no wildcard-to-wildcard feedback | ✔ | ✔ routes only along compiled edges | | | |
-| Each member of a handled family has exactly one handler | ✔ | ✔ unhandled → `dispatch-failed` | | | |
+| Only tools the definition provides can be called | ✔ families resolve to concrete members | ✔ publishing outside the resolved set is an undeclared emit | ✔ the emitter filters model output against its resolved set | | |
 | Cross-session events match what the target accepts | ✔ each side separately | ✔ paired at publish time | | | C5 |
 | Interrupt use is explicit and visible | ✔ | ✔ | | Whether a given interrupt use is *justified* | C7 |
 | A configuration that fails to compile never runs, and the failure leaves current sessions untouched | ✔ | ✔ | | | C6 |
@@ -202,11 +224,11 @@ Each property is assigned to the party that is responsible for it. The rubric ID
 
 **Accepted: chat loop.**
 - `chat-context` emits `model-request`; `openrouter` consumes it and emits `model-response`.
-- `chat-context` consumes `model-response` and emits the `tool-call/*` family.
-- `file-tools` handles `tool-call/read_file` and emits `tool-result`.
+- `chat-context` consumes `model-response` and emits the `tool-call/*` family, which the compiler resolves to `tool-call/read_file`.
+- `file-tools` subscribes to `tool-call/read_file` and emits `tool-result`.
 - `chat-context` consumes `tool-result` and emits `model-request`.
 
-This compiles. The cycle `model-request → model-response → tool-call/* → tool-result → model-request` is reported as information. `web-ui` subscribes to the whole family as an async `sink`.
+This compiles. The cycle `model-request → model-response → tool-call/read_file → tool-result → model-request` is reported as an internal cycle. `web-ui` watches the session through `observe`.
 
 **Rejected: an emitter that falls short.** `shell` emits `tool-result {content, exit_code}`, `mcp-bridge` emits `tool-result {content}`, and `retry` requires `exit_code`. The error names the `mcp-bridge → retry` edge and the missing `exit_code` key. The fixes: make `exit_code` optional in `retry`, supply it from `mcp-bridge`, or use a separate event name.
 
@@ -218,6 +240,8 @@ This compiles. The cycle `model-request → model-response → tool-call/* → t
 
 **Accepted, with a warning.** `ask-parent` subscribes to `answer`, and nothing in this definition emits it and no `inbound` declares it. The warning names the unfed subscription. Declaring `inbound answer {...}` in the definition removes it.
 
+**Runtime: the model invents a tool.** The model asks for `delete_everything`, which is not in `chat-context`'s resolved set. `chat-context` does not publish; it answers the model with "no such tool: delete_everything". Had it published anyway, that would be an undeclared emit and a hard failure.
+
 **Rejected: dynamic definition.** An orchestrator calls `start-session` with a definition it wrote moments earlier, and that definition has a starved consumer. No session is created, and the orchestrator receives the diagnostics as an event.
 
 ## 12. Changes to the High-Level Design
@@ -228,12 +252,14 @@ The High-Level Design has been updated in place for each of these; this list is 
 2. **The transform model is `receives` and `returns`.** Transforms are not "preserves/adds" lists: blocking subscribers declare `returns`, which are applied sequentially. Keys are never removed.
 3. **Recursion is analysed, not bounded.** The HLD's "recursion bounded" becomes: self-subscription forbidden, wildcard feedback impossible by construction, cycles reported, and no core depth limit. The prototype's `max_causal_depth` has no place in the end state.
 4. **The graph is the routing table.** It is not only a validation artifact. Pipelines are its per-event view.
-5. **Event families exist.** The HLD forbids emit wildcards; this design allows declared families instead, which replace keyed owners (`keyed:` and the prototype's `ownTools`) for tool routing.
+5. **Event families exist.** The HLD forbids emit wildcards; this design allows declared families instead, which the compiler resolves into concrete events. They replace keyed owners (`keyed:` and the prototype's `ownTools`) for tool routing. There is no exactly-one-handler rule and no `dispatch-failed`; failures surface as `invocation-failed`.
 6. **Wildcard emitters are allowed,** under the expansion rules.
 7. **Dead listeners are relaxed.** A dead listener is an error only at the plugin level (the plugin never fires). An individual unfed subscription is a warning.
 8. **Order comes from the definition,** through phases. Plugins never declare their own order.
 9. **Context is a slot.** Context is one of the definition's typed slots, delivered only on request, rather than an implicit part of every envelope.
 10. **Revisions are per session,** and every start or apply compiles first.
+11. **Lanes are chosen per publish,** from the lanes an emit declares. Steering and queueing are one event on two lanes.
+12. **Sessions start through a runtime call,** and only the core emits `session-started`.
 
 ## 13. Deferred to other work
 

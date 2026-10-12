@@ -1,13 +1,14 @@
 # AgentMod prototype — default deployment.
 #
 # Everything here is a plugin; the core ships no agent features. Session
-# definitions list which plugins participate and in what order (blocking
-# subscribers run in this order). Plugin commands run from this directory.
+# definitions list which plugins a session runs and the phases that order its
+# blocking subscribers; the compiler derives every edge (`agentmod compile`
+# prints the graph). Plugin commands run from this directory.
+#
+# There is no core loop limit: agent loops are cycles, reported by the
+# compiler, and bounding them is plugin policy (see `budget`).
 
 [runtime]
-max_causal_depth = 2048        # runtime bound for cyclic graphs (agent loops; a coding
-                               # task's tool loop is ~4 events per round, so ~500 rounds
-                               # per user message; budgets bound runaway agents sooner)
 spill_threshold_bytes = 16384  # larger payloads spill to content-addressed files
 max_attempts = 3               # orphan restarts before an invocation is failed
 
@@ -46,6 +47,14 @@ module = "plugins/ask-user/main.js"
 command = ["node", "plugins/budget/main.js"]
 module = "plugins/budget/main.js"
 config = { max_model_requests = 40, max_wall_seconds = 1800 }
+
+# The agent loop's bound per user message, for interactive sessions. The core
+# has no loop or depth limit; this is the same budget plugin, configured as a
+# per-turn limit (~500 model/tool rounds per message).
+[plugins.loop-limit]
+command = ["node", "plugins/budget/main.js"]
+module = "plugins/budget/main.js"
+config = { max_turn_model_requests = 500 }
 
 # --- context + loop ----------------------------------------------------------
 [plugins.chat-context]
@@ -172,78 +181,139 @@ module = "plugins/heartbeat/main.js"
 config = { every_seconds = 0, agent_every = 0, agent_definition = "chat" }
 
 # --- session definitions ----------------------------------------------------------
+#
+# Phases order blocking subscribers (a phase is only a name). Every blocking
+# subscriber gets a phase, per plugin or per event; wherever two subscribers
+# in one phase could affect each other (one returns a key the other reads,
+# both contribute context, or either can veto) the definition orders them.
+# Plugins that offer tool specs at session start all contribute context in
+# phase `offer`, hence the `session-started` / `config-applied` orders.
+# `inbound` lists the events a session accepts from other sessions.
+
 [definitions.chat]
 description = "Interactive chat agent with tools, memory, approval, and sub-agents"
-subscribers = [
-  { plugin = "web-ui" },
-  { plugin = "redactor" },
-  { plugin = "approval-gate" },
-  { plugin = "chat-context" },
-  { plugin = "openrouter-model" },
-  { plugin = "titler" },
-  { plugin = "memory" },
-  { plugin = "tool-clock" },
-  { plugin = "tool-calc" },
-  { plugin = "py-wordcount" },
-  { plugin = "subagent" },
-]
+runtime = "0.1"
+phases = ["offer", "intake", "guard", "loop"]
+
+[definitions.chat.plugins]
+web-ui = {}
+redactor = { phase = "intake" }
+approval-gate = { phase = "guard" }
+loop-limit = { phase = "guard" }
+chat-context = { phase = "loop" }
+openrouter-model = {}
+titler = {}
+memory = { phase = "offer" }
+tool-clock = { phase = "offer" }
+tool-calc = { phase = "offer" }
+py-wordcount = { phase = "offer" }
+subagent = { phase = "offer" }
+
+[definitions.chat.order.session-started]
+offer = ["memory", "tool-clock", "tool-calc", "py-wordcount", "subagent"]
+
+[definitions.chat.order.config-applied]
+offer = ["memory", "tool-clock", "tool-calc", "py-wordcount", "subagent"]
+
+[definitions.chat.inbound.subagent-result]
+call_id = { shape = "string" }
+text = { shape = "string" }
+worker = { shape = "string" }
+evidence = { shape = "object" }
 
 [definitions.worker]
 description = "Child agent started by `delegate`: scoped tools, budget, isolated workspace; reports back to its parent"
-subscribers = [
-  { plugin = "web-ui" },
-  { plugin = "policy" },
-  { plugin = "budget" },
-  { plugin = "chat-context" },
-  { plugin = "openrouter-model" },
-  { plugin = "plan" },
-  { plugin = "tool-discovery" },
-  { plugin = "linux-sandbox" },
-  { plugin = "local-workspace" },
-  { plugin = "tool-clock" },
-  { plugin = "tool-calc" },
-  { plugin = "subagent-reporter" },
-]
+runtime = "0.1"
+phases = ["offer", "intake", "guard", "loop"]
+
+[definitions.worker.plugins]
+web-ui = {}
+policy = { phase = "guard" }
+budget = { phase = "guard" }
+chat-context = { phase = "loop" }
+openrouter-model = {}
+plan = { phase = "offer" }
+tool-discovery = { phase = "offer", phases = { user-message = "intake" } }
+linux-sandbox = { phase = "offer" }
+local-workspace = { phase = "offer" }
+tool-clock = { phase = "offer" }
+tool-calc = { phase = "offer" }
+subagent-reporter = {}
+
+[definitions.worker.order.session-started]
+offer = ["plan", "tool-discovery", "linux-sandbox", "local-workspace", "tool-clock", "tool-calc"]
+
+[definitions.worker.order.config-applied]
+offer = ["plan", "tool-discovery", "linux-sandbox", "local-workspace", "tool-clock", "tool-calc"]
+
+# The budget can veto a model request; policy contributes the tool visibility.
+[definitions.worker.order.model-request]
+guard = ["budget", "policy"]
 
 # The coding harness. In the browser the tools run in the Linux VM
-# (linux-sandbox); natively they run in local-workspace's directory. Blocking
-# order matters: redactor rewrites user text, ask-user takes answers to open
-# questions, policy decides tool calls and tool visibility, chat-context runs
-# the loop.
+# (linux-sandbox); natively they run in local-workspace's directory. The
+# redactor rewrites user text, ask-user takes answers to open questions,
+# tool-discovery loads tools a message asks for, policy decides tool calls and
+# tool visibility, chat-context runs the loop.
 [definitions.coder]
 description = "Coding agent: plans, searches, edits with patches, runs builds/tests/servers, delegates, and can be rewound"
-subscribers = [
-  { plugin = "web-ui" },
-  { plugin = "redactor" },
-  { plugin = "ask-user" },
-  { plugin = "policy" },
-  { plugin = "chat-context" },
-  { plugin = "openrouter-model" },
-  { plugin = "titler" },
-  { plugin = "plan" },
-  { plugin = "tool-discovery" },
-  { plugin = "linux-sandbox" },
-  { plugin = "local-workspace" },
-  { plugin = "subagent" },
-  { plugin = "memory" },
-  { plugin = "web-fetch" },
-  { plugin = "mcp-bridge" },
-  { plugin = "browser-control" },
-]
+runtime = "0.1"
+phases = ["offer", "intake", "guard", "loop"]
+
+[definitions.coder.plugins]
+web-ui = {}
+redactor = { phase = "intake" }
+ask-user = { phase = "offer", phases = { user-message = "intake" } }
+policy = { phase = "guard" }
+loop-limit = { phase = "guard" }
+chat-context = { phase = "loop" }
+openrouter-model = {}
+titler = {}
+plan = { phase = "offer" }
+tool-discovery = { phase = "offer", phases = { user-message = "intake" } }
+linux-sandbox = { phase = "offer" }
+local-workspace = { phase = "offer" }
+subagent = { phase = "offer" }
+memory = { phase = "offer" }
+web-fetch = { phase = "offer" }
+mcp-bridge = { phase = "offer" }
+browser-control = { phase = "offer" }
+
+[definitions.coder.order.session-started]
+offer = ["ask-user", "plan", "tool-discovery", "linux-sandbox", "local-workspace", "subagent", "memory", "web-fetch", "mcp-bridge", "browser-control"]
+
+[definitions.coder.order.config-applied]
+offer = ["ask-user", "plan", "tool-discovery", "linux-sandbox", "local-workspace", "subagent", "memory", "web-fetch", "mcp-bridge", "browser-control"]
+
+[definitions.coder.order.user-message]
+intake = ["redactor", "ask-user", "tool-discovery"]
+
+# The loop limit can veto a model request; policy contributes the tool visibility.
+[definitions.coder.order.model-request]
+guard = ["loop-limit", "policy"]
+
+[definitions.coder.inbound.subagent-result]
+call_id = { shape = "string" }
+text = { shape = "string" }
+worker = { shape = "string" }
+evidence = { shape = "object" }
 
 # Benchmark baseline: model → shell → result → model, nothing else.
 [definitions.minimal]
 description = "Baseline loop for benchmarks: a provider, the chat loop, and one shell tool"
-subscribers = [
-  { plugin = "web-ui" },
-  { plugin = "chat-context" },
-  { plugin = "openrouter-minimal" },
-  { plugin = "minimal-shell" },
-]
+runtime = "0.1"
+phases = ["offer", "loop"]
+
+[definitions.minimal.plugins]
+web-ui = {}
+chat-context = { phase = "loop" }
+openrouter-minimal = {}
+minimal-shell = { phase = "offer" }
 
 [definitions.heartbeat]
 description = "Journal session for the heartbeat trigger (one record per fire)"
-subscribers = [
-  { plugin = "web-ui" },
-  { plugin = "heartbeat" },
-]
+runtime = "0.1"
+
+[definitions.heartbeat.plugins]
+web-ui = {}
+heartbeat = {}

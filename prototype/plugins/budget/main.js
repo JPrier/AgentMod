@@ -4,23 +4,26 @@
 // why, so a child reports back instead of running away.
 //
 // Bounds come from config ({ max_model_requests, max_tool_calls,
-// max_output_tokens, max_wall_seconds }) and, tighter, from a delegation's
-// `budget` in the session's first user message.
-import { definePlugin } from '../sdk/agentmod.js';
+// max_output_tokens, max_wall_seconds, max_turn_model_requests }) and,
+// tighter, from a delegation's `budget` in the session's first user message.
+// `max_turn_model_requests` is the agent loop's bound per user message: the
+// core has no recursion or depth limit (cycles are legal and reported by the
+// compiler), so loop limits are this plugin's policy.
+import { definePlugin, key, optional } from '../sdk/agentmod.js';
 
-import { effectiveBudget, usage, exceeded } from '../sdk/budget.js';
+import { currentTurn, effectiveBudget, usage, exceeded } from '../sdk/budget.js';
 
 definePlugin({
   manifest: {
     name: 'budget',
     version: '0.1.0',
     description: 'Hard per-session bounds on model requests, tool calls, tokens, and wall time.',
-    consumes: [{ event: 'model-request', demands: ['turn'], mode: 'blocking', context: false }],
-    emits: [
-      { event: 'budget-exhausted', supplies: ['reason'] },
-      { event: 'assistant-message', supplies: ['text'] },
+    subscribe: [{ event: 'model-request', mode: 'blocking', actions: ['veto'], receives: { turn: key('string') } }],
+    emit: [
+      { event: 'budget-exhausted', keys: { reason: key('string'), usage: optional('object'), budget: optional('object') } },
+      { event: 'assistant-message', keys: { text: key('string'), budget_exhausted: optional('bool') } },
     ],
-    config_schema: { max_model_requests: 0, max_tool_calls: 0, max_output_tokens: 0, max_wall_seconds: 0 },
+    config_schema: { max_model_requests: 0, max_tool_calls: 0, max_output_tokens: 0, max_wall_seconds: 0, max_turn_model_requests: 0 },
   },
   handlers: {
     'model-request': async (ctx) => {
@@ -31,7 +34,8 @@ definePlugin({
       const u = usage(view.events);
       const why = exceeded(budget, u);
       if (!why) return;
-      if (view.events.some((e) => e.event_name === 'budget-exhausted')) {
+      // Tell the user once per turn; later requests in the turn are vetoed quietly.
+      if (currentTurn(view.events).some((e) => e.event_name === 'budget-exhausted')) {
         ctx.veto(`budget exhausted: ${why}`);
         return;
       }

@@ -22,7 +22,7 @@ export const SUBAGENTS = toolSpec('subagents', 'List your child agents and their
 export function evidenceOf(view) {
   const ev = view.events || [];
   const results = new Map(ev.filter((e) => e.event_name === 'tool-result').map((e) => [e.payload.call_id, e.payload]));
-  const commands = ev.filter((e) => e.event_name === 'tool-call' && e.payload.name === 'shell').map((e) => {
+  const commands = ev.filter((e) => e.event_name === 'tool-call/shell').map((e) => {
     const r = results.get(e.payload.call_id);
     return { command: String(e.payload.args?.command || '').slice(0, 200), exit_code: r?.exit_code ?? null, error: !!r?.error };
   });

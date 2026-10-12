@@ -15,7 +15,7 @@
 //
 // Place it before chat-context in a definition (it is a blocking subscriber on
 // user-message).
-import { definePlugin, declareTools, offerTools, ownTools } from '../sdk/agentmod.js';
+import { definePlugin, key, offerSubscriptions, offerTools, optional, toolCalls, toolResult } from '../sdk/agentmod.js';
 
 import { ASK_USER } from '../sdk/ask.js';
 
@@ -30,23 +30,21 @@ definePlugin({
     name: 'ask-user',
     version: '0.1.0',
     description: 'ask_user: questions to the human as recorded continuations.',
-    consumes: [
-      { event: 'session-started' },
-      { event: 'config-applied' },
-      ownTools(['ask_user']),
-      { event: 'ui-action', demands: ['reply_to', 'action'], mode: 'async', context: false },
-      { event: 'user-message', demands: ['text'], mode: 'blocking', context: false },
+    subscribe: [
+      ...offerSubscriptions(),
+      ...toolCalls(['ask_user']),
+      { event: 'ui-action', mode: 'async', receives: { reply_to: key('string'), action: key('string'), values: optional('object') } },
+      { event: 'user-message', mode: 'blocking', actions: ['veto'], receives: { text: key('string') } },
     ],
-    tools: declareTools([ASK_USER]),
-    emits: [
-      { event: 'user-input-requested', supplies: ['call_id', 'question'] },
-      { event: 'tool-result', supplies: ['call_id', 'name', 'output'] },
+    emit: [
+      { event: 'user-input-requested', keys: { call_id: key('string'), question: key('string'), options: optional('array<string>') } },
+      toolResult({ authority: optional('string'), request: optional('string') }),
     ],
   },
   handlers: {
     'session-started': (ctx) => offerTools(ctx, [ASK_USER]),
     'config-applied': (ctx) => offerTools(ctx, [ASK_USER]),
-    'tool-call': async (ctx) => {
+    'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (name !== 'ask_user') return;
       const question = String(args?.question ?? '').trim();

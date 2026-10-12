@@ -3,7 +3,7 @@
 // conclusion plus evidence derived from the child's own log (commands and exit
 // codes, tests, files changed, workspace, usage). It is a recorded
 // cross-session publish; the parent link comes from the child's first message.
-import { definePlugin } from '../sdk/agentmod.js';
+import { definePlugin, key } from '../sdk/agentmod.js';
 import { evidenceOf } from '../sdk/delegation.js';
 
 definePlugin({
@@ -11,8 +11,9 @@ definePlugin({
     name: 'subagent-reporter',
     version: '0.2.0',
     description: 'Reports a child session\'s answer and evidence back to its parent session.',
-    consumes: [{ event: 'assistant-message', demands: ['text'], mode: 'async', context: false }],
-    emits: [{ event: 'subagent-result', supplies: ['call_id', 'text'] }],
+    subscribe: [{ event: 'assistant-message', mode: 'async', receives: { text: key('string') } }],
+    // Sent to the parent session, which must declare `subagent-result` inbound.
+    outbound: [{ event: 'subagent-result', keys: { call_id: key('string'), text: key('string'), worker: key('string'), evidence: key('object') } }],
     capabilities: ['cross-session'],
   },
   handlers: {

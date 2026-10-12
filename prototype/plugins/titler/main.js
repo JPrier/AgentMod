@@ -1,14 +1,14 @@
 // titler: background session auto-titling. An async observer of user messages
 // that contributes a `title` context item once per session.
-import { definePlugin } from '../sdk/agentmod.js';
+import { definePlugin, key, withContext } from '../sdk/agentmod.js';
 
 definePlugin({
   manifest: {
     name: 'titler',
     version: '0.1.0',
     description: 'Auto-titles a session from its first user message.',
-    consumes: [{ event: 'user-message', demands: ['text'], mode: 'async' }],
-    emits: [{ event: 'session-titled', supplies: ['title'] }],
+    subscribe: [{ event: 'user-message', mode: 'async', actions: ['contribute-context'], receives: withContext({ text: key('string') }) }],
+    emit: [{ event: 'session-titled', keys: { title: key('string') } }],
   },
   handlers: {
     'user-message': async (ctx) => {

@@ -6,12 +6,16 @@ export const WEB_UI_MANIFEST = {
   description: 'Web frontend: renders UI hints, publishes user actions, sends dispatcher commands.',
   // One standing invocation per session (at its start) is all a frontend
   // needs: user actions cite it. It reads everything else as a watcher
-  // (records and live streams), so it is not invoked for every event.
-  consumes: [{ event: 'session-started', mode: 'async', context: false }],
-  emits: [
-    { event: 'user-message', supplies: ['text'], deferred: true },
-    { event: 'ui-action', supplies: ['reply_to', 'action'], deferred: true },
-    { event: 'context-edit', supplies: ['ops'], deferred: true },
+  // (records and live streams), so it is not invoked for every event — not
+  // even the `tool-call/*` family, which it renders from the records.
+  subscribe: [{ event: 'session-started', mode: 'async' }],
+  emit: [
+    { event: 'user-message', deferred: true, keys: { text: { shape: 'string' }, attachments: { shape: 'array<object>', optional: true } } },
+    { event: 'ui-action', deferred: true, keys: { reply_to: { shape: 'string' }, action: { shape: 'string' }, values: { shape: 'object', optional: true } } },
+    // Operator edits of the context jump the queue: the interrupt lane.
+    { event: 'context-edit', deferred: true, lane: 'interrupt', keys: { ops: { shape: 'array<object>' } } },
   ],
-  capabilities: ['deferred-publish', 'start-session', 'control', 'observe'],
+  capabilities: ['deferred-publish', 'start-session', 'interrupt', 'control', 'observe'],
+  // Its effect is outside the bus: rendering for a human.
+  sink: true,
 };

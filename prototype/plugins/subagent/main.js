@@ -12,7 +12,7 @@
 // The child's full transcript stays in its own log; the parent gets a concise
 // conclusion plus evidence. `subagents` lists children and cancels one; a hard
 // stop of the parent cascades to its running children.
-import { definePlugin, declareTools, offerTools, ownTools } from '../sdk/agentmod.js';
+import { definePlugin, key, offerSubscriptions, offerTools, optional, toolCalls, toolResult } from '../sdk/agentmod.js';
 import { DELEGATE, SUBAGENTS, CHILD_DEFAULT_TOOLS, READ_ONLY_TOOLS, childReport } from '../sdk/delegation.js';
 
 const TOOLS = [DELEGATE, SUBAGENTS];
@@ -28,17 +28,17 @@ definePlugin({
     name: 'subagent',
     version: '0.2.0',
     description: 'delegate / subagents: isolated child agents with scoped tools, workspaces, and budgets.',
-    consumes: [
-      { event: 'session-started' },
-      { event: 'config-applied' },
-      ownTools(TOOLS.map((t) => t.name)),
-      { event: 'subagent-result', demands: ['call_id', 'text'], mode: 'async', context: false },
+    subscribe: [
+      ...offerSubscriptions(),
+      ...toolCalls(TOOLS.map((t) => t.name)),
+      // From child sessions: the parent definition declares it `inbound`.
+      { event: 'subagent-result', mode: 'async', receives: { call_id: key('string'), text: key('string'), worker: key('string'), evidence: key('object') } },
     ],
-    tools: declareTools(TOOLS),
-    emits: [
-      { event: 'user-message', supplies: ['text', 'parent'] },
-      { event: 'subagent-started', supplies: ['call_id', 'child'] },
-      { event: 'tool-result', supplies: ['call_id', 'name', 'output'] },
+    emit: [
+      // The initial event of each child session (start-session).
+      { event: 'user-message', keys: { text: key('string'), parent: key('object'), delegation: key('object') } },
+      { event: 'subagent-started', keys: { call_id: key('string'), child: key('string'), definition: optional('string'), workspace: optional('string'), tools: optional('array<string>') } },
+      toolResult({ child: optional('string'), evidence: optional('object'), trust: optional('string'), cancelled: optional('bool') }),
     ],
     capabilities: ['start-session', 'control', 'observe'],
     config_schema: { definition: 'session definition for children (default "worker")', default_tools: CHILD_DEFAULT_TOOLS, max_steps: 30, max_children: 8 },
@@ -61,7 +61,7 @@ definePlugin({
   handlers: {
     'session-started': (ctx) => offerTools(ctx, TOOLS),
     'config-applied': (ctx) => offerTools(ctx, TOOLS),
-    'tool-call': async (ctx) => {
+    'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (name === 'subagents') {
         const kids = await childrenOf(ctx.host, ctx.sessionId);

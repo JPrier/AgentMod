@@ -109,10 +109,10 @@ async function route(req, res) {
       if (sub === 'commands') return send(res, 200, await plugin.host.command(sid, b.command));
       const cite = await citeFor(sid);
       if (sub === 'messages') {
-        return send(res, 200, await plugin.host.publishDeferred('user-message', { text: b.text }, { cite, lane: b.lane || 'normal', ui: { v: 1, kind: 'text', role: 'user', text: b.text } }));
+        return send(res, 200, await plugin.host.publishDeferred('user-message', { text: b.text }, { cite, ui: { v: 1, kind: 'text', role: 'user', text: b.text } }));
       }
       if (sub === 'actions') return send(res, 200, await plugin.host.publishDeferred('ui-action', { reply_to: b.reply_to, action: b.action, values: b.values || {} }, { cite }));
-      if (sub === 'context-edit') return send(res, 200, await plugin.host.publishDeferred('context-edit', { ops: b.ops || [] }, { cite, lane: 'priority' }));
+      if (sub === 'context-edit') return send(res, 200, await plugin.host.publishDeferred('context-edit', { ops: b.ops || [] }, { cite }));
     }
   }
   return null;

@@ -50,8 +50,8 @@ pub fn inspect(data: &Path, session: Option<&str>, as_json: bool) -> Result<(), 
         return Ok(());
     }
     println!(
-        "{} · definition `{}` · config {} · {} records · state {:?}",
-        view.session_id, view.definition, view.config, view.records, view.state
+        "{} · definition `{}` · revision {} · {} records · state {:?}",
+        view.session_id, view.definition, view.revision, view.records, view.state
     );
     for e in &view.events {
         println!(
@@ -81,6 +81,15 @@ pub fn inspect(data: &Path, session: Option<&str>, as_json: bool) -> Result<(), 
             println!("        {:?} {:<18} {}{}", i.mode, i.plugin, out, publ);
         }
     }
+    for b in &view.breaches {
+        println!(
+            "breach #{} {} — {} [{}]",
+            b["sequence"],
+            b["plugin"].as_str().unwrap_or(""),
+            b["reason"].as_str().unwrap_or(""),
+            b["reaction"].as_str().unwrap_or("")
+        );
+    }
     for b in &view.blocked {
         println!(
             "blocked #{} {} {}: {}",
@@ -97,9 +106,11 @@ pub fn inspect(data: &Path, session: Option<&str>, as_json: bool) -> Result<(), 
 pub fn verify(data: &Path) -> Result<(), String> {
     let store = Store::open(data, usize::MAX)?;
     let mut k = Kernel::new();
-    let configs = store.compilations();
-    for c in configs {
+    for c in store.compilations() {
         let _ = k.install(c);
+    }
+    for r in store.revisions() {
+        k.install_revision(r);
     }
     let mut n = 0;
     let mut records_total = 0;
@@ -191,7 +202,7 @@ pub fn metrics(
             g("wall_ms") / 1000.0
         );
         println!(
-            "  control plane: {} records / {} bytes, {} events ({} semantic, {} stream-chunk), {} pipelines, {} invocations ({} blocking, {} async, {} no-op), tool dispatch: {} owner / {} broadcast",
+            "  control plane: {} records / {} bytes, {} events ({} semantic, {} stream-chunk), {} pipelines, {} invocations ({} blocking, {} async, {} no-op), tool dispatch: {} to handlers / {} to observers",
             g("records"),
             g("record_bytes"),
             g("events"),
@@ -202,8 +213,8 @@ pub fn metrics(
             g("blocking_invocations"),
             g("async_invocations"),
             g("noop_invocations"),
-            g("exact_owner_dispatches"),
-            g("candidate_dispatches"),
+            g("exact_handler_dispatches"),
+            g("observer_dispatches"),
         );
         println!(
             "  streams: {} provider events -> {} frames -> {} live frames; pipelines/event {}, invocations/tool call {}, live frames/provider event {}, events/model response {}, journal bytes/useful byte {}",

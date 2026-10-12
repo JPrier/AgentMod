@@ -6,10 +6,10 @@
 // the projection renders it at the end of every request so a resumed agent can
 // reorient at once. Children keep their own plans; nothing is shared.
 //
-//   consumes  session-started, config-applied   offer the tool
-//             tool-call (async)                  update_plan
-//   emits     plan-updated (UI hint `plan`), tool-result
-import { definePlugin, declareTools, offerTools, ownTools } from '../sdk/agentmod.js';
+//   subscribe  session-started, config-applied   offer the tool
+//              tool-call/update_plan (async)      update the plan
+//   emit       plan-updated (UI hint `plan`), tool-result
+import { definePlugin, key, offerSubscriptions, offerTools, optional, toolCalls, toolResult } from '../sdk/agentmod.js';
 
 import { UPDATE_PLAN, validatePlan } from '../sdk/plan.js';
 
@@ -18,21 +18,16 @@ definePlugin({
     name: 'plan',
     version: '0.1.0',
     description: 'update_plan: a tiny, durable task list kept in session context.',
-    consumes: [
-      { event: 'session-started' },
-      { event: 'config-applied' },
-      ownTools(['update_plan']),
-    ],
-    tools: declareTools([UPDATE_PLAN]),
-    emits: [
-      { event: 'plan-updated', supplies: ['items'] },
-      { event: 'tool-result', supplies: ['call_id', 'name', 'output'] },
+    subscribe: [...offerSubscriptions(), ...toolCalls(['update_plan'], { actions: ['contribute-context'] })],
+    emit: [
+      { event: 'plan-updated', keys: { items: key('array<object>'), call_id: optional('string') } },
+      toolResult(),
     ],
   },
   handlers: {
     'session-started': (ctx) => offerTools(ctx, [UPDATE_PLAN]),
     'config-applied': (ctx) => offerTools(ctx, [UPDATE_PLAN]),
-    'tool-call': async (ctx) => {
+    'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (name !== 'update_plan') return;
       let items;

@@ -1,6 +1,5 @@
 {
   "runtime": {
-    "max_causal_depth": 2048,
     "spill_threshold_bytes": 16384,
     "max_attempts": 3,
     "streaming": {
@@ -88,6 +87,16 @@
         "root": ".agentmod/workspace"
       },
       "timeout_ms": 1900000
+    },
+    "loop-limit": {
+      "command": [
+        "node",
+        "plugins/budget/main.js"
+      ],
+      "module": "plugins/budget/main.js",
+      "config": {
+        "max_turn_model_requests": 500
+      }
     },
     "mcp-bridge": {
       "command": [
@@ -267,163 +276,1084 @@
   "definitions": {
     "chat": {
       "description": "Interactive chat agent with tools, memory, approval, and sub-agents",
-      "subscribers": [
-        {
-          "plugin": "web-ui"
+      "runtime": "0.1",
+      "phases": [
+        "offer",
+        "intake",
+        "guard",
+        "loop"
+      ],
+      "plugins": {
+        "approval-gate": {
+          "phase": "guard"
         },
-        {
-          "plugin": "redactor"
+        "chat-context": {
+          "phase": "loop"
         },
-        {
-          "plugin": "approval-gate"
+        "loop-limit": {
+          "phase": "guard"
         },
-        {
-          "plugin": "chat-context"
+        "memory": {
+          "phase": "offer"
         },
-        {
-          "plugin": "openrouter-model"
+        "openrouter-model": {},
+        "py-wordcount": {
+          "phase": "offer"
         },
-        {
-          "plugin": "titler"
+        "redactor": {
+          "phase": "intake"
         },
-        {
-          "plugin": "memory"
+        "subagent": {
+          "phase": "offer"
         },
-        {
-          "plugin": "tool-clock"
+        "titler": {},
+        "tool-calc": {
+          "phase": "offer"
         },
-        {
-          "plugin": "tool-calc"
+        "tool-clock": {
+          "phase": "offer"
         },
-        {
-          "plugin": "py-wordcount"
+        "web-ui": {}
+      },
+      "order": {
+        "config-applied": {
+          "offer": [
+            "memory",
+            "tool-clock",
+            "tool-calc",
+            "py-wordcount",
+            "subagent"
+          ]
         },
-        {
-          "plugin": "subagent"
+        "session-started": {
+          "offer": [
+            "memory",
+            "tool-clock",
+            "tool-calc",
+            "py-wordcount",
+            "subagent"
+          ]
         }
-      ]
+      },
+      "inbound": {
+        "subagent-result": {
+          "call_id": {
+            "shape": "string"
+          },
+          "evidence": {
+            "shape": "object"
+          },
+          "text": {
+            "shape": "string"
+          },
+          "worker": {
+            "shape": "string"
+          }
+        }
+      }
     },
     "coder": {
       "description": "Coding agent: plans, searches, edits with patches, runs builds/tests/servers, delegates, and can be rewound",
-      "subscribers": [
-        {
-          "plugin": "web-ui"
+      "runtime": "0.1",
+      "phases": [
+        "offer",
+        "intake",
+        "guard",
+        "loop"
+      ],
+      "plugins": {
+        "ask-user": {
+          "phase": "offer",
+          "phases": {
+            "user-message": "intake"
+          }
         },
-        {
-          "plugin": "redactor"
+        "browser-control": {
+          "phase": "offer"
         },
-        {
-          "plugin": "ask-user"
+        "chat-context": {
+          "phase": "loop"
         },
-        {
-          "plugin": "policy"
+        "linux-sandbox": {
+          "phase": "offer"
         },
-        {
-          "plugin": "chat-context"
+        "local-workspace": {
+          "phase": "offer"
         },
-        {
-          "plugin": "openrouter-model"
+        "loop-limit": {
+          "phase": "guard"
         },
-        {
-          "plugin": "titler"
+        "mcp-bridge": {
+          "phase": "offer"
         },
-        {
-          "plugin": "plan"
+        "memory": {
+          "phase": "offer"
         },
-        {
-          "plugin": "tool-discovery"
+        "openrouter-model": {},
+        "plan": {
+          "phase": "offer"
         },
-        {
-          "plugin": "linux-sandbox"
+        "policy": {
+          "phase": "guard"
         },
-        {
-          "plugin": "local-workspace"
+        "redactor": {
+          "phase": "intake"
         },
-        {
-          "plugin": "subagent"
+        "subagent": {
+          "phase": "offer"
         },
-        {
-          "plugin": "memory"
+        "titler": {},
+        "tool-discovery": {
+          "phase": "offer",
+          "phases": {
+            "user-message": "intake"
+          }
         },
-        {
-          "plugin": "web-fetch"
+        "web-fetch": {
+          "phase": "offer"
         },
-        {
-          "plugin": "mcp-bridge"
+        "web-ui": {}
+      },
+      "order": {
+        "config-applied": {
+          "offer": [
+            "ask-user",
+            "plan",
+            "tool-discovery",
+            "linux-sandbox",
+            "local-workspace",
+            "subagent",
+            "memory",
+            "web-fetch",
+            "mcp-bridge",
+            "browser-control"
+          ]
         },
-        {
-          "plugin": "browser-control"
+        "model-request": {
+          "guard": [
+            "loop-limit",
+            "policy"
+          ]
+        },
+        "session-started": {
+          "offer": [
+            "ask-user",
+            "plan",
+            "tool-discovery",
+            "linux-sandbox",
+            "local-workspace",
+            "subagent",
+            "memory",
+            "web-fetch",
+            "mcp-bridge",
+            "browser-control"
+          ]
+        },
+        "user-message": {
+          "intake": [
+            "redactor",
+            "ask-user",
+            "tool-discovery"
+          ]
         }
-      ]
+      },
+      "inbound": {
+        "subagent-result": {
+          "call_id": {
+            "shape": "string"
+          },
+          "evidence": {
+            "shape": "object"
+          },
+          "text": {
+            "shape": "string"
+          },
+          "worker": {
+            "shape": "string"
+          }
+        }
+      }
     },
     "heartbeat": {
       "description": "Journal session for the heartbeat trigger (one record per fire)",
-      "subscribers": [
-        {
-          "plugin": "web-ui"
-        },
-        {
-          "plugin": "heartbeat"
-        }
-      ]
+      "runtime": "0.1",
+      "plugins": {
+        "heartbeat": {},
+        "web-ui": {}
+      }
     },
     "minimal": {
       "description": "Baseline loop for benchmarks: a provider, the chat loop, and one shell tool",
-      "subscribers": [
-        {
-          "plugin": "web-ui"
+      "runtime": "0.1",
+      "phases": [
+        "offer",
+        "loop"
+      ],
+      "plugins": {
+        "chat-context": {
+          "phase": "loop"
         },
-        {
-          "plugin": "chat-context"
+        "minimal-shell": {
+          "phase": "offer"
         },
-        {
-          "plugin": "openrouter-minimal"
-        },
-        {
-          "plugin": "minimal-shell"
-        }
-      ]
+        "openrouter-minimal": {},
+        "web-ui": {}
+      }
     },
     "worker": {
       "description": "Child agent started by `delegate`: scoped tools, budget, isolated workspace; reports back to its parent",
-      "subscribers": [
-        {
-          "plugin": "web-ui"
+      "runtime": "0.1",
+      "phases": [
+        "offer",
+        "intake",
+        "guard",
+        "loop"
+      ],
+      "plugins": {
+        "budget": {
+          "phase": "guard"
         },
-        {
-          "plugin": "policy"
+        "chat-context": {
+          "phase": "loop"
         },
-        {
-          "plugin": "budget"
+        "linux-sandbox": {
+          "phase": "offer"
         },
-        {
-          "plugin": "chat-context"
+        "local-workspace": {
+          "phase": "offer"
         },
-        {
-          "plugin": "openrouter-model"
+        "openrouter-model": {},
+        "plan": {
+          "phase": "offer"
         },
-        {
-          "plugin": "plan"
+        "policy": {
+          "phase": "guard"
         },
-        {
-          "plugin": "tool-discovery"
+        "subagent-reporter": {},
+        "tool-calc": {
+          "phase": "offer"
         },
-        {
-          "plugin": "linux-sandbox"
+        "tool-clock": {
+          "phase": "offer"
         },
-        {
-          "plugin": "local-workspace"
+        "tool-discovery": {
+          "phase": "offer",
+          "phases": {
+            "user-message": "intake"
+          }
         },
-        {
-          "plugin": "tool-clock"
+        "web-ui": {}
+      },
+      "order": {
+        "config-applied": {
+          "offer": [
+            "plan",
+            "tool-discovery",
+            "linux-sandbox",
+            "local-workspace",
+            "tool-clock",
+            "tool-calc"
+          ]
         },
-        {
-          "plugin": "tool-calc"
+        "model-request": {
+          "guard": [
+            "budget",
+            "policy"
+          ]
         },
-        {
-          "plugin": "subagent-reporter"
+        "session-started": {
+          "offer": [
+            "plan",
+            "tool-discovery",
+            "linux-sandbox",
+            "local-workspace",
+            "tool-clock",
+            "tool-calc"
+          ]
         }
-      ]
+      }
+    }
+  },
+  "sources": {
+    "definitions.chat": {
+      "file": "agentmod.toml",
+      "line": 193
+    },
+    "definitions.chat.description": {
+      "file": "agentmod.toml",
+      "line": 194
+    },
+    "definitions.chat.inbound.subagent-result": {
+      "file": "agentmod.toml",
+      "line": 218
+    },
+    "definitions.chat.inbound.subagent-result.call_id": {
+      "file": "agentmod.toml",
+      "line": 219
+    },
+    "definitions.chat.inbound.subagent-result.evidence": {
+      "file": "agentmod.toml",
+      "line": 222
+    },
+    "definitions.chat.inbound.subagent-result.text": {
+      "file": "agentmod.toml",
+      "line": 220
+    },
+    "definitions.chat.inbound.subagent-result.worker": {
+      "file": "agentmod.toml",
+      "line": 221
+    },
+    "definitions.chat.order.config-applied": {
+      "file": "agentmod.toml",
+      "line": 215
+    },
+    "definitions.chat.order.config-applied.offer": {
+      "file": "agentmod.toml",
+      "line": 216
+    },
+    "definitions.chat.order.session-started": {
+      "file": "agentmod.toml",
+      "line": 212
+    },
+    "definitions.chat.order.session-started.offer": {
+      "file": "agentmod.toml",
+      "line": 213
+    },
+    "definitions.chat.phases": {
+      "file": "agentmod.toml",
+      "line": 196
+    },
+    "definitions.chat.plugins": {
+      "file": "agentmod.toml",
+      "line": 198
+    },
+    "definitions.chat.plugins.approval-gate": {
+      "file": "agentmod.toml",
+      "line": 201
+    },
+    "definitions.chat.plugins.chat-context": {
+      "file": "agentmod.toml",
+      "line": 203
+    },
+    "definitions.chat.plugins.loop-limit": {
+      "file": "agentmod.toml",
+      "line": 202
+    },
+    "definitions.chat.plugins.memory": {
+      "file": "agentmod.toml",
+      "line": 206
+    },
+    "definitions.chat.plugins.openrouter-model": {
+      "file": "agentmod.toml",
+      "line": 204
+    },
+    "definitions.chat.plugins.py-wordcount": {
+      "file": "agentmod.toml",
+      "line": 209
+    },
+    "definitions.chat.plugins.redactor": {
+      "file": "agentmod.toml",
+      "line": 200
+    },
+    "definitions.chat.plugins.subagent": {
+      "file": "agentmod.toml",
+      "line": 210
+    },
+    "definitions.chat.plugins.titler": {
+      "file": "agentmod.toml",
+      "line": 205
+    },
+    "definitions.chat.plugins.tool-calc": {
+      "file": "agentmod.toml",
+      "line": 208
+    },
+    "definitions.chat.plugins.tool-clock": {
+      "file": "agentmod.toml",
+      "line": 207
+    },
+    "definitions.chat.plugins.web-ui": {
+      "file": "agentmod.toml",
+      "line": 199
+    },
+    "definitions.chat.runtime": {
+      "file": "agentmod.toml",
+      "line": 195
+    },
+    "definitions.coder": {
+      "file": "agentmod.toml",
+      "line": 258
+    },
+    "definitions.coder.description": {
+      "file": "agentmod.toml",
+      "line": 259
+    },
+    "definitions.coder.inbound.subagent-result": {
+      "file": "agentmod.toml",
+      "line": 295
+    },
+    "definitions.coder.inbound.subagent-result.call_id": {
+      "file": "agentmod.toml",
+      "line": 296
+    },
+    "definitions.coder.inbound.subagent-result.evidence": {
+      "file": "agentmod.toml",
+      "line": 299
+    },
+    "definitions.coder.inbound.subagent-result.text": {
+      "file": "agentmod.toml",
+      "line": 297
+    },
+    "definitions.coder.inbound.subagent-result.worker": {
+      "file": "agentmod.toml",
+      "line": 298
+    },
+    "definitions.coder.order.config-applied": {
+      "file": "agentmod.toml",
+      "line": 285
+    },
+    "definitions.coder.order.config-applied.offer": {
+      "file": "agentmod.toml",
+      "line": 286
+    },
+    "definitions.coder.order.model-request": {
+      "file": "agentmod.toml",
+      "line": 292
+    },
+    "definitions.coder.order.model-request.guard": {
+      "file": "agentmod.toml",
+      "line": 293
+    },
+    "definitions.coder.order.session-started": {
+      "file": "agentmod.toml",
+      "line": 282
+    },
+    "definitions.coder.order.session-started.offer": {
+      "file": "agentmod.toml",
+      "line": 283
+    },
+    "definitions.coder.order.user-message": {
+      "file": "agentmod.toml",
+      "line": 288
+    },
+    "definitions.coder.order.user-message.intake": {
+      "file": "agentmod.toml",
+      "line": 289
+    },
+    "definitions.coder.phases": {
+      "file": "agentmod.toml",
+      "line": 261
+    },
+    "definitions.coder.plugins": {
+      "file": "agentmod.toml",
+      "line": 263
+    },
+    "definitions.coder.plugins.ask-user": {
+      "file": "agentmod.toml",
+      "line": 266
+    },
+    "definitions.coder.plugins.browser-control": {
+      "file": "agentmod.toml",
+      "line": 280
+    },
+    "definitions.coder.plugins.chat-context": {
+      "file": "agentmod.toml",
+      "line": 269
+    },
+    "definitions.coder.plugins.linux-sandbox": {
+      "file": "agentmod.toml",
+      "line": 274
+    },
+    "definitions.coder.plugins.local-workspace": {
+      "file": "agentmod.toml",
+      "line": 275
+    },
+    "definitions.coder.plugins.loop-limit": {
+      "file": "agentmod.toml",
+      "line": 268
+    },
+    "definitions.coder.plugins.mcp-bridge": {
+      "file": "agentmod.toml",
+      "line": 279
+    },
+    "definitions.coder.plugins.memory": {
+      "file": "agentmod.toml",
+      "line": 277
+    },
+    "definitions.coder.plugins.openrouter-model": {
+      "file": "agentmod.toml",
+      "line": 270
+    },
+    "definitions.coder.plugins.plan": {
+      "file": "agentmod.toml",
+      "line": 272
+    },
+    "definitions.coder.plugins.policy": {
+      "file": "agentmod.toml",
+      "line": 267
+    },
+    "definitions.coder.plugins.redactor": {
+      "file": "agentmod.toml",
+      "line": 265
+    },
+    "definitions.coder.plugins.subagent": {
+      "file": "agentmod.toml",
+      "line": 276
+    },
+    "definitions.coder.plugins.titler": {
+      "file": "agentmod.toml",
+      "line": 271
+    },
+    "definitions.coder.plugins.tool-discovery": {
+      "file": "agentmod.toml",
+      "line": 273
+    },
+    "definitions.coder.plugins.web-fetch": {
+      "file": "agentmod.toml",
+      "line": 278
+    },
+    "definitions.coder.plugins.web-ui": {
+      "file": "agentmod.toml",
+      "line": 264
+    },
+    "definitions.coder.runtime": {
+      "file": "agentmod.toml",
+      "line": 260
+    },
+    "definitions.heartbeat": {
+      "file": "agentmod.toml",
+      "line": 313
+    },
+    "definitions.heartbeat.description": {
+      "file": "agentmod.toml",
+      "line": 314
+    },
+    "definitions.heartbeat.plugins": {
+      "file": "agentmod.toml",
+      "line": 317
+    },
+    "definitions.heartbeat.plugins.heartbeat": {
+      "file": "agentmod.toml",
+      "line": 319
+    },
+    "definitions.heartbeat.plugins.web-ui": {
+      "file": "agentmod.toml",
+      "line": 318
+    },
+    "definitions.heartbeat.runtime": {
+      "file": "agentmod.toml",
+      "line": 315
+    },
+    "definitions.minimal": {
+      "file": "agentmod.toml",
+      "line": 302
+    },
+    "definitions.minimal.description": {
+      "file": "agentmod.toml",
+      "line": 303
+    },
+    "definitions.minimal.phases": {
+      "file": "agentmod.toml",
+      "line": 305
+    },
+    "definitions.minimal.plugins": {
+      "file": "agentmod.toml",
+      "line": 307
+    },
+    "definitions.minimal.plugins.chat-context": {
+      "file": "agentmod.toml",
+      "line": 309
+    },
+    "definitions.minimal.plugins.minimal-shell": {
+      "file": "agentmod.toml",
+      "line": 311
+    },
+    "definitions.minimal.plugins.openrouter-minimal": {
+      "file": "agentmod.toml",
+      "line": 310
+    },
+    "definitions.minimal.plugins.web-ui": {
+      "file": "agentmod.toml",
+      "line": 308
+    },
+    "definitions.minimal.runtime": {
+      "file": "agentmod.toml",
+      "line": 304
+    },
+    "definitions.worker": {
+      "file": "agentmod.toml",
+      "line": 224
+    },
+    "definitions.worker.description": {
+      "file": "agentmod.toml",
+      "line": 225
+    },
+    "definitions.worker.order.config-applied": {
+      "file": "agentmod.toml",
+      "line": 246
+    },
+    "definitions.worker.order.config-applied.offer": {
+      "file": "agentmod.toml",
+      "line": 247
+    },
+    "definitions.worker.order.model-request": {
+      "file": "agentmod.toml",
+      "line": 250
+    },
+    "definitions.worker.order.model-request.guard": {
+      "file": "agentmod.toml",
+      "line": 251
+    },
+    "definitions.worker.order.session-started": {
+      "file": "agentmod.toml",
+      "line": 243
+    },
+    "definitions.worker.order.session-started.offer": {
+      "file": "agentmod.toml",
+      "line": 244
+    },
+    "definitions.worker.phases": {
+      "file": "agentmod.toml",
+      "line": 227
+    },
+    "definitions.worker.plugins": {
+      "file": "agentmod.toml",
+      "line": 229
+    },
+    "definitions.worker.plugins.budget": {
+      "file": "agentmod.toml",
+      "line": 232
+    },
+    "definitions.worker.plugins.chat-context": {
+      "file": "agentmod.toml",
+      "line": 233
+    },
+    "definitions.worker.plugins.linux-sandbox": {
+      "file": "agentmod.toml",
+      "line": 237
+    },
+    "definitions.worker.plugins.local-workspace": {
+      "file": "agentmod.toml",
+      "line": 238
+    },
+    "definitions.worker.plugins.openrouter-model": {
+      "file": "agentmod.toml",
+      "line": 234
+    },
+    "definitions.worker.plugins.plan": {
+      "file": "agentmod.toml",
+      "line": 235
+    },
+    "definitions.worker.plugins.policy": {
+      "file": "agentmod.toml",
+      "line": 231
+    },
+    "definitions.worker.plugins.subagent-reporter": {
+      "file": "agentmod.toml",
+      "line": 241
+    },
+    "definitions.worker.plugins.tool-calc": {
+      "file": "agentmod.toml",
+      "line": 240
+    },
+    "definitions.worker.plugins.tool-clock": {
+      "file": "agentmod.toml",
+      "line": 239
+    },
+    "definitions.worker.plugins.tool-discovery": {
+      "file": "agentmod.toml",
+      "line": 236
+    },
+    "definitions.worker.plugins.web-ui": {
+      "file": "agentmod.toml",
+      "line": 230
+    },
+    "definitions.worker.runtime": {
+      "file": "agentmod.toml",
+      "line": 226
+    },
+    "plugins.approval-gate": {
+      "file": "agentmod.toml",
+      "line": 25
+    },
+    "plugins.approval-gate.command": {
+      "file": "agentmod.toml",
+      "line": 26
+    },
+    "plugins.approval-gate.config": {
+      "file": "agentmod.toml",
+      "line": 28
+    },
+    "plugins.approval-gate.module": {
+      "file": "agentmod.toml",
+      "line": 27
+    },
+    "plugins.ask-user": {
+      "file": "agentmod.toml",
+      "line": 41
+    },
+    "plugins.ask-user.command": {
+      "file": "agentmod.toml",
+      "line": 42
+    },
+    "plugins.ask-user.module": {
+      "file": "agentmod.toml",
+      "line": 43
+    },
+    "plugins.browser-control": {
+      "file": "agentmod.toml",
+      "line": 173
+    },
+    "plugins.browser-control.command": {
+      "file": "agentmod.toml",
+      "line": 174
+    },
+    "plugins.browser-control.timeout_ms": {
+      "file": "agentmod.toml",
+      "line": 175
+    },
+    "plugins.budget": {
+      "file": "agentmod.toml",
+      "line": 46
+    },
+    "plugins.budget.command": {
+      "file": "agentmod.toml",
+      "line": 47
+    },
+    "plugins.budget.config": {
+      "file": "agentmod.toml",
+      "line": 49
+    },
+    "plugins.budget.module": {
+      "file": "agentmod.toml",
+      "line": 48
+    },
+    "plugins.chat-context": {
+      "file": "agentmod.toml",
+      "line": 60
+    },
+    "plugins.chat-context.command": {
+      "file": "agentmod.toml",
+      "line": 61
+    },
+    "plugins.chat-context.module": {
+      "file": "agentmod.toml",
+      "line": 62
+    },
+    "plugins.heartbeat": {
+      "file": "agentmod.toml",
+      "line": 178
+    },
+    "plugins.heartbeat.command": {
+      "file": "agentmod.toml",
+      "line": 179
+    },
+    "plugins.heartbeat.config": {
+      "file": "agentmod.toml",
+      "line": 181
+    },
+    "plugins.heartbeat.module": {
+      "file": "agentmod.toml",
+      "line": 180
+    },
+    "plugins.linux-sandbox": {
+      "file": "agentmod.toml",
+      "line": 130
+    },
+    "plugins.linux-sandbox.config": {
+      "file": "agentmod.toml",
+      "line": 133
+    },
+    "plugins.linux-sandbox.module": {
+      "file": "agentmod.toml",
+      "line": 131
+    },
+    "plugins.linux-sandbox.timeout_ms": {
+      "file": "agentmod.toml",
+      "line": 132
+    },
+    "plugins.local-workspace": {
+      "file": "agentmod.toml",
+      "line": 138
+    },
+    "plugins.local-workspace.command": {
+      "file": "agentmod.toml",
+      "line": 139
+    },
+    "plugins.local-workspace.config": {
+      "file": "agentmod.toml",
+      "line": 141
+    },
+    "plugins.local-workspace.timeout_ms": {
+      "file": "agentmod.toml",
+      "line": 140
+    },
+    "plugins.loop-limit": {
+      "file": "agentmod.toml",
+      "line": 54
+    },
+    "plugins.loop-limit.command": {
+      "file": "agentmod.toml",
+      "line": 55
+    },
+    "plugins.loop-limit.config": {
+      "file": "agentmod.toml",
+      "line": 57
+    },
+    "plugins.loop-limit.module": {
+      "file": "agentmod.toml",
+      "line": 56
+    },
+    "plugins.mcp-bridge": {
+      "file": "agentmod.toml",
+      "line": 167
+    },
+    "plugins.mcp-bridge.command": {
+      "file": "agentmod.toml",
+      "line": 168
+    },
+    "plugins.mcp-bridge.config": {
+      "file": "agentmod.toml",
+      "line": 170
+    },
+    "plugins.mcp-bridge.timeout_ms": {
+      "file": "agentmod.toml",
+      "line": 169
+    },
+    "plugins.memory": {
+      "file": "agentmod.toml",
+      "line": 79
+    },
+    "plugins.memory.command": {
+      "file": "agentmod.toml",
+      "line": 80
+    },
+    "plugins.memory.module": {
+      "file": "agentmod.toml",
+      "line": 81
+    },
+    "plugins.minimal-shell": {
+      "file": "agentmod.toml",
+      "line": 144
+    },
+    "plugins.minimal-shell.command": {
+      "file": "agentmod.toml",
+      "line": 145
+    },
+    "plugins.minimal-shell.config": {
+      "file": "agentmod.toml",
+      "line": 147
+    },
+    "plugins.minimal-shell.timeout_ms": {
+      "file": "agentmod.toml",
+      "line": 146
+    },
+    "plugins.openai-model": {
+      "file": "agentmod.toml",
+      "line": 93
+    },
+    "plugins.openai-model.command": {
+      "file": "agentmod.toml",
+      "line": 94
+    },
+    "plugins.openai-model.config": {
+      "file": "agentmod.toml",
+      "line": 96
+    },
+    "plugins.openai-model.module": {
+      "file": "agentmod.toml",
+      "line": 95
+    },
+    "plugins.openrouter-minimal": {
+      "file": "agentmod.toml",
+      "line": 151
+    },
+    "plugins.openrouter-minimal.command": {
+      "file": "agentmod.toml",
+      "line": 152
+    },
+    "plugins.openrouter-minimal.config": {
+      "file": "agentmod.toml",
+      "line": 153
+    },
+    "plugins.openrouter-model": {
+      "file": "agentmod.toml",
+      "line": 87
+    },
+    "plugins.openrouter-model.command": {
+      "file": "agentmod.toml",
+      "line": 88
+    },
+    "plugins.openrouter-model.config": {
+      "file": "agentmod.toml",
+      "line": 90
+    },
+    "plugins.openrouter-model.module": {
+      "file": "agentmod.toml",
+      "line": 89
+    },
+    "plugins.plan": {
+      "file": "agentmod.toml",
+      "line": 69
+    },
+    "plugins.plan.command": {
+      "file": "agentmod.toml",
+      "line": 70
+    },
+    "plugins.plan.module": {
+      "file": "agentmod.toml",
+      "line": 71
+    },
+    "plugins.policy": {
+      "file": "agentmod.toml",
+      "line": 35
+    },
+    "plugins.policy.command": {
+      "file": "agentmod.toml",
+      "line": 36
+    },
+    "plugins.policy.config": {
+      "file": "agentmod.toml",
+      "line": 38
+    },
+    "plugins.policy.module": {
+      "file": "agentmod.toml",
+      "line": 37
+    },
+    "plugins.py-wordcount": {
+      "file": "agentmod.toml",
+      "line": 107
+    },
+    "plugins.py-wordcount.command": {
+      "file": "agentmod.toml",
+      "line": 108
+    },
+    "plugins.redactor": {
+      "file": "agentmod.toml",
+      "line": 21
+    },
+    "plugins.redactor.command": {
+      "file": "agentmod.toml",
+      "line": 22
+    },
+    "plugins.redactor.module": {
+      "file": "agentmod.toml",
+      "line": 23
+    },
+    "plugins.subagent": {
+      "file": "agentmod.toml",
+      "line": 110
+    },
+    "plugins.subagent-reporter": {
+      "file": "agentmod.toml",
+      "line": 115
+    },
+    "plugins.subagent-reporter.command": {
+      "file": "agentmod.toml",
+      "line": 116
+    },
+    "plugins.subagent-reporter.module": {
+      "file": "agentmod.toml",
+      "line": 117
+    },
+    "plugins.subagent.command": {
+      "file": "agentmod.toml",
+      "line": 111
+    },
+    "plugins.subagent.config": {
+      "file": "agentmod.toml",
+      "line": 113
+    },
+    "plugins.subagent.module": {
+      "file": "agentmod.toml",
+      "line": 112
+    },
+    "plugins.titler": {
+      "file": "agentmod.toml",
+      "line": 64
+    },
+    "plugins.titler.command": {
+      "file": "agentmod.toml",
+      "line": 65
+    },
+    "plugins.titler.module": {
+      "file": "agentmod.toml",
+      "line": 66
+    },
+    "plugins.tool-calc": {
+      "file": "agentmod.toml",
+      "line": 103
+    },
+    "plugins.tool-calc.command": {
+      "file": "agentmod.toml",
+      "line": 104
+    },
+    "plugins.tool-calc.module": {
+      "file": "agentmod.toml",
+      "line": 105
+    },
+    "plugins.tool-clock": {
+      "file": "agentmod.toml",
+      "line": 99
+    },
+    "plugins.tool-clock.command": {
+      "file": "agentmod.toml",
+      "line": 100
+    },
+    "plugins.tool-clock.module": {
+      "file": "agentmod.toml",
+      "line": 101
+    },
+    "plugins.tool-discovery": {
+      "file": "agentmod.toml",
+      "line": 75
+    },
+    "plugins.tool-discovery.command": {
+      "file": "agentmod.toml",
+      "line": 76
+    },
+    "plugins.tool-discovery.module": {
+      "file": "agentmod.toml",
+      "line": 77
+    },
+    "plugins.web-fetch": {
+      "file": "agentmod.toml",
+      "line": 158
+    },
+    "plugins.web-fetch.command": {
+      "file": "agentmod.toml",
+      "line": 159
+    },
+    "plugins.web-fetch.config": {
+      "file": "agentmod.toml",
+      "line": 161
+    },
+    "plugins.web-fetch.module": {
+      "file": "agentmod.toml",
+      "line": 160
+    },
+    "plugins.web-ui": {
+      "file": "agentmod.toml",
+      "line": 16
+    },
+    "plugins.web-ui.command": {
+      "file": "agentmod.toml",
+      "line": 17
+    },
+    "plugins.web-ui.config": {
+      "file": "agentmod.toml",
+      "line": 18
+    },
+    "runtime": {
+      "file": "agentmod.toml",
+      "line": 11
+    },
+    "runtime.max_attempts": {
+      "file": "agentmod.toml",
+      "line": 13
+    },
+    "runtime.spill_threshold_bytes": {
+      "file": "agentmod.toml",
+      "line": 12
     }
   }
 }

@@ -7,7 +7,7 @@
 // saved, by which session, why it was injected), and a `memory-injected` event
 // records what entered the session. Children started by `delegate` are not
 // given memory unless their definition includes this plugin.
-import { definePlugin, declareTools, offerTools, ownTools, toolSpec } from '../sdk/agentmod.js';
+import { definePlugin, key, offerSubscriptions, offerTools, optional, toolCalls, toolResult, toolSpec } from '../sdk/agentmod.js';
 
 const TOOLS = [
   toolSpec('remember', 'Save a short note that future sessions will see (preferences, conventions, facts about this user or project).', { note: { type: 'string' } }, { required: ['note'], tier: 'deferred', group: 'memory', effects: 'write' }),
@@ -21,15 +21,10 @@ definePlugin({
     name: 'memory',
     version: '0.2.0',
     description: 'Persistent notes injected into every new session, with provenance; remember/recall tools.',
-    consumes: [
-      { event: 'session-started' },
-      { event: 'config-applied' },
-      ownTools(TOOLS.map((t) => t.name)),
-    ],
-    tools: declareTools(TOOLS),
-    emits: [
-      { event: 'tool-result', supplies: ['call_id', 'name', 'output'] },
-      { event: 'memory-injected', supplies: ['count'] },
+    subscribe: [...offerSubscriptions(), ...toolCalls(TOOLS.map((t) => t.name), { actions: ['contribute-context'] })],
+    emit: [
+      toolResult(),
+      { event: 'memory-injected', keys: { count: key('integer'), notes: optional('array<string>') } },
     ],
   },
   handlers: {
@@ -40,7 +35,7 @@ definePlugin({
       if (notes.length) await ctx.publish('memory-injected', { count: notes.length, notes: notes.map((n) => n.text.slice(0, 200)) }, { ui: { v: 1, kind: 'progress', label: `${notes.length} remembered note(s) injected` } });
     },
     'config-applied': (ctx) => offerTools(ctx, TOOLS),
-    'tool-call': async (ctx) => {
+    'tool-call/*': async (ctx) => {
       const { name, call_id, args } = ctx.payload;
       if (name === 'remember') {
         const text = String(args?.note ?? '').trim();

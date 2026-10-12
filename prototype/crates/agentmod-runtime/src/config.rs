@@ -2,7 +2,9 @@
 
 use std::path::{Path, PathBuf};
 
-use agentmod_core::manifest::DeploymentConfig;
+use std::collections::BTreeMap;
+
+use agentmod_core::manifest::{DeploymentConfig, SourceRef};
 use sha2::{Digest, Sha256};
 
 /// A loaded config plus the directory plugin commands run from (the config's directory).
@@ -29,8 +31,91 @@ pub fn load(path: &Path) -> Result<Loaded, String> {
     } else {
         base_dir
     };
+    let file = path.file_name().map_or_else(
+        || path.display().to_string(),
+        |f| f.to_string_lossy().into_owned(),
+    );
+    config.sources = scan_sources(&text, &file);
     stamp_binaries(&mut config, &base_dir);
     Ok(Loaded { config, base_dir })
+}
+
+/// Unquote one TOML key segment (`"tool-call/*"` → `tool-call/*`).
+fn unquote(k: &str) -> String {
+    let k = k.trim();
+    k.strip_prefix('"')
+        .and_then(|x| x.strip_suffix('"'))
+        .or_else(|| k.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
+        .unwrap_or(k)
+        .to_owned()
+}
+
+/// Split a dotted TOML key, respecting quotes.
+fn split_key(k: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    for c in k.chars() {
+        match (quote, c) {
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            (Some(q), c) if c == q => {
+                quote = None;
+                cur.push(c);
+            }
+            (None, '.') => out.push(unquote(&std::mem::take(&mut cur))),
+            _ => cur.push(c),
+        }
+    }
+    out.push(unquote(&cur));
+    out
+}
+
+/// Line numbers of every table header and `key =` line, by config path
+/// (`definitions.coder.plugins.policy`), so diagnostics can name the file and
+/// line a finding traces to. A deliberately small scanner: it reads headers and
+/// keys, not values.
+#[must_use]
+pub fn scan_sources(text: &str, file: &str) -> BTreeMap<String, SourceRef> {
+    let mut out = BTreeMap::new();
+    let mut table: Vec<String> = Vec::new();
+    let mut depth = 0i32; // open brackets of a multi-line array value
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.split(" #").next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if depth > 0 {
+            depth += line.matches('[').count() as i32 - line.matches(']').count() as i32;
+            continue;
+        }
+        let at = SourceRef {
+            file: file.to_owned(),
+            line: i + 1,
+        };
+        if let Some(h) = line.strip_prefix("[[").and_then(|l| l.split("]]").next()) {
+            table = split_key(h);
+            out.entry(table.join(".")).or_insert(at);
+            continue;
+        }
+        if let Some(h) = line.strip_prefix('[').and_then(|l| l.split(']').next()) {
+            table = split_key(h);
+            out.insert(table.join("."), at);
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            let mut path = table.clone();
+            path.extend(split_key(k));
+            out.insert(path.join("."), at);
+            let v = v.trim();
+            if v.starts_with('[') {
+                depth = v.matches('[').count() as i32 - v.matches(']').count() as i32;
+            }
+        }
+    }
+    out
 }
 
 /// Relative module specifiers a JavaScript file imports statically
@@ -134,6 +219,17 @@ pub fn disable_unrunnable(config: &mut DeploymentConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sources_name_definition_lines() {
+        let src = "# c\n[definitions.chat]\nruntime = \"0.1\"\nphases = [\n  \"guard\",\n]\n[definitions.chat.plugins]\nweb-ui = {}\npolicy = { phase = \"guard\" }\n[definitions.chat.order.\"tool-call\"]\nguard = [\"policy\"]\n";
+        let s = scan_sources(src, "agentmod.toml");
+        assert_eq!(s["definitions.chat"].line, 2);
+        assert_eq!(s["definitions.chat.phases"].line, 4);
+        assert_eq!(s["definitions.chat.plugins.policy"].line, 9);
+        assert_eq!(s["definitions.chat.order.tool-call.guard"].line, 11);
+        assert_eq!(s["definitions.chat.plugins.web-ui"].file, "agentmod.toml");
+    }
 
     #[test]
     fn worker_only_plugins_are_disabled_natively() {

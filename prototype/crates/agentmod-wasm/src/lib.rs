@@ -124,8 +124,39 @@ impl WasmKernel {
     }
 
     #[must_use]
-    pub fn configs_in_use(&self) -> String {
-        out(&self.k.configs_in_use())
+    pub fn revisions_in_use(&self) -> String {
+        out(&self.k.revisions_in_use())
+    }
+
+    /// `[[name, stamp, config], …]` of every plugin instance a revision in use needs.
+    #[must_use]
+    pub fn plugins_in_use(&self) -> String {
+        out(&self
+            .k
+            .plugins_in_use()
+            .into_iter()
+            .map(|((n, s), c)| json!([n, s, c]))
+            .collect::<Vec<_>>())
+    }
+
+    /// Install a persisted revision; returns `{revision}` or `{error}`.
+    pub fn install_revision(&mut self, revision_json: &str) -> String {
+        match serde_json::from_str(revision_json) {
+            Ok(r) => json!({ "revision": self.k.install_revision(r) }).to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    /// A revision by hash (or null).
+    #[must_use]
+    pub fn revision(&self, hash: &str) -> String {
+        out(&self.k.revision(hash))
+    }
+
+    /// The revision a loaded session runs under (or null).
+    #[must_use]
+    pub fn session_revision(&self, session_id: &str) -> String {
+        out(&self.k.session_revision(session_id))
     }
 
     pub fn start_session(&mut self, req_json: &str, now: f64) -> String {
@@ -222,10 +253,10 @@ impl WasmKernel {
         self.k.is_loaded(session_id)
     }
 
-    /// Compiled keyed-dispatch tables of a session's config.
+    /// Compiled `exactly_one_handler` families of a session's revision.
     #[must_use]
-    pub fn routes(&self, session_id: &str) -> String {
-        out(&self.k.routes(session_id))
+    pub fn families(&self, session_id: &str) -> String {
+        out(&self.k.families(session_id))
     }
 
     /// `[plugin, open]` for an invocation, or null.
@@ -355,14 +386,15 @@ mod tests {
     #[test]
     fn json_api_round_trip() {
         let manifests = json!({
-            "ui": { "name": "ui", "version": "1", "consumes": [{ "event": "*", "mode": "async", "context": false }],
-                    "emits": [{ "event": "user-message", "supplies": ["text"], "deferred": true }],
+            "ui": { "name": "ui", "version": "1", "sink": true,
+                    "subscribe": [{ "event": "session-started", "mode": "async" }],
+                    "emit": [{ "event": "user-message", "keys": { "text": { "shape": "string" } }, "deferred": true }],
                     "capabilities": ["start-session", "deferred-publish"] },
-            "echo": { "name": "echo", "version": "1", "consumes": [{ "event": "user-message", "demands": ["text"] }] }
+            "echo": { "name": "echo", "version": "1", "subscribe": [{ "event": "user-message", "mode": "blocking", "receives": { "text": { "shape": "string" } }, "actions": ["veto"] }] }
         });
         let config = json!({
             "plugins": { "ui": { "module": "ui.js" }, "echo": { "module": "echo.js" } },
-            "definitions": { "chat": { "subscribers": [{ "plugin": "ui" }, { "plugin": "echo" }] } }
+            "definitions": { "chat": { "runtime": "0.1", "phases": ["main"], "plugins": { "ui": {}, "echo": { "phase": "main" } } } }
         });
         let comp = compile(&config.to_string(), &manifests.to_string());
         let c: Value = serde_json::from_str(&comp).unwrap();

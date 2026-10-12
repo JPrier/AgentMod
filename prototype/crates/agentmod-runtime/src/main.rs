@@ -126,37 +126,13 @@ async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
                 Severity::Warning => "warning",
                 Severity::Info => "info",
             };
-            let loc = [
-                d.definition.as_deref(),
-                d.plugin.as_deref(),
-                d.event.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" / ");
-            eprintln!("{sev}[{}] {loc}: {}", d.code, d.message);
+            if compile_only || d.severity != Severity::Info {
+                eprintln!("{sev}[{}] {}: {}", d.code, d.location(), d.message);
+            }
         }
         if compile_only {
-            for (name, def) in &compilation.definitions {
-                println!("definition `{name}` — {} plugin(s)", def.plugins.len());
-                for (event, p) in &def.pipelines {
-                    let b: Vec<&str> = p.blocking.iter().map(|s| s.plugin.as_str()).collect();
-                    let a: Vec<&str> = p.asyncs.iter().map(|s| s.plugin.as_str()).collect();
-                    println!(
-                        "  {event:<20} blocking [{}]  async [{}]",
-                        b.join(" → "),
-                        a.join(", ")
-                    );
-                    if let Some(r) = &p.routed {
-                        let owners: Vec<String> = r
-                            .entries()
-                            .into_iter()
-                            .map(|(v, o)| format!("{v}→{o}"))
-                            .collect();
-                        println!("  {:<20} owner by `{}`: {}", "", r.key, owners.join(" "));
-                    }
-                }
+            for (name, rev) in &compilation.definitions {
+                print_revision(name, rev);
             }
             println!(
                 "config {} — {}",
@@ -184,6 +160,86 @@ async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
     });
     host.run().await;
     Ok(())
+}
+
+/// Print one compiled definition: its graph (as routes), and the report sections.
+fn print_revision(name: &str, rev: &agentmod_core::compiler::Revision) {
+    let g = &rev.graph;
+    let members = rev.plugins.values().filter(|m| m.member).count();
+    println!(
+        "definition `{name}` — revision {} — runtime {} — {members} plugin(s){}",
+        rev.revision,
+        rev.runtime,
+        if rev.ok { "" } else { " — REJECTED" }
+    );
+    if !rev.definition.phases.is_empty() {
+        println!("  phases: {}", rev.definition.phases.join(" → "));
+    }
+    println!("  graph ({} edges):", g.edges.len());
+    for r in &g.routes {
+        let chain: Vec<String> = r
+            .blocking
+            .iter()
+            .map(|i| {
+                let e = g.edge(*i);
+                let ph = e.position.as_ref().map(|p| p.phase.as_str()).unwrap_or("?");
+                format!("{ph}:{}", e.to)
+            })
+            .collect();
+        let asyncs: Vec<&str> = r.asyncs.iter().map(|i| g.edge(*i).to.as_str()).collect();
+        let mut line = format!("    {} --{}-->", r.from, r.class);
+        if !chain.is_empty() {
+            line.push_str(&format!(" blocking [{}]", chain.join(" → ")));
+        }
+        if !asyncs.is_empty() {
+            line.push_str(&format!(" async [{}]", asyncs.join(", ")));
+        }
+        match (r.handler, r.exactly_one_handler) {
+            (Some(i), _) => line.push_str(&format!(" handler {}", g.edge(i).to)),
+            (None, true) => line.push_str(" handler (none: dispatch-failed)"),
+            _ => {}
+        }
+        println!("{line}");
+    }
+    let rp = &rev.report;
+    let section = |title: &str, items: Vec<String>| {
+        if !items.is_empty() {
+            println!("  {title}:");
+            for i in items {
+                println!("    {i}");
+            }
+        }
+    };
+    section("cycles", rp.cycles.iter().map(|c| c.join(" → ")).collect());
+    section(
+        "families",
+        rp.families
+            .iter()
+            .flat_map(|(f, h)| {
+                h.members
+                    .iter()
+                    .chain(&h.subfamilies)
+                    .map(move |(m, p)| format!("{f} {m} → {p}"))
+            })
+            .collect(),
+    );
+    section(
+        "capabilities",
+        rp.capabilities
+            .iter()
+            .map(|(c, p)| format!("{c}: {}", p.join(", ")))
+            .collect(),
+    );
+    section("interrupt", rp.interrupt.clone());
+    section("unlisted keys", rp.unlisted_keys.clone());
+    section(
+        "external surface",
+        rp.external_surface
+            .iter()
+            .map(|(k, v)| format!("{k}: {}", v.join("; ")))
+            .collect(),
+    );
+    section("fixed orders", rp.fixed_orders.clone());
 }
 
 fn export_config(args: &Args) -> Result<(), String> {

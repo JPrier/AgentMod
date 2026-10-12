@@ -26,8 +26,8 @@ export function harnessSummary(view, sessions = []) {
     return u;
   }, { model_requests: 0, input_tokens: 0, output_tokens: 0, cached_tokens: 0, cost: 0, retries: 0, latency_ms: 0, elided: 0, dropped: 0 });
   const lastMetrics = last(responses)?.metrics || null;
-  const calls = of('tool-call').filter((e) => !e.payload.approved);
-  const results = new Map(of('tool-result').map((e) => [e.payload.call_id, e.payload]));
+  const calls = ev.filter((e) => e.event_name.startsWith('tool-call/') && !e.payload.approved);
+  const results = new Map([...of('tool-result'), ...of('tool-call-rejected')].map((e) => [e.payload.call_id, e.payload]));
   const processes = new Map();
   for (const e of of('process-started')) processes.set(e.payload.process_id, { id: e.payload.process_id, name: e.payload.name, command: e.payload.command, state: 'running', event_id: e.event_id });
   for (const e of of('process-exited')) {

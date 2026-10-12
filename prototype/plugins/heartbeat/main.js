@@ -5,7 +5,7 @@
 //
 // Config: { every_seconds: 0 (off), agent_every: 0, agent_definition: "chat",
 //           agent_prompt: "Heartbeat check-in: what time is it?" }
-import { definePlugin } from '../sdk/agentmod.js';
+import { definePlugin, key } from '../sdk/agentmod.js';
 
 let timer = null;
 let beats = 0;
@@ -35,11 +35,14 @@ definePlugin({
     name: 'heartbeat',
     version: '0.1.0',
     description: 'Interval trigger with a journal session; can spawn background agent sessions.',
-    consumes: [{ event: 'session-started', mode: 'async', context: false }],
-    emits: [
-      { event: 'heartbeat', supplies: ['beat'], deferred: true },
-      { event: 'user-message', supplies: ['text'] },
+    subscribe: [{ event: 'session-started', mode: 'async' }],
+    emit: [
+      { event: 'heartbeat', deferred: true, keys: { beat: key('integer') } },
+      // The initial event of the agent sessions it starts.
+      { event: 'user-message', keys: { text: key('string') } },
     ],
+    // Its journal session is its durable memory; the effect is outside the bus.
+    sink: true,
     capabilities: ['deferred-publish', 'start-session'],
     config_schema: { every_seconds: 0, agent_every: 0, agent_definition: 'chat', agent_prompt: 'Heartbeat check-in: what time is it?' },
   },

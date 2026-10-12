@@ -30,9 +30,6 @@ pub struct InvocationView {
     pub started_at: u64,
     pub attempts: u32,
     pub input: Value,
-    /// The family member that selected this plugin as its handler, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub route: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -173,7 +170,6 @@ pub fn project(records: &[Record]) -> SessionView {
                 stamp,
                 revision,
                 payload,
-                route,
             } => {
                 if let Some(&i) = by_event.get(event_id) {
                     by_inv.insert(invocation_id.clone(), (i, events[i].invocations.len()));
@@ -190,7 +186,6 @@ pub fn project(records: &[Record]) -> SessionView {
                         started_at: r.at,
                         attempts: 1,
                         input: payload.clone(),
-                        route: route.clone(),
                         completed_seq: None,
                         completed_at: None,
                         outcome: None,

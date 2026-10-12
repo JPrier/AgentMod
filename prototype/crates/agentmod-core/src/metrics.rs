@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value, json};
 
+use crate::manifest::is_family;
 use crate::projection::project;
 use crate::record::{Body, Outcome, Record};
 use crate::types::Mode;
@@ -64,7 +65,6 @@ pub fn session_metrics(records: &[Record]) -> Value {
     // ---------------- control plane, from records ----------------
     let mut event_names: BTreeMap<String, String> = BTreeMap::new();
     let mut inv_event: BTreeMap<String, String> = BTreeMap::new();
-    let mut inv_routed: BTreeMap<String, bool> = BTreeMap::new();
     let mut by_name: BTreeMap<String, u64> = BTreeMap::new();
     let mut turns: Vec<Turn> = Vec::new();
     for r in records {
@@ -114,7 +114,7 @@ pub fn session_metrics(records: &[Record]) -> Value {
                 invocation_id,
                 event_id,
                 mode,
-                route,
+                subscription,
                 ..
             } => {
                 add(&mut m, "plugin_invocations", 1.0);
@@ -125,16 +125,16 @@ pub fn session_metrics(records: &[Record]) -> Value {
                 let name = event_names.get(event_id).cloned().unwrap_or_default();
                 if is_tool_call(&name) {
                     add(&mut m, "tool_call_invocations", 1.0);
-                    if route.is_some() {
-                        add(&mut m, "exact_handler_dispatches", 1.0);
+                    // A subscriber of the concrete member (the tool itself), or
+                    // an async subscriber of the family or a sub-family (an
+                    // observer; blocking family subscribers are gates).
+                    if !is_family(subscription) && subscription != "*" {
+                        add(&mut m, "member_dispatches", 1.0);
                     } else if *mode == Mode::Async {
-                        // Delivered to a plugin that is not the member's handler:
-                        // a family observer.
                         add(&mut m, "observer_dispatches", 1.0);
                     }
                 }
                 inv_event.insert(invocation_id.clone(), name);
-                inv_routed.insert(invocation_id.clone(), route.is_some());
                 if let Some(t) = turns.last_mut() {
                     t.invocations += 1;
                 }
@@ -240,7 +240,7 @@ pub fn session_metrics(records: &[Record]) -> Value {
                 add(&mut m, "tool_time_ms", num(p.get("duration_ms")));
                 useful += bytes_of(p.get("output").unwrap_or(&Value::Null));
             }
-            "dispatch-failed" => add(&mut m, "dispatch_failures", 1.0),
+            "invocation-failed" => add(&mut m, "invocation_failures", 1.0),
             "workspace-change" => {
                 add(&mut m, "edits", 1.0);
                 first_edit.get_or_insert(e.at);

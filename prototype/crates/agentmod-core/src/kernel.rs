@@ -16,12 +16,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::compiler::{
-    Compilation, Diagnostic, Edge, FamilyHandlers, Revision, compile_definition,
-};
+use crate::compiler::{Compilation, Diagnostic, Edge, ResolvedEmit, Revision, compile_definition};
 use crate::context::ContextState;
 use crate::core_manifest::{
-    BOUNDARY, CONFIG_APPLIED, DISPATCH_FAILED, SESSION_START_FAILED, SESSION_STARTED,
+    BOUNDARY, CONFIG_APPLIED, INVOCATION_FAILED, SESSION_START_FAILED, SESSION_STARTED,
 };
 use crate::manifest::{
     ACTION_CONTRIBUTE, ACTION_VETO, CONTEXT_SLOT, Capability, Definition, Manifest, PluginConfig,
@@ -61,6 +59,10 @@ pub enum Effect {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InvokeRequest {
     pub invocation_id: String,
+    /// The revision the invocation runs under; it selects the plugin's
+    /// resolved emit set (sent to the plugin before its first invocation
+    /// under any revision).
+    pub revision: String,
     pub mode: Mode,
     pub position: usize,
     pub attempt: u32,
@@ -260,8 +262,6 @@ struct InvInfo {
     /// executor identity even if the session's revision changed since.
     stamp: Stamp,
     revision: String,
-    /// Family member of a handler dispatch.
-    route: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -536,10 +536,10 @@ impl Kernel {
         })
     }
 
-    /// The compiled `exactly_one_handler` families of a session's revision.
+    /// A plugin's resolved emit set under an installed revision.
     #[must_use]
-    pub fn families(&self, session_id: &str) -> Option<BTreeMap<String, FamilyHandlers>> {
-        Some(self.session_revision(session_id)?.report.families.clone())
+    pub fn emit_set(&self, revision: &str, plugin: &str) -> Option<Vec<ResolvedEmit>> {
+        Some(self.revision(revision)?.emit_set(plugin).to_vec())
     }
 
     // ------------------------------------------------------------------
@@ -645,7 +645,6 @@ impl Kernel {
                 stamp,
                 revision,
                 payload,
-                route,
                 subscription,
                 ..
             } => {
@@ -685,7 +684,6 @@ impl Kernel {
                         attempt_outputs: 0,
                         stamp: stamp.clone(),
                         revision: revision.clone(),
-                        route: route.clone(),
                     },
                 );
                 match mode {
@@ -770,31 +768,14 @@ impl Kernel {
         self.revisions.get(&s.revision).cloned()
     }
 
-    /// The edges an event takes, in order: (blocking, asyncs, handler, decl info).
+    /// The edges an event takes, in order: its blocking chain, then its asyncs.
+    /// The graph holds only concrete events, so this is one exact lookup.
     fn route_edges(rev: &Revision, ev: &EventRecord) -> Option<RouteEdges> {
-        let emitter = emitter_of(&ev.origin);
-        let (decl, route) = rev.route(&emitter, &ev.event_name)?;
-        let Some(route) = route else {
-            return Some(RouteEdges {
-                family: decl.event.clone(),
-                exactly_one_handler: decl.exactly_one_handler,
-                ..Default::default()
-            });
-        };
+        let route = rev.graph.route(&emitter_of(&ev.origin), &ev.event_name)?;
+        let edges = |ix: &[usize]| ix.iter().map(|i| rev.graph.edge(*i).clone()).collect();
         Some(RouteEdges {
-            blocking: route
-                .blocking
-                .iter()
-                .map(|i| rev.graph.edge(*i).clone())
-                .collect(),
-            asyncs: route
-                .asyncs
-                .iter()
-                .map(|i| rev.graph.edge(*i).clone())
-                .collect(),
-            handler: route.handler.map(|i| rev.graph.edge(i).clone()),
-            exactly_one_handler: route.exactly_one_handler,
-            family: decl.event.clone(),
+            blocking: edges(&route.blocking),
+            asyncs: edges(&route.asyncs),
         })
     }
 
@@ -864,14 +845,12 @@ impl Kernel {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn start_invocation(
         &mut self,
         sid: &str,
         edge: &Edge,
         event_id: &str,
         payload: &Value,
-        route: Option<String>,
         now: u64,
         fx: &mut Vec<Effect>,
     ) {
@@ -902,7 +881,6 @@ impl Kernel {
                 stamp: stamp.clone(),
                 revision: rev.revision.clone(),
                 payload: delivered.clone(),
-                route,
             },
             fx,
         );
@@ -932,7 +910,8 @@ impl Kernel {
                 },
                 fx,
             );
-            // Recorded as a failed invocation; the dispatch loop moves on.
+            // Recorded as a failed invocation, reported as `invocation-failed`;
+            // the dispatch loop moves on.
             self.emit(
                 sid,
                 now,
@@ -947,6 +926,7 @@ impl Kernel {
                 },
                 fx,
             );
+            self.report_failure(sid, &invocation_id, &reason, now, fx);
             if edge.mode == Mode::Blocking {
                 self.emit(
                     sid,
@@ -970,6 +950,7 @@ impl Kernel {
             attempt: 1,
             request: InvokeRequest {
                 invocation_id,
+                revision: rev.revision.clone(),
                 mode: edge.mode,
                 position,
                 attempt: 1,
@@ -1027,14 +1008,14 @@ impl Kernel {
                 if run.open.is_some() {
                     return;
                 }
-                let ev = s.events[&run.event_id].record.clone();
+                let ev = &s.events[&run.event_id].record;
                 let route = self
                     .rev_of(s)
-                    .and_then(|rev| Self::route_edges(&rev, &ev))
+                    .and_then(|rev| Self::route_edges(&rev, ev))
                     .unwrap_or_default();
                 if let Some(edge) = route.blocking.get(run.next_blocking) {
                     let edge = edge.clone();
-                    self.start_invocation(sid, &edge, &run.event_id, &run.payload, None, now, fx);
+                    self.start_invocation(sid, &edge, &run.event_id, &run.payload, now, fx);
                     if self
                         .sessions
                         .get(sid)
@@ -1056,49 +1037,7 @@ impl Kernel {
                     fx,
                 );
                 for edge in &route.asyncs {
-                    self.start_invocation(sid, edge, &run.event_id, &run.payload, None, now, fx);
-                }
-                // Family handler: exactly the one compiled handler, never a scan.
-                if let Some(edge) = &route.handler {
-                    self.start_invocation(
-                        sid,
-                        edge,
-                        &run.event_id,
-                        &run.payload,
-                        Some(member_of(&ev.event_name, &route.family)),
-                        now,
-                        fx,
-                    );
-                } else if route.exactly_one_handler {
-                    let handled: Vec<String> = self
-                        .rev_of(&self.sessions[sid])
-                        .and_then(|r| r.report.families.get(&route.family).cloned())
-                        .map(|f| {
-                            f.members
-                                .keys()
-                                .chain(f.subfamilies.keys())
-                                .map(|m| member_of(m, &route.family))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    self.append_event(
-                        sid,
-                        now,
-                        DISPATCH_FAILED,
-                        json!({
-                            "reason": "no-handler", "event_id": run.event_id, "event_name": ev.event_name,
-                            "family": route.family, "member": member_of(&ev.event_name, &route.family),
-                            "payload": run.payload, "handled": handled,
-                        }),
-                        None,
-                        Lane::Normal,
-                        Cause::Core {
-                            reason: DISPATCH_FAILED.into(),
-                        },
-                        Origin::Core,
-                        None,
-                        fx,
-                    );
+                    self.start_invocation(sid, edge, &run.event_id, &run.payload, now, fx);
                 }
                 continue;
             }
@@ -1114,6 +1053,53 @@ impl Kernel {
             };
             self.emit(sid, now, Body::PipelineStarted { event_id: next }, fx);
         }
+    }
+
+    /// A plugin invocation failed: the core emits `invocation-failed` with the
+    /// failed event, the plugin, and the error (compiler.md §3.4 step 7, §7).
+    /// A failure while handling `invocation-failed` itself is recorded but not
+    /// reported again, so one broken subscriber cannot loop.
+    fn report_failure(
+        &mut self,
+        sid: &str,
+        invocation_id: &str,
+        error: &str,
+        now: u64,
+        fx: &mut Vec<Effect>,
+    ) {
+        let s = &self.sessions[sid];
+        let Some(info) = s.invocations.get(invocation_id) else {
+            return;
+        };
+        let Some(ev) = s.events.get(&info.event_id) else {
+            return;
+        };
+        if ev.record.event_name == INVOCATION_FAILED {
+            return;
+        }
+        let payload = json!({
+            "event_id": info.event_id,
+            "event_name": ev.record.event_name,
+            "payload": ev.record.payload,
+            "plugin": info.plugin,
+            "invocation_id": invocation_id,
+            "mode": info.mode,
+            "error": error,
+        });
+        self.append_event(
+            sid,
+            now,
+            INVOCATION_FAILED,
+            payload,
+            None,
+            Lane::Normal,
+            Cause::Invocation {
+                invocation_id: invocation_id.to_owned(),
+            },
+            Origin::Core,
+            None,
+            fx,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1512,12 +1498,19 @@ impl Kernel {
                 now,
             );
         }
-        // An event of this session: the emit declaration decides everything.
-        let Some(decl) = manifest.emit_for(&req.event_name).cloned() else {
-            let declared: Vec<&str> = manifest.emit.iter().map(|e| e.event.as_str()).collect();
-            return self.breach_block(&source, req, json!({ "kind": "emit", "plugin": req.plugin, "event": req.event_name, "declared": declared }), format!("undeclared emit `{}` (declared: {})", req.event_name, declared.join(", ")), now);
+        // An event of this session: the plugin's resolved emit set decides
+        // everything. A family member the definition does not resolve is an
+        // undeclared emit like any other (compiler.md §3.4 step 5).
+        let Some(resolved) = rev.resolved_emit(&req.plugin, &req.event_name) else {
+            let declared: Vec<&str> = rev
+                .emit_set(&req.plugin)
+                .iter()
+                .map(|e| e.event.as_str())
+                .collect();
+            return self.breach_block(&source, req, json!({ "kind": "emit", "plugin": req.plugin, "event": req.event_name, "declared": manifest.emit.iter().map(|e| &e.event).collect::<Vec<_>>(), "resolved": declared }), format!("undeclared emit `{}` (resolved emit set: {})", req.event_name, if declared.is_empty() { "nothing".to_owned() } else { declared.join(", ") }), now);
         };
-        let decl_json = json!({ "kind": "emit", "plugin": req.plugin, "event": decl.event, "lane": decl.lane, "deferred": decl.deferred, "keys": decl.keys });
+        let decl = resolved.decl();
+        let decl_json = json!({ "kind": "emit", "plugin": req.plugin, "event": decl.event, "family": resolved.family, "lane": decl.lane, "deferred": decl.deferred, "keys": decl.keys });
         if deferred && !(decl.deferred && manifest.has(Capability::DeferredPublish)) {
             return self.breach_block(&source, req, decl_json, format!("`{}` may not be published deferred (invocation closed or absent; the emit is not declared `deferred`)", req.event_name), now);
         }
@@ -2006,31 +1999,8 @@ impl Kernel {
             },
             &mut fx,
         );
-        if let (Some(member), Outcome::Failed { error }) = (&info.route, &outcome) {
-            let ev = self.sessions[sid].events[&info.event_id].record.clone();
-            let family = self
-                .rev_of(&self.sessions[sid])
-                .and_then(|r| r.emit_decl(&emitter_of(&ev.origin), &ev.event_name))
-                .map(|d| d.event)
-                .unwrap_or_default();
-            self.append_event(
-                sid,
-                now,
-                DISPATCH_FAILED,
-                json!({
-                    "reason": "handler-failed", "event_id": info.event_id, "event_name": ev.event_name,
-                    "family": family, "member": member, "payload": ev.payload,
-                    "plugin": info.plugin, "error": error,
-                }),
-                None,
-                Lane::Normal,
-                Cause::Core {
-                    reason: DISPATCH_FAILED.into(),
-                },
-                Origin::Core,
-                None,
-                &mut fx,
-            );
+        if let Outcome::Failed { error } = &outcome {
+            self.report_failure(sid, invocation_id, error, now, &mut fx);
         }
         if info.mode == Mode::Blocking {
             let settlement = match outcome {
@@ -2106,6 +2076,7 @@ impl Kernel {
             attempt,
             request: InvokeRequest {
                 invocation_id: invocation_id.to_owned(),
+                revision: info.revision.clone(),
                 mode: info.mode,
                 position: info.position,
                 attempt,
@@ -2401,9 +2372,6 @@ impl Kernel {
 struct RouteEdges {
     blocking: Vec<Edge>,
     asyncs: Vec<Edge>,
-    handler: Option<Edge>,
-    exactly_one_handler: bool,
-    family: String,
 }
 
 struct BreachInfo {
@@ -2414,32 +2382,4 @@ struct BreachInfo {
     observed: Value,
     reason: String,
     reaction: &'static str,
-}
-
-/// The member part of a family event name (`tool-call/read_file` → `read_file`).
-fn member_of(name: &str, family: &str) -> String {
-    let base = family.trim_end_matches('*');
-    let base = base.rsplit_once('/').map_or(base, |(b, _)| b);
-    name.strip_prefix(base)
-        .and_then(|r| r.strip_prefix('/'))
-        .unwrap_or(name)
-        .to_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::member_of;
-
-    #[test]
-    fn members() {
-        assert_eq!(member_of("tool-call/read_file", "tool-call/*"), "read_file");
-        assert_eq!(
-            member_of("tool-call/mcp__gh__x", "tool-call/*"),
-            "mcp__gh__x"
-        );
-        assert_eq!(
-            member_of("tool-call/mcp__gh__*", "tool-call/*"),
-            "mcp__gh__*"
-        );
-    }
 }

@@ -253,10 +253,11 @@ impl WasmKernel {
         self.k.is_loaded(session_id)
     }
 
-    /// Compiled `exactly_one_handler` families of a session's revision.
+    /// A plugin's resolved emit set under an installed revision (`null` when
+    /// the revision is not installed).
     #[must_use]
-    pub fn families(&self, session_id: &str) -> String {
-        out(&self.k.families(session_id))
+    pub fn emit_set(&self, revision: &str, plugin: &str) -> String {
+        out(&self.k.emit_set(revision, plugin))
     }
 
     /// `[plugin, open]` for an invocation, or null.

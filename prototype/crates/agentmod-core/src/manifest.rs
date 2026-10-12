@@ -6,9 +6,11 @@
 //! registry, no event ownership, and no dependency between plugins.
 //!
 //! A session definition (§4) lists the plugins a session runs, the phases that
-//! order its blocking subscribers, tie-breaks, handler picks for event
-//! families, the events it accepts from other sessions, and its slots. It
-//! never lists edges: those are compiler output.
+//! order its blocking subscribers, tie-breaks, the events it accepts from other
+//! sessions, and its slots. It never lists edges: those are compiler output.
+//!
+//! Manifests and definitions reject fields they do not know, so a field the
+//! design removed fails loudly instead of being silently ignored.
 
 use std::collections::BTreeMap;
 
@@ -217,6 +219,7 @@ impl Receives {
 
 /// One subscription: an event, a family, or `*`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Subscription {
     pub event: String,
     pub mode: Mode,
@@ -232,6 +235,16 @@ pub struct Subscription {
     /// Blocking only: keys handed back to the chain (overwrite or add; never remove).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub returns: Keys,
+    /// What this subscriber does with the event, for people and for the
+    /// emitter of a family it subscribes a member of (`chat-context` shows a
+    /// tool member's description to the model). Documentation only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Free-form hints for a member's emitter and its observers (a tool's
+    /// tier, group, effects). Never checked by the compiler; documentation for
+    /// other plugins, delivered with the resolved emit set.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub hints: Value,
 }
 
 impl Subscription {
@@ -248,6 +261,7 @@ impl Subscription {
 
 /// One emitted event or event family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmitDecl {
     pub event: String,
     /// `interrupt` requires the interrupt capability.
@@ -256,9 +270,6 @@ pub struct EmitDecl {
     /// May be published without an open invocation (requires deferred-publish).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
-    /// Families only: every member must have exactly one handling subscriber.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub exactly_one_handler: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keys: Keys,
 }
@@ -397,6 +408,7 @@ impl PluginConfig {
 
 /// A plugin's participation in a session definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DefPlugin {
     /// Phase of every blocking subscription of this plugin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -435,6 +447,7 @@ impl Interface {
 
 /// A named session definition (or a reusable fragment of one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Definition {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
@@ -452,13 +465,9 @@ pub struct Definition {
     pub plugins: BTreeMap<String, DefPlugin>,
     /// Tie-breaks: `order[event][phase] = [plugins in order]`. The event key is
     /// an event name, a family pattern (`tool-call/*`), or a family name
-    /// (`tool-call`, covering all its members).
+    /// (`tool-call`); a key naming a family applies to every member of it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub order: BTreeMap<String, BTreeMap<String, Vec<String>>>,
-    /// Handler picks for `exactly_one_handler` families: member or sub-family
-    /// pattern → plugin.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub handlers: BTreeMap<String, String>,
     /// Events accepted from other sessions, with their shapes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inbound: BTreeMap<String, Keys>,
@@ -612,7 +621,7 @@ mod tests {
                 "receives": { "model": { "shape": "string" }, "slots": { "context": { "shape": "array<object>" } } },
                 "returns": { "temperature": { "shape": "number" } }
             }],
-            "emit": [{ "event": "tool-call/*", "exactly_one_handler": true, "keys": { "call_id": { "shape": "string" } } }],
+            "emit": [{ "event": "tool-call/*", "keys": { "call_id": { "shape": "string" } } }],
             "capabilities": ["interrupt", "sessions.find"],
             "outbound": [{ "event": "answer", "keys": { "text": { "shape": "string" } } }],
             "sink": true
@@ -638,12 +647,31 @@ mod tests {
             "runtime": "0.1", "phases": ["guard", "loop"],
             "plugins": { "policy": { "phase": "guard", "phases": { "model-request": "loop" } }, "web-ui": {} },
             "order": { "tool-call": { "guard": ["policy", "approval-gate"] } },
-            "handlers": { "tool-call/read_file": "local-workspace" },
             "inbound": { "subagent-result": { "call_id": { "shape": "string" } } },
             "deny_warnings": true
         }))
         .unwrap();
         assert_eq!(d.effective_slots()["context"], default_context_slot());
         assert_eq!(d.plugins["policy"].phases["model-request"], "loop");
+    }
+
+    #[test]
+    fn removed_fields_are_rejected_not_ignored() {
+        let emit = |extra: serde_json::Value| {
+            let mut e = json!({ "event": "tool-call/*" });
+            e.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<Manifest>(json!({ "name": "p", "version": "1", "emit": [e] }))
+        };
+        assert!(emit(json!({})).is_ok());
+        assert!(emit(json!({ "exactly_one_handler": true })).is_err());
+        assert!(
+            serde_json::from_value::<Definition>(
+                json!({ "runtime": "0.1", "handlers": { "tool-call/x": "p" } })
+            )
+            .is_err(),
+            "handler picks are gone"
+        );
     }
 }

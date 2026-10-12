@@ -187,17 +187,17 @@ fn print_revision(name: &str, rev: &agentmod_core::compiler::Revision) {
             })
             .collect();
         let asyncs: Vec<&str> = r.asyncs.iter().map(|i| g.edge(*i).to.as_str()).collect();
-        let mut line = format!("    {} --{}-->", r.from, r.class);
+        let via = if r.emit == r.event {
+            String::new()
+        } else {
+            format!(" (from {})", r.emit)
+        };
+        let mut line = format!("    {} --{}{via}-->", r.from, r.event);
         if !chain.is_empty() {
             line.push_str(&format!(" blocking [{}]", chain.join(" → ")));
         }
         if !asyncs.is_empty() {
             line.push_str(&format!(" async [{}]", asyncs.join(", ")));
-        }
-        match (r.handler, r.exactly_one_handler) {
-            (Some(i), _) => line.push_str(&format!(" handler {}", g.edge(i).to)),
-            (None, true) => line.push_str(" handler (none: dispatch-failed)"),
-            _ => {}
         }
         println!("{line}");
     }
@@ -215,11 +215,17 @@ fn print_revision(name: &str, rev: &agentmod_core::compiler::Revision) {
         "families",
         rp.families
             .iter()
-            .flat_map(|(f, h)| {
-                h.members
-                    .iter()
-                    .chain(&h.subfamilies)
-                    .map(move |(m, p)| format!("{f} {m} → {p}"))
+            .flat_map(|(f, by)| {
+                by.iter().map(move |(emitter, members)| {
+                    format!(
+                        "{emitter}: {f} → {}",
+                        if members.is_empty() {
+                            "(nothing)".to_owned()
+                        } else {
+                            members.join(", ")
+                        }
+                    )
+                })
             })
             .collect(),
     );

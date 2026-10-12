@@ -22,6 +22,10 @@ class Ctx:
         self.subscription = req.get("subscription")
         self.session_id = self.event["session_id"]
         self.invocation_id = req["invocation_id"]
+        # The revision this invocation runs under, and this plugin's resolved
+        # emit set under it: the concrete events it may emit (compiler.md §3.4).
+        self.revision = req.get("revision")
+        self.emits = plugin.emits_for(self.revision)
         self.config = plugin.config
         self.result = {"contributions": []}
 
@@ -59,6 +63,8 @@ class Plugin:
         self.manifest = manifest
         self.handlers = handlers
         self.config = {}
+        self.emit_sets = {}
+        self.latest_revision = None
         self._next = 1
         self._pending = {}
         self._lock = threading.Lock()
@@ -82,6 +88,10 @@ class Plugin:
         if "error" in msg:
             raise RuntimeError(msg["error"]["message"])
         return msg.get("result")
+
+    def emits_for(self, revision=None):
+        """The resolved emit set under a revision (the latest one received if omitted)."""
+        return self.emit_sets.get(revision if revision is not None else self.latest_revision, [])
 
     def handler_for(self, name, subscription):
         """Exact event name, the subscription's pattern, a matching family (`tool-call/*`), or '*'."""
@@ -129,6 +139,9 @@ class Plugin:
             elif method == "shutdown":
                 self.send({"id": rid, "result": None})
                 return
+            elif method == "emit_set":
+                self.emit_sets[params.get("revision")] = params.get("emits") or []
+                self.latest_revision = params.get("revision")
             elif method in ("cancel", "record"):
                 pass
             elif rid is not None:

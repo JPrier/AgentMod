@@ -202,7 +202,7 @@ pub fn metrics(
             g("wall_ms") / 1000.0
         );
         println!(
-            "  control plane: {} records / {} bytes, {} events ({} semantic, {} stream-chunk), {} pipelines, {} invocations ({} blocking, {} async, {} no-op), tool dispatch: {} to handlers / {} to observers",
+            "  control plane: {} records / {} bytes, {} events ({} semantic, {} stream-chunk), {} pipelines, {} invocations ({} blocking, {} async, {} no-op), tool dispatch: {} to member subscribers / {} to observers",
             g("records"),
             g("record_bytes"),
             g("events"),
@@ -213,7 +213,7 @@ pub fn metrics(
             g("blocking_invocations"),
             g("async_invocations"),
             g("noop_invocations"),
-            g("exact_handler_dispatches"),
+            g("member_dispatches"),
             g("observer_dispatches"),
         );
         println!(

@@ -15,7 +15,7 @@
 //
 // Place it before chat-context in a definition (it is a blocking subscriber on
 // user-message).
-import { definePlugin, key, offerSubscriptions, offerTools, optional, toolCalls, toolResult } from '../sdk/agentmod.js';
+import { definePlugin, key, optional, toolCalls, toolResult } from '../sdk/agentmod.js';
 
 import { ASK_USER } from '../sdk/ask.js';
 
@@ -31,8 +31,7 @@ definePlugin({
     version: '0.1.0',
     description: 'ask_user: questions to the human as recorded continuations.',
     subscribe: [
-      ...offerSubscriptions(),
-      ...toolCalls(['ask_user']),
+      ...toolCalls([ASK_USER]),
       { event: 'ui-action', mode: 'async', receives: { reply_to: key('string'), action: key('string'), values: optional('object') } },
       { event: 'user-message', mode: 'blocking', actions: ['veto'], receives: { text: key('string') } },
     ],
@@ -42,8 +41,6 @@ definePlugin({
     ],
   },
   handlers: {
-    'session-started': (ctx) => offerTools(ctx, [ASK_USER]),
-    'config-applied': (ctx) => offerTools(ctx, [ASK_USER]),
     'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (name !== 'ask_user') return;

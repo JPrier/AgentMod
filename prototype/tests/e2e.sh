@@ -201,7 +201,11 @@ assert any(p['payload']['scope'] in ('child','mode') for p in tp)" || fail "chil
 test ! -f "$DATA/ws/nope.txt" || fail "forbidden write happened"
 B2=$(newsess coder 'script:bad')
 wait_for $B2 "assert any(e['event_name']=='assistant-message' and 'recovered' in e['payload']['text'] for e in d['events'])" 100
-ev $B2 "assert any(e['event_name']=='tool-call-rejected' and 'There is no tool named' in e['payload']['output'] for e in d['events'])" || fail "unknown tool"
+# The model invented a tool: chat-context answered it from its resolved emit set
+# and never published it (compiler.md §3.4, §11).
+ev $B2 "
+assert any(e['event_name']=='tool-call-rejected' and e['payload']['output'].startswith('no such tool: ') for e in d['events'])
+assert not any(e['event_name']=='tool-call/no_such_tool' for e in d['events'])" || fail "unknown tool"
 
 echo "16. provider hot swap mid-session: the next model request uses the new provider"
 H=$(newsess coder 'first turn on the original provider')
@@ -246,7 +250,7 @@ wait_for $PB "assert any(e['event_name']=='assistant-message' and 'batch done: 4
 ev $PB "
 assert sum(1 for e in d['events'] if e['event_name']=='model-request')==2
 calls=[e for e in d['events'] if e['event_name'].startswith('tool-call/')]  # incl. the approved re-publish
-owners=[i['plugin'] for e in calls for i in e['invocations'] if i.get('route')]
+owners=[i['plugin'] for e in calls for i in e['invocations'] if i['subscription']==e['event_name']]  # member subscribers
 assert owners==['local-workspace']*4, owners
 assert all(len([i for i in e['invocations'] if i['mode']=='async'])<=1 for e in calls), 'unrelated plugins invoked'" || fail "batch settlement"
 curl -s "$B/sessions/$PB/context" | py "assert any(c['slot']=='environment' and 'bash' in c['value']['tools'] for c in d)" || fail "environment facts"

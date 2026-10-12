@@ -6,16 +6,13 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "sdk"))
 from agentmod import Plugin  # noqa: E402
 
-TOOL = {"name": "wordcount", "description": "Count words and characters in text.", "parameters": {"text": {"type": "string"}}}
-
-
-TOOL_CALL = {"call_id": {"shape": "string"}, "name": {"shape": "string"}, "args": {"shape": "object"}}
-CONTEXT = {"slots": {"context": {"shape": "array<object>"}}}
-
-
-def offer(ctx):
-    if not any(t.get("name") == "wordcount" for t in ctx.slot("tools")):
-        ctx.add("tools", TOOL)
+# The tool exists because this plugin subscribes to its member; the member's
+# `receives.args` is the tool's argument schema (compiler.md §3.4).
+TOOL_CALL = {
+    "call_id": {"shape": "string"},
+    "name": {"shape": "string"},
+    "args": {"shape": "object", "keys": {"text": {"shape": "string", "optional": True, "description": "the text to count"}}},
+}
 
 
 def tool_call(ctx):
@@ -33,13 +30,11 @@ Plugin(
         "version": "0.1.0",
         "description": "Tool written in Python: word counts.",
         "subscribe": [
-            {"event": "session-started", "mode": "blocking", "actions": ["contribute-context"], "receives": CONTEXT},
-            {"event": "config-applied", "mode": "blocking", "actions": ["contribute-context"], "receives": CONTEXT},
-            # The one handler of `tool-call/wordcount`.
-            {"event": "tool-call/wordcount", "mode": "async", "receives": TOOL_CALL},
+            {"event": "tool-call/wordcount", "mode": "async", "receives": TOOL_CALL,
+             "description": "Count words and characters in text."},
         ],
         "emit": [{"event": "tool-result", "keys": {
             "call_id": {"shape": "string"}, "name": {"shape": "string"}, "output": {"shape": "string"}}}],
     },
-    {"session-started": offer, "config-applied": offer, "tool-call/*": tool_call},
+    {"tool-call/*": tool_call},
 ).run()

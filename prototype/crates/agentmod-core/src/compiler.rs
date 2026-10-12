@@ -13,10 +13,10 @@ use serde_json::{Value, json};
 use crate::core_manifest::{BOUNDARY, core_manifest};
 use crate::manifest::{
     ACTION_CONTRIBUTE, ACTION_VETO, ACTIONS, Capability, DefPlugin, Definition, DeploymentConfig,
-    EmitDecl, Manifest, PluginConfig, SourceRef, Subscription, WILDCARD, is_family,
-    pattern_contains, pattern_error, pattern_matches,
+    EmitDecl, Manifest, PluginConfig, SourceRef, Subscription, is_family, pattern_contains,
+    pattern_error, pattern_matches,
 };
-use crate::shape::{KeyDecl, Keys, MismatchKind, compatible, keys_mismatches};
+use crate::shape::{KeyDecl, Keys, MismatchKind, Shape, compatible, keys_mismatches};
 use crate::types::{Lane, Mode, Stamp, hash_json};
 
 // ----------------------------------------------------------------------
@@ -108,10 +108,10 @@ pub enum Via {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
     pub from: String,
-    /// The event class: a concrete event, a family member, a sub-family, or
-    /// the family itself (members no narrower subscription names).
+    /// The concrete event (a family emit is resolved into its members).
     pub event: String,
-    /// The emitter's declaration this class belongs to.
+    /// The emitter's declaration it came from: the event itself, or the family
+    /// (`tool-call/*`) it was resolved from.
     pub emit: String,
     pub to: String,
     /// The subscriber's event pattern.
@@ -125,9 +125,6 @@ pub struct Edge {
     /// Slots delivered with the event.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slots: Vec<String>,
-    /// The one handler of this member of an `exactly_one_handler` family.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub handler: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
     pub via: Via,
@@ -151,22 +148,21 @@ pub struct Node {
     pub sink: bool,
 }
 
-/// The per-event view of the graph: one class's ordered destinations.
+/// The per-event view of the graph: one emitter's concrete event and its
+/// ordered destinations.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Route {
     pub from: String,
+    /// The declaration the event came from (the event, or its family).
     pub emit: String,
-    pub class: String,
+    /// The concrete event.
+    pub event: String,
     /// Edge indices of the blocking chain, in run order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocking: Vec<usize>,
     /// Edge indices started together once the chain settles.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub asyncs: Vec<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub handler: Option<usize>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub exactly_one_handler: bool,
 }
 
 /// The compiled graph: nodes, edges, and the routes the runtime reads.
@@ -178,28 +174,19 @@ pub struct Graph {
 }
 
 impl Graph {
-    /// The route of a concrete event published by `from`, under its emit
-    /// declaration `emit`: the most specific class matching the name.
+    /// The route of a concrete event published by `from`. The graph holds only
+    /// concrete events, so this is an exact lookup, never a pattern scan.
     #[must_use]
-    pub fn route(&self, from: &str, emit: &str, name: &str) -> Option<&Route> {
+    pub fn route(&self, from: &str, name: &str) -> Option<&Route> {
         self.routes
             .iter()
-            .filter(|r| r.from == from && r.emit == emit && class_matches(&r.class, name))
-            .max_by_key(|r| class_specificity(&r.class))
+            .find(|r| r.from == from && r.event == name)
     }
 
     #[must_use]
     pub fn edge(&self, i: usize) -> &Edge {
         &self.edges[i]
     }
-}
-
-fn class_matches(class: &str, name: &str) -> bool {
-    class == name || (is_family(class) && pattern_matches(class, name))
-}
-
-fn class_specificity(class: &str) -> (bool, usize) {
-    (!is_family(class), class.len())
 }
 
 /// A member plugin of a compiled definition (everything the runtime needs).
@@ -217,27 +204,54 @@ fn yes() -> bool {
     true
 }
 
-/// A compiled event family with one handler per member.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct FamilyHandlers {
-    /// Exact member → handling plugin.
-    pub members: BTreeMap<String, String>,
-    /// Sub-family pattern → handling plugin.
+/// A subscriber of a concrete family member, as its emitter sees it in the
+/// resolved emit set: who subscribes and what the member must carry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberSubscriber {
+    pub plugin: String,
+    pub mode: Mode,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub hints: Value,
+    /// The subscriber's `receives`: for a tool, its argument schema.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub subfamilies: BTreeMap<String, String>,
+    pub receives: Keys,
 }
 
-impl FamilyHandlers {
-    /// The handler of a concrete member name, if one is compiled.
+/// One concrete event a plugin may emit under a revision. A plugin's resolved
+/// emit set is every one of these: its single-event emits, plus each family
+/// emit replaced by the members the definition's subscribers name (§3.4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedEmit {
+    pub event: String,
+    /// The family emit this member was resolved from (`tool-call/*`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    pub lane: Lane,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
+    /// The keys the event carries. For a family member, every open `object`
+    /// key of the family (`args`) is narrowed to the keys its member
+    /// subscribers declare.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: Keys,
+    /// Family members only: the subscribers of this member (not the family's
+    /// observers and gates, which never add members).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscribers: Vec<MemberSubscriber>,
+}
+
+impl ResolvedEmit {
+    /// The concrete emit declaration (what the runtime checks a publish against).
     #[must_use]
-    pub fn handler(&self, name: &str) -> Option<&str> {
-        self.members.get(name).map(String::as_str).or_else(|| {
-            self.subfamilies
-                .iter()
-                .filter(|(p, _)| pattern_matches(p, name))
-                .max_by_key(|(p, _)| p.len())
-                .map(|(_, h)| h.as_str())
-        })
+    pub fn decl(&self) -> EmitDecl {
+        EmitDecl {
+            event: self.event.clone(),
+            lane: self.lane,
+            deferred: self.deferred,
+            keys: self.keys.clone(),
+        }
     }
 }
 
@@ -256,8 +270,8 @@ pub struct Report {
     pub external_surface: BTreeMap<String, Vec<String>>,
     /// Blocking orders the compiler fixed by plugin name (no observable tie).
     pub fixed_orders: Vec<String>,
-    /// `exactly_one_handler` families and their compiled handlers.
-    pub families: BTreeMap<String, FamilyHandlers>,
+    /// Resolved families: family emit → emitter → the concrete members.
+    pub families: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 
 /// One compiled session definition: the unit a session runs under.
@@ -274,6 +288,8 @@ pub struct Revision {
     pub definition: Definition,
     pub plugins: BTreeMap<String, Member>,
     pub graph: Graph,
+    /// Each member plugin's resolved emit set: the concrete events it may emit.
+    pub emit_sets: BTreeMap<String, Vec<ResolvedEmit>>,
     pub diagnostics: Vec<Diagnostic>,
     pub report: Report,
 }
@@ -303,31 +319,55 @@ impl Revision {
         core_manifest(&self.runtime).unwrap_or_default()
     }
 
-    /// The emit declaration of `emitter` covering `name` (the boundary's core
-    /// events and inbound declarations included).
+    /// A plugin's resolved emit set under this revision (empty for a plugin
+    /// that is not a member).
     #[must_use]
-    pub fn emit_decl(&self, emitter: &str, name: &str) -> Option<EmitDecl> {
+    pub fn emit_set(&self, plugin: &str) -> &[ResolvedEmit] {
+        self.emit_sets.get(plugin).map_or(&[], Vec::as_slice)
+    }
+
+    /// The concrete emit of `emitter` named `name`, if it may emit it: an
+    /// entry of its resolved emit set, or for the boundary node a core or
+    /// inbound event. A family member outside the resolved set is not
+    /// declared (publishing it is an undeclared emit, §3.4 step 5).
+    #[must_use]
+    pub fn resolved_emit(&self, emitter: &str, name: &str) -> Option<ResolvedEmit> {
         if emitter == BOUNDARY {
-            if let Some(e) = self.core().emit_for(name) {
-                return Some(e.clone());
-            }
-            return self.definition.inbound.get(name).map(|keys| EmitDecl {
+            let decl = match self.core().emit_for(name) {
+                Some(e) => e.clone(),
+                None => EmitDecl {
+                    event: name.to_owned(),
+                    lane: Lane::Normal,
+                    deferred: false,
+                    keys: self.definition.inbound.get(name)?.clone(),
+                },
+            };
+            return Some(ResolvedEmit {
                 event: name.to_owned(),
-                lane: Lane::Normal,
-                deferred: false,
-                exactly_one_handler: false,
-                keys: keys.clone(),
+                family: None,
+                lane: decl.lane,
+                deferred: decl.deferred,
+                keys: decl.keys,
+                subscribers: Vec::new(),
             });
         }
-        self.manifest(emitter)?.emit_for(name).cloned()
+        self.emit_set(emitter)
+            .iter()
+            .find(|e| e.event == name)
+            .cloned()
+    }
+
+    /// The emit declaration `emitter` publishes `name` under (concrete).
+    #[must_use]
+    pub fn emit_decl(&self, emitter: &str, name: &str) -> Option<EmitDecl> {
+        self.resolved_emit(emitter, name).map(|e| e.decl())
     }
 
     /// The route an event takes: by emitter and concrete name.
     #[must_use]
     pub fn route(&self, emitter: &str, name: &str) -> Option<(EmitDecl, Option<&Route>)> {
         let decl = self.emit_decl(emitter, name)?;
-        let r = self.graph.route(emitter, &decl.event, name);
-        Some((decl, r))
+        Some((decl, self.graph.route(emitter, name)))
     }
 
     /// The subscription an edge was compiled from.
@@ -561,9 +601,6 @@ fn check_manifest(dx: &mut Diags<'_>, name: &str, m: &Manifest, path: Option<Str
                 format!("`{name}` declares emit `{}` twice", e.event),
             );
         }
-        if e.exactly_one_handler && !is_family(&e.event) {
-            dx.err("invalid-family", p(), Some(&e.event), &[name], format!("`{name}`: `exactly_one_handler` applies to families (`{}/*`), not to the single event `{}`", e.event, e.event));
-        }
         if e.deferred && !m.has(Capability::DeferredPublish) {
             dx.err(
                 "missing-capability",
@@ -786,20 +823,6 @@ fn flatten(dx: &mut Diags<'_>, name: &str, def: &Definition) -> Definition {
                 }
             }
         }
-        for (k, v) in &part.handlers {
-            match out.handlers.get(k) {
-                Some(prev) if prev != v => dx.err(
-                    "conflicting-handler",
-                    Some(format!("{from}.handlers")),
-                    Some(k),
-                    &[prev, v],
-                    format!("handler pick for `{k}` differs between `{from}` and an earlier part"),
-                ),
-                _ => {
-                    out.handlers.insert(k.clone(), v.clone());
-                }
-            }
-        }
         for (k, v) in &part.inbound {
             match out.inbound.get(k) {
                 Some(prev) if prev != v => dx.err(
@@ -969,7 +992,7 @@ pub fn compile_definition(
     );
     let mut c = DefCompiler::new(&mut dx, &flat, config, manifests);
     c.run();
-    let (graph, report, plugins) = (c.graph, c.report, c.plugins);
+    let (graph, report, plugins, emit_sets) = (c.graph, c.report, c.plugins, c.emit_sets);
     let mut diags = std::mem::take(&mut dx.out);
     if flat.deny_warnings {
         for d in &mut diags {
@@ -997,6 +1020,7 @@ pub fn compile_definition(
         "definition": def_hashed,
         "plugins": plugins,
         "graph": graph,
+        "emit_sets": emit_sets,
         "diagnostics": unsourced,
     }))[..16]
         .to_owned();
@@ -1009,6 +1033,7 @@ pub fn compile_definition(
         definition: flat,
         plugins,
         graph,
+        emit_sets,
         diagnostics: diags,
         report,
     }
@@ -1037,12 +1062,23 @@ impl EmbedCx<'_, '_> {
 // The per-definition compiler.
 // ----------------------------------------------------------------------
 
-/// One emitter declaration feeding the session.
+/// One concrete emit feeding the session (a family emit appears once per
+/// resolved member).
 #[derive(Clone)]
 struct Emitter {
     from: String,
+    /// The concrete declaration (a member's keys already narrowed).
     decl: EmitDecl,
+    /// The family emit the member was resolved from.
+    family: Option<String>,
     via: Via,
+}
+
+impl Emitter {
+    /// The declaration this emit came from: the family, or the event itself.
+    fn declared(&self) -> &str {
+        self.family.as_deref().unwrap_or(&self.decl.event)
+    }
 }
 
 struct SubRef<'m> {
@@ -1060,6 +1096,7 @@ struct DefCompiler<'x, 'a, 'm> {
     graph: Graph,
     report: Report,
     plugins: BTreeMap<String, Member>,
+    emit_sets: BTreeMap<String, Vec<ResolvedEmit>>,
     /// (plugin, subscription event, mode) → fed?
     fed: BTreeMap<(String, String, Mode), bool>,
 }
@@ -1081,6 +1118,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
             graph: Graph::default(),
             report: Report::default(),
             plugins: BTreeMap::new(),
+            emit_sets: BTreeMap::new(),
             fed: BTreeMap::new(),
         }
     }
@@ -1099,7 +1137,6 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
         self.check_phases();
         self.check_slots();
         self.build(&emitters);
-        self.check_handler_picks();
         self.analyse(&emitters);
         self.report_sections(&emitters);
     }
@@ -1214,6 +1251,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                 out.push(Emitter {
                     from: BOUNDARY.into(),
                     decl: e.clone(),
+                    family: None,
                     via: Via::Core,
                 });
             }
@@ -1248,28 +1286,41 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                     event: ev.clone(),
                     lane: Lane::Normal,
                     deferred: false,
-                    exactly_one_handler: false,
                     keys: keys.clone(),
                 },
+                family: None,
                 via: Via::Inbound,
             });
         }
-        for (name, m) in &self.members {
+        let subs = self.subs();
+        let members: Vec<(String, &'m Manifest)> =
+            self.members.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for (name, m) in members {
             for e in m
                 .emit
                 .iter()
                 .filter(|e| pattern_error(&e.event, true).is_none())
             {
-                out.push(Emitter {
-                    from: name.clone(),
-                    decl: e.clone(),
-                    via: Via::Emit,
-                });
+                if is_family(&e.event) {
+                    out.extend(self.resolve_family(&name, e, &subs, Via::Emit));
+                } else {
+                    out.push(Emitter {
+                        from: name.clone(),
+                        decl: e.clone(),
+                        family: None,
+                        via: Via::Emit,
+                    });
+                }
             }
         }
-        for (name, member) in self.plugins.iter().filter(|(_, m)| !m.member) {
-            for e in member
-                .manifest
+        let starters: Vec<(String, Manifest)> = self
+            .plugins
+            .iter()
+            .filter(|(_, m)| !m.member)
+            .map(|(n, m)| (n.clone(), m.manifest.clone()))
+            .collect();
+        for (name, manifest) in starters {
+            for e in manifest
                 .emit
                 .iter()
                 .filter(|e| pattern_error(&e.event, true).is_none() && !is_family(&e.event))
@@ -1277,8 +1328,184 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                 out.push(Emitter {
                     from: name.clone(),
                     decl: e.clone(),
+                    family: None,
                     via: Via::StartSession,
                 });
+            }
+        }
+        // Every plugin's resolved emit set, in event order.
+        for e in out.iter().filter(|e| e.from != BOUNDARY) {
+            let subscribers = match &e.family {
+                Some(_) => subs
+                    .iter()
+                    .filter(|sr| sr.sub.event == e.decl.event && sr.plugin != e.from)
+                    .map(|sr| MemberSubscriber {
+                        plugin: sr.plugin.clone(),
+                        mode: sr.sub.mode,
+                        description: sr.sub.description.clone(),
+                        hints: sr.sub.hints.clone(),
+                        receives: sr.sub.receives.keys.clone(),
+                    })
+                    .collect(),
+                None => Vec::new(),
+            };
+            self.emit_sets
+                .entry(e.from.clone())
+                .or_default()
+                .push(ResolvedEmit {
+                    event: e.decl.event.clone(),
+                    family: e.family.clone(),
+                    lane: e.decl.lane,
+                    deferred: e.decl.deferred,
+                    keys: e.decl.keys.clone(),
+                    subscribers,
+                });
+        }
+        for set in self.emit_sets.values_mut() {
+            set.sort_by(|a, b| a.event.cmp(&b.event));
+        }
+        out
+    }
+
+    /// Resolve a family emit into the concrete members the definition's
+    /// subscribers name (compiler.md §3.3, §3.4). Only subscriptions to a
+    /// concrete member define members; family and sub-family subscriptions only
+    /// observe or gate. Each member's open `object` keys (a tool call's `args`)
+    /// are narrowed to what its member subscribers declare, so the member's
+    /// argument schema is its subscribers' `receives`.
+    fn resolve_family(
+        &mut self,
+        emitter: &str,
+        family: &EmitDecl,
+        subs: &[SubRef<'m>],
+        via: Via,
+    ) -> Vec<Emitter> {
+        let mut members: BTreeMap<&str, Vec<&SubRef<'m>>> = BTreeMap::new();
+        for sr in subs {
+            let ev = sr.sub.event.as_str();
+            if !sr.sub.wildcard()
+                && !is_family(ev)
+                && sr.plugin != emitter
+                && pattern_matches(&family.event, ev)
+            {
+                members.entry(ev).or_default().push(sr);
+            }
+        }
+        let path = self.at(&format!("plugins.{emitter}"));
+        let names: Vec<String> = members.keys().map(|m| (*m).to_owned()).collect();
+        self.dx.info(
+            "resolved-family",
+            path,
+            Some(&family.event),
+            &[emitter],
+            if names.is_empty() {
+                format!(
+                    "`{emitter}` emits `{}`, which resolves to nothing: no plugin of this definition subscribes to a member",
+                    family.event
+                )
+            } else {
+                format!(
+                    "`{emitter}` emits `{}`, resolved to {} member{}: {}",
+                    family.event,
+                    names.len(),
+                    if names.len() == 1 { "" } else { "s" },
+                    names.join(", ")
+                )
+            },
+        );
+        self.report
+            .families
+            .entry(family.event.clone())
+            .or_default()
+            .insert(emitter.to_owned(), names);
+        let mut out = Vec::new();
+        for (member, subscribers) in members {
+            let keys = self.narrow(emitter, &family.event, member, &family.keys, &subscribers);
+            out.push(Emitter {
+                from: emitter.to_owned(),
+                decl: EmitDecl {
+                    event: member.to_owned(),
+                    lane: family.lane,
+                    deferred: family.deferred,
+                    keys,
+                },
+                family: Some(family.event.clone()),
+                via,
+            });
+        }
+        out
+    }
+
+    /// A member's keys: the family's, with every open `object` key replaced by
+    /// the union of the nested keys its member subscribers declare for it (a
+    /// nested key is required if any subscriber requires it).
+    fn narrow(
+        &mut self,
+        emitter: &str,
+        family: &str,
+        member: &str,
+        keys: &Keys,
+        subscribers: &[&SubRef<'m>],
+    ) -> Keys {
+        let mut out = keys.clone();
+        for (k, decl) in keys {
+            if decl.shape != Shape::Object(None) {
+                continue;
+            }
+            let mut merged: Option<(Keys, String)> = None;
+            for sr in subscribers {
+                let Some(Shape::Object(Some(nested))) =
+                    sr.sub.receives.keys.get(k).map(|d| &d.shape)
+                else {
+                    continue;
+                };
+                let Some((acc, first)) = merged.as_mut() else {
+                    merged = Some((nested.clone(), sr.plugin.clone()));
+                    continue;
+                };
+                for (nk, nd) in nested {
+                    match acc.get_mut(nk) {
+                        None => {
+                            acc.insert(nk.clone(), nd.clone());
+                        }
+                        Some(have) if same_shape(&have.shape, &nd.shape) => {
+                            have.optional &= nd.optional;
+                            if have.description.is_none() {
+                                have.description.clone_from(&nd.description);
+                            }
+                        }
+                        Some(have) => {
+                            let path = self.at(&format!("plugins.{}", sr.plugin));
+                            let msg = format!(
+                                "`{first}` and `{}` both subscribe to `{member}` but declare `{k}.{nk}` as `{}` and `{}`: the member's `{k}` (resolved from `{emitter}`'s `{family}`) has no single shape; make them agree",
+                                sr.plugin, have.shape, nd.shape
+                            );
+                            let plugins =
+                                vec![first.clone(), sr.plugin.clone(), emitter.to_owned()];
+                            self.dx.push(
+                                D {
+                                    sev: Severity::Error,
+                                    code: "conflicting-member-shape",
+                                    path,
+                                    event: Some(member),
+                                    key: Some(format!("{k}.{nk}")),
+                                    plugins,
+                                },
+                                msg,
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some((nested, _)) = merged {
+                out.insert(
+                    k.clone(),
+                    KeyDecl {
+                        shape: Shape::Object(Some(nested)),
+                        optional: decl.optional,
+                        description: decl.description.clone(),
+                    },
+                );
             }
         }
         out
@@ -1385,29 +1612,6 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
         }
     }
 
-    /// The classes an emitter declaration splits into.
-    fn classes(&self, e: &Emitter, subs: &[SubRef<'m>]) -> Vec<String> {
-        if !is_family(&e.decl.event) {
-            return vec![e.decl.event.clone()];
-        }
-        let fam = &e.decl.event;
-        let mut out: BTreeSet<String> = BTreeSet::from([fam.clone()]);
-        for sr in subs {
-            let p = &sr.sub.event;
-            if p != fam && p != WILDCARD && pattern_contains(fam, p) {
-                out.insert(p.clone());
-            }
-        }
-        if e.decl.exactly_one_handler {
-            for k in self.def.handlers.keys() {
-                if k != fam && pattern_contains(fam, k) {
-                    out.insert(k.clone());
-                }
-            }
-        }
-        out.into_iter().collect()
-    }
-
     /// The tie-break list that orders `class` in `phase`.
     fn order_list(&self, class: &str, emit: &str, phase: &str) -> Option<&'m Vec<String>> {
         self.order_entry(class, emit, phase).map(|(_, l)| l)
@@ -1470,202 +1674,79 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
         }
         let mut fixed: BTreeSet<String> = BTreeSet::new();
         for e in emitters {
-            for class in self.classes(e, &subs) {
-                // Destinations of this class, by the expansion rules.
-                let mut dests: Vec<&SubRef<'m>> = Vec::new();
-                for sr in &subs {
-                    let p = &sr.sub.event;
-                    if sr.sub.wildcard() {
-                        // A wildcard subscriber never receives its own plugin's emits,
-                        // nor events emitted by any wildcard subscriber.
-                        if sr.plugin == e.from || wild.contains(&e.from) {
-                            continue;
-                        }
-                    } else if !pattern_contains(p, &class) || sr.plugin == e.from {
+            let event = e.decl.event.clone();
+            // Destinations of this concrete event, by the expansion rules.
+            let mut dests: Vec<&SubRef<'m>> = Vec::new();
+            for sr in &subs {
+                if sr.sub.wildcard() {
+                    // A wildcard subscriber never receives its own plugin's emits,
+                    // nor events emitted by any wildcard subscriber.
+                    if sr.plugin == e.from || wild.contains(&e.from) {
                         continue;
                     }
-                    dests.push(sr);
+                } else if !pattern_matches(&sr.sub.event, &event) || sr.plugin == e.from {
+                    continue;
                 }
-                // Family handlers: narrower-than-family async subscriptions.
-                let mut handler_idx: Option<usize> = None;
-                if e.decl.exactly_one_handler {
-                    let cands: Vec<usize> = dests
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, d)| is_handler_sub(&e.decl.event, d.sub))
-                        .map(|(i, _)| i)
-                        .collect();
-                    let pick = self.pick_for(&class, &e.decl.event);
-                    let chosen = if cands.len() > 1 {
-                        match pick {
-                            Some((key, plugin)) => match cands
-                                .iter()
-                                .find(|i| dests[**i].plugin == plugin)
-                            {
-                                Some(i) => Some(*i),
-                                None => {
-                                    let names: Vec<&str> =
-                                        cands.iter().map(|i| dests[*i].plugin.as_str()).collect();
-                                    let path = self.at(&format!("handlers.{key}"));
-                                    let mut ps = names.clone();
-                                    ps.push(plugin);
-                                    self.dx.err("stale-handler-pick", path, Some(&class), &ps, format!("the handler pick for `{key}` names `{plugin}`, but the possible handlers of `{class}` are {}", names.join(", ")));
-                                    None
-                                }
-                            },
-                            None => {
-                                let names: Vec<&str> =
-                                    cands.iter().map(|i| dests[*i].plugin.as_str()).collect();
-                                let path = self.at("handlers");
-                                self.dx.err("missing-handler-pick", path, Some(&class), &names, format!("`{class}` (family `{}`, exactly one handler) has {} possible handlers ({}); pick one: `handlers.\"{class}\" = \"{}\"`", e.decl.event, names.len(), names.join(", "), names[0]));
-                                None
-                            }
-                        }
-                    } else {
-                        cands.first().copied()
-                    };
-                    // Possible handlers that were not chosen get no edge for this class.
-                    let losers: BTreeSet<usize> = cands
-                        .iter()
-                        .copied()
-                        .filter(|i| Some(*i) != chosen)
-                        .collect();
-                    let chosen_plugin = chosen.map(|i| dests[i].plugin.clone());
-                    dests = dests
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(i, _)| !losers.contains(i))
-                        .map(|(_, d)| d)
-                        .collect();
-                    handler_idx = chosen_plugin.and_then(|p| {
-                        dests
-                            .iter()
-                            .position(|d| d.plugin == p && is_handler_sub(&e.decl.event, d.sub))
-                    });
-                    if let Some(i) = handler_idx {
-                        self.report
-                            .families
-                            .entry(e.decl.event.clone())
-                            .or_default()
-                            .insert(&class, &dests[i].plugin);
-                    }
-                }
-                // Order the blocking chain.
-                let mut blocking: Vec<(usize, usize, String, usize)> = Vec::new(); // (phase_idx, listed rank, plugin, dest idx)
-                for (i, d) in dests
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, d)| d.sub.mode == Mode::Blocking)
-                {
-                    let Some(ph) = self.phase_of(&d.plugin, d.sub) else {
-                        continue;
-                    };
-                    let Some(pi) = self.def.phases.iter().position(|p| p == ph) else {
-                        continue;
-                    };
-                    let listed = self
-                        .order_list(&class, &e.decl.event, ph)
-                        .and_then(|l| l.iter().position(|x| *x == d.plugin))
-                        .unwrap_or(usize::MAX);
-                    blocking.push((pi, listed, d.plugin.clone(), i));
-                }
-                blocking.sort();
-                self.check_ties(e, &class, &dests, &blocking, &mut fixed);
-                self.check_tie_lists(&class, &e.decl.event, &dests);
-                // Walk supply through the chain and lay down the edges.
-                let mut supply = e.decl.keys.clone();
-                let mut route = Route {
-                    from: e.from.clone(),
-                    emit: e.decl.event.clone(),
-                    class: class.clone(),
-                    blocking: Vec::new(),
-                    asyncs: Vec::new(),
-                    handler: None,
-                    exactly_one_handler: e.decl.exactly_one_handler,
+                dests.push(sr);
+            }
+            // Order the blocking chain.
+            let mut blocking: Vec<(usize, usize, String, usize)> = Vec::new(); // (phase_idx, listed rank, plugin, dest idx)
+            for (i, d) in dests
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.sub.mode == Mode::Blocking)
+            {
+                let Some(ph) = self.phase_of(&d.plugin, d.sub) else {
+                    continue;
                 };
-                let mut rank_in_phase: BTreeMap<usize, usize> = BTreeMap::new();
-                for (chain, (pi, _, _, di)) in blocking.iter().enumerate() {
-                    let d = dests[*di];
-                    let r = rank_in_phase.entry(*pi).or_default();
-                    let position = Position {
-                        phase: self.def.phases[*pi].clone(),
-                        phase_index: *pi,
-                        rank: *r,
-                        chain,
-                    };
-                    *r += 1;
-                    self.check_receives(e, &class, d, &supply);
-                    let idx = self.push_edge(e, &class, d, Some(position), &supply, false);
-                    route.blocking.push(idx);
-                    supply = self.walk_returns(e, &class, d, supply);
-                }
-                for (i, d) in dests
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, d)| d.sub.mode == Mode::Async)
-                {
-                    self.check_receives(e, &class, d, &supply);
-                    let is_handler = handler_idx == Some(i);
-                    let idx = self.push_edge(e, &class, d, None, &supply, is_handler);
-                    if is_handler {
-                        route.handler = Some(idx);
-                    } else {
-                        route.asyncs.push(idx);
-                    }
-                }
-                if !route.blocking.is_empty()
-                    || !route.asyncs.is_empty()
-                    || route.handler.is_some()
-                    || route.exactly_one_handler
-                {
-                    self.graph.routes.push(route);
-                }
+                let Some(pi) = self.def.phases.iter().position(|p| p == ph) else {
+                    continue;
+                };
+                let listed = self
+                    .order_list(&event, e.declared(), ph)
+                    .and_then(|l| l.iter().position(|x| *x == d.plugin))
+                    .unwrap_or(usize::MAX);
+                blocking.push((pi, listed, d.plugin.clone(), i));
+            }
+            blocking.sort();
+            self.check_ties(e, &event, &dests, &blocking, &mut fixed);
+            self.check_tie_lists(&event, e.declared(), &dests);
+            // Walk supply through the chain and lay down the edges.
+            let mut supply = e.decl.keys.clone();
+            let mut route = Route {
+                from: e.from.clone(),
+                emit: e.declared().to_owned(),
+                event: event.clone(),
+                blocking: Vec::new(),
+                asyncs: Vec::new(),
+            };
+            let mut rank_in_phase: BTreeMap<usize, usize> = BTreeMap::new();
+            for (chain, (pi, _, _, di)) in blocking.iter().enumerate() {
+                let d = dests[*di];
+                let r = rank_in_phase.entry(*pi).or_default();
+                let position = Position {
+                    phase: self.def.phases[*pi].clone(),
+                    phase_index: *pi,
+                    rank: *r,
+                    chain,
+                };
+                *r += 1;
+                self.check_receives(e, &event, d, &supply);
+                let idx = self.push_edge(e, &event, d, Some(position), &supply);
+                route.blocking.push(idx);
+                supply = self.walk_returns(e, &event, d, supply);
+            }
+            for d in dests.iter().filter(|d| d.sub.mode == Mode::Async) {
+                self.check_receives(e, &event, d, &supply);
+                let idx = self.push_edge(e, &event, d, None, &supply);
+                route.asyncs.push(idx);
+            }
+            if !route.blocking.is_empty() || !route.asyncs.is_empty() {
+                self.graph.routes.push(route);
             }
         }
         for f in fixed {
             self.report.fixed_orders.push(f);
-        }
-    }
-
-    fn pick_for(&self, class: &str, family: &str) -> Option<(&'m str, &'m str)> {
-        self.def
-            .handlers
-            .iter()
-            .filter(|(k, _)| {
-                pattern_contains(family, k)
-                    && (k.as_str() == class || (is_family(k) && pattern_contains(k, class)))
-            })
-            .max_by_key(|(k, _)| (!is_family(k), k.len()))
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-    }
-
-    fn check_handler_picks(&mut self) {
-        let handlers = self.def.handlers.clone();
-        for (k, plugin) in &handlers {
-            if self.host_disabled(plugin) {
-                continue;
-            }
-            let path = self.at(&format!("handlers.{k}"));
-            let resolved =
-                self.report.families.values().any(|f| {
-                    f.members.get(k) == Some(plugin) || f.subfamilies.get(k) == Some(plugin)
-                });
-            let mentioned = self
-                .graph
-                .routes
-                .iter()
-                .any(|r| r.exactly_one_handler && pattern_contains(&r.emit, k));
-            if !mentioned {
-                self.dx.err("stale-handler-pick", path, Some(k), &[plugin], format!("handler pick `{k}` → `{plugin}`, but no member of this definition emits an exactly-one-handler family containing `{k}`"));
-            } else if !resolved
-                && !self
-                    .dx
-                    .out
-                    .iter()
-                    .any(|d| d.code == "stale-handler-pick" && d.event.as_deref() == Some(k))
-            {
-                self.dx.err("stale-handler-pick", path, Some(k), &[plugin], format!("handler pick `{k}` → `{plugin}`, but `{plugin}` is not a possible handler of `{k}` in this definition (disabled, or not subscribed to it)"));
-            }
         }
     }
 
@@ -1705,7 +1786,11 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                 match reason {
                     Some(why) if !both_listed => {
                         let path = self.at("order");
-                        self.dx.err("observable-tie", path, Some(class), &[&a.2, &b.2], format!("`{}` and `{}` are both in phase `{phase}` for `{class}` and {why}; order them: `order.\"{}\".{phase} = [\"{}\", \"{}\"]`", a.2, b.2, if is_family(&e.decl.event) { e.decl.event.trim_end_matches("/*") } else { class }, a.2, b.2));
+                        let key = match &e.family {
+                            Some(f) => f.trim_end_matches("/*"),
+                            None => class,
+                        };
+                        self.dx.err("observable-tie", path, Some(class), &[&a.2, &b.2], format!("`{}` and `{}` are both in phase `{phase}` for `{class}` and {why}; order them: `order.\"{key}\".{phase} = [\"{}\", \"{}\"]`", a.2, b.2, a.2, b.2));
                     }
                     None if !both_listed => {
                         fixed.insert(format!(
@@ -1805,7 +1890,6 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
         d: &SubRef<'m>,
         position: Option<Position>,
         supply: &Keys,
-        handler: bool,
     ) -> usize {
         if let Some(f) = self
             .fed
@@ -1816,7 +1900,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
         self.graph.edges.push(Edge {
             from: e.from.clone(),
             event: class.to_owned(),
-            emit: e.decl.event.clone(),
+            emit: e.declared().to_owned(),
             to: d.plugin.clone(),
             subscription: d.sub.event.clone(),
             mode: d.sub.mode,
@@ -1824,7 +1908,6 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
             lane: e.decl.lane,
             supply: supply.clone(),
             slots: d.sub.receives.slots.keys().cloned().collect(),
-            handler,
             deferred: e.decl.deferred,
             via: e.via,
         });
@@ -2072,24 +2155,21 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
     }
 }
 
-impl FamilyHandlers {
-    fn insert(&mut self, class: &str, plugin: &str) {
-        if is_family(class) {
-            self.subfamilies.insert(class.to_owned(), plugin.to_owned());
-        } else {
-            self.members.insert(class.to_owned(), plugin.to_owned());
+/// Are two shapes the same, ignoring documentation (descriptions)?
+fn same_shape(a: &Shape, b: &Shape) -> bool {
+    match (a, b) {
+        (Shape::Array(x), Shape::Array(y)) => same_shape(x, y),
+        (Shape::Object(Some(x)), Shape::Object(Some(y))) => {
+            x.len() == y.len()
+                && x.iter().zip(y).all(|((ka, da), (kb, db))| {
+                    ka == kb && da.optional == db.optional && same_shape(&da.shape, &db.shape)
+                })
         }
+        (Shape::Union(x), Shape::Union(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| same_shape(p, q))
+        }
+        _ => a == b,
     }
-}
-
-/// Is a subscription a member handler for an `exactly_one_handler` family?
-/// Handlers are async subscriptions narrower than the family (a member or a
-/// sub-family); subscribers of the whole family are observers.
-fn is_handler_sub(family: &str, s: &Subscription) -> bool {
-    s.mode == Mode::Async
-        && s.event != family
-        && !s.wildcard()
-        && pattern_contains(family, &s.event)
 }
 
 /// Does `a` return a key `b` receives or returns (or, with unlisted keys, any key)?

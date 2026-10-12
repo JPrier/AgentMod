@@ -186,9 +186,13 @@ config = { every_seconds = 0, agent_every = 0, agent_definition = "chat" }
 # subscriber gets a phase, per plugin or per event; wherever two subscribers
 # in one phase could affect each other (one returns a key the other reads,
 # both contribute context, or either can veto) the definition orders them.
-# Plugins that offer tool specs at session start all contribute context in
-# phase `offer`, hence the `session-started` / `config-applied` orders.
 # `inbound` lists the events a session accepts from other sessions.
+#
+# Tools are not listed anywhere: a tool exists because a plugin here subscribes
+# to its `tool-call/<name>` member, and the compiler resolves chat-context's
+# `tool-call/*` family into exactly those members (compiler.md §3.4). Plugins
+# that prepare a session (workspace, memory) contribute context at start in
+# phase `offer`; chat-context then writes the session's tools in `loop`.
 
 [definitions.chat]
 description = "Interactive chat agent with tools, memory, approval, and sub-agents"
@@ -204,16 +208,10 @@ chat-context = { phase = "loop" }
 openrouter-model = {}
 titler = {}
 memory = { phase = "offer" }
-tool-clock = { phase = "offer" }
-tool-calc = { phase = "offer" }
-py-wordcount = { phase = "offer" }
-subagent = { phase = "offer" }
-
-[definitions.chat.order.session-started]
-offer = ["memory", "tool-clock", "tool-calc", "py-wordcount", "subagent"]
-
-[definitions.chat.order.config-applied]
-offer = ["memory", "tool-clock", "tool-calc", "py-wordcount", "subagent"]
+tool-clock = {}
+tool-calc = {}
+py-wordcount = {}
+subagent = {}
 
 [definitions.chat.inbound.subagent-result]
 call_id = { shape = "string" }
@@ -232,19 +230,19 @@ policy = { phase = "guard" }
 budget = { phase = "guard" }
 chat-context = { phase = "loop" }
 openrouter-model = {}
-plan = { phase = "offer" }
-tool-discovery = { phase = "offer", phases = { user-message = "intake" } }
+plan = {}
+tool-discovery = { phase = "intake" }
 linux-sandbox = { phase = "offer" }
 local-workspace = { phase = "offer" }
-tool-clock = { phase = "offer" }
-tool-calc = { phase = "offer" }
+tool-clock = {}
+tool-calc = {}
 subagent-reporter = {}
 
 [definitions.worker.order.session-started]
-offer = ["plan", "tool-discovery", "linux-sandbox", "local-workspace", "tool-clock", "tool-calc"]
+offer = ["linux-sandbox", "local-workspace"]
 
 [definitions.worker.order.config-applied]
-offer = ["plan", "tool-discovery", "linux-sandbox", "local-workspace", "tool-clock", "tool-calc"]
+offer = ["linux-sandbox", "local-workspace"]
 
 # The budget can veto a model request; policy contributes the tool visibility.
 [definitions.worker.order.model-request]
@@ -263,27 +261,27 @@ phases = ["offer", "intake", "guard", "loop"]
 [definitions.coder.plugins]
 web-ui = {}
 redactor = { phase = "intake" }
-ask-user = { phase = "offer", phases = { user-message = "intake" } }
+ask-user = { phase = "intake" }
 policy = { phase = "guard" }
 loop-limit = { phase = "guard" }
 chat-context = { phase = "loop" }
 openrouter-model = {}
 titler = {}
-plan = { phase = "offer" }
-tool-discovery = { phase = "offer", phases = { user-message = "intake" } }
+plan = {}
+tool-discovery = { phase = "intake" }
 linux-sandbox = { phase = "offer" }
 local-workspace = { phase = "offer" }
-subagent = { phase = "offer" }
+subagent = {}
 memory = { phase = "offer" }
-web-fetch = { phase = "offer" }
-mcp-bridge = { phase = "offer" }
-browser-control = { phase = "offer" }
+web-fetch = {}
+mcp-bridge = {}
+browser-control = {}
 
 [definitions.coder.order.session-started]
-offer = ["ask-user", "plan", "tool-discovery", "linux-sandbox", "local-workspace", "subagent", "memory", "web-fetch", "mcp-bridge", "browser-control"]
+offer = ["linux-sandbox", "local-workspace", "memory"]
 
 [definitions.coder.order.config-applied]
-offer = ["ask-user", "plan", "tool-discovery", "linux-sandbox", "local-workspace", "subagent", "memory", "web-fetch", "mcp-bridge", "browser-control"]
+offer = ["linux-sandbox", "local-workspace"]
 
 [definitions.coder.order.user-message]
 intake = ["redactor", "ask-user", "tool-discovery"]

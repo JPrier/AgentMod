@@ -1,5 +1,5 @@
 // tool-calc: a safe arithmetic evaluator (no eval). Supports + - * / % ^ and parentheses.
-import { definePlugin, offerSubscriptions, offerTools, toolCalls, toolResult, toolSpec } from '../sdk/agentmod.js';
+import { definePlugin, toolCalls, toolResult, toolSpec } from '../sdk/agentmod.js';
 
 const TOOLS = [toolSpec('calc', 'Evaluate an arithmetic expression.', { expression: { type: 'string' } })];
 
@@ -42,12 +42,10 @@ definePlugin({
     name: 'tool-calc',
     version: '0.1.0',
     description: 'Tool: arithmetic.',
-    subscribe: [...offerSubscriptions(), ...toolCalls(['calc'])],
+    subscribe: toolCalls(TOOLS),
     emit: [toolResult()],
   },
   handlers: {
-    'session-started': (ctx) => offerTools(ctx, TOOLS),
-    'config-applied': (ctx) => offerTools(ctx, TOOLS),
     'tool-call/*': async (ctx) => {
       if (ctx.payload.name !== 'calc') return;
       const { call_id } = ctx.payload;

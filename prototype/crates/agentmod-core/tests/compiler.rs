@@ -172,7 +172,7 @@ fn row_observable_ties_name_the_pair_the_event_and_the_reason() {
         let (c, ..) = build(&ms, def);
         assert!(c.ok, "{:#?}", c.diagnostics);
         let r = &rev(&c).graph;
-        let route = r.routes.iter().find(|x| x.class == "go").unwrap();
+        let route = r.routes.iter().find(|x| x.event == "go").unwrap();
         let order: Vec<&str> = route
             .blocking
             .iter()
@@ -243,60 +243,57 @@ fn row_fragments_with_conflicting_phase_lists() {
 }
 
 fn family_ms() -> Value {
-    // Each handler also follows `go`, so losing a pick does not leave it idle.
-    let h = |ev: &str| json!({ "subscribe": [{ "event": ev, "mode": "async" }, { "event": "go", "mode": "async" }], "emit": [{ "event": "tool-result" }] });
+    let h = |ev: &str| json!({ "subscribe": [{ "event": ev, "mode": "async" }], "emit": [{ "event": "tool-result" }] });
     json!({
         "ui": ui(),
-        "loop": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "tool-result", "mode": "async" }], "emit": [{ "event": "tool-call/*", "exactly_one_handler": true, "keys": { "call_id": k(S) } }] },
+        "loop": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "tool-result", "mode": "async" }], "emit": [{ "event": "tool-call/*", "keys": { "call_id": k(S) } }] },
         "local": h("tool-call/read_file"),
         "vm": h("tool-call/read_file"),
-        "mcp": h("tool-call/mcp__*"),
-        "gh": h("tool-call/mcp__gh__*"),
+        "gh": h("tool-call/mcp__gh__issues"),
+        "watch": { "subscribe": [{ "event": "tool-call/mcp__gh__*", "mode": "async" }], "sink": true },
         "audit": { "subscribe": [{ "event": "tool-call/*", "mode": "async" }], "sink": true }
     })
 }
 
+/// §3.3/§3.4: a family emit resolves into the concrete members the
+/// definition's subscribers name; family and sub-family subscriptions only
+/// observe; two subscribers of one member are not an error.
 #[test]
-fn row_exactly_one_handler_members_need_a_pick() {
+fn row_families_resolve_and_a_member_may_have_several_subscribers() {
     let plugins =
-        json!({ "ui": {}, "loop": {}, "local": {}, "vm": {}, "mcp": {}, "gh": {}, "audit": {} });
-    let (c, ..) = build(&family_ms(), base_def(plugins.clone()));
-    let picks = find(&c, "missing-handler-pick");
-    assert_eq!(picks.len(), 2, "{picks:#?}");
-    assert!(
-        picks
-            .iter()
-            .any(|d| d.event.as_deref() == Some("tool-call/read_file")
-                && d.plugins == ["local", "vm"])
-    );
-    assert!(
-        picks
-            .iter()
-            .any(|d| d.event.as_deref() == Some("tool-call/mcp__gh__*")
-                && d.plugins == ["gh", "mcp"])
-    );
-    let mut def = base_def(plugins.clone());
-    def["handlers"] = json!({ "tool-call/read_file": "vm", "tool-call/mcp__gh__*": "gh" });
-    let (c, ..) = build(&family_ms(), def);
+        json!({ "ui": {}, "loop": {}, "local": {}, "vm": {}, "gh": {}, "watch": {}, "audit": {} });
+    let (c, ..) = build(&family_ms(), base_def(plugins));
     assert!(c.ok, "{:#?}", c.diagnostics);
-    let fam = &rev(&c).report.families["tool-call/*"];
-    assert_eq!(fam.handler("tool-call/read_file"), Some("vm"));
-    assert_eq!(fam.handler("tool-call/mcp__gh__issues"), Some("gh"));
-    assert_eq!(fam.handler("tool-call/mcp__fs__ls"), Some("mcp"));
-    // The losing candidate gets no edge for that member; the observer sees every member.
-    let g = &rev(&c).graph;
-    let to: Vec<&str> = g
-        .edges
-        .iter()
-        .filter(|e| e.event == "tool-call/read_file")
-        .map(|e| e.to.as_str())
-        .collect();
-    assert_eq!(to, vec!["audit", "vm"]);
-    // A pick naming a plugin that is not a possible handler is stale.
-    let mut def = base_def(plugins);
-    def["handlers"] = json!({ "tool-call/read_file": "audit", "tool-call/mcp__gh__*": "gh" });
-    let (c, ..) = build(&family_ms(), def);
-    one(&c, "stale-handler-pick");
+    let r = rev(&c);
+    assert_eq!(
+        r.report.families["tool-call/*"]["loop"],
+        vec!["tool-call/mcp__gh__issues", "tool-call/read_file"]
+    );
+    let info = one(&c, "resolved-family");
+    assert_eq!(info.severity, Severity::Info);
+    assert!(
+        info.message.contains("resolved to 2 members"),
+        "{}",
+        info.message
+    );
+    // The graph holds only concrete events.
+    assert!(r.graph.edges.iter().all(|e| !e.event.contains('*')));
+    assert!(r.graph.routes.iter().all(|x| !x.event.contains('*')));
+    let to = |ev: &str| -> Vec<&str> {
+        r.graph
+            .edges
+            .iter()
+            .filter(|e| e.event == ev)
+            .map(|e| e.to.as_str())
+            .collect()
+    };
+    // Both subscribers of read_file run; observers see every member.
+    assert_eq!(to("tool-call/read_file"), vec!["audit", "local", "vm"]);
+    assert_eq!(
+        to("tool-call/mcp__gh__issues"),
+        vec!["audit", "gh", "watch"]
+    );
+    assert!(find(&c, "missing-handler-pick").is_empty());
 }
 
 #[test]
@@ -667,7 +664,7 @@ fn revisions_are_deterministic_and_content_addressed() {
 
 fn chat_loop_ms() -> Value {
     json!({
-        "web-ui": { "subscribe": [{ "event": "session-started", "mode": "async" }, { "event": "tool-call/*", "mode": "async" }], "emit": [{ "event": "user-message", "deferred": true, "keys": { "text": k(S) } }], "capabilities": ["deferred-publish"], "sink": true },
+        "web-ui": { "subscribe": [{ "event": "session-started", "mode": "async" }], "emit": [{ "event": "user-message", "deferred": true, "keys": { "text": k(S) } }], "capabilities": ["deferred-publish", "observe"], "sink": true },
         "chat-context": {
             "subscribe": [
                 { "event": "user-message", "mode": "blocking", "actions": ["contribute-context"], "receives": { "text": k(S) } },
@@ -676,7 +673,7 @@ fn chat_loop_ms() -> Value {
             ],
             "emit": [
                 { "event": "model-request", "keys": { "model": k(S), "messages": k("array<object>") } },
-                { "event": "tool-call/*", "exactly_one_handler": true, "keys": { "call_id": k(S), "args": k("object") } }
+                { "event": "tool-call/*", "keys": { "call_id": k(S), "args": k("object") } }
             ]
         },
         "openrouter": { "subscribe": [{ "event": "model-request", "mode": "async", "receives": { "model": k(S), "messages": k("array<object>") } }], "emit": [{ "event": "model-response", "keys": { "text": k(S) } }] },
@@ -693,14 +690,13 @@ fn example_accepted_chat_loop() {
     let (c, ..) = build(&chat_loop_ms(), chat_loop_def());
     assert!(c.ok, "{:#?}", c.diagnostics);
     let r = rev(&c);
-    // Plugin-level: web-ui is in it too (it observes the family and emits the user's messages).
+    // web-ui watches the session through `observe`, so it is not in the loop.
     assert_eq!(
         r.report.cycles,
         vec![vec![
             "chat-context".to_owned(),
             "file-tools".to_owned(),
             "openrouter".to_owned(),
-            "web-ui".to_owned()
         ]]
     );
     assert!(
@@ -708,20 +704,24 @@ fn example_accepted_chat_loop() {
             .iter()
             .all(|d| d.severity == Severity::Info)
     );
-    // web-ui observes the whole family as an async sink; file-tools handles read_file.
+    // chat-context's `tool-call/*` resolves to read_file, which file-tools subscribes to.
+    assert_eq!(
+        r.report.families["tool-call/*"]["chat-context"],
+        vec!["tool-call/read_file"]
+    );
     let read = r
         .graph
         .routes
         .iter()
-        .find(|x| x.class == "tool-call/read_file")
+        .find(|x| x.event == "tool-call/read_file")
         .unwrap();
-    assert_eq!(r.graph.edge(read.handler.unwrap()).to, "file-tools");
+    assert_eq!(read.emit, "tool-call/*");
     assert_eq!(
         read.asyncs
             .iter()
             .map(|i| r.graph.edge(*i).to.as_str())
             .collect::<Vec<_>>(),
-        vec!["web-ui"]
+        vec!["file-tools"]
     );
 }
 

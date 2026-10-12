@@ -17,9 +17,10 @@ pub const SUPPORTED_RUNTIMES: &[&str] = &[RUNTIME_VERSION];
 
 pub const SESSION_STARTED: &str = "session-started";
 pub const CONFIG_APPLIED: &str = "config-applied";
-/// An `exactly_one_handler` family member had no handler, or its handler
-/// failed without answering.
-pub const DISPATCH_FAILED: &str = "dispatch-failed";
+/// A plugin invocation failed (it reported an error, contradicted a
+/// declaration, or gave up after retries): the failed event, the plugin, and
+/// the error, so plugins can react (compiler.md §3.4 step 7, §7).
+pub const INVOCATION_FAILED: &str = "invocation-failed";
 /// A `start-session` whose definition failed to compile; delivered to the
 /// calling invocation's session with the diagnostics.
 pub const SESSION_START_FAILED: &str = "session-start-failed";
@@ -50,7 +51,6 @@ pub fn core_manifest(version: &str) -> Option<Manifest> {
                 event: SESSION_STARTED.into(),
                 lane: Lane::Normal,
                 deferred: false,
-                exactly_one_handler: false,
                 keys: keys(vec![
                     ("definition", key("string")),
                     ("revision", key("string")),
@@ -62,34 +62,29 @@ pub fn core_manifest(version: &str) -> Option<Manifest> {
                 event: CONFIG_APPLIED.into(),
                 lane: Lane::Interrupt,
                 deferred: false,
-                exactly_one_handler: false,
                 keys: keys(vec![
                     ("revision", key("string")),
                     ("previous", key("string")),
                 ]),
             },
             EmitDecl {
-                event: DISPATCH_FAILED.into(),
+                event: INVOCATION_FAILED.into(),
                 lane: Lane::Normal,
                 deferred: false,
-                exactly_one_handler: false,
                 keys: keys(vec![
-                    ("reason", key("\"no-handler\" | \"handler-failed\"")),
                     ("event_id", key("string")),
                     ("event_name", key("string")),
-                    ("family", key("string")),
-                    ("member", key("string")),
                     ("payload", key("object")),
-                    ("plugin", opt("string")),
-                    ("error", opt("string")),
-                    ("handled", opt("array<string>")),
+                    ("plugin", key("string")),
+                    ("invocation_id", key("string")),
+                    ("mode", key("\"blocking\" | \"async\"")),
+                    ("error", key("string")),
                 ]),
             },
             EmitDecl {
                 event: SESSION_START_FAILED.into(),
                 lane: Lane::Normal,
                 deferred: false,
-                exactly_one_handler: false,
                 keys: keys(vec![
                     ("definition", key("string")),
                     ("error", key("string")),

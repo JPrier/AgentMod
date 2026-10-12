@@ -13,8 +13,8 @@
 // replayable and visible) and announced with a `workspace-info` event.
 //
 // Events:
-//   subscribe  session-started, config-applied   offer tools
-//              tool-call/<tool> (async)           handle our tools (one member each)
+//   subscribe  session-started, config-applied   describe the execution target
+//              tool-call/<tool> (async)           our tools (one member each)
 //              ui-action (async)                  "restore" on a checkpoint event
 //   emit       tool-result                        what the model sees
 //             workspace-info                     root, environment, git state
@@ -23,7 +23,7 @@
 //             process-started / process-exited
 //             diagnostics                        typed compiler/test findings
 //             workspace-status                   target lifecycle (booting, ready, failed)
-import { definePlugin, key, offerTools, optional, TOOL_CALL_KEYS, toolCalls, toolResult, withContext } from './agentmod.js';
+import { definePlugin, key, optional, TOOL_CALL_KEYS, toolCalls, toolResult, withContext } from './agentmod.js';
 import { codingToolkit, toolSpecs } from './coding/toolkit.js';
 import { normalizePath, shq } from './coding/paths.js';
 
@@ -147,10 +147,8 @@ export function defineWorkspacePlugin(spec) {
     return sessions.get(sid);
   }
 
+  /** At start and after an apply: describe the execution target (the tools themselves are the member subscriptions). */
   function offer(ctx) {
-    const tk = kit(ctx, defaultRoot(ctx));
-    offerTools(ctx, tk.specs);
-    offerTools(ctx, [ADOPT_SPEC, LOAD_SKILL_SPEC]);
     const note = spec.describe(ctx.config ?? {});
     if (note && !ctx.slot('system').includes(note)) ctx.add('system', note);
   }
@@ -243,7 +241,8 @@ export function defineWorkspacePlugin(spec) {
     return { output: lines.join('\n'), error: res.adopted.length === 0 && res.conflicts.length > 0, summary: `${res.adopted.length} adopted`, data: { adopted: res.adopted, conflicts: res.conflicts, checkpoint: res.checkpoint, from: other, from_tree: snap.tree } };
   }
 
-  // The tools this plugin handles, from config alone (compile-time handlers).
+  // The tools this plugin provides, from config alone: one member subscription
+  // each, so the compiler knows them when it resolves the loop's family.
   const declared = (cfg) => [
     ...toolSpecs({ root: normalizePath(spec.root(cfg || {})), lifecycle: !!spec.lifecycle, importRepos: (cfg || {}).import_repos !== false }),
     ADOPT_SPEC,
@@ -258,7 +257,7 @@ export function defineWorkspacePlugin(spec) {
         { event: 'session-started', mode: 'blocking', actions: ['contribute-context'], receives: withContext() },
         { event: 'config-applied', mode: 'blocking', actions: ['contribute-context'], receives: withContext() },
         // Tool calls record the session's workspace and environment in context.
-        ...toolCalls(declared(cfg).map((t) => t.name), { actions: ['contribute-context'], receives: withContext({ ...TOOL_CALL_KEYS }) }),
+        ...toolCalls(declared(cfg), { actions: ['contribute-context'], receives: withContext({ ...TOOL_CALL_KEYS }) }),
         { event: 'ui-action', mode: 'async', receives: { reply_to: key('string'), action: key('string') } },
       ],
       emit: [

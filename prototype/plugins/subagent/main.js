@@ -12,7 +12,7 @@
 // The child's full transcript stays in its own log; the parent gets a concise
 // conclusion plus evidence. `subagents` lists children and cancels one; a hard
 // stop of the parent cascades to its running children.
-import { definePlugin, key, offerSubscriptions, offerTools, optional, toolCalls, toolResult } from '../sdk/agentmod.js';
+import { definePlugin, key, optional, toolCalls, toolResult } from '../sdk/agentmod.js';
 import { DELEGATE, SUBAGENTS, CHILD_DEFAULT_TOOLS, READ_ONLY_TOOLS, childReport } from '../sdk/delegation.js';
 
 const TOOLS = [DELEGATE, SUBAGENTS];
@@ -29,8 +29,7 @@ definePlugin({
     version: '0.2.0',
     description: 'delegate / subagents: isolated child agents with scoped tools, workspaces, and budgets.',
     subscribe: [
-      ...offerSubscriptions(),
-      ...toolCalls(TOOLS.map((t) => t.name)),
+      ...toolCalls(TOOLS),
       // From child sessions: the parent definition declares it `inbound`.
       { event: 'subagent-result', mode: 'async', receives: { call_id: key('string'), text: key('string'), worker: key('string'), evidence: key('object') } },
     ],
@@ -59,8 +58,6 @@ definePlugin({
     }
   },
   handlers: {
-    'session-started': (ctx) => offerTools(ctx, TOOLS),
-    'config-applied': (ctx) => offerTools(ctx, TOOLS),
     'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (name === 'subagents') {

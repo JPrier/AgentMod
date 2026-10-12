@@ -1040,7 +1040,7 @@ function hotPathSection(row, n) {
     row('records · bytes', `${n(m.records)} · ${n(m.record_bytes)}`),
     row('events · pipelines', `${n(m.events)} (${n(m.semantic_events)} semantic) · ${n(m.pipeline_starts)}`),
     row('plugin invocations', `${n(m.plugin_invocations)} (${n(m.blocking_invocations)} blocking, ${n(m.async_invocations)} async, ${n(m.noop_invocations)} no-op)`),
-    row('tool dispatch', `${n(m.exact_handler_dispatches)} to handlers, ${n(m.observer_dispatches)} to observers; ${r.plugin_invocations_per_tool_call ?? '-'} invocations per call`),
+    row('tool dispatch', `${n(m.member_dispatches)} to member subscribers, ${n(m.observer_dispatches)} to observers; ${r.plugin_invocations_per_tool_call ?? '-'} invocations per call`),
     row('streams', `${n(m.stream_provider_events)} provider events → ${n(m.stream_live_frames)} live frames (${r.live_frames_per_provider_event ?? '-'} per event)`),
     row('per model response', `${r.canonical_events_per_model_response ?? '-'} events, ${r.records_per_model_response ?? '-'} records`),
     row('journal bytes / useful byte', r.journal_bytes_per_useful_output_byte ?? '-'),
@@ -1242,32 +1242,31 @@ function graphPane() {
   if (!r) return h('p.help', 'No definitions compiled on this host.');
   const { edges, routes } = r.graph;
   const plugins = ['core', ...Object.keys(r.plugins)];
-  const classes = [...new Set(routes.map((x) => x.class))].sort();
+  const classes = [...new Set(routes.map((x) => x.event))].sort();
   const cell = (cls, p) => {
     const parts = [];
-    const out = routes.filter((x) => x.class === cls && x.from === p);
+    const out = routes.filter((x) => x.event === cls && x.from === p);
     if (out.length) {
-      const e = out.map((x) => [...(x.blocking || []), ...(x.asyncs || []), ...(x.handler != null ? [x.handler] : [])].map((i) => edges[i])).flat()[0];
+      const e = out.map((x) => [...(x.blocking || []), ...(x.asyncs || [])].map((i) => edges[i])).flat()[0];
       const label = `E${e?.deferred ? '*' : ''}${e?.lane === 'interrupt' ? '!' : ''}`;
-      parts.push(h('span.cell-e', { title: `emits ${cls}${e?.deferred ? ' (deferred allowed)' : ''}${e?.lane === 'interrupt' ? ' on the interrupt lane' : ''}; keys: ${Object.keys(e?.supply || {}).join(', ') || 'none'}` }, label));
+      parts.push(h('span.cell-e', { title: `emits ${cls}${e && e.emit !== cls ? ` (resolved from ${e.emit})` : ''}${e?.deferred ? ' (deferred allowed)' : ''}${e?.lane === 'interrupt' ? ' on the interrupt lane' : ''}; keys: ${Object.keys(e?.supply || {}).join(', ') || 'none'}` }, label));
     }
     const ins = edges.filter((e) => e.event === cls && e.to === p);
     const b = ins.find((e) => e.mode === 'blocking');
     if (b) parts.push(h('span.cell-b', { title: `blocking, phase ${b.position.phase}, chain position ${b.position.chain + 1}; receives ${Object.keys(b.supply).join(', ') || 'envelope only'}` }, `${b.position.phase}:${b.position.chain + 1}`));
-    if (ins.some((e) => e.handler)) parts.push(h('span.cell-a', { title: 'the one handler of this family member' }, 'H'));
-    else if (ins.some((e) => e.mode === 'async')) parts.push(h('span.cell-a', { title: 'async' }, 'A'));
+    if (ins.some((e) => e.mode === 'async')) parts.push(h('span.cell-a', { title: 'async' }, 'A'));
     return h('td', parts);
   };
   const rp = r.report;
   const section = (title, items, help) => items.length > 0 && [h('h3', title), help && h('p.help', help), items.map((x) => h('div.diag', x))];
   return [
     h('div.pane-tools', h('label', 'Definition ', h('select', { onchange: (e) => { state.graphDef = e.target.value; render(); } }, defs.map((x) => h('option', { selected: x === name }, x))))),
-    h('p.help', `Revision ${r.revision} of \`${name}\` (runtime ${r.runtime}). The compiled graph is the routing table: each edge is "when A emits X, B is a destination", with its mode, phase position, lane and the keys it carries. E = emits (E* deferred allowed, E! interrupt lane), phase:n = blocking position, A = async, H = the family member's one handler.`),
+    h('p.help', `Revision ${r.revision} of \`${name}\` (runtime ${r.runtime}). The compiled graph is the routing table: each edge is "when A emits X, B is a destination", with its mode, phase position, lane and the keys it carries. E = emits (E* deferred allowed, E! interrupt lane), phase:n = blocking position, A = async. Family emits (tool-call/*) appear as the concrete members they resolve to.`),
     r.definition.phases?.length ? h('p.help', `Phases: ${r.definition.phases.join(' → ')}`) : null,
     h('div.matrix-wrap', h('table.matrix', h('thead', h('tr', h('th', ''), plugins.map((p) => h('th', p)))), h('tbody', classes.map((c) => h('tr', h('th', c), plugins.map((p) => cell(c, p))))))),
     h('h3', 'Diagnostics'),
     diagnosticRows(r.diagnostics.filter((x) => x.severity !== 'info')),
-    section('Event families', Object.entries(rp.families || {}).flatMap(([f, hs]) => [...Object.entries(hs.members || {}), ...Object.entries(hs.subfamilies || {})].map(([m, p]) => `${f} · ${m} → ${p}`)), 'Each member has exactly one handler; a member nobody handles becomes dispatch-failed.'),
+    section('Resolved families', Object.entries(rp.families || {}).flatMap(([f, by]) => Object.entries(by).map(([emitter, members]) => `${emitter}: ${f} → ${members.length ? members.join(', ') : '(nothing)'}`)), 'A family emit is resolved into the concrete members this definition\'s plugins subscribe to; the graph holds only those. For tool calls, they are the tools the model is offered.'),
     section('Cycles', (rp.cycles || []).map((c) => c.join(' → ')), 'Legal (agent loops are cycles). The core has no depth limit; bounding loops is plugin policy.'),
     section('Fixed orders', rp.fixed_orders || [], 'No observable tie, so the compiler ordered these by name.'),
     section('Capabilities', Object.entries(rp.capabilities || {}).map(([c, ps]) => `${c}: ${ps.join(', ')}`)),

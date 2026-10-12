@@ -8,7 +8,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { codingToolkit, toolSpecs } from '../plugins/sdk/coding/toolkit.js';
 import { localTarget } from '../plugins/local-workspace/target.js';
-import { checkArgs, suggestTools } from '../plugins/sdk/toolargs.js';
+import { suggestTools } from '../plugins/sdk/toolargs.js';
+import { argsKey, conformArgs, schemaOfKeys, toolOfMember } from '../plugins/sdk/toolschema.js';
 import { project } from '../plugins/sdk/projection.js';
 
 function setup() {
@@ -52,19 +53,35 @@ test('environment facts are probed once, with versions', async () => {
   assert.match(p.system, /Network: none\./);
 });
 
-test('argument checks reject clear mistakes with a corrected example, and nothing else', () => {
-  const spec = toolSpecs().find((t) => t.name === 'read_file');
-  assert.equal(checkArgs(spec, { path: 'a.c', start_line: '5' }), null, 'tools coerce reasonable input');
-  const m = checkArgs(spec, { file: 'a.c' });
-  assert.match(m, /missing required `path`/);
-  assert.match(m, /Call it again like \{"path":"<path>"\}/);
-  const st = toolSpecs().find((t) => t.name === 'search_text');
-  assert.equal(checkArgs(st, { query: 'x', include: 'kilo.c' }), null, 'one glob instead of a list is fine');
-  assert.match(checkArgs(st, { query: { regex: 'x' } }), /`query` must be a string/);
+test('arguments are fitted to the member shape: unambiguous coercions pass, clear mistakes are named', () => {
+  // A tool's argument schema is its member subscription's `receives.args` (compiler.md §3.4).
+  const keys = argsKey(toolSpecs().find((t) => t.name === 'read_file')).keys;
+  const ok = conformArgs(keys, { path: 'a.c', start_line: '5' });
+  assert.deepEqual(ok.errors, []);
+  assert.equal(ok.args.start_line, 5, 'a number given as text becomes a number');
+  assert.deepEqual(conformArgs(keys, { file: 'a.c' }).errors, ['missing required `path`']);
+  const st = argsKey(toolSpecs().find((t) => t.name === 'search_text')).keys;
+  const glob = conformArgs(st, { query: 'x', include: 'kilo.c' });
+  assert.deepEqual(glob.errors, [], 'one glob instead of a list is fine');
+  assert.deepEqual(glob.args.include, ['kilo.c']);
+  assert.match(conformArgs(st, { query: { regex: 'x' } }).errors[0], /`query` must be string/);
 });
 
-test('unknown tools get the closest names, and deferred ones say how to load', () => {
+test('the model-facing tool comes from the resolved member: its name, its schema, its hints', () => {
+  const spec = toolSpecs().find((t) => t.name === 'read_file');
+  const args = argsKey(spec);
+  const tool = toolOfMember({ event: 'tool-call/read_file', keys: { args }, subscribers: [{ plugin: 'local-workspace', description: spec.description, hints: { tier: spec.tier, group: spec.group, effects: spec.effects } }] });
+  assert.equal(tool.name, 'read_file');
+  assert.equal(tool.description, spec.description);
+  assert.equal(tool.tier, spec.tier);
+  assert.deepEqual(tool.required, spec.required);
+  assert.deepEqual(Object.keys(tool.parameters), Object.keys(spec.parameters));
+  assert.equal(schemaOfKeys(args.keys).properties.path.type, 'string');
+});
+
+test('unknown tools: "no such tool", with the closest names', () => {
   const offered = ['read_file', 'search_text', 'shell', 'tool_search'];
+  assert.match(suggestTools('readfile', offered), /^no such tool: readfile\./);
   assert.match(suggestTools('readfile', offered), /Did you mean `read_file`\?/);
   assert.match(suggestTools('grep', offered), /call tool_search/);
 });

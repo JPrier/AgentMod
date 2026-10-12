@@ -54,14 +54,24 @@ test('MCP client: handshake, list, call; specs are deferred, external, untrusted
   assert.ok(big.truncated && big.text.length < 1200);
 });
 
-test('mcp-bridge plugin: offers deferred tools, answers calls, labels results untrusted', async () => {
+test('mcp-bridge plugin: declares one member per server tool, answers calls, labels results untrusted', async () => {
   const p = runPlugin(path.join(here, '..', 'plugins', 'mcp-bridge', 'main.js'), { servers: { fx: { command: [process.execPath, FIXTURE] } } });
   try {
     const init = await p.init();
-    assert.equal(init.result.manifest.name, 'mcp-bridge');
-    const started = await p.call('invoke', { invocation_id: 'i1', attempt: 1, mode: 'blocking', event: p.ev('session-started', {}, 1) });
-    const offered = started.result.contributions.filter((c) => c.slot === 'tools').map((c) => c.value.name);
-    assert.deepEqual(offered, ['mcp__fx__echo', 'mcp__fx__note']);
+    const m = init.result.manifest;
+    assert.equal(m.name, 'mcp-bridge');
+    // It connects during the handshake, then declares one concrete member per
+    // tool (compiler.md §3.4): deferred, with the server's argument schema.
+    const members = m.subscribe.filter((s) => s.event.startsWith('tool-call/'));
+    assert.deepEqual(members.map((s) => s.event), ['tool-call/mcp__fx__echo', 'tool-call/mcp__fx__note']);
+    assert.ok(members.every((s) => s.mode === 'async' && s.hints.tier === 'deferred' && s.hints.trust === 'external'));
+    assert.deepEqual(members.map((s) => s.hints.effects), ['read', 'external']);
+    assert.equal(members[0].receives.args.keys.text.shape, 'string');
+    assert.match(members[0].description, /^\[MCP fx\]/);
+    // Each session it runs in records which servers connected.
+    await p.call('invoke', { invocation_id: 'i1', attempt: 1, mode: 'async', subscription: 'session-started', event: p.ev('session-started', {}, 1) });
+    const status = p.publishes.find((x) => x.event_name === 'mcp-status').payload;
+    assert.deepEqual(status.servers, [{ name: 'fx', connected: true, tools: 2 }]);
     await p.call('invoke', { invocation_id: 'i2', attempt: 1, mode: 'async', event: p.ev('tool-call/mcp__fx__echo', { call_id: 'c1', name: 'mcp__fx__echo', args: { text: 'yo' } }, 2) });
     const res = p.publishes.find((x) => x.event_name === 'tool-result').payload;
     assert.equal(res.trust, 'external');

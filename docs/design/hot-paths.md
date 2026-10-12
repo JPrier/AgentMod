@@ -172,6 +172,8 @@ canonical events once those arrive.
 
 ## 4. Compiled tool routing
 
+> **Superseded in the design:** the end-state design routes tool calls by **event families** (`tool-call/<name>` with `exactly_one_handler`), not keyed owners — see [compiler.md](compiler.md) §3.3. This section describes what the prototype implements today.
+
 Plugins declare the tools they own, from their configuration, at handshake:
 
 ```js

@@ -12,9 +12,9 @@ though nothing generic was happening on them:
    every async subscriber (the frontend among them), and broadcast to watchers —
    one full control-plane round per token.
 2. **Tool calls.** Every `tool-call` event was delivered to every plugin that
-   consumes `tool-call` — about ten in the `coder` definition — and all but one
-   returned without doing anything. Ownership was already known from
-   configuration.
+   consumed `tool-call` — about ten in the `coder` definition — and all but one
+   returned without doing anything. Which plugin handles which tool was already
+   known from configuration.
 
 This document describes what replaced them, how the harness now avoids model
 turns that carry no information, how the cost of the control plane is
@@ -44,12 +44,13 @@ Every event family in the bundled plugins, classified:
 
 | Family | Class | Frequency | Notes |
 |---|---|---|---|
-| `session-started`, `config-applied` | canonical semantic | per session / per config change | core lifecycle |
-| `dispatch-failed` | canonical semantic | rare | core: a keyed event had no owner, or its owner failed without answering |
+| `session-started`, `config-applied` | canonical semantic | per session / per revision change | core events (the core manifest); `config-applied` is on the interrupt lane |
+| `dispatch-failed` | canonical semantic | rare | core: a member of an `exactly_one_handler` family had no handler, or its handler failed without answering |
+| `session-start-failed` | canonical semantic | rare | core: a `start-session` whose definition failed to compile, with the diagnostics, in the caller's session |
 | `user-message`, `assistant-message` | canonical semantic | per turn | |
 | `model-request`, `model-response` | canonical semantic | per model turn | the response carries text, tool calls, model/provider identity, normalized usage, and the stream's own counts |
-| `tool-call`, `tool-result` | canonical semantic | per tool call | the approved re-publish of a call is its own event |
-| `policy-decision`, `approval-requested`, `ui-action`, `context-edit` | canonical semantic | per decision / user action | a quiet `allow` leaves only the policy invocation record |
+| `tool-call/<name>`, `tool-result`, `tool-call-rejected` | canonical semantic | per tool call | one family member per call; the approved re-publish of a call is its own event; a call answered before dispatch is `tool-call-rejected` |
+| `policy-decision`, `approval-requested`, `approval-granted`, `ui-action`, `context-edit` | canonical semantic | per decision / user action | a quiet `allow` leaves only the policy invocation record; `context-edit` is on the interrupt lane |
 | `plan-updated`, `user-input-requested`, `session-titled`, `memory-injected` | canonical semantic | per call | |
 | `workspace-info`, `workspace-change`, `checkpoint-created`, `workspace-restored`, `process-started`, `process-exited`, `diagnostics` | canonical semantic | bounded per tool call | world-state facts that rewind and audit depend on |
 | `workspace-status` | ephemeral presentation, recorded | ≤ a few per tool call (boot, import progress) | low volume, so left as events; a candidate for the stream channel if it grows |
@@ -67,7 +68,10 @@ Only token deltas were high-frequency; nothing else needed moving.
   invocation per session to cite for user actions, and reads everything else
   as a watcher, so it now consumes `session-started` only. Before, every event
   cost two extra records and an IPC round trip to the gateway.
-* Tool calls go to their compiled owner (§4).
+* Each tool call goes to its compiled handler (§4).
+* Delivery is projected: each invocation carries the envelope plus exactly the
+  keys and slots its subscription declares, so the context (often the largest
+  part of a delivery) goes only to the subscriptions that request it.
 
 ## 3. The live stream subsystem
 
@@ -170,39 +174,66 @@ while visible, nothing while hidden, and once (the latest state) when the tab
 becomes visible again. Live bubbles update in place; they give way to the
 canonical events once those arrive.
 
-## 4. Compiled tool routing
+## 4. Compiled tool routing: the `tool-call/*` family
 
-> **Superseded in the design:** the end-state design routes tool calls by **event families** (`tool-call/<name>` with `exactly_one_handler`), not keyed owners — see [compiler.md](compiler.md) §3.3. This section describes what the prototype implements today.
-
-Plugins declare the tools they own, from their configuration, at handshake:
+Tool calls are an **event family** ([compiler.md](compiler.md) §3.3). The
+loop plugin (`chat-context`) emits `tool-call/<name>` for each call the model
+makes, declaring the family once with `exactly_one_handler`:
 
 ```js
-consumes: [ownTools(['read_file', 'list_dir', …])],   // { event: 'tool-call', keyed: { key: 'name', values } }
-tools: declareTools(specs),                           // names, parameters, required, tier
+emit: [{ event: 'tool-call/*', exactly_one_handler: true, keys: { call_id, name, args, approved? } }]
 ```
 
-MCP servers own families (`mcp__github__*`). The compiler builds, per
-definition and keyed event, one owner table and rejects: duplicate ownership
-and overlapping prefix families (unless the definition pins an owner with
-`route_owners`), pins naming a plugin that does not own the value (stale or
-disabled), tools declared without owning them, invalid tool schemas, keyed
-consumers that are blocking or wildcards, and plugin versions other than the
-one a config requires (`version = "0.2"`). `agentmod compile` prints each
-table; `routes_revision` hashes them.
+Each tool plugin subscribes to its own members, from its configuration, at
+handshake (`toolCalls(names)` in `plugins/sdk/agentmod.js`):
 
-At runtime the kernel dispatches each settled `tool-call` to exactly the
-owner its name selects, plus the observers (the policy gate before it, any
-async observers after). The invocation record carries `route` — the tool name
-that selected the owner — and the stamp (binary + config hash) bound at
-dispatch. Retries and cancellations use that recorded executor identity, so
-a hot configuration change can never move an effect to another executor
-mid-flight; the next call uses the new revision. A call no owner claims, or
-whose owner fails without answering, becomes `dispatch-failed`, which
-chat-context answers so the loop never waits forever.
+```js
+subscribe: [{ event: 'tool-call/read_file', mode: 'async', receives: { call_id, name, args } }, …]
+```
 
-Lazy discovery binds to the table: `tool_search` loads only tools with a
-compiled owner, loading is session-sticky (the `tools-loaded` slot), and
-there is no runtime scanning.
+MCP servers are sub-families (`tool-call/mcp__github__*`), handled by
+`mcp-bridge` from its config before any tool list arrives. Gates (`policy`,
+`approval-gate`) are blocking subscribers of the whole family; any async
+subscriber of the whole family (a telemetry exporter, a frontend) is an
+observer and receives every member. The web frontend is not one: it reads
+records as a watcher (§2), so it costs no invocation per call.
+
+The compiler resolves, per definition, every member a subscription names to
+exactly one handler: an async subscription narrower than the family (a member
+or a sub-family). Two possible handlers for the same member (two execution
+targets both handling `read_file`, or overlapping sub-families) are a compile
+error unless the definition picks one (`handlers."tool-call/read_file" =
+"linux-sandbox"`); a pick naming a plugin that is not a possible handler (stale
+or disabled) is an error too. The result is part of the compiled graph — edges
+`chat-context --tool-call/read_file--> local-workspace` marked as the handler,
+under the session's revision — and `agentmod compile` prints the family's
+handlers in its report. There is no separate route table and no
+`routes_revision`: the revision covers routing.
+
+At runtime the kernel dispatches each settled `tool-call/<name>` along its
+compiled edges: the blocking gates in phase order, then the observers and
+exactly the member's one handler. The handler's invocation record carries
+`route` — the member that selected it — and the stamp (binary + config hash)
+and revision bound at dispatch. Retries and cancellations use that recorded
+executor identity, so applying a new revision can never move an effect to
+another executor mid-flight; the next call uses the new revision. A member
+with no compiled handler, or whose handler fails without answering, becomes
+the core `dispatch-failed` event, which `chat-context` answers inline so the
+loop never waits forever. A call it can reject before dispatch (arguments that
+are not JSON or do not match the tool's schema, a tool nobody offers) never
+becomes a family member: it is answered inline and recorded as
+`tool-call-rejected`. (`chat-context` consumes `tool-result`, so it never emits
+one: a plugin may not consume its own emits.)
+
+Approvals: a gate vetoes the call, asks, and on approval publishes
+`approval-granted`; `chat-context` re-publishes the member citing that grant
+(`approved.grant`), and the gate lets it through only if the grant is its own
+and matches the call (policy also checks the action digest).
+
+Lazy discovery binds to the compiled handlers: `tool_search` loads only tools
+the session's revision has a handler for (the host's `handlers` query), loading
+is session-sticky (the `tools-loaded` context section), and there is no runtime
+scanning. A plugin offers only the tools it subscribes to as members.
 
 ## 5. Tool batch settlement
 
@@ -242,8 +273,8 @@ and a live delivery, so before/after use one definition):
 
 * **control plane** — records and bytes, events (semantic vs `stream-chunk`),
   pipeline starts/settles, plugin invocations (blocking, async, no-op, failed,
-  retried), tool-call invocations split into exact-owner and broadcast
-  dispatches, provider events → frames → live frames, recovery writes/bytes;
+  retried), tool-call invocations split into exact-handler dispatches and
+  family-observer dispatches, contract breaches, provider events → frames → live frames, recovery writes/bytes;
 * **model efficiency** — requests, prompt / cached / uncached / completion
   tokens, cost, latency, provider retries, recovered invocations, compactions,
   child-agent calls, failed tools, dispatch failures, context size per turn,
@@ -300,8 +331,8 @@ from a client subscribed to the gateway's SSE stream. Results for
 | Canonical events | 415 (311 `stream-chunk`) | 104 | −75% |
 | Pipeline executions | 415 | 104 | −75% |
 | Plugin invocations | 739 (635 no-op) | 150 (45 no-op) | −80% |
-| Plugin invocations per tool call | 11 | 2 (policy + owner) | −82% |
-| Tool dispatch | 220 broadcast | 22 exact owner, 0 broadcast | |
+| Plugin invocations per tool call | 11 | 2 (policy + handler) | −82% |
+| Tool dispatch | 220 broadcast | 22 to exactly one handler, 0 broadcast | |
 | Journal records · bytes | 2,724 · 936 KB | 613 · 370 KB | −77% · −61% |
 | Events per model response | 18.0 | 4.5 | −75% |
 | Journal bytes per useful output byte | 36.5 | 14.4 | −61% |
@@ -337,7 +368,7 @@ real model: `node bench/kilo.mjs --real --model <id>` (needs
 
 CI runs `node bench/kilo.mjs --assert`, which fails if any run fails, if a
 token fragment reaches the log, if any tool call is not dispatched to exactly
-one owner, or if records per model response, events per model response,
+one handler, or if records per model response, events per model response,
 invocations per tool call, or the adaptive script's turn count regress.
 
 ## 9. Auditability
@@ -345,11 +376,12 @@ invocations per tool call, or the adaptive script's turn count regress.
 | Question | Where the answer is |
 |---|---|
 | Which model ran? | `model-response.model` (served), `requested_model`, `provider`, `attempt_id`; the provider invocation's stamp |
-| Which tool, with what arguments? | the `tool-call` event (and its approved re-publish) |
-| Which plugin executed it? | the owner's `invocation-started` record: `plugin`, `route`, `stamp` |
-| Under what config? | `session-created` / `config-applied` hashes; the stamp on every invocation; `routes_revision` |
+| Which tool, with what arguments? | the `tool-call/<name>` event (and its approved re-publish) |
+| Which plugin executed it? | the handler's `invocation-started` record: `plugin`, `route`, `stamp`, `revision` |
+| Under what config? | `session-created` / `config-applied` revisions; the revision and stamp on every invocation |
+| Did any plugin break its declarations? | `breach` records: the declaration violated, the value observed, the reaction |
 | What policy allowed it? | `policy-decision` for every non-quiet decision; the policy invocation (quiet allows); approvals and `ui-action`s |
-| What came back? | `tool-result`, or `dispatch-failed` |
+| What came back? | `tool-result`, `tool-call-rejected`, or `dispatch-failed` |
 | What files changed? | `workspace-change`, `checkpoint-created`, `workspace-restored` |
 | What child acted? | `subagent-started` and the child's own session |
 | What recovery occurred? | `invocation-retried`, attempt counts, `usage_total`, stream attempt counts in the response's metrics |
@@ -364,8 +396,8 @@ invocations per tool call, or the adaptive script's turn count regress.
 | Browser host integration | `ui/runtime/browser-host.js`, `persist.js`, `crates/agentmod-wasm` | `tests/browser-runtime.test.mjs`; `tests/browser.mjs` (headless Chrome, real WASM: live text renders mid-stream, nothing in the log) |
 | Provider side | `plugins/sdk/sse.js`, `stream.js`, `openai-compat.js` | `tests/streaming.test.mjs`: every byte split, UTF-8, CRLF/LF/CR, malformed final frames, usage modes, retry after partial output, truncated streams, fallback, cancellation, tool arguments |
 | Client store | `ui/runtime/stream-store.js` | `tests/streaming.test.mjs`: hydration barrier, gaps, duplicates, new attempts, hidden tabs |
-| Keyed dispatch | `compiler.rs`, `kernel.rs`, `plugins/sdk/agentmod.js` (`ownTools`, `declareTools`) | `crates/agentmod-core/tests/routing.rs`: exact owner, duplicates, pins, stale owners, prefixes, schema, versions, no-owner/owner-failed, config revision, retry executor identity, replay |
+| Family dispatch | `compiler.rs` (handlers, picks), `kernel.rs`, `plugins/sdk/agentmod.js` (`toolCalls`, `offerTools`) | `crates/agentmod-core/tests/families.rs`: exact handler, observers, sub-families, no-handler/handler-failed, revision boundary, retry executor identity, replay, metrics; `tests/compiler.rs`: two possible handlers need a pick, stale picks, self-subscription through a family |
 | Batch settlement | `plugins/chat-context` | `tests/e2e.sh` step 16b |
 | Turn economy | `plugins/sdk/coding/toolkit.js`, `toolargs.js`, `projection.js`, `tool-discovery` | `tests/turn-ergonomics.test.mjs`, `tests/harness.test.mjs` |
-| Metrics | `crates/agentmod-core/src/metrics.rs` | `routing.rs`, e2e step 19 |
+| Metrics | `crates/agentmod-core/src/metrics.rs` | `families.rs`, e2e step 19 |
 | Benchmark | `bench/kilo.mjs`, `kilo-world.mjs`, `turns.mjs` | CI `kilo.mjs --assert` |

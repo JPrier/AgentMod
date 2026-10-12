@@ -1024,3 +1024,28 @@ fn example_rejected_dynamic_definition() {
     assert_eq!(Some(sim.saved[0].revision.clone()), ok.revision);
     let _: Value = json!(ms);
 }
+
+#[test]
+fn embedded_workflows_are_rejected_explicitly_until_supported() {
+    // Not implemented in this prototype (see the PR): an explicit error, never a silent default.
+    let ms = json!({ "ui": ui() });
+    let msv = common::manifests(ms);
+    let mut cfg = deployment(
+        &msv,
+        json!({
+            "d": { "runtime": "0.1", "plugins": { "ui": {}, "research": { "workflow": "researcher" } } },
+            "researcher": { "runtime": "0.1", "plugins": { "ui": {} }, "interface": { "receives": { "go": { "text": k(S) } } } }
+        }),
+    );
+    cfg.sources.insert(
+        "definitions.d.plugins.research".into(),
+        SourceRef {
+            file: "agentmod.toml".into(),
+            line: 3,
+        },
+    );
+    let c = compile(&cfg, &msv);
+    let d = one(&c, "unsupported-workflow");
+    assert_eq!(d.plugins, vec!["research"]);
+    assert_eq!(d.source.as_ref().map(|s| s.line), Some(3));
+}

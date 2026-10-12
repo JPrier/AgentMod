@@ -908,7 +908,7 @@ function threadItems(v) {
       continue;
     }
     if (name === 'tool-call-rejected' && !tools.has(e.payload.call_id)) {
-      // Answered by the loop before dispatch (bad arguments, unknown tool, no handler).
+      // Answered by the loop before dispatch (bad arguments, an unknown tool) or after a failed invocation.
       const t = { status: h('span.pill', 'rejected'), res: h('span.res') };
       tools.set(e.payload.call_id, t);
       out.push(h('div.tool', h('span.name', e.payload.name), h('span.args', ''), t.status, t.res));
@@ -1129,7 +1129,7 @@ function pipelinePane() {
   const rows = evs.map((e) => eventRow(v, e));
   const hidden = v.events.length - evs.length;
   return [
-    h('p.help', `${v.records} records in ${v.session_id} (revision ${v.revision.slice(0, 8)}). Each row is an event; the chips are the edges it took in the compiled graph: blocking subscribers in phase order, then async observers and the family handler (H). Click a row for its full record.`),
+    h('p.help', `${v.records} records in ${v.session_id} (revision ${v.revision.slice(0, 8)}). Each row is an event; the chips are the edges it took in the compiled graph: blocking subscribers in phase order, then async subscribers. Click a row for its full record.`),
     tools,
     hidden ? h('p.help', `${hidden} stream chunks hidden.`) : null,
     rows,
@@ -1143,7 +1143,7 @@ function eventRow(v, e) {
   const invs = e.invocations.filter((i) => !(state.hideFrontend && i.plugin === 'web-ui'));
   const blocking = invs.filter((i) => i.mode === 'blocking');
   const asyncs = invs.filter((i) => i.mode === 'async');
-  const chip = (i) => h('span.chip.' + (i.mode === 'blocking' ? 'b' : 'a') + (outcomeClass(i) ? '.' + outcomeClass(i) : ''), { title: `${i.invocation_id} · ${i.phase ? `phase ${i.phase} · ` : ''}${i.route ? `handler of ${i.route} · ` : ''}${i.subscription ? `via ${i.subscription} · ` : ''}${i.outcome?.status || 'running'}${i.attempts > 1 ? ` · attempt ${i.attempts}` : ''}` }, (i.phase ? `${i.phase}:` : '') + i.plugin + (i.route ? ' (H)' : '') + (i.attempts > 1 ? ` ×${i.attempts}` : ''));
+  const chip = (i) => h('span.chip.' + (i.mode === 'blocking' ? 'b' : 'a') + (outcomeClass(i) ? '.' + outcomeClass(i) : ''), { title: `${i.invocation_id} · ${i.phase ? `phase ${i.phase} · ` : ''}${i.subscription ? `via ${i.subscription} · ` : ''}${i.outcome?.status || 'running'}${i.attempts > 1 ? ` · attempt ${i.attempts}` : ''}` }, (i.phase ? `${i.phase}:` : '') + i.plugin + (i.attempts > 1 ? ` ×${i.attempts}` : ''));
   const chain = [];
   blocking.forEach((i, n) => { if (n) chain.push(h('span.arrow', '→')); chain.push(chip(i)); });
   if (asyncs.length) { if (blocking.length) chain.push(h('span.fork', '⋮')); asyncs.forEach((i) => chain.push(chip(i))); }

@@ -85,12 +85,17 @@ The normal loop stays the bundled chat convention:
 
 ```text
 user-message → chat-context → model-request → provider → model-response
-   → tool-call/<name>* ─(policy: blocking veto/ask)→ its one handler → tool-result* → model-request …
+   → tool-call/<name>* ─(policy: blocking veto/ask)→ the member's subscriber → tool-result* → model-request …
 ```
 
-Tool calls are the `tool-call/*` event family: each member reaches exactly the
-one plugin that handles it ([hot-paths.md](hot-paths.md) §4). Nothing below
-adds a kernel concept. The new pieces are:
+A session starts with the core's `session-started`, which carries the
+`start-session` input; `chat-context` turns its text into the first model
+request, and later turns arrive as `user-message`. Tool calls are the
+`tool-call/*` event family, resolved at compile time into the members the
+definition's tool plugins subscribe to; each call reaches its member's
+subscribers, the model is offered exactly those tools, and an unknown tool
+name is answered by `chat-context` before it is ever published
+([hot-paths.md](hot-paths.md) §4). Nothing below adds a kernel concept. The new pieces are:
 
 | Piece | Kind | Purpose |
 |---|---|---|
@@ -151,12 +156,12 @@ action (`process` with `action: "kill"`, or the UI).
 ### 3.3 Context authority classes
 
 Every projected context item gets one authority class, decided by the projection
-from *who contributed it and through which slot*, never from its text:
+from *who contributed it and through which context section*, never from its text:
 
 | Class | Source |
 |---|---|
-| `system` | `system` slot from plugins listed in the projection's trusted set, the projection's own preamble |
-| `user` | `user-message` events published by a frontend (`web-ui`), and `ask_user` answers |
+| `system` | the `system` section from plugins listed in the projection's trusted set, the projection's own preamble |
+| `user` | `user-message` events published by a frontend (`web-ui`), the text of a session's start input from a frontend, and `ask_user` answers |
 | `workspace` | project instruction files (`AGENTS.md`, `CLAUDE.md`, `.agentmod/instructions.md`), repository skills |
 | `agent` | the model's own messages and plan |
 | `tool-data` | structured tool metadata produced by a trusted tool plugin (exit codes, paths, hashes) |
@@ -206,9 +211,12 @@ question was open wins, and a digest mismatch is rejected.
 
 Tool specs carry a `tier`: `core` (always sent) or `deferred`. The projection
 sends core tools plus deferred tools the session has loaded (`tools-loaded`
-slot), in a deterministic order (fixed core order, then name), so the tool
-block is byte-stable across turns for prompt caching. `tool_search` (core)
-searches every offered spec by name, description, and group and loads matches.
+section), in a deterministic order (fixed core order, then name), so the tool
+block is byte-stable across turns for prompt caching. The specs are the
+session's resolved `tool-call/*` members (name = member, parameters = the
+subscriber's `receives`), written by `chat-context` from its resolved emit
+set. `tool_search` (core) searches that same set by name, description, and
+group and loads matches.
 The projection reports `tool_schema_tokens` (estimated) and `tools_sent` with
 each model request, and the benchmark tracks them.
 
@@ -240,8 +248,10 @@ UI renders a generic settings form; nothing in `ui/` names OpenRouter.
 ### 3.8 Child capability and context isolation
 
 A child is an ordinary session (`start-session`, cause = the parent's
-`delegate` invocation) from a configured definition. It receives only: the task
-text, explicitly passed context snippets, an allowlist of tools, a budget, and a
+`delegate` invocation) from a configured definition. Its start input carries
+the task as `text` and the parent link and delegation as `data`; the child's
+own plugins (policy, budget, workspace, reporter) read them from
+`session-started`. It receives only: the task text, explicitly passed context snippets, an allowlist of tools, a budget, and a
 workspace choice (`shared` read-only view, or `isolated` worktree materialized
 from a parent checkpoint). It inherits no memory, secrets, or tools by default.
 Its result returns as `subagent-result` with a concise conclusion plus
@@ -268,7 +278,7 @@ command-line adapters; none is a test dependency.
 A skill is a directory with a `SKILL.md` (front matter: `name`, `description`)
 under `.agentmod/skills/`, `.claude/skills/`, or a configured extra directory.
 The workspace plugin contributes only an index (name + description, ordered by
-name) to the `skills-index` slot; `load_skill` (deferred, auto-offered when the
+name) to the `skills-index` context section; `load_skill` (deferred, auto-offered when the
 index is non-empty) returns the body. Skills come from the repository, so they
 are `workspace` authority: they can instruct, never authorize, and their text
 is wrapped like any other workspace instruction.
@@ -310,10 +320,11 @@ reload instead of continuing.
 
 ### 4.5 Observability without a telemetry backend
 
-Control-plane cost (records, events, pipelines, plugin invocations, handler vs
-observer dispatch, stream frames, amplification ratios) and the hot-path
-changes behind it — live streams outside the log, compiled tool handlers,
-batch settlement, turn economy — are in [hot-paths.md](hot-paths.md).
+Control-plane cost (records, events, pipelines, plugin invocations,
+member-subscriber vs observer dispatch, invocation failures, stream frames,
+amplification ratios) and the hot-path changes behind it — live streams outside
+the log, tool-call families resolved at compile time, batch settlement, turn
+economy — are in [hot-paths.md](hot-paths.md).
 
 Providers record per-call metrics on `model-response` (latency, time to first
 token, tokens, cached tokens, cost, retries, finish reason); the projection

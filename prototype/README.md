@@ -38,16 +38,16 @@ prototype/
 | --- | --- |
 | The compiler ([compiler.md](../docs/design/compiler.md)): manifests + one flattened definition → one compiled graph, which is also the routing table; its hash is the session's revision | `core/src/compiler.rs` (graph, every §6 check, report sections), `core/src/shape.rs` (typed shapes), `core/src/manifest.rs` (manifests, definitions, fragments), `core/src/core_manifest.rs` (the runtime's own events, versioned) |
 | Envelope (`event_id`, `session_id`, `event_name`, `sequence`, `cause`, `lane`, `arrived_at`) plus exactly the declared keys and slots | `core/src/types.rs`; projection in `Kernel::start_invocation` |
-| One publish primitive: pipeline output vs cited deferred publish vs `start-session` | `Kernel::publish`, `Kernel::start_session` — every start compiles first; refused publishes are recorded, never silent |
+| One publish primitive: pipeline output vs cited deferred publish; `start-session` is a runtime call | `Kernel::publish`, `Kernel::start_session` — every start compiles first (a failure creates no session and returns the diagnostics, also as `session-start-failed`); on success only the core emits `session-started`, carrying the caller's input; refused publishes are recorded, never silent |
 | Blocking chain in phase order (return keys / contribute / veto) + async observers | `Kernel::advance` along compiled edges; anything that contradicts a declaration is a recorded `breach` |
-| Two FIFO lanes; soft stop / hard stop / resume are commands, not events | `Kernel::command` |
+| Two FIFO lanes, chosen per publish among the lanes an emit declares (the UI's steer and queue are one `user-message` on two lanes); soft stop / hard stop / resume are commands, not events | `Kernel::publish`, `Kernel::command` |
 | Per-session append-only log projecting into session → events → invocations | `core/src/record.rs`, `core/src/projection.rs`, JSONL + content-addressed spill in `runtime/src/store.rs` |
 | History-is-truth recovery: orphan scan bounded by the active-set index | `Kernel::load_session` + `Kernel::recover`; deterministic output ids make re-published outputs idempotent |
 | Live, layered, stamped configuration; revisions are per session | `Kernel::apply_config` (targets sessions, rejected whole on any error, applied at the next event boundary); every invocation records its revision, code and config hashes |
 | Plugins are supervised processes over one JSON-RPC wire protocol | `runtime/src/host.rs` (stdio) and `ui/runtime/browser-host.js` (Web Workers) |
 | Frontends as plugins with UI-hint payloads | `plugins/web-ui` (gateway) and the page itself; vocabulary: text, markdown, tool, choice, progress, diff, form (old logs may also carry `stream-chunk`) |
 | Live model output outside the log | `core/src/stream.rs`: normalized provider frames, coalescing, recovery state, byte-bounded clients; one canonical `model-response` per turn ([hot-paths.md](../docs/design/hot-paths.md)) |
-| Tool calls as an event family | `tool-call/<name>` with `exactly_one_handler`: each member reaches exactly its compiled handler (MCP servers are sub-families); a member nobody handles becomes `dispatch-failed` |
+| Tool calls as an event family | `tool-call/*` is resolved at compile time into the members the definition's tool plugins subscribe to (an MCP bridge declares one per server tool); each plugin gets its resolved emit set; the model is offered exactly those tools and an unknown name is answered by `chat-context`; any failed invocation becomes the core's `invocation-failed` |
 
 The core ships no agent features. Chat shape, tools, memory, approval, titling, sub-agents,
 triggers, and the model itself are all plugins:
@@ -95,8 +95,9 @@ Session definitions in `agentmod.toml`: `chat` (general assistant), `coder` (the
 
 A plugin declares, at handshake, what it receives, returns, emits and may call; every key has a
 shape. A definition lists the plugins a session runs, the phases that order its blocking
-subscribers, tie-breaks where the compiler finds an observable tie, handler picks for event
-families, the events it accepts from other sessions, and its slots. It never lists edges.
+subscribers, tie-breaks where the compiler finds an observable tie, the events it accepts from
+other sessions, and its slots. It never lists edges. Session slots are requested in a
+subscription's `slots`, a sibling of `receives`.
 
 ```js
 // plugins/redactor/main.js (manifest)
@@ -116,17 +117,18 @@ approval-gate = { phase = "guard" }
 chat-context = { phase = "loop" }
 openrouter-model = {}                             # async only: no phase needed
 
-[definitions.chat.order.session-started]          # both contribute context: order them
-offer = ["memory", "tool-clock"]
+[definitions.coder.order.session-started]         # several contribute context: order them
+offer = ["linux-sandbox", "local-workspace", "memory"]
 
 [definitions.chat.inbound.subagent-result]        # accepted from child sessions
 call_id = { shape = "string" }
 ```
 
 `agentmod compile` prints each definition's graph (one line per emitter and event class: the
-blocking chain with phases, async destinations, the family handler), every diagnostic with the
-file and line it traces to, and the report sections (cycles, families, capabilities, interrupt
-use, unlisted keys, the external surface, orders fixed by name).
+blocking chain with phases, async destinations), every diagnostic with the file and line it
+traces to, and the report sections (internal cycles and cycles through external input, resolved
+families, capabilities, interrupt use, unlisted keys, the external surface, orders fixed by
+name).
 
 ## Run it natively
 

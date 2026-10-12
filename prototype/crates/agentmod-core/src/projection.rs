@@ -16,13 +16,21 @@ pub struct InvocationView {
     pub invocation_id: String,
     pub plugin: String,
     pub mode: Mode,
+    /// The subscription (event pattern) the compiled edge came from.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub subscription: String,
     pub position: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     pub stamp: Stamp,
+    /// The revision the invocation ran under.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub revision: String,
     pub started_seq: u64,
     pub started_at: u64,
     pub attempts: u32,
     pub input: Value,
-    /// The key value that routed this owner (keyed dispatch), if any.
+    /// The family member that selected this plugin as its handler, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -31,8 +39,9 @@ pub struct InvocationView {
     pub completed_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
+    /// Keys returned to the chain (blocking subscribers).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transform: Option<Value>,
+    pub returns: Option<Value>,
     #[serde(default)]
     pub contributions: Vec<ContextOp>,
     /// Events published by this invocation (fan-out links).
@@ -50,7 +59,6 @@ pub struct EventView {
     pub lane: Lane,
     pub cause: Cause,
     pub origin: Origin,
-    pub depth: u32,
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<Value>,
@@ -84,7 +92,8 @@ pub struct ControlView {
 pub struct SessionView {
     pub session_id: String,
     pub definition: String,
-    pub config: String,
+    /// The revision the session runs under now.
+    pub revision: String,
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<Cause>,
@@ -98,6 +107,9 @@ pub struct SessionView {
     pub events: Vec<EventView>,
     pub context: Vec<ContextItem>,
     pub blocked: Vec<BlockedView>,
+    /// Contract breaches: behaviour that contradicted a compiled declaration.
+    #[serde(default)]
+    pub breaches: Vec<Value>,
     pub control: Vec<ControlView>,
     /// Cross-session publishes recorded in this log (mirrors).
     pub sent: Vec<Value>,
@@ -116,13 +128,13 @@ pub fn project(records: &[Record]) -> SessionView {
         match &r.body {
             Body::SessionCreated {
                 definition,
-                config,
+                revision,
                 cause,
                 fork_of,
             } => {
                 v.session_id.clone_from(&r.session_id);
                 v.definition.clone_from(definition);
-                v.config.clone_from(config);
+                v.revision.clone_from(revision);
                 v.created_at = r.at;
                 v.cause = Some(cause.clone());
                 v.fork_of.clone_from(fork_of);
@@ -138,7 +150,6 @@ pub fn project(records: &[Record]) -> SessionView {
                     lane: event.lane,
                     cause: event.cause.clone(),
                     origin: event.origin.clone(),
-                    depth: event.depth,
                     payload: event.payload.clone(),
                     ui: event.ui.clone(),
                     status: "queued".into(),
@@ -156,8 +167,11 @@ pub fn project(records: &[Record]) -> SessionView {
                 event_id,
                 plugin,
                 mode,
+                subscription,
                 position,
+                phase,
                 stamp,
+                revision,
                 payload,
                 route,
             } => {
@@ -167,8 +181,11 @@ pub fn project(records: &[Record]) -> SessionView {
                         invocation_id: invocation_id.clone(),
                         plugin: plugin.clone(),
                         mode: *mode,
+                        subscription: subscription.clone(),
                         position: *position,
+                        phase: phase.clone(),
                         stamp: stamp.clone(),
+                        revision: revision.clone(),
                         started_seq: r.sequence,
                         started_at: r.at,
                         attempts: 1,
@@ -177,7 +194,7 @@ pub fn project(records: &[Record]) -> SessionView {
                         completed_seq: None,
                         completed_at: None,
                         outcome: None,
-                        transform: None,
+                        returns: None,
                         contributions: Vec::new(),
                         published: Vec::new(),
                     });
@@ -195,7 +212,7 @@ pub fn project(records: &[Record]) -> SessionView {
             Body::InvocationCompleted {
                 invocation_id,
                 outcome,
-                transform,
+                returns,
                 contributions,
                 published,
             } => {
@@ -204,7 +221,7 @@ pub fn project(records: &[Record]) -> SessionView {
                     inv.completed_seq = Some(r.sequence);
                     inv.completed_at = Some(r.at);
                     inv.outcome = Some(outcome.clone());
-                    inv.transform.clone_from(transform);
+                    inv.returns.clone_from(returns);
                     inv.contributions.clone_from(contributions);
                     inv.published.clone_from(published);
                     if let Some(title) = contributions.iter().rev().find_map(|c| match c {
@@ -265,12 +282,20 @@ pub fn project(records: &[Record]) -> SessionView {
                 });
             }
             Body::ConfigApplied {
-                config,
+                revision,
                 previous,
                 scoped,
             } => {
-                v.config.clone_from(config);
-                v.control.push(ControlView { sequence: r.sequence, at: r.at, kind: "config-applied".into(), detail: serde_json::json!({ "config": config, "previous": previous, "scoped": scoped }) });
+                v.revision.clone_from(revision);
+                v.control.push(ControlView { sequence: r.sequence, at: r.at, kind: "config-applied".into(), detail: serde_json::json!({ "revision": revision, "previous": previous, "scoped": scoped }) });
+            }
+            Body::Breach { .. } => {
+                let mut b = serde_json::to_value(&r.body).unwrap_or(Value::Null);
+                if let Some(o) = b.as_object_mut() {
+                    o.insert("sequence".into(), serde_json::json!(r.sequence));
+                    o.insert("at".into(), serde_json::json!(r.at));
+                }
+                v.breaches.push(b);
             }
         }
     }

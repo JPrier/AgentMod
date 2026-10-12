@@ -47,7 +47,7 @@ function startPlugin(devices) {
   return { child, call, publishes };
 }
 
-const event = (event_name, payload, n) => ({ event_id: `s1.e${n}`, session_id: 's1', event_name, sequence: n, payload, context: [] });
+const event = (event_name, payload, n) => ({ event_id: `s1.e${n}`, session_id: 's1', event_name, sequence: n, payload, slots: { context: [] } });
 
 test('linux-sandbox speaks the plugin protocol and answers its tools', async () => {
   // The page the device runs on is cross-origin isolated.
@@ -62,18 +62,21 @@ test('linux-sandbox speaks the plugin protocol and answers its tools', async () 
     const m = init.result.manifest;
     assert.equal(m.name, 'linux-sandbox');
     assert.deepEqual(m.devices, ['linux-vm']);
-    assert.deepEqual(m.consumes.map((c) => c.event), ['session-started', 'config-applied', 'tool-call', 'ui-action']);
-    assert.equal(m.consumes[2].mode, 'async');
-    assert.deepEqual(m.emits.map((e) => e.event), ['tool-result', 'workspace-info', 'workspace-change', 'checkpoint-created', 'workspace-restored', 'process-started', 'process-exited', 'diagnostics', 'workspace-status']);
+    const subs = m.subscribe.map((c) => c.event);
+    assert.deepEqual([subs[0], subs[1], subs.at(-1)], ['session-started', 'config-applied', 'ui-action']);
+    // One `tool-call/<tool>` member per tool it handles (async), nothing broader.
+    const members = m.subscribe.filter((c) => c.event.startsWith('tool-call/'));
+    assert.ok(members.some((c) => c.event === 'tool-call/shell') && members.every((c) => c.mode === 'async' && !c.event.endsWith('*')));
+    assert.deepEqual(m.emit.map((e) => e.event), ['tool-result', 'workspace-info', 'workspace-change', 'checkpoint-created', 'workspace-restored', 'process-started', 'process-exited', 'diagnostics', 'workspace-status']);
 
-    const started = await p.call('invoke', { invocation_id: 'i1', attempt: 1, mode: 'blocking', event: event('session-started', {}, 1) });
+    const started = await p.call('invoke', { invocation_id: 'i1', attempt: 1, mode: 'blocking', subscription: 'session-started', event: event('session-started', {}, 1) });
     const adds = started.result.contributions;
     const offered = adds.filter((c) => c.slot === 'tools').map((c) => c.value);
     assert.deepEqual(offered.filter((t) => t.tier === 'core').map((t) => t.name), ['shell', 'process', 'read_file', 'list_dir', 'search_files', 'search_text', 'apply_patch']);
     assert.deepEqual(offered.filter((t) => t.tier === 'deferred').map((t) => t.name), ['view_image', 'repo_map', 'checkpoints', 'import_repo', 'sandbox_status', 'sandbox_logs', 'sandbox_restart', 'sandbox_stop', 'adopt_changes', 'load_skill']);
     assert.match(adds.find((c) => c.slot === 'system').value, new RegExp(`Work in ${ws}`));
 
-    const run = await p.call('invoke', { invocation_id: 'i2', attempt: 1, mode: 'async', event: event('tool-call', { call_id: 'c1', name: 'shell', args: { command: 'echo hi from the vm' } }, 2) });
+    const run = await p.call('invoke', { invocation_id: 'i2', attempt: 1, mode: 'async', subscription: 'tool-call/shell', event: event('tool-call/shell', { call_id: 'c1', name: 'shell', args: { command: 'echo hi from the vm' } }, 2) });
     assert.equal(run.result.error, undefined);
     const names = p.publishes.map((x) => `${x.event_name}:${x.payload.state ?? x.payload.name ?? ''}`);
     assert.deepEqual(names, ['workspace-status:booting', 'workspace-status:ready', 'workspace-info:', 'tool-result:shell']);
@@ -90,7 +93,7 @@ test('linux-sandbox speaks the plugin protocol and answers its tools', async () 
     assert.equal(run.result.contributions.find((c) => c.slot === 'workspace').value.root, ws);
 
     p.publishes.length = 0;
-    await p.call('invoke', { invocation_id: 'i3', attempt: 1, mode: 'async', event: event('tool-call', { call_id: 'c2', name: 'apply_patch', args: { changes: [{ action: 'create', path: 'a.txt', content: 'one\n' }] } }, 3) });
+    await p.call('invoke', { invocation_id: 'i3', attempt: 1, mode: 'async', subscription: 'tool-call/apply_patch', event: event('tool-call/apply_patch', { call_id: 'c2', name: 'apply_patch', args: { changes: [{ action: 'create', path: 'a.txt', content: 'one\n' }] } }, 3) });
     assert.deepEqual(p.publishes.map((x) => x.event_name), ['checkpoint-created', 'workspace-change', 'tool-result']);
     assert.equal(p.publishes[1].ui.kind, 'diff');
     assert.match(p.publishes[1].payload.unified, /\+one/);
@@ -98,8 +101,8 @@ test('linux-sandbox speaks the plugin protocol and answers its tools', async () 
     assert.match(p.publishes[2].payload.checkpoint, /^[0-9a-f]{40}$/);
 
     p.publishes.length = 0;
-    const other = await p.call('invoke', { invocation_id: 'i4', attempt: 1, mode: 'async', event: event('tool-call', { call_id: 'c3', name: 'calc', args: {} }, 4) });
-    assert.deepEqual(other.result.contributions, []);
+    const other = await p.call('invoke', { invocation_id: 'i4', attempt: 1, mode: 'async', subscription: 'tool-call/calc', event: event('tool-call/calc', { call_id: 'c3', name: 'calc', args: {} }, 4) });
+    assert.equal(other.result.contributions, undefined);
     assert.equal(p.publishes.length, 0, 'other plugins’ tools are not answered');
   } finally {
     p.child.kill();

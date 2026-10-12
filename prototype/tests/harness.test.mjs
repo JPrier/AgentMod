@@ -190,12 +190,17 @@ test('budgets: tighter of config and delegation; usage from the log', () => {
   const events = [
     { event_name: 'user-message', at: 0, payload: {} },
     ...Array.from({ length: 5 }, (_, i) => ({ event_name: 'model-response', at: i * 1000, payload: { metrics: { output_tokens: 10 } } })),
-    { event_name: 'tool-call', at: 6000, payload: {} },
+    { event_name: 'tool-call/shell', at: 6000, payload: {} },
   ];
   const u = usage(events);
-  assert.deepEqual(u, { model_requests: 5, tool_calls: 1, output_tokens: 50, wall_seconds: 6 });
+  assert.deepEqual(u, { model_requests: 5, tool_calls: 1, output_tokens: 50, wall_seconds: 6, turn_model_requests: 5 });
   assert.match(exceeded(b, u), /max_model_requests=5/);
   assert.equal(exceeded({ max_model_requests: 6 }, u), null);
+  // The per-turn loop bound counts only since the latest user message.
+  const next = usage([...events, { event_name: 'user-message', at: 7000, payload: {} }, { event_name: 'model-response', at: 8000, payload: {} }]);
+  assert.equal(next.turn_model_requests, 1);
+  assert.match(exceeded({ max_turn_model_requests: 5 }, u), /max_turn_model_requests=5 in this turn/);
+  assert.equal(exceeded({ max_turn_model_requests: 5 }, next), null);
 });
 
 test('plans are validated', () => {
@@ -207,11 +212,11 @@ test('plans are validated', () => {
 test('child evidence is derived from its log and bounded', () => {
   const view = { events: [
     { event_name: 'workspace-info', payload: { root: '/w/.agentmod/state/worktrees/s0002', mode: 'isolated' } },
-    { event_name: 'tool-call', payload: { call_id: 'a', name: 'shell', args: { command: 'npm test' } } },
+    { event_name: 'tool-call/shell', payload: { call_id: 'a', name: 'shell', args: { command: 'npm test' } } },
     { event_name: 'tool-result', payload: { call_id: 'a', exit_code: 1, error: true } },
     { event_name: 'workspace-change', payload: { files: [{ path: 'src/x.js' }] } },
     { event_name: 'checkpoint-created', payload: { checkpoint: 'abc' } },
-    { event_name: 'tool-call', payload: { call_id: 'b', name: 'shell', args: { command: 'npm test' } } },
+    { event_name: 'tool-call/shell', payload: { call_id: 'b', name: 'shell', args: { command: 'npm test' } } },
     { event_name: 'tool-result', payload: { call_id: 'b', exit_code: 0 } },
     { event_name: 'model-response', payload: { metrics: { input_tokens: 100, output_tokens: 10, cost: 0.01 } } },
   ] };

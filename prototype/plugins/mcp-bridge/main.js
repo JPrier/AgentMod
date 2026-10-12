@@ -15,7 +15,7 @@
 //
 // Config: { servers: { <name>: { command: [...], env: {}, cwd } | { url, headers } , tier? },
 //           timeout_seconds: 120, max_output_bytes: 20000 }
-import { definePlugin, offerTools, ownTools } from '../sdk/agentmod.js';
+import { definePlugin, offerSubscriptions, offerTools, optional, toolCalls, toolResult } from '../sdk/agentmod.js';
 import { connectStdio, connectHttp, toSpec, flattenResult } from '../sdk/mcp.js';
 
 const servers = new Map(); // name -> { client, specs, error }
@@ -44,8 +44,9 @@ async function offer(ctx) {
   offerTools(ctx, allSpecs());
 }
 
-// Each configured server owns the family `mcp__<server>__*`: ownership is
-// known from config at compile time even though the tool list arrives later.
+// Each configured server is a sub-family `tool-call/mcp__<server>__*`: this
+// plugin is its handler, known from config at compile time even though the
+// tool list arrives later.
 const families = (cfg) => Object.keys(cfg.servers || {}).map((n) => `mcp__${n}__*`);
 
 definePlugin({
@@ -54,14 +55,9 @@ definePlugin({
     name: 'mcp-bridge',
     version: '0.1.0',
     description: 'MCP servers (stdio / streamable HTTP) as deferred, policy-gated, untrusted tools.',
-    consumes: [
-      { event: 'session-started' },
-      { event: 'config-applied' },
-      ownTools(families(cfg)),
-    ],
-    emits: [{ event: 'tool-result', supplies: ['call_id', 'name', 'output'] }],
+    subscribe: [...offerSubscriptions(), ...toolCalls(families(cfg))],
+    emit: [toolResult({ trust: optional('string'), server: optional('string'), tool: optional('string') })],
     services: [{ name: 'servers', description: 'Connected MCP servers, their tools, and connection errors' }],
-    tools: families(cfg).map((name) => ({ name, tier: 'deferred' })),
     config_schema: { servers: {}, timeout_seconds: 120, max_output_bytes: 20000 },
   }),
   init: (p) => start(p.config || {}),
@@ -74,7 +70,7 @@ definePlugin({
   handlers: {
     'session-started': offer,
     'config-applied': offer,
-    'tool-call': async (ctx) => {
+    'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (!name.startsWith('mcp__')) return;
       await start(ctx.config || {});

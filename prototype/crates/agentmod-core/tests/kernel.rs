@@ -1,430 +1,241 @@
-//! Scenario tests for the kernel: dispatch, publishing, control, recovery.
+//! Scenario tests for the kernel: dispatch along the compiled graph,
+//! publishing, control, recovery, revisions.
 
-use std::collections::{BTreeMap, VecDeque};
+mod common;
 
-use agentmod_core::compiler::compile;
+use std::collections::BTreeMap;
+
+use agentmod_core::compiler::{Compilation, compile};
 use agentmod_core::kernel::{
-    Effect, InitialEvent, InvocationResult, InvokeRequest, Kernel, PublishRequest, Scope,
-    StartRequest,
+    InitialEvent, InvocationResult, InvokeRequest, Kernel, PublishRequest, Scope, StartRequest,
 };
-use agentmod_core::manifest::{
-    Capability, Consume, Definition, DeploymentConfig, Emit, Manifest, PluginConfig, Subscriber,
-    Transform,
-};
+use agentmod_core::manifest::{DeploymentConfig, Manifest};
 use agentmod_core::projection::{context_at, project};
 use agentmod_core::record::{Body, Command, DispatchState, Outcome, Record, Settlement};
 use agentmod_core::types::{ContextOp, Lane, LogRef, Mode, Origin};
+use common::{S, Sim, deployment, k};
 use serde_json::{Value, json};
 
 // ----------------------------------------------------------------------------
 // Fixtures
 // ----------------------------------------------------------------------------
 
-fn c(event: &str, demands: &[&str]) -> Consume {
-    Consume {
-        event: event.into(),
-        demands: demands.iter().map(|s| (*s).into()).collect(),
-        mode: None,
-        context: true,
-        keyed: None,
-    }
-}
-fn ca(event: &str) -> Consume {
-    Consume {
-        event: event.into(),
-        demands: vec![],
-        mode: Some(Mode::Async),
-        context: false,
-        keyed: None,
-    }
-}
-fn e(event: &str, supplies: &[&str]) -> Emit {
-    Emit {
-        event: event.into(),
-        supplies: supplies.iter().map(|s| (*s).into()).collect(),
-        deferred: false,
-    }
-}
-fn ed(event: &str, supplies: &[&str]) -> Emit {
-    Emit {
-        deferred: true,
-        ..e(event, supplies)
-    }
-}
-fn m(name: &str, consumes: Vec<Consume>, emits: Vec<Emit>, caps: Vec<Capability>) -> Manifest {
-    Manifest {
-        name: name.into(),
-        version: "1".into(),
-        description: String::new(),
-        consumes,
-        emits,
-        transforms: vec![],
-        capabilities: caps,
-        config_schema: Value::Null,
-        ..Default::default()
-    }
-}
-
-/// A small chat deployment: ui (frontend), redact (transformer), gate (veto),
-/// chat (context + loop), model (async provider), worker (cross-session).
+/// A small chat deployment: ui (frontend, wildcard observer), redact (returns
+/// a rewritten `text`), gate (veto), chat (context + loop), model (async
+/// provider), ping/pong (a cycle), reporter (cross-session), collector.
 fn manifests() -> BTreeMap<String, Manifest> {
-    let ui = m(
-        "ui",
-        vec![ca("*")],
-        vec![ed("user-message", &["text"]), ed("steer", &["text"])],
-        vec![
-            Capability::StartSession,
-            Capability::DeferredPublish,
-            Capability::Control,
-            Capability::Observe,
-        ],
-    );
-    let mut redact = m("redact", vec![c("user-message", &["text"])], vec![], vec![]);
-    redact.transforms = vec![Transform {
-        event: "user-message".into(),
-        preserves: vec!["text".into()],
-        adds: vec!["redacted".into()],
-    }];
-    let gate = m("gate", vec![c("user-message", &["text"])], vec![], vec![]);
-    let chat = m(
-        "chat",
-        vec![
-            c("user-message", &["text"]),
-            c("model-response", &["text"]),
-            c("steer", &["text"]),
-        ],
-        vec![
-            e("model-request", &["turn"]),
-            e("assistant-message", &["text"]),
-        ],
-        vec![],
-    );
-    let model = m(
-        "model",
-        vec![Consume {
-            mode: Some(Mode::Async),
-            ..c("model-request", &["turn"])
-        }],
-        vec![e("model-response", &["text"]), e("stream-chunk", &["text"])],
-        vec![],
-    );
-    let ping = m("ping", vec![c("pong", &[])], vec![e("ping", &[])], vec![]);
-    let pong = m(
-        "pong",
-        vec![c("ping", &[]), c("session-started", &[])],
-        vec![e("pong", &[])],
-        vec![],
-    );
-    let reporter = m(
-        "reporter",
-        vec![c("assistant-message", &["text"])],
-        vec![e("worker-result", &["text"])],
-        vec![Capability::CrossSession],
-    );
-    let nocross = m(
-        "nocross",
-        vec![c("assistant-message", &["text"])],
-        vec![e("worker-result", &["text"])],
-        vec![],
-    );
-    let collector = m(
-        "collector",
-        vec![c("worker-result", &["text"])],
-        vec![],
-        vec![],
-    );
-    [
-        ui, redact, gate, chat, model, ping, pong, reporter, nocross, collector,
-    ]
-    .into_iter()
-    .map(|m| (m.name.clone(), m))
-    .collect()
-}
-
-fn sub(p: &str) -> Subscriber {
-    Subscriber {
-        plugin: p.into(),
-        mode: None,
-    }
-}
-
-fn config(chat_subs: &[&str]) -> DeploymentConfig {
-    let mut cfg = DeploymentConfig::default();
-    for name in manifests().keys() {
-        cfg.plugins.insert(
-            name.clone(),
-            PluginConfig {
-                command: vec![name.clone()],
-                module: None,
-                config: json!({}),
-                timeout_ms: None,
-                binary_hash: Some(format!("bin-{name}")),
-                disabled: false,
-                version: None,
-            },
-        );
-    }
-    cfg.runtime.max_causal_depth = 12;
-    cfg.definitions.insert(
-        "chat".into(),
-        Definition {
-            description: "chat".into(),
-            subscribers: chat_subs.iter().map(|s| sub(s)).collect(),
-            ..Default::default()
-        },
-    );
-    cfg.definitions.insert(
-        "pingpong".into(),
-        Definition {
-            description: String::new(),
-            subscribers: vec![sub("ui"), sub("ping"), sub("pong")],
-            ..Default::default()
-        },
-    );
-    cfg.definitions.insert(
-        "worker".into(),
-        Definition {
-            description: String::new(),
-            subscribers: vec![
-                sub("ui"),
-                sub("chat"),
-                sub("model"),
-                sub("reporter"),
-                sub("nocross"),
+    let ctx = json!({ "context": k("array<object>") });
+    common::manifests(json!({
+        "ui": {
+            "subscribe": [{ "event": "*", "mode": "async" }],
+            "emit": [
+                { "event": "user-message", "deferred": true, "keys": { "text": k(S) } },
+                { "event": "steer", "deferred": true, "lane": "interrupt", "keys": { "text": k(S) } }
             ],
-            ..Default::default()
+            "capabilities": ["start-session", "deferred-publish", "interrupt", "control", "observe"],
+            "sink": true
         },
-    );
-    cfg
+        "redact": {
+            "subscribe": [{ "event": "user-message", "mode": "blocking", "receives": { "text": k(S) }, "returns": { "text": k(S), "redacted": k("bool") } }]
+        },
+        "gate": {
+            "subscribe": [{ "event": "user-message", "mode": "blocking", "actions": ["veto"], "receives": { "text": k(S) } }]
+        },
+        "chat": {
+            "subscribe": [
+                { "event": "user-message", "mode": "blocking", "actions": ["contribute-context"], "receives": { "text": k(S) } },
+                { "event": "model-response", "mode": "blocking", "actions": ["contribute-context"], "receives": { "text": k(S) } },
+                { "event": "steer", "mode": "blocking", "actions": ["contribute-context"], "receives": { "text": k(S) } }
+            ],
+            "emit": [
+                { "event": "model-request", "keys": { "turn": k(S) } },
+                { "event": "assistant-message", "keys": { "text": k(S) } }
+            ]
+        },
+        "model": {
+            "subscribe": [{ "event": "model-request", "mode": "async", "receives": { "turn": k(S), "slots": ctx } }],
+            "emit": [{ "event": "model-response", "keys": { "text": k(S) } }]
+        },
+        "ping": { "subscribe": [{ "event": "pong", "mode": "blocking" }], "emit": [{ "event": "ping" }] },
+        "pong": {
+            "subscribe": [{ "event": "ping", "mode": "blocking" }, { "event": "session-started", "mode": "blocking" }],
+            "emit": [{ "event": "pong" }]
+        },
+        "reporter": {
+            "subscribe": [{ "event": "assistant-message", "mode": "async", "receives": { "text": k(S) } }],
+            "outbound": [{ "event": "worker-result", "keys": { "text": k(S) } }],
+            "capabilities": ["cross-session"]
+        },
+        "nocross": { "subscribe": [{ "event": "assistant-message", "mode": "async", "receives": { "text": k(S) } }] },
+        "collector": { "subscribe": [{ "event": "worker-result", "mode": "async", "receives": { "text": k(S) } }], "sink": true }
+    }))
+}
+
+fn phase_of(p: &str) -> Value {
+    match p {
+        "redact" => json!({ "phase": "intake" }),
+        "gate" => json!({ "phase": "guard" }),
+        "chat" => json!({ "phase": "loop" }),
+        _ => json!({}),
+    }
+}
+
+fn config(chat_plugins: &[&str]) -> DeploymentConfig {
+    let plugins: serde_json::Map<String, Value> = chat_plugins
+        .iter()
+        .map(|p| ((*p).to_owned(), phase_of(p)))
+        .collect();
+    deployment(
+        &manifests(),
+        json!({
+            "chat": { "description": "chat", "runtime": "0.1", "phases": ["intake", "guard", "loop"], "plugins": plugins, "inbound": { "worker-result": { "text": k(S) } } },
+            "pingpong": { "runtime": "0.1", "phases": ["main"], "plugins": { "ui": {}, "ping": { "phase": "main" }, "pong": { "phase": "main" } } },
+            "worker": { "runtime": "0.1", "phases": ["loop"], "plugins": { "ui": {}, "chat": { "phase": "loop" }, "model": {}, "reporter": {}, "nocross": {} } }
+        }),
+    )
 }
 
 const CHAT: &[&str] = &["ui", "redact", "gate", "chat", "model", "collector"];
 
-// ----------------------------------------------------------------------------
-// Simulator: plays plugins against the kernel deterministically.
-// ----------------------------------------------------------------------------
-
-#[derive(Default)]
-struct Sim {
-    k: Kernel,
-    logs: BTreeMap<String, Vec<Record>>,
-    pending: VecDeque<(String, InvokeRequest)>,
-    cancelled: Vec<String>,
-    now: u64,
-    auto: bool,
+fn compiled(cfg: &DeploymentConfig) -> Compilation {
+    let c = compile(cfg, &manifests());
+    assert!(c.ok, "{:#?}", c.errors());
+    c
 }
 
-impl Sim {
-    fn new(cfg: &DeploymentConfig) -> Self {
-        let mut k = Kernel::new();
-        let comp = compile(cfg, &manifests());
-        assert!(comp.ok, "{:#?}", comp.diagnostics);
-        k.install(comp).unwrap();
-        Sim {
-            k,
-            auto: true,
-            ..Default::default()
-        }
-    }
-
-    fn take(&mut self, fx: Vec<Effect>) {
-        for f in fx {
-            match f {
-                Effect::Append { record } => {
-                    let log = self.logs.entry(record.session_id.clone()).or_default();
-                    assert_eq!(
-                        record.sequence,
-                        log.len() as u64 + 1,
-                        "sequences are dense and monotonic"
-                    );
-                    log.push(record);
-                }
-                Effect::Invoke {
-                    plugin, request, ..
-                } => self.pending.push_back((plugin, request)),
-                Effect::Cancel { invocation_id, .. } => self.cancelled.push(invocation_id),
-            }
-        }
-    }
-
-    fn tick(&mut self) -> u64 {
-        self.now += 10;
-        self.now
-    }
-
-    fn start(&mut self, def: &str, text: Option<&str>) -> String {
-        let req = StartRequest {
-            plugin: "ui".into(),
-            definition: def.into(),
-            invocation_id: None,
-            initial: text.map(|t| InitialEvent {
-                event_name: "user-message".into(),
-                payload: json!({ "text": t }),
-                ui: None,
-            }),
-            fork_from: None,
-        };
-        let now = self.tick();
-        let out = self.k.start_session(&req, now);
-        assert!(out.error.is_none(), "{:?}", out.error);
-        self.take(out.effects);
-        out.session_id.unwrap()
-    }
-
-    fn publish(&mut self, req: PublishRequest) -> Result<String, String> {
-        let now = self.tick();
-        let out = self.k.publish(&req, now);
-        self.take(out.effects);
-        match (out.event_id, out.blocked) {
-            (Some(id), None) => Ok(id),
-            (_, Some(b)) => Err(b),
-            _ => unreachable!(),
-        }
-    }
-
-    fn complete(&mut self, inv: &str, result: InvocationResult) {
-        let now = self.tick();
-        let fx = self.k.complete(inv, &result, now);
-        self.take(fx);
-    }
-
-    /// Default plugin behaviour, used when `auto` is on.
-    fn behave(&mut self, plugin: &str, req: &InvokeRequest) {
-        let ev = &req.event;
-        let inv = req.invocation_id.clone();
-        let publish = |name: &str, payload: Value| PublishRequest {
-            plugin: plugin.into(),
-            invocation_id: Some(inv.clone()),
-            cite: None,
-            event_name: name.into(),
-            payload,
-            ui: None,
-            lane: Lane::Normal,
-            target_session: None,
-        };
-        let mut result = InvocationResult::default();
-        match (plugin, ev.event_name.as_str()) {
-            ("redact", "user-message") => {
-                let text = ev.payload["text"]
-                    .as_str()
-                    .unwrap_or("")
-                    .replace("secret", "******");
-                result.transform = Some(json!({ "text": text, "redacted": true }));
-            }
-            ("gate", "user-message")
-                if ev.payload["text"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("forbidden") =>
-            {
-                result.veto = Some("policy".into());
-            }
-            ("chat", "user-message" | "steer") => {
-                result.contributions = vec![ContextOp::Add {
-                    slot: "messages".into(),
-                    value: json!({ "role": "user", "content": ev.payload["text"] }),
-                }];
-                let _ = self.publish(publish("model-request", json!({ "turn": ev.event_id })));
-            }
-            ("chat", "model-response") => {
-                result.contributions = vec![ContextOp::Add {
-                    slot: "messages".into(),
-                    value: json!({ "role": "assistant", "content": ev.payload["text"] }),
-                }];
-                let _ = self.publish(publish(
-                    "assistant-message",
-                    json!({ "text": ev.payload["text"] }),
-                ));
-            }
-            ("model", "model-request") => {
-                let n = ev.context.as_ref().map_or(0, Vec::len);
-                let _ = self.publish(publish("stream-chunk", json!({ "text": "he" })));
-                let _ = self.publish(publish(
-                    "model-response",
-                    json!({ "text": format!("reply with {n} context items") }),
-                ));
-            }
-            ("ping", "pong") => {
-                let _ = self.publish(publish("ping", json!({})));
-            }
-            ("pong", "session-started") => {
-                let _ = self.publish(publish("pong", json!({})));
-            }
-            ("pong", "ping") => {
-                let _ = self.publish(publish("pong", json!({})));
-            }
-            ("reporter" | "nocross", "assistant-message") => {
-                let parent = ev
-                    .payload
-                    .get("parent")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .or_else(|| PARENT.with(|p| p.borrow().clone()));
-                if let Some(parent) = parent {
-                    let mut p = publish("worker-result", json!({ "text": ev.payload["text"] }));
-                    p.target_session = Some(parent);
-                    let _ = self.publish(p);
-                }
-            }
-            _ => {}
-        }
-        self.complete(&inv, result);
-    }
-
-    fn run(&mut self) {
-        let mut guard = 0;
-        while let Some((plugin, req)) = self.pending.pop_front() {
-            guard += 1;
-            assert!(guard < 10_000, "runaway");
-            if self.cancelled.contains(&req.invocation_id) {
-                continue;
-            }
-            self.behave(&plugin, &req);
-        }
-    }
-
-    fn log(&self, sid: &str) -> &[Record] {
-        &self.logs[sid]
-    }
-
-    fn kinds(&self, sid: &str) -> Vec<String> {
-        self.log(sid)
-            .iter()
-            .map(|r| r.body.kind().to_owned())
-            .collect()
-    }
-
-    fn events(&self, sid: &str) -> Vec<String> {
-        self.log(sid)
-            .iter()
-            .filter_map(|r| match &r.body {
-                Body::EventAppended { event } => Some(event.event_name.clone()),
-                _ => None,
-            })
-            .collect()
-    }
+fn new_sim(cfg: &DeploymentConfig) -> Sim {
+    Sim::new(compiled(cfg))
 }
 
 thread_local! {
     static PARENT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
-fn ui_cite(sim: &Sim, sid: &str) -> String {
-    sim.log(sid)
-        .iter()
-        .rev()
-        .find_map(|r| match &r.body {
-            Body::InvocationStarted {
-                invocation_id,
-                plugin,
-                ..
-            } if plugin == "ui" => Some(invocation_id.clone()),
-            _ => None,
-        })
-        .expect("ui has a standing invocation")
+/// Default plugin behaviour.
+fn behave(sim: &mut Sim, plugin: &str, req: &InvokeRequest) -> InvocationResult {
+    let ev = &req.event;
+    let inv = req.invocation_id.clone();
+    let mut result = InvocationResult::default();
+    match (plugin, ev.event_name.as_str()) {
+        ("redact", "user-message") => {
+            let text = ev.payload["text"]
+                .as_str()
+                .unwrap_or("")
+                .replace("secret", "******");
+            result.returns = Some(
+                json!({ "text": text, "redacted": true })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            );
+        }
+        ("gate", "user-message")
+            if ev.payload["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("forbidden") =>
+        {
+            result.veto = Some("policy".into());
+        }
+        ("chat", "user-message" | "steer") => {
+            result.contributions = vec![ContextOp::Add {
+                slot: "messages".into(),
+                value: json!({ "role": "user", "content": ev.payload["text"] }),
+            }];
+            let _ = sim.emit(
+                "chat",
+                &inv,
+                "model-request",
+                json!({ "turn": ev.event_id }),
+            );
+        }
+        ("chat", "model-response") => {
+            result.contributions = vec![ContextOp::Add {
+                slot: "messages".into(),
+                value: json!({ "role": "assistant", "content": ev.payload["text"] }),
+            }];
+            let _ = sim.emit(
+                "chat",
+                &inv,
+                "assistant-message",
+                json!({ "text": ev.payload["text"] }),
+            );
+        }
+        ("model", "model-request") => {
+            let n = ev
+                .slots
+                .as_ref()
+                .and_then(|s| s.get("context"))
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let _ = sim.emit(
+                "model",
+                &inv,
+                "model-response",
+                json!({ "text": format!("reply with {n} context items") }),
+            );
+        }
+        ("ping", "pong") => {
+            let _ = sim.emit("ping", &inv, "ping", json!({}));
+        }
+        ("pong", "session-started" | "ping") => {
+            let _ = sim.emit("pong", &inv, "pong", json!({}));
+        }
+        ("reporter" | "nocross", "assistant-message") => {
+            if let Some(parent) = PARENT.with(|p| p.borrow().clone()) {
+                let _ = sim.publish(PublishRequest {
+                    plugin: plugin.into(),
+                    invocation_id: Some(inv.clone()),
+                    cite: None,
+                    event_name: "worker-result".into(),
+                    payload: json!({ "text": ev.payload["text"] }),
+                    ui: None,
+                    lane: None,
+                    target_session: Some(parent),
+                });
+            }
+        }
+        _ => {}
+    }
+    result
 }
 
-fn user(sim: &Sim, sid: &str, text: &str, lane: Lane) -> PublishRequest {
+fn run(sim: &mut Sim) {
+    sim.run(&mut behave);
+}
+
+fn step(sim: &mut Sim, plugin: &str, req: &InvokeRequest) {
+    let r = behave(sim, plugin, req);
+    sim.complete(&req.invocation_id, r);
+}
+
+/// Pop pending invocations, behaving normally, until `plugin`'s turn comes.
+fn until(sim: &mut Sim, plugin: &str) -> InvokeRequest {
+    loop {
+        let (p, _, req) = sim
+            .pending
+            .pop_front()
+            .unwrap_or_else(|| panic!("{plugin} reached"));
+        if p == plugin {
+            return req;
+        }
+        step(sim, &p, &req);
+    }
+}
+
+fn start(sim: &mut Sim, def: &str, text: Option<&str>) -> String {
+    sim.start(
+        "ui",
+        def,
+        text.map(|t| ("user-message", json!({ "text": t }))),
+    )
+}
+
+fn ui_cite(sim: &Sim, sid: &str) -> String {
+    sim.first_invocation(sid, "ui")
+}
+
+fn user(sim: &Sim, sid: &str, text: &str) -> PublishRequest {
     PublishRequest {
         plugin: "ui".into(),
         invocation_id: None,
@@ -432,8 +243,15 @@ fn user(sim: &Sim, sid: &str, text: &str, lane: Lane) -> PublishRequest {
         event_name: "user-message".into(),
         payload: json!({ "text": text }),
         ui: None,
-        lane,
+        lane: None,
         target_session: None,
+    }
+}
+
+fn steer(sim: &Sim, sid: &str, text: &str) -> PublishRequest {
+    PublishRequest {
+        event_name: "steer".into(),
+        ..user(sim, sid, text)
     }
 }
 
@@ -442,88 +260,109 @@ fn user(sim: &Sim, sid: &str, text: &str, lane: Lane) -> PublishRequest {
 // ----------------------------------------------------------------------------
 
 #[test]
-fn chat_turn_runs_pipelines_in_order_and_records_everything() {
-    let mut sim = Sim::new(&config(CHAT));
-    let sid = sim.start("chat", Some("hello secret world"));
-    sim.run();
+fn chat_turn_runs_the_compiled_chain_in_phase_order_and_records_everything() {
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("hello secret world"));
+    run(&mut sim);
     assert_eq!(
         sim.events(&sid),
         vec![
             "session-started",
             "user-message",
             "model-request",
-            "stream-chunk",
             "model-response",
             "assistant-message"
         ]
     );
     let view = project(sim.log(&sid));
-    assert!(
-        view.events.iter().all(|e| e.status == "delivered"),
-        "{:#?}",
-        view.events
-            .iter()
-            .map(|e| (&e.event_name, &e.status))
-            .collect::<Vec<_>>()
-    );
-    // The blocking chain ran in declared order; the transform reached downstream.
+    assert!(view.events.iter().all(|e| e.status == "delivered"));
+    // The blocking chain ran in phase order; the return reached downstream. The
+    // wildcard observer `ui` is not invoked for its own `user-message`.
     let um = &view.events[1];
     let order: Vec<_> = um
         .invocations
         .iter()
-        .map(|i| (i.plugin.as_str(), i.mode))
+        .map(|i| (i.plugin.as_str(), i.mode, i.phase.as_deref()))
         .collect();
     assert_eq!(
         order,
         vec![
-            ("redact", Mode::Blocking),
-            ("gate", Mode::Blocking),
-            ("chat", Mode::Blocking),
-            ("ui", Mode::Async)
+            ("redact", Mode::Blocking, Some("intake")),
+            ("gate", Mode::Blocking, Some("guard")),
+            ("chat", Mode::Blocking, Some("loop")),
         ]
     );
     assert_eq!(um.invocations[1].input["text"], "hello ****** world");
     assert_eq!(um.invocations[0].input["text"], "hello secret world");
-    // Stamps are recorded on every invocation.
+    // Projection: each subscriber received exactly the keys it declared.
+    assert_eq!(
+        um.invocations[1].input,
+        json!({ "text": "hello ****** world" }),
+        "gate did not get `redacted`"
+    );
+    // Stamps and the revision are recorded on every invocation.
+    let rev = sim.k.status(&sid).unwrap().revision;
     assert_eq!(um.invocations[0].stamp.binary, "bin-redact");
+    assert!(
+        view.events
+            .iter()
+            .flat_map(|e| &e.invocations)
+            .all(|i| i.revision == rev)
+    );
     // Context: user + assistant messages, attributed to chat.
     assert_eq!(view.context.len(), 2);
     assert!(view.context.iter().all(|c| c.plugin == "chat"));
-    // The model saw the user message in its context.
-    assert_eq!(view.events[4].payload["text"], "reply with 1 context items");
+    // The model asked for the context slot and saw the user message in it.
+    assert_eq!(view.events[3].payload["text"], "reply with 1 context items");
     // Pipeline outputs have deterministic ids and causes.
     let mr = &view.events[2];
     assert!(mr.event_id.ends_with(".o0"));
     assert!(matches!(&mr.origin, Origin::Pipeline { plugin, .. } if plugin == "chat"));
-    assert_eq!(mr.depth, 1);
     assert_eq!(sim.k.status(&sid).unwrap().activity, "idle");
+    assert!(view.breaches.is_empty());
+}
+
+#[test]
+fn context_is_delivered_only_to_subscriptions_that_request_it() {
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("hi"));
+    let mut seen: Vec<(String, bool)> = Vec::new();
+    sim.run(&mut |s: &mut Sim, p: &str, req: &InvokeRequest| {
+        seen.push((
+            format!("{p}:{}", req.event.event_name),
+            req.event.slots.is_some(),
+        ));
+        behave(s, p, req)
+    });
+    let with: Vec<&String> = seen.iter().filter(|(_, c)| *c).map(|(n, _)| n).collect();
+    assert_eq!(with, vec!["model:model-request"], "{seen:?}");
+    let _ = sid;
 }
 
 #[test]
 fn replay_rebuilds_identical_state_and_reruns_identically() {
     let cfg = config(CHAT);
-    let mut a = Sim::new(&cfg);
-    let sid = a.start("chat", Some("one"));
-    a.run();
-    let p = a.publish(user(&a, &sid, "two", Lane::Normal));
-    assert!(p.is_ok());
-    a.run();
+    let mut a = new_sim(&cfg);
+    let sid = start(&mut a, "chat", Some("one"));
+    run(&mut a);
+    a.publish(user(&a, &sid, "two")).unwrap();
+    run(&mut a);
     // Deterministic: an identical script yields byte-identical logs.
-    let mut b = Sim::new(&cfg);
-    let sid_b = b.start("chat", Some("one"));
-    b.run();
-    b.publish(user(&b, &sid_b, "two", Lane::Normal)).unwrap();
-    b.run();
+    let mut b = new_sim(&cfg);
+    let sid_b = start(&mut b, "chat", Some("one"));
+    run(&mut b);
+    b.publish(user(&b, &sid_b, "two")).unwrap();
+    run(&mut b);
     assert_eq!(
         serde_json::to_string(a.log(&sid)).unwrap(),
         serde_json::to_string(b.log(&sid_b)).unwrap()
     );
     // Replay-as-reading rebuilds the same status and context.
-    let mut k = Kernel::new();
-    k.install(compile(&cfg, &manifests())).unwrap();
-    k.load_session(a.log(&sid)).unwrap();
-    assert_eq!(k.status(&sid), a.k.status(&sid));
-    assert_eq!(k.context(&sid), a.k.context(&sid));
+    let mut k2 = Kernel::new();
+    k2.install(compiled(&cfg)).unwrap();
+    k2.load_session(a.log(&sid)).unwrap();
+    assert_eq!(k2.status(&sid), a.k.status(&sid));
+    assert_eq!(k2.context(&sid), a.k.context(&sid));
     // Records round-trip through JSON.
     let json = serde_json::to_string(a.log(&sid)).unwrap();
     let back: Vec<Record> = serde_json::from_str(&json).unwrap();
@@ -532,52 +371,97 @@ fn replay_rebuilds_identical_state_and_reruns_identically() {
 
 #[test]
 fn veto_settles_the_event_and_skips_async_observers() {
-    let mut sim = Sim::new(&config(CHAT));
-    let sid = sim.start("chat", Some("this is forbidden"));
-    sim.run();
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("this is forbidden"));
+    run(&mut sim);
     let view = project(sim.log(&sid));
     let um = &view.events[1];
     assert_eq!(um.status, "vetoed");
     assert!(matches!(&um.settlement, Some(Settlement::Vetoed { plugin, .. }) if plugin == "gate"));
-    assert!(
-        um.invocations
-            .iter()
-            .all(|i| i.plugin != "chat" && i.plugin != "ui")
-    );
+    assert!(um.invocations.iter().all(|i| i.plugin != "chat"));
     assert_eq!(sim.events(&sid), vec!["session-started", "user-message"]);
 }
 
 #[test]
-fn transform_violating_its_declaration_fails_the_pipeline() {
-    let mut sim = Sim::new(&config(CHAT));
-    sim.auto = false;
-    let sid = sim.start("chat", Some("x"));
-    // session-started → ui async only.
-    while let Some((plugin, req)) = sim.pending.pop_front() {
-        if plugin == "redact" {
-            sim.complete(
-                &req.invocation_id,
-                InvocationResult {
-                    transform: Some(json!({ "other": 1 })),
-                    ..Default::default()
-                },
-            );
+fn returns_contradicting_the_declaration_fail_the_pipeline_with_a_breach() {
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("x"));
+    sim.run(&mut |s: &mut Sim, p: &str, req: &InvokeRequest| {
+        if p == "redact" {
+            InvocationResult {
+                returns: Some(
+                    json!({ "text": 42, "redacted": true })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+                ..Default::default()
+            }
         } else {
-            sim.complete(&req.invocation_id, InvocationResult::default());
+            behave(s, p, req)
         }
-    }
+    });
     let view = project(sim.log(&sid));
     assert_eq!(view.events[1].status, "failed");
     let out = view.events[1].invocations[0].outcome.clone().unwrap();
-    assert!(matches!(out, Outcome::Failed { error } if error.contains("preserved key `text`")));
+    assert!(matches!(out, Outcome::Failed { error } if error.contains("returned `text`")));
+    let b = &view.breaches[0];
+    assert_eq!(b["plugin"], "redact");
+    assert_eq!(b["declaration"]["kind"], "returns");
+    assert_eq!(b["declaration"]["key"], "text");
+    assert_eq!(b["declaration"]["shape"]["shape"], "string");
+    assert_eq!(b["observed"], 42);
+    assert_eq!(b["reaction"], "invocation-failed");
 }
 
 #[test]
-fn async_subscribers_cannot_veto() {
-    let mut sim = Sim::new(&config(CHAT));
-    sim.auto = false;
-    let sid = sim.start("chat", None);
-    let (_, req) = sim.pending.pop_front().unwrap();
+fn returns_may_not_add_undeclared_keys_or_omit_required_ones() {
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("x"));
+    sim.run(&mut |s: &mut Sim, p: &str, req: &InvokeRequest| match p {
+        "redact" => InvocationResult {
+            returns: Some(
+                json!({ "text": "t", "redacted": true, "extra": 1 })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ..Default::default()
+        },
+        _ => behave(s, p, req),
+    });
+    let view = project(sim.log(&sid));
+    assert!(
+        view.breaches[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("does not declare"),
+        "{:?}",
+        view.breaches
+    );
+    let mut sim2 = new_sim(&config(CHAT));
+    let sid2 = start(&mut sim2, "chat", Some("x"));
+    sim2.run(&mut |s: &mut Sim, p: &str, req: &InvokeRequest| match p {
+        "redact" => InvocationResult {
+            returns: Some(json!({ "text": "t" }).as_object().unwrap().clone()),
+            ..Default::default()
+        },
+        _ => behave(s, p, req),
+    });
+    let view = project(sim2.log(&sid2));
+    assert!(
+        view.breaches[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("did not return required `redacted`")
+    );
+}
+
+#[test]
+fn async_subscribers_cannot_veto_and_undeclared_actions_are_breaches() {
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", None);
+    let (_, _, req) = sim.pending.pop_front().unwrap();
     sim.complete(
         &req.invocation_id,
         InvocationResult {
@@ -591,13 +475,35 @@ fn async_subscribers_cannot_veto() {
         Some(Outcome::Failed { .. })
     ));
     assert_eq!(view.events[0].status, "delivered");
+    assert_eq!(view.breaches[0]["declaration"]["kind"], "actions");
+    // gate contributes context without declaring `contribute-context`.
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("hi"));
+    sim.run(&mut |s: &mut Sim, p: &str, req: &InvokeRequest| match p {
+        "gate" => InvocationResult {
+            contributions: vec![ContextOp::Add {
+                slot: "x".into(),
+                value: json!(1),
+            }],
+            ..Default::default()
+        },
+        _ => behave(s, p, req),
+    });
+    let view = project(sim.log(&sid));
+    assert!(
+        view.breaches[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("contribute-context")
+    );
+    assert!(view.context.iter().all(|c| c.slot != "x"));
 }
 
 #[test]
-fn publish_classification_and_blocking_are_recorded() {
-    let mut sim = Sim::new(&config(CHAT));
-    let sid = sim.start("chat", None);
-    sim.run();
+fn publish_classification_blocks_and_breaches_are_recorded() {
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", None);
+    run(&mut sim);
     let base = PublishRequest {
         plugin: "ui".into(),
         invocation_id: None,
@@ -605,7 +511,7 @@ fn publish_classification_and_blocking_are_recorded() {
         event_name: "user-message".into(),
         payload: json!({ "text": "hi" }),
         ui: None,
-        lane: Lane::Normal,
+        lane: None,
         target_session: None,
     };
     // No invocation, no citation.
@@ -618,16 +524,15 @@ fn publish_classification_and_blocking_are_recorded() {
         .contains("must cite")
     );
     // Citing an invocation dispatched to another plugin.
-    let chat_inv = format!("{sid}/i999");
     assert!(
         sim.publish(PublishRequest {
-            cite: Some(chat_inv),
+            cite: Some(format!("{sid}/i999")),
             ..base.clone()
         })
         .unwrap_err()
         .contains("uncitable")
     );
-    // Undeclared emit.
+    // Undeclared emit: a breach.
     let cite = ui_cite(&sim, &sid);
     assert!(
         sim.publish(PublishRequest {
@@ -638,7 +543,7 @@ fn publish_classification_and_blocking_are_recorded() {
         .unwrap_err()
         .contains("undeclared emit")
     );
-    // Missing supplied key.
+    // Missing declared key: a breach.
     assert!(
         sim.publish(PublishRequest {
             cite: Some(cite.clone()),
@@ -646,7 +551,27 @@ fn publish_classification_and_blocking_are_recorded() {
             ..base.clone()
         })
         .unwrap_err()
-        .contains("missing supplied keys [text]")
+        .contains("`text`: expected required string, observed absent")
+    );
+    // Wrong shape: a breach.
+    assert!(
+        sim.publish(PublishRequest {
+            cite: Some(cite.clone()),
+            payload: json!({ "text": 1 }),
+            ..base.clone()
+        })
+        .unwrap_err()
+        .contains("expected string")
+    );
+    // Wrong lane: a breach.
+    assert!(
+        sim.publish(PublishRequest {
+            cite: Some(cite.clone()),
+            lane: Some(Lane::Interrupt),
+            ..base.clone()
+        })
+        .unwrap_err()
+        .contains("lane")
     );
     // Bad UI hint.
     assert!(
@@ -658,31 +583,32 @@ fn publish_classification_and_blocking_are_recorded() {
         .unwrap_err()
         .contains("ui hint")
     );
-    // A valid deferred publish.
+    // A valid deferred publish; an undeclared extra key passes untyped.
     let id = sim
         .publish(PublishRequest {
             cite: Some(cite.clone()),
+            payload: json!({ "text": "hi", "extra": [1] }),
             ui: Some(json!({ "kind": "text", "text": "hi" })),
             ..base.clone()
         })
         .unwrap();
-    sim.run();
+    run(&mut sim);
     let view = project(sim.log(&sid));
     let ev = view.events.iter().find(|e| e.event_id == id).unwrap();
     assert!(matches!(&ev.origin, Origin::Deferred { cites, .. } if cites == &cite));
-    assert_eq!(view.blocked.len(), 5, "{:#?}", view.blocked);
-    // A non-deferred emit published without an open invocation is blocked.
-    let chat_closed = sim.log(&sid).iter().find_map(|r| match &r.body {
-        Body::InvocationStarted {
-            invocation_id,
-            plugin,
-            ..
-        } if plugin == "chat" => Some(invocation_id.clone()),
-        _ => None,
-    });
+    assert_eq!(ev.payload["extra"], json!([1]));
+    assert_eq!(view.blocked.len(), 3, "{:#?}", view.blocked);
+    assert_eq!(view.breaches.len(), 4, "{:#?}", view.breaches);
+    assert!(
+        view.breaches
+            .iter()
+            .all(|b| b["reaction"] == "publish-blocked" && b["revision"] == json!(view.revision))
+    );
+    // A non-deferred emit published without an open invocation is a breach.
+    let chat_closed = sim.first_invocation(&sid, "chat");
     let late = PublishRequest {
         plugin: "chat".into(),
-        invocation_id: chat_closed,
+        invocation_id: Some(chat_closed),
         event_name: "model-request".into(),
         payload: json!({ "turn": "x" }),
         ..base
@@ -695,123 +621,90 @@ fn publish_classification_and_blocking_are_recorded() {
 }
 
 #[test]
-fn priority_lane_wins_next_but_never_interrupts() {
-    let mut sim = Sim::new(&config(CHAT));
-    sim.auto = false;
-    let sid = sim.start("chat", None);
-    let (_, ui0) = sim.pending.pop_front().unwrap();
+fn interrupt_lane_wins_next_but_never_interrupts() {
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", None);
+    let (_, _, ui0) = sim.pending.pop_front().unwrap();
     sim.complete(&ui0.invocation_id, InvocationResult::default());
-    let cite = ui0.invocation_id.clone();
-    let mk = |text: &str, lane: Lane| PublishRequest {
-        plugin: "ui".into(),
-        invocation_id: None,
-        cite: Some(cite.clone()),
-        event_name: "user-message".into(),
-        payload: json!({ "text": text }),
-        ui: None,
-        lane,
-        target_session: None,
-    };
-    sim.publish(mk("first", Lane::Normal)).unwrap();
-    // First pipeline is now running (redact open). Queue normal, then priority.
-    sim.publish(mk("second", Lane::Normal)).unwrap();
-    sim.publish(mk("urgent", Lane::Priority)).unwrap();
+    sim.publish(user(&sim, &sid, "first")).unwrap();
+    // First pipeline is now running (redact open). Queue normal, then interrupt.
+    sim.publish(user(&sim, &sid, "second")).unwrap();
+    sim.publish(steer(&sim, &sid, "urgent")).unwrap();
     let status = sim.k.status(&sid).unwrap();
-    assert_eq!((status.queued_normal, status.queued_priority), (1, 1));
-    sim.auto = true;
-    sim.run();
-    let order: Vec<String> = project(sim.log(&sid))
+    assert_eq!((status.queued_normal, status.queued_interrupt), (1, 1));
+    run(&mut sim);
+    let view = project(sim.log(&sid));
+    let text = |id: &str| {
+        view.events
+            .iter()
+            .find(|e| e.event_id == id)
+            .and_then(|e| e.payload["text"].as_str().map(str::to_owned))
+    };
+    let appended: Vec<String> = view
         .events
         .iter()
-        .filter(|e| e.event_name == "user-message")
-        .map(|e| e.payload["text"].as_str().unwrap().to_owned())
+        .filter_map(|e| {
+            e.payload["text"]
+                .as_str()
+                .filter(|_| e.event_name == "user-message" || e.event_name == "steer")
+                .map(str::to_owned)
+        })
         .collect();
-    assert_eq!(order, vec!["first", "second", "urgent"], "append order");
+    assert_eq!(appended, vec!["first", "second", "urgent"], "append order");
     let dispatched: Vec<String> = sim
         .log(&sid)
         .iter()
         .filter_map(|r| match &r.body {
-            Body::PipelineStarted { event_id } => Some(event_id.clone()),
+            Body::PipelineStarted { event_id } => text(event_id),
             _ => None,
         })
+        .filter(|t| ["first", "second", "urgent"].contains(&t.as_str()))
         .collect();
-    let view = project(sim.log(&sid));
-    let name = |id: &str| {
-        view.events
-            .iter()
-            .find(|e| e.event_id == id)
-            .map(|e| {
-                e.payload["text"]
-                    .as_str()
-                    .unwrap_or(&e.event_name)
-                    .to_owned()
-            })
-            .unwrap()
-    };
-    let users: Vec<String> = dispatched
-        .iter()
-        .map(|d| name(d))
-        .filter(|n| ["first", "second", "urgent"].contains(&n.as_str()))
-        .collect();
-    assert_eq!(users, vec!["first", "urgent", "second"]);
+    assert_eq!(dispatched, vec!["first", "urgent", "second"]);
 }
 
 #[test]
 fn soft_stop_drains_then_parks_and_resume_continues() {
-    let mut sim = Sim::new(&config(CHAT));
-    sim.auto = false;
-    let sid = sim.start("chat", Some("a"));
-    // Pipeline for session-started is running (ui async is not blocking) → settle.
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("a"));
     let fx = sim.k.command(&sid, Command::SoftStop, "test", 1).unwrap();
     sim.take(fx);
     assert_eq!(sim.k.status(&sid).unwrap().state, DispatchState::Draining);
-    sim.auto = true;
-    sim.run();
+    run(&mut sim);
     let st = sim.k.status(&sid).unwrap();
     assert_eq!(st.activity, "parked");
-    // The in-flight pipeline (session-started) finished; user-message waits.
     assert!(st.queued_normal >= 1);
     let fx = sim.k.command(&sid, Command::Resume, "test", 2).unwrap();
     sim.take(fx);
-    sim.run();
+    run(&mut sim);
     assert_eq!(sim.k.status(&sid).unwrap().activity, "idle");
     assert!(sim.events(&sid).contains(&"assistant-message".to_owned()));
 }
 
 #[test]
 fn hard_stop_cancels_in_flight_work_and_late_results_are_inert() {
-    let mut sim = Sim::new(&config(CHAT));
-    sim.auto = false;
-    let sid = sim.start("chat", Some("a"));
-    // Drive until the model invocation is open.
-    let model_inv = loop {
-        let (plugin, req) = sim.pending.pop_front().expect("model reached");
-        if plugin == "model" {
-            break req;
-        }
-        sim.behave(&plugin, &req);
-    };
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("a"));
+    let model_inv = until(&mut sim, "model");
     let fx = sim.k.command(&sid, Command::HardStop, "user", 99).unwrap();
     sim.take(fx);
     assert!(sim.cancelled.contains(&model_inv.invocation_id));
     let st = sim.k.status(&sid).unwrap();
     assert_eq!(st.state, DispatchState::Halted);
     assert!(st.open_invocations.is_empty());
-    // A late completion is ignored; a late publish is classified deferred and blocked.
+    // A late completion is ignored; a late publish is classified deferred and refused.
     let before = sim.log(&sid).len();
     sim.complete(&model_inv.invocation_id, InvocationResult::default());
     assert_eq!(sim.log(&sid).len(), before);
-    let late = PublishRequest {
-        plugin: "model".into(),
-        invocation_id: Some(model_inv.invocation_id.clone()),
-        cite: None,
-        event_name: "model-response".into(),
-        payload: json!({ "text": "late" }),
-        ui: None,
-        lane: Lane::Normal,
-        target_session: None,
-    };
-    assert!(sim.publish(late).is_err());
+    assert!(
+        sim.emit(
+            "model",
+            &model_inv.invocation_id,
+            "model-response",
+            json!({ "text": "late" })
+        )
+        .is_err()
+    );
     let view = project(sim.log(&sid));
     assert_eq!(view.state, DispatchState::Halted);
     assert!(
@@ -824,74 +717,54 @@ fn hard_stop_cancels_in_flight_work_and_late_results_are_inert() {
 
 #[test]
 fn hard_stop_aborts_a_running_blocking_pipeline() {
-    let mut sim = Sim::new(&config(CHAT));
-    sim.auto = false;
-    let sid = sim.start("chat", Some("a"));
-    loop {
-        let (plugin, req) = sim.pending.pop_front().unwrap();
-        if plugin == "redact" {
-            let fx = sim.k.command(&sid, Command::HardStop, "user", 5).unwrap();
-            sim.take(fx);
-            assert!(sim.cancelled.contains(&req.invocation_id));
-            break;
-        }
-        sim.behave(&plugin, &req);
-    }
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("a"));
+    let redact = until(&mut sim, "redact");
+    let fx = sim.k.command(&sid, Command::HardStop, "user", 5).unwrap();
+    sim.take(fx);
+    assert!(sim.cancelled.contains(&redact.invocation_id));
     let view = project(sim.log(&sid));
     assert_eq!(view.events[1].status, "aborted");
-    // Resume continues with remaining queued work, not the aborted event.
     let fx = sim.k.command(&sid, Command::Resume, "user", 6).unwrap();
     sim.take(fx);
-    sim.auto = true;
-    sim.run();
+    run(&mut sim);
     assert!(!sim.events(&sid).contains(&"model-request".to_owned()));
 }
 
 #[test]
 fn crash_mid_pipeline_recovers_from_history_with_idempotent_outputs() {
     let cfg = config(CHAT);
-    let mut sim = Sim::new(&cfg);
-    sim.auto = false;
-    let sid = sim.start("chat", Some("hello"));
-    // Run until chat's invocation publishes model-request but crash before completion.
-    let chat_req = loop {
-        let (plugin, req) = sim.pending.pop_front().unwrap();
-        if plugin == "chat" {
-            break req;
-        }
-        sim.behave(&plugin, &req);
-    };
-    sim.publish(PublishRequest {
-        plugin: "chat".into(),
-        invocation_id: Some(chat_req.invocation_id.clone()),
-        cite: None,
-        event_name: "model-request".into(),
-        payload: json!({ "turn": "t" }),
-        ui: None,
-        lane: Lane::Normal,
-        target_session: None,
-    })
+    let mut sim = new_sim(&cfg);
+    let sid = start(&mut sim, "chat", Some("hello"));
+    let chat_req = until(&mut sim, "chat");
+    sim.emit(
+        "chat",
+        &chat_req.invocation_id,
+        "model-request",
+        json!({ "turn": "t" }),
+    )
     .unwrap();
     let crashed_log = sim.log(&sid).to_vec();
     // "Restart": fresh kernel, replay, recover.
-    let mut fresh = Sim::new(&cfg);
+    let mut fresh = Sim::new(compiled(&cfg));
     fresh.k.load_session(&crashed_log).unwrap();
-    fresh.logs.insert(sid.clone(), crashed_log.clone());
+    fresh.logs.insert(sid.clone(), crashed_log);
     let fx = fresh.k.recover(&sid, 3, 1000);
     fresh.take(fx);
     let retried: Vec<_> = fresh
         .pending
         .iter()
-        .filter(|(_, r)| r.attempt == 2)
-        .map(|(p, r)| (p.clone(), r.invocation_id.clone()))
+        .filter(|(_, _, r)| r.attempt == 2)
+        .map(|(p, _, r)| (p.clone(), r.invocation_id.clone()))
         .collect();
     assert!(
         retried.contains(&("chat".to_owned(), chat_req.invocation_id.clone())),
         "{retried:?}"
     );
     // The orphan's re-publish (same deterministic output id) is deduplicated.
-    fresh.run();
-    assert!(project(fresh.log(&sid)).blocked.is_empty());
+    run(&mut fresh);
+    let view = project(fresh.log(&sid));
+    assert!(view.blocked.is_empty() && view.breaches.is_empty());
     assert_eq!(
         fresh
             .events(&sid)
@@ -906,10 +779,9 @@ fn crash_mid_pipeline_recovers_from_history_with_idempotent_outputs() {
 
 #[test]
 fn orphans_give_up_after_max_attempts() {
-    let mut sim = Sim::new(&config(CHAT));
-    sim.auto = false;
-    let sid = sim.start("chat", None);
-    let (_, req) = sim.pending.pop_front().unwrap();
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", None);
+    let (_, _, req) = sim.pending.pop_front().unwrap();
     for _ in 0..3 {
         let fx = sim.k.retry(&req.invocation_id, "crash", 3, 7);
         sim.take(fx);
@@ -921,36 +793,30 @@ fn orphans_give_up_after_max_attempts() {
 }
 
 #[test]
-fn config_apply_waits_for_the_event_boundary() {
+fn a_new_revision_takes_effect_at_the_event_boundary() {
     let cfg = config(CHAT);
-    let mut sim = Sim::new(&cfg);
-    sim.auto = false;
-    let sid = sim.start("chat", Some("first"));
-    // Advance until redact (blocking) is open on user-message.
-    let redact_req = loop {
-        let (plugin, req) = sim.pending.pop_front().unwrap();
-        if plugin == "redact" {
-            break req;
-        }
-        sim.behave(&plugin, &req);
-    };
-    let old = sim.k.active_hash().to_owned();
-    // New config: drop the gate.
+    let mut sim = new_sim(&cfg);
+    let sid = start(&mut sim, "chat", Some("first"));
+    let redact_req = until(&mut sim, "redact");
+    let old = sim.k.status(&sid).unwrap().revision;
+    // New config: drop the gate. The chat definition compiles to a new revision.
     let new_cfg = config(&["ui", "redact", "chat", "model", "collector"]);
-    let hash = sim.k.install(compile(&new_cfg, &manifests())).unwrap();
-    assert_ne!(hash, old);
+    let comp = compiled(&new_cfg);
+    let new_rev = comp.definitions["chat"].revision.clone();
+    assert_ne!(new_rev, old);
+    let hash = sim.k.install(comp).unwrap();
     let out = sim.k.apply_config(&hash, &Scope::Global, 50);
+    assert!(out.error.is_none());
+    assert_eq!(out.revisions[&sid], new_rev);
     sim.take(out.effects);
     assert!(
         !sim.kinds(&sid).contains(&"config-applied".to_owned()),
         "not mid-pipeline"
     );
-    sim.behave("redact", &redact_req);
-    // Remaining blocking subscribers of the in-flight event still follow the old graph.
-    sim.auto = true;
-    sim.run();
+    step(&mut sim, "redact", &redact_req);
+    run(&mut sim);
     let view = project(sim.log(&sid));
-    assert_eq!(view.config, hash);
+    assert_eq!(view.revision, new_rev);
     let applied_at = sim
         .log(&sid)
         .iter()
@@ -962,20 +828,20 @@ fn config_apply_waits_for_the_event_boundary() {
         view.events[1]
             .invocations
             .iter()
-            .any(|i| i.plugin == "gate"),
-        "old graph for in-flight event"
+            .any(|i| i.plugin == "gate" && i.revision == old),
+        "old revision for the in-flight event"
     );
-    // config-applied lifecycle event went through the priority lane.
+    // config-applied is a core event on the interrupt lane, with the revisions.
     let ca = view
         .events
         .iter()
         .find(|e| e.event_name == "config-applied")
         .unwrap();
-    assert_eq!(ca.lane, Lane::Priority);
-    // Next turn uses the new graph.
-    sim.publish(user(&sim, &sid, "second", Lane::Normal))
-        .unwrap();
-    sim.run();
+    assert_eq!(ca.lane, Lane::Interrupt);
+    assert_eq!(ca.payload, json!({ "revision": new_rev, "previous": old }));
+    // The next turn runs under the new revision, without the gate.
+    sim.publish(user(&sim, &sid, "second")).unwrap();
+    run(&mut sim);
     let view = project(sim.log(&sid));
     let last = view
         .events
@@ -983,22 +849,27 @@ fn config_apply_waits_for_the_event_boundary() {
         .rev()
         .find(|e| e.event_name == "user-message")
         .unwrap();
-    assert!(last.invocations.iter().all(|i| i.plugin != "gate"));
+    assert!(
+        last.invocations
+            .iter()
+            .all(|i| i.plugin != "gate" && i.revision == new_rev)
+    );
 }
 
 #[test]
-fn session_scoped_apply_leaves_other_sessions_alone() {
-    let mut sim = Sim::new(&config(CHAT));
-    let a = sim.start("chat", None);
-    let b = sim.start("chat", None);
-    sim.run();
-    let hash = sim
-        .k
-        .install(compile(
-            &config(&["ui", "chat", "model", "collector"]),
-            &manifests(),
-        ))
-        .unwrap();
+fn apply_targets_sessions_and_is_rejected_whole_on_any_error() {
+    let mut sim = new_sim(&config(CHAT));
+    let a = start(&mut sim, "chat", None);
+    let b = start(&mut sim, "chat", None);
+    let w = start(&mut sim, "worker", None);
+    run(&mut sim);
+    let (ra, rb) = (
+        sim.k.status(&a).unwrap().revision,
+        sim.k.status(&b).unwrap().revision,
+    );
+    let comp = compiled(&config(&["ui", "chat", "model", "collector"]));
+    let new_rev = comp.definitions["chat"].revision.clone();
+    let hash = sim.k.install(comp).unwrap();
     let out = sim.k.apply_config(
         &hash,
         &Scope::Session {
@@ -1007,49 +878,69 @@ fn session_scoped_apply_leaves_other_sessions_alone() {
         5,
     );
     sim.take(out.effects);
-    assert_eq!(sim.k.status(&a).unwrap().config, hash);
-    assert_ne!(sim.k.status(&b).unwrap().config, hash);
-    // A missing definition is skipped, not silently applied.
+    assert_eq!(sim.k.status(&a).unwrap().revision, new_rev);
+    assert_eq!(sim.k.status(&b).unwrap().revision, rb);
+    // A target whose definition the config lacks rejects the whole apply.
     let mut cfg = config(CHAT);
-    cfg.definitions.remove("chat");
-    let h2 = sim.k.install(compile(&cfg, &manifests())).unwrap();
-    let out = sim.k.apply_config(&h2, &Scope::Global, 6);
-    assert_eq!(out.skipped, vec![b]);
+    cfg.definitions.remove("worker");
+    let h2 = sim.k.install(compiled(&cfg)).unwrap();
+    let out = sim.k.apply_config(
+        &h2,
+        &Scope::Sessions {
+            session_ids: vec![b.clone(), w.clone()],
+        },
+        6,
+    );
+    assert!(
+        out.error.as_deref().unwrap().contains("no session changed"),
+        "{:?}",
+        out.error
+    );
+    assert!(out.effects.is_empty() && out.revisions.is_empty());
+    assert_eq!(sim.k.status(&b).unwrap().revision, rb);
+    let _ = ra;
 }
 
 #[test]
 fn rejected_configs_are_not_installed() {
-    let mut k = Kernel::new();
+    let mut k2 = Kernel::new();
     let mut cfg = config(CHAT);
     cfg.definitions
         .get_mut("chat")
         .unwrap()
-        .subscribers
-        .push(sub("ghost"));
-    let err = k.install(compile(&cfg, &manifests())).unwrap_err();
+        .plugins
+        .insert("ghost".into(), Default::default());
+    let err = k2.install(compile(&cfg, &manifests())).unwrap_err();
     assert!(err.contains("ghost"));
 }
 
 #[test]
-fn causal_depth_bounds_cycles() {
-    let mut sim = Sim::new(&config(CHAT));
-    let sid = sim.start("pingpong", None);
-    sim.run();
+fn cycles_run_without_a_core_depth_limit() {
+    // The core has no recursion or depth limit: a ping-pong cycle runs until
+    // something stops it (here, the operator).
+    let mut sim = new_sim(&config(CHAT));
+    let sid = sim.start("ui", "pingpong", None);
+    sim.run_steps(600, &mut behave);
+    let n = sim.events(&sid).len();
+    assert!(n > 300, "{n} events");
     let view = project(sim.log(&sid));
-    assert!(!view.blocked.is_empty());
-    assert!(view.blocked[0].reason.contains("max_causal_depth=12"));
-    assert!(view.events.iter().all(|e| e.depth <= 12));
-    assert_eq!(sim.k.status(&sid).unwrap().activity, "idle");
+    assert!(view.blocked.is_empty() && view.breaches.is_empty());
+    let fx = sim
+        .k
+        .command(&sid, Command::HardStop, "operator", 1)
+        .unwrap();
+    sim.take(fx);
+    assert_eq!(sim.k.status(&sid).unwrap().activity, "halted");
 }
 
 #[test]
-fn cross_session_publish_requires_capability_and_is_mirrored() {
-    let mut sim = Sim::new(&config(CHAT));
-    let parent = sim.start("chat", None);
-    sim.run();
+fn cross_session_publishes_are_paired_with_the_targets_inbound_and_mirrored() {
+    let mut sim = new_sim(&config(CHAT));
+    let parent = start(&mut sim, "chat", None);
+    run(&mut sim);
     PARENT.with(|p| *p.borrow_mut() = Some(parent.clone()));
-    let worker = sim.start("worker", Some("do work"));
-    sim.run();
+    let worker = start(&mut sim, "worker", Some("do work"));
+    run(&mut sim);
     PARENT.with(|p| *p.borrow_mut() = None);
     let pv = project(sim.log(&parent));
     let results: Vec<_> = pv
@@ -1057,64 +948,93 @@ fn cross_session_publish_requires_capability_and_is_mirrored() {
         .iter()
         .filter(|e| e.event_name == "worker-result")
         .collect();
-    assert_eq!(results.len(), 1, "only the capable reporter got through");
+    assert_eq!(results.len(), 1, "only the declared outbound got through");
     assert!(
         matches!(&results[0].origin, Origin::CrossSession { from_session, .. } if from_session == &worker)
     );
     assert_eq!(results[0].status, "delivered");
-    let wv = project(sim.log(&worker));
-    assert_eq!(wv.sent.len(), 1);
+    // The boundary node emits it in the target, to the inbound's subscriber.
     assert!(
-        wv.blocked
+        results[0]
+            .invocations
             .iter()
-            .any(|b| b.plugin == "nocross" && b.reason.contains("cross-session"))
+            .any(|i| i.plugin == "collector")
+    );
+    // Cause links cross sessions; ids are globally unique (`<session>/i<n>.o<k>`).
+    assert!(results[0].event_id.starts_with(&format!("{worker}/")));
+    let wv = project(sim.log(&worker));
+    assert_eq!(wv.sent.len(), 1, "mirrored in the sender's log");
+    assert_eq!(wv.sent[0]["event_id"], json!(results[0].event_id));
+    assert!(wv.breaches.iter().any(|b| {
+        b["plugin"] == "nocross"
+            && b["reason"]
+                .as_str()
+                .unwrap()
+                .contains("undeclared outbound")
+    }));
+}
+
+#[test]
+fn a_cross_session_pairing_mismatch_fails_back_to_the_sender_only() {
+    let mut sim = new_sim(&config(CHAT));
+    // The target is another worker: its definition accepts no `worker-result`.
+    let other = start(&mut sim, "worker", None);
+    run(&mut sim);
+    PARENT.with(|p| *p.borrow_mut() = Some(other.clone()));
+    let worker = start(&mut sim, "worker", Some("do work"));
+    run(&mut sim);
+    PARENT.with(|p| *p.borrow_mut() = None);
+    let wv = project(sim.log(&worker));
+    assert!(
+        wv.blocked.iter().any(|b| b.plugin == "reporter"
+            && b.reason.contains("pairing failed")
+            && b.reason.contains("does not accept")),
+        "{:#?}",
+        wv.blocked
+    );
+    assert!(
+        project(sim.log(&other))
+            .events
+            .iter()
+            .all(|e| e.event_name != "worker-result")
+    );
+    // The sender's session carries on.
+    assert_eq!(sim.k.status(&worker).unwrap().state, DispatchState::Running);
+    assert!(
+        sim.events(&worker)
+            .contains(&"assistant-message".to_owned())
     );
 }
 
 #[test]
 fn fork_seeds_context_and_restore_is_an_append() {
-    let mut sim = Sim::new(&config(CHAT));
-    let sid = sim.start("chat", Some("one"));
-    sim.run();
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("one"));
+    run(&mut sim);
     let mid = sim.log(&sid).last().unwrap().sequence;
-    sim.publish(user(&sim, &sid, "two", Lane::Normal)).unwrap();
-    sim.run();
+    sim.publish(user(&sim, &sid, "two")).unwrap();
+    run(&mut sim);
     assert_eq!(sim.k.context(&sid).unwrap().len(), 4);
     assert_eq!(context_at(sim.log(&sid), mid).len(), 2);
-    // Fork from the midpoint.
-    let now = sim.tick();
-    let out = sim.k.start_session(
-        &StartRequest {
+    let fork = sim
+        .start_req(&StartRequest {
             plugin: "ui".into(),
             definition: "chat".into(),
+            spec: None,
             invocation_id: None,
             initial: None,
             fork_from: Some(LogRef {
                 session_id: sid.clone(),
                 sequence: mid,
             }),
-        },
-        now,
-    );
-    sim.take(out.effects);
-    let fork = out.session_id.unwrap();
-    sim.run();
+        })
+        .unwrap();
+    run(&mut sim);
     assert_eq!(sim.k.context(&fork).unwrap().len(), 2);
     assert!(sim.kinds(&fork).contains(&"context-seeded".to_owned()));
     // Restore in the original session via a contribution; history keeps both states.
-    sim.auto = false;
-    sim.publish(PublishRequest {
-        plugin: "ui".into(),
-        invocation_id: None,
-        cite: Some(ui_cite(&sim, &sid)),
-        event_name: "steer".into(),
-        payload: json!({ "text": "restore" }),
-        ui: None,
-        lane: Lane::Priority,
-        target_session: None,
-    })
-    .unwrap();
-    while let Some((plugin, req)) = sim.pending.pop_front() {
+    sim.publish(steer(&sim, &sid, "restore")).unwrap();
+    while let Some((plugin, _, req)) = sim.pending.pop_front() {
         let mut r = InvocationResult::default();
         if plugin == "chat" {
             r.contributions = vec![ContextOp::Restore { to_sequence: mid }];
@@ -1136,9 +1056,8 @@ fn fork_seeds_context_and_restore_is_an_append() {
             _ => None,
         })
         .unwrap();
-    let before_restore = restore_seq - 1;
     assert_eq!(
-        context_at(sim.log(&sid), before_restore).len(),
+        context_at(sim.log(&sid), restore_seq - 1).len(),
         4,
         "pre-revert state still reconstructable"
     );
@@ -1146,14 +1065,12 @@ fn fork_seeds_context_and_restore_is_an_append() {
 
 #[test]
 fn idle_sessions_unload_and_reload_on_demand() {
-    let cfg = config(CHAT);
-    let mut sim = Sim::new(&cfg);
-    let sid = sim.start("chat", Some("hi"));
-    sim.run();
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", Some("hi"));
+    run(&mut sim);
     assert!(sim.k.unload_if_idle(&sid));
     assert!(!sim.k.is_loaded(&sid));
-    // A publish into an unloaded session asks the host to load it first.
-    let req = user(&sim, &sid, "again", Lane::Normal);
+    let req = user(&sim, &sid, "again");
     assert!(
         sim.k
             .publish(&req, 1)
@@ -1164,7 +1081,7 @@ fn idle_sessions_unload_and_reload_on_demand() {
     let log = sim.log(&sid).to_vec();
     sim.k.load_session(&log).unwrap();
     sim.publish(req).unwrap();
-    sim.run();
+    run(&mut sim);
     assert_eq!(
         sim.events(&sid)
             .iter()
@@ -1175,11 +1092,12 @@ fn idle_sessions_unload_and_reload_on_demand() {
 }
 
 #[test]
-fn start_session_validates_capability_definition_and_supply() {
-    let mut sim = Sim::new(&config(CHAT));
+fn start_session_validates_capability_definition_and_initial_event() {
+    let mut sim = new_sim(&config(CHAT));
     let bad = |plugin: &str, def: &str, payload: Value| StartRequest {
         plugin: plugin.into(),
         definition: def.into(),
+        spec: None,
         invocation_id: None,
         initial: Some(InitialEvent {
             event_name: "user-message".into(),
@@ -1207,11 +1125,11 @@ fn start_session_validates_capability_definition_and_supply() {
             .start_session(&bad("ui", "chat", json!({})), 1)
             .error
             .unwrap()
-            .contains("missing supplied keys")
+            .contains("contradicts")
     );
-    let ok = sim.start("chat", None);
+    let ok = start(&mut sim, "chat", None);
     assert_eq!(ok, "s0001");
-    assert_eq!(sim.start("chat", None), "s0002");
+    assert_eq!(start(&mut sim, "chat", None), "s0002");
 }
 
 /// Randomized interleavings: after every step, replaying the log into a fresh
@@ -1220,6 +1138,7 @@ fn start_session_validates_capability_definition_and_supply() {
 fn randomized_interleavings_replay_exactly() {
     let cfg = config(CHAT);
     let alt = config(&["ui", "chat", "model", "collector"]);
+    let (comp_main, comp_alt) = (compiled(&cfg), compiled(&alt));
     for seed in 1..=40u64 {
         let mut rng = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
         let mut next = move |n: u64| {
@@ -1228,27 +1147,27 @@ fn randomized_interleavings_replay_exactly() {
                 .wrapping_add(1_442_695_040_888_963_407);
             (rng >> 33) % n
         };
-        let mut sim = Sim::new(&cfg);
-        let h_alt = sim.k.install(compile(&alt, &manifests())).unwrap();
+        let mut sim = Sim::new(comp_main.clone());
+        let h_alt = sim.k.install(comp_alt.clone()).unwrap();
         let h_main = sim.k.active_hash().to_owned();
-        let sid = sim.start("chat", Some("start"));
-        for step in 0..60 {
+        let sid = start(&mut sim, "chat", Some("start"));
+        for step_n in 0..60 {
             match next(9) {
                 0 | 1 => {
-                    let lane = if next(3) == 0 {
-                        Lane::Priority
-                    } else {
-                        Lane::Normal
-                    };
                     let text = if next(5) == 0 { "forbidden" } else { "msg" };
-                    let _ = sim.publish(user(&sim, &sid, text, lane));
+                    let req = if next(3) == 0 {
+                        steer(&sim, &sid, text)
+                    } else {
+                        user(&sim, &sid, text)
+                    };
+                    let _ = sim.publish(req);
                 }
                 2..=4 => {
                     if !sim.pending.is_empty() {
                         let i = usize::try_from(next(sim.pending.len() as u64)).unwrap();
-                        let (plugin, req) = sim.pending.remove(i).unwrap();
+                        let (plugin, _, req) = sim.pending.remove(i).unwrap();
                         if !sim.cancelled.contains(&req.invocation_id) {
-                            sim.behave(&plugin, &req);
+                            step(&mut sim, &plugin, &req);
                         }
                     }
                 }
@@ -1259,43 +1178,44 @@ fn randomized_interleavings_replay_exactly() {
                         Command::Resume,
                         Command::Resume,
                     ][usize::try_from(next(4)).unwrap()];
-                    let fx = sim.k.command(&sid, cmd, "rng", step).unwrap();
+                    let fx = sim.k.command(&sid, cmd, "rng", step_n).unwrap();
                     sim.take(fx);
                 }
                 6 => {
-                    if let Some((_, req)) = sim.pending.front().cloned() {
-                        let fx = sim.k.retry(&req.invocation_id, "chaos", 3, step);
+                    if let Some((_, _, req)) = sim.pending.front().cloned() {
+                        let fx = sim.k.retry(&req.invocation_id, "chaos", 3, step_n);
                         sim.take(fx);
                     }
                 }
                 7 => {
                     let h = if next(2) == 0 { &h_alt } else { &h_main };
-                    let out = sim.k.apply_config(h, &Scope::Global, step);
+                    let out = sim.k.apply_config(h, &Scope::Global, step_n);
                     sim.take(out.effects);
                 }
                 _ => {
-                    let fx = sim.k.command(&sid, Command::Resume, "rng", step).unwrap();
+                    let fx = sim.k.command(&sid, Command::Resume, "rng", step_n).unwrap();
                     sim.take(fx);
                 }
             }
-            let mut k = Kernel::new();
-            k.install(compile(&cfg, &manifests())).unwrap();
-            k.install(compile(&alt, &manifests())).unwrap();
-            k.set_active(sim.k.active_hash()).unwrap();
-            k.load_session(sim.log(&sid)).unwrap();
+            let mut k2 = Kernel::new();
+            k2.install(comp_main.clone()).unwrap();
+            k2.install(comp_alt.clone()).unwrap();
+            k2.load_session(sim.log(&sid)).unwrap();
             let mut live = sim.k.status(&sid).unwrap();
-            let mut replayed = k.status(&sid).unwrap();
-            // A replayed session may pick up the active config lazily; compare the rest.
-            live.pending_config = None;
-            replayed.pending_config = None;
-            assert_eq!(replayed, live, "seed {seed} step {step}");
+            let mut replayed = k2.status(&sid).unwrap();
+            // A pending revision is not in the log until it takes effect.
+            live.pending_revision = None;
+            replayed.pending_revision = None;
+            assert_eq!(replayed, live, "seed {seed} step {step_n}");
             assert_eq!(
-                k.context(&sid),
+                k2.context(&sid),
                 sim.k.context(&sid),
-                "seed {seed} step {step}"
+                "seed {seed} step {step_n}"
             );
-            let view = project(sim.log(&sid));
-            assert_eq!(view.last_sequence, sim.log(&sid).len() as u64);
+            assert_eq!(
+                project(sim.log(&sid)).last_sequence,
+                sim.log(&sid).len() as u64
+            );
         }
     }
 }
@@ -1303,37 +1223,43 @@ fn randomized_interleavings_replay_exactly() {
 #[test]
 fn published_links_survive_replay_and_retry() {
     let cfg = config(CHAT);
-    let mut sim = Sim::new(&cfg);
-    sim.auto = false;
-    let sid = sim.start("chat", Some("hi"));
-    let model = loop {
-        let (plugin, req) = sim.pending.pop_front().unwrap();
-        if plugin == "model" {
-            break req;
-        }
-        sim.behave(&plugin, &req);
-    };
-    let mk = |t: &str| PublishRequest {
-        plugin: "model".into(),
-        invocation_id: Some(model.invocation_id.clone()),
-        cite: None,
-        event_name: "stream-chunk".into(),
-        payload: json!({ "text": t }),
-        ui: None,
-        lane: Lane::Normal,
-        target_session: None,
-    };
-    sim.publish(mk("a")).unwrap();
+    let mut sim = new_sim(&cfg);
+    let sid = start(&mut sim, "chat", Some("hi"));
+    let model = until(&mut sim, "model");
+    sim.emit(
+        "model",
+        &model.invocation_id,
+        "model-response",
+        json!({ "text": "a" }),
+    )
+    .unwrap();
     // Crash + replay + retry: the earlier output stays linked to the invocation.
     let log = sim.log(&sid).to_vec();
-    let mut fresh = Sim::new(&cfg);
+    let mut fresh = Sim::new(compiled(&cfg));
     fresh.k.load_session(&log).unwrap();
     fresh.logs.insert(sid.clone(), log);
     let fx = fresh.k.recover(&sid, 3, 500);
     fresh.take(fx);
-    let dup = fresh.k.publish(&mk("a"), 501);
+    let req = PublishRequest {
+        plugin: "model".into(),
+        invocation_id: Some(model.invocation_id.clone()),
+        cite: None,
+        event_name: "model-response".into(),
+        payload: json!({ "text": "a" }),
+        ui: None,
+        lane: None,
+        target_session: None,
+    };
+    let dup = fresh.k.publish(&req, 501);
     assert!(dup.duplicate);
-    fresh.publish(mk("b")).unwrap();
+    fresh
+        .emit(
+            "model",
+            &model.invocation_id,
+            "model-response",
+            json!({ "text": "b" }),
+        )
+        .unwrap();
     fresh.complete(&model.invocation_id, InvocationResult::default());
     let view = project(fresh.log(&sid));
     let inv = view

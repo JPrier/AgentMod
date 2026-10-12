@@ -9,6 +9,10 @@ from agentmod import Plugin  # noqa: E402
 TOOL = {"name": "wordcount", "description": "Count words and characters in text.", "parameters": {"text": {"type": "string"}}}
 
 
+TOOL_CALL = {"call_id": {"shape": "string"}, "name": {"shape": "string"}, "args": {"shape": "object"}}
+CONTEXT = {"slots": {"context": {"shape": "array<object>"}}}
+
+
 def offer(ctx):
     if not any(t.get("name") == "wordcount" for t in ctx.slot("tools")):
         ctx.add("tools", TOOL)
@@ -28,14 +32,14 @@ Plugin(
         "name": "py-wordcount",
         "version": "0.1.0",
         "description": "Tool written in Python: word counts.",
-        "consumes": [
-            {"event": "session-started"},
-            {"event": "config-applied"},
-            {"event": "tool-call", "demands": ["call_id", "name", "args"], "mode": "async", "context": False,
-             "keyed": {"key": "name", "values": ["wordcount"]}},
+        "subscribe": [
+            {"event": "session-started", "mode": "blocking", "actions": ["contribute-context"], "receives": CONTEXT},
+            {"event": "config-applied", "mode": "blocking", "actions": ["contribute-context"], "receives": CONTEXT},
+            # The one handler of `tool-call/wordcount`.
+            {"event": "tool-call/wordcount", "mode": "async", "receives": TOOL_CALL},
         ],
-        "tools": [{"name": "wordcount", "parameters": TOOL["parameters"]}],
-        "emits": [{"event": "tool-result", "supplies": ["call_id", "name", "output"]}],
+        "emit": [{"event": "tool-result", "keys": {
+            "call_id": {"shape": "string"}, "name": {"shape": "string"}, "output": {"shape": "string"}}}],
     },
-    {"session-started": offer, "config-applied": offer, "tool-call": tool_call},
+    {"session-started": offer, "config-applied": offer, "tool-call/*": tool_call},
 ).run()

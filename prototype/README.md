@@ -36,18 +36,18 @@ prototype/
 
 | HLD concept | Where it lives |
 | --- | --- |
-| Config-compiled event bus; graph is a compile-time artifact | `core/src/compiler.rs` — demand/supply matching, dead listeners, starved consumers, supply walked through transforms, wildcard placement, cycle report, external surface |
-| Envelope (`event_id`, `session_id`, `event_name`, `sequence`, `cause`, `lane`, `arrived_at`, `payload`, `context`) | `core/src/types.rs` |
-| One publish primitive: pipeline output vs cited deferred publish vs `start-session` | `Kernel::publish`, `Kernel::start_session` — blocked publishes are recorded, never silent |
-| Blocking chain (contribute / transform / veto) + async observers | `Kernel::advance`; transforms are checked against their declaration at runtime |
+| The compiler ([compiler.md](../docs/design/compiler.md)): manifests + one flattened definition → one compiled graph, which is also the routing table; its hash is the session's revision | `core/src/compiler.rs` (graph, every §6 check, report sections), `core/src/shape.rs` (typed shapes), `core/src/manifest.rs` (manifests, definitions, fragments), `core/src/core_manifest.rs` (the runtime's own events, versioned) |
+| Envelope (`event_id`, `session_id`, `event_name`, `sequence`, `cause`, `lane`, `arrived_at`) plus exactly the declared keys and slots | `core/src/types.rs`; projection in `Kernel::start_invocation` |
+| One publish primitive: pipeline output vs cited deferred publish vs `start-session` | `Kernel::publish`, `Kernel::start_session` — every start compiles first; refused publishes are recorded, never silent |
+| Blocking chain in phase order (return keys / contribute / veto) + async observers | `Kernel::advance` along compiled edges; anything that contradicts a declaration is a recorded `breach` |
 | Two FIFO lanes; soft stop / hard stop / resume are commands, not events | `Kernel::command` |
 | Per-session append-only log projecting into session → events → invocations | `core/src/record.rs`, `core/src/projection.rs`, JSONL + content-addressed spill in `runtime/src/store.rs` |
 | History-is-truth recovery: orphan scan bounded by the active-set index | `Kernel::load_session` + `Kernel::recover`; deterministic output ids make re-published outputs idempotent |
-| Live, layered, stamped configuration | `Kernel::apply_config` (global or one session, applied at the next event boundary); every invocation records code + config hashes |
+| Live, layered, stamped configuration; revisions are per session | `Kernel::apply_config` (targets sessions, rejected whole on any error, applied at the next event boundary); every invocation records its revision, code and config hashes |
 | Plugins are supervised processes over one JSON-RPC wire protocol | `runtime/src/host.rs` (stdio) and `ui/runtime/browser-host.js` (Web Workers) |
 | Frontends as plugins with UI-hint payloads | `plugins/web-ui` (gateway) and the page itself; vocabulary: text, markdown, tool, choice, progress, diff, form (old logs may also carry `stream-chunk`) |
 | Live model output outside the log | `core/src/stream.rs`: normalized provider frames, coalescing, recovery state, byte-bounded clients; one canonical `model-response` per turn ([hot-paths.md](../docs/design/hot-paths.md)) |
-| Compiled tool ownership | `keyed` consumes → one owner table per keyed event (`core/src/compiler.rs`); the kernel dispatches each tool call to exactly its owner |
+| Tool calls as an event family | `tool-call/<name>` with `exactly_one_handler`: each member reaches exactly its compiled handler (MCP servers are sub-families); a member nobody handles becomes `dispatch-failed` |
 
 The core ships no agent features. Chat shape, tools, memory, approval, titling, sub-agents,
 triggers, and the model itself are all plugins:
@@ -57,7 +57,7 @@ triggers, and the model itself are all plugins:
 | `openrouter-model` | The model. OpenRouter chat completions with streaming and tool calls; serves its model catalog and credential check to frontends. **Requires a key.** |
 | `openai-model` | Alternative provider for any OpenAI-compatible endpoint. |
 | `chat-context` | Folds messages into context and drives the model ↔ tool loop. Stateless. |
-| `redactor` | Blocking transformer that masks credentials in user messages. |
+| `redactor` | Blocking subscriber that returns a credential-masked `text` for user messages. |
 | `policy` | Layered permissions: tool visibility, deny > ask > allow across scopes, explained decisions, digest-bound approvals revalidated on arrival, permission modes. |
 | `approval-gate` | The older tool-name approval gate (used by `chat`). |
 | `local-workspace` | The coding toolkit in a local directory. Native runtime only; not a sandbox. |
@@ -65,7 +65,7 @@ triggers, and the model itself are all plugins:
 | `plan` | `update_plan`: a tiny, visible plan. |
 | `ask-user` | `ask_user`: a question to the user whose answer continues the tool call. |
 | `tool-discovery` | `tool_search`: finds and loads deferred tools. |
-| `budget` | Turn and token bounds (used for children). |
+| `budget` | Model-request, tool-call, token and wall-time bounds (used for children); as `loop-limit`, the per-turn bound on the agent loop (the core has no loop limit). |
 | `subagent`, `subagent-reporter` | `delegate`: isolated child sessions (tool allowlist, budget, worktree, evidence); `adopt_changes`. |
 | `memory` | `remember`/`recall`; notes injected with provenance. |
 | `web-fetch` | `web_fetch` (deferred), untrusted, no private hosts. |
@@ -91,6 +91,43 @@ The coding toolkit (`plugins/sdk/coding/`) is shared by every execution target:
 Session definitions in `agentmod.toml`: `chat` (general assistant), `coder` (the coding harness),
 `worker` (what `delegate` starts), `minimal` (provider + chat loop + one shell tool), `heartbeat`.
 
+### Manifests and definitions
+
+A plugin declares, at handshake, what it receives, returns, emits and may call; every key has a
+shape. A definition lists the plugins a session runs, the phases that order its blocking
+subscribers, tie-breaks where the compiler finds an observable tie, handler picks for event
+families, the events it accepts from other sessions, and its slots. It never lists edges.
+
+```js
+// plugins/redactor/main.js (manifest)
+subscribe: [{ event: 'user-message', mode: 'blocking',
+              receives: { text: { shape: 'string' } },
+              returns:  { text: { shape: 'string' }, redacted: { shape: 'integer' } } }],
+```
+
+```toml
+[definitions.chat]
+runtime = "0.1"                                   # selects the core manifest
+phases = ["offer", "intake", "guard", "loop"]
+
+[definitions.chat.plugins]
+redactor = { phase = "intake" }
+approval-gate = { phase = "guard" }
+chat-context = { phase = "loop" }
+openrouter-model = {}                             # async only: no phase needed
+
+[definitions.chat.order.session-started]          # both contribute context: order them
+offer = ["memory", "tool-clock"]
+
+[definitions.chat.inbound.subagent-result]        # accepted from child sessions
+call_id = { shape = "string" }
+```
+
+`agentmod compile` prints each definition's graph (one line per emitter and event class: the
+blocking chain with phases, async destinations, the family handler), every diagnostic with the
+file and line it traces to, and the report sections (cycles, families, capabilities, interrupt
+use, unlisted keys, the external surface, orders fixed by name).
+
 ## Run it natively
 
 Requirements: Rust (stable), Node 20+, Python 3 (for `py-wordcount`), and an OpenRouter key.
@@ -114,7 +151,7 @@ For coding against a local directory, start a `coder` session; the workspace is
 Harness state (checkpoints, processes, full outputs) lives in `<root>/.agentmod/state/`.
 
 ```shell
-cargo run -p agentmod-runtime -- compile            # handshake plugins, print pipelines + diagnostics
+cargo run -p agentmod-runtime -- compile            # handshake plugins, print the compiled graphs, diagnostics, report
 cargo run -p agentmod-runtime -- inspect [s0001]    # replay-as-reading: runs no plugins
 cargo run -p agentmod-runtime -- verify             # replay every log through a fresh kernel
 cargo run -p agentmod-runtime -- metrics [s0001] [--json] [--turns]   # model efficiency + control-plane amplification, from the logs
@@ -122,7 +159,8 @@ cargo run -p agentmod-runtime -- config > ui/runtime/agentmod.config.json   # br
 ```
 
 Data lives in `.agentmod/`: `sessions/*.jsonl` (the logs), `spill/` (content-addressed payloads),
-`configs/` (compiled configs by hash), `journal.jsonl`, and `index.json` (derived, rebuildable).
+`configs/` (compiled configs by hash), `revisions/` (revisions compiled at start-session or apply),
+`journal.jsonl`, and `index.json` (derived, rebuildable).
 
 The hosted UI can attach to your local runtime: choose **Local runtime** and enter
 `http://127.0.0.1:7700` (the gateway sends CORS and Private-Network-Access headers).
@@ -139,7 +177,7 @@ cargo install wasm-bindgen-cli --version 0.2.100 --locked
 ## Tests
 
 ```shell
-cargo test --workspace                 # compiler, kernel scenarios, randomized replay equivalence, store
+cargo test --workspace                 # compiler (every §6 check, every §11 example), families, kernel scenarios, randomized replay equivalence, store
 (cd tests && npm install)              # fake-indexeddb, ws (test-only)
 node --test tests/*.test.mjs           # coding toolkit, policy, projection, browser runtime, streaming, turn ergonomics, MCP/web, CDP, sandbox (fake CheerpX)
 ./tests/e2e.sh                         # native: real runtime + plugin processes, mock OpenRouter
@@ -177,15 +215,16 @@ experiments to inform those decisions, not resolutions of them.
   sends `cancel`; a plugin that ignores it for 3 s is killed, and its other in-flight
   invocations are retried from the record.
 - **Hot swap (#12).** A new plugin version runs alongside the old one; old processes drain when no
-  installed-and-used config references them. Sessions adopt a global apply at their next event
-  boundary; a session-scoped apply is a per-session layer.
-- **Recursion (#9).** Cycles are legal and reported as info; a runtime `max_causal_depth` bounds
-  every causal chain, including chains through `start-session`.
+  revision in use references them. A global apply targets every loaded session that follows the
+  global layer (and becomes the config new sessions start from); a session-scoped apply is a
+  per-session layer. Either is rejected whole if any target's candidate revision fails to compile.
+- **Recursion (#9).** Cycles are legal and reported as info. The core has no recursion or depth
+  limit; the `loop-limit` instance of the `budget` plugin bounds each turn's agent loop.
 - **Context.** Contributions are ops (`add`, `replace`, `remove`, `clear-slot`, `restore`) folded
   in log order. `restore` returns context to its state at an earlier record — as a new record,
   so it can itself be undone. Branching copies context into the new log (`context-seeded`).
-- **Redaction.** A transformer changes what later subscribers and the settled event carry; the
-  arrival record keeps what was published, because history is never rewritten.
+- **Redaction.** A blocking subscriber's `returns` change what later subscribers and the settled
+  event carry; the arrival record keeps what was published, because history is never rewritten.
 
 ## Known limits
 

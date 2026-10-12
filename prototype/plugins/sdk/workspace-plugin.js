@@ -13,17 +13,17 @@
 // replayable and visible) and announced with a `workspace-info` event.
 //
 // Events:
-//   consumes  session-started, config-applied   offer tools
-//             tool-call (async)                  answer calls for our tool names
-//             ui-action (async)                  "restore" on a checkpoint event
-//   emits     tool-result                        what the model sees
+//   subscribe  session-started, config-applied   offer tools
+//              tool-call/<tool> (async)           handle our tools (one member each)
+//              ui-action (async)                  "restore" on a checkpoint event
+//   emit       tool-result                        what the model sees
 //             workspace-info                     root, environment, git state
 //             workspace-change                   a file edit, with a `diff` hint
 //             checkpoint-created / workspace-restored
 //             process-started / process-exited
 //             diagnostics                        typed compiler/test findings
 //             workspace-status                   target lifecycle (booting, ready, failed)
-import { declareTools, definePlugin, offerTools, ownTools } from './agentmod.js';
+import { definePlugin, key, offerTools, optional, TOOL_CALL_KEYS, toolCalls, toolResult, withContext } from './agentmod.js';
 import { codingToolkit, toolSpecs } from './coding/toolkit.js';
 import { normalizePath, shq } from './coding/paths.js';
 
@@ -243,7 +243,7 @@ export function defineWorkspacePlugin(spec) {
     return { output: lines.join('\n'), error: res.adopted.length === 0 && res.conflicts.length > 0, summary: `${res.adopted.length} adopted`, data: { adopted: res.adopted, conflicts: res.conflicts, checkpoint: res.checkpoint, from: other, from_tree: snap.tree } };
   }
 
-  // The tools this plugin owns, from config alone (compile-time ownership).
+  // The tools this plugin handles, from config alone (compile-time handlers).
   const declared = (cfg) => [
     ...toolSpecs({ root: normalizePath(spec.root(cfg || {})), lifecycle: !!spec.lifecycle, importRepos: (cfg || {}).import_repos !== false }),
     ADOPT_SPEC,
@@ -254,16 +254,16 @@ export function defineWorkspacePlugin(spec) {
     name: spec.manifest.name,
     manifest: (cfg) => ({
       ...spec.manifest,
-      consumes: [
-        { event: 'session-started' },
-        { event: 'config-applied' },
-        ownTools(declared(cfg).map((t) => t.name)),
-        { event: 'ui-action', demands: ['reply_to', 'action'], mode: 'async', context: false },
+      subscribe: [
+        { event: 'session-started', mode: 'blocking', actions: ['contribute-context'], receives: withContext() },
+        { event: 'config-applied', mode: 'blocking', actions: ['contribute-context'], receives: withContext() },
+        // Tool calls record the session's workspace and environment in context.
+        ...toolCalls(declared(cfg).map((t) => t.name), { actions: ['contribute-context'], receives: withContext({ ...TOOL_CALL_KEYS }) }),
+        { event: 'ui-action', mode: 'async', receives: { reply_to: key('string'), action: key('string') } },
       ],
-      tools: declareTools(declared(cfg)),
-      emits: [
-        { event: 'tool-result', supplies: ['call_id', 'name', 'output'] },
-        ...WORKSPACE_EVENTS.map((event) => ({ event, supplies: [] })),
+      emit: [
+        toolResult({ exit_code: optional('integer | null'), duration_ms: optional('number'), checkpoint: optional('string'), attachments: optional('array<object>') }),
+        ...WORKSPACE_EVENTS.map((event) => ({ event })),
       ],
     }),
     validate: spec.validate,
@@ -273,7 +273,7 @@ export function defineWorkspacePlugin(spec) {
     handlers: {
       'session-started': offer,
       'config-applied': offer,
-      'tool-call': async (ctx) => {
+      'tool-call/*': async (ctx) => {
         const { call_id, name, args } = ctx.payload;
         const { target } = current(ctx);
         const base = kit(ctx, defaultRoot(ctx));

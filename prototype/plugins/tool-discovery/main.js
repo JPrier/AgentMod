@@ -15,18 +15,18 @@
 // deferred tool's declared `intents` (e.g. "import the GitHub repo …" →
 // import_repo) loads it before the first model request, saving the model a
 // discovery turn for an obvious capability.
-import { definePlugin, declareTools, offerTools, ownTools } from '../sdk/agentmod.js';
+import { definePlugin, key, offerSubscriptions, offerTools, optional, toolCalls, toolResult, withContext } from '../sdk/agentmod.js';
 
 import { TOOL_SEARCH, searchTools, brief } from '../sdk/discovery.js';
 
-/** The session's compiled tool owners (null when the host cannot say). */
+/** The session's compiled tool handlers (null when the host cannot say). */
 async function ownedBy(ctx) {
   try {
-    const r = await ctx.host.query('routes', { session_id: ctx.sessionId });
-    const table = r?.routes?.['tool-call'];
-    if (!table) return null;
-    const prefixes = (table.prefixes || []).map((p) => p.prefix);
-    return (name) => Object.hasOwn(table.exact || {}, name) || prefixes.some((p) => name.startsWith(p));
+    const r = await ctx.host.query('handlers', { session_id: ctx.sessionId });
+    const fam = r?.families?.['tool-call/*'];
+    if (!fam) return null;
+    const subs = Object.keys(fam.subfamilies || {}).map((p) => p.replace(/^tool-call\//, '').replace(/\*$/, ''));
+    return (name) => Object.hasOwn(fam.members || {}, `tool-call/${name}`) || subs.some((p) => name.startsWith(p));
   } catch {
     return null;
   }
@@ -37,14 +37,12 @@ definePlugin({
     name: 'tool-discovery',
     version: '0.1.0',
     description: 'tool_search: find and load deferred tools on demand.',
-    consumes: [
-      { event: 'session-started' },
-      { event: 'config-applied' },
-      { event: 'user-message', demands: ['text'], mode: 'blocking' },
-      ownTools(['tool_search']),
+    subscribe: [
+      ...offerSubscriptions(),
+      { event: 'user-message', mode: 'blocking', actions: ['contribute-context'], receives: withContext({ text: key('string') }) },
+      ...toolCalls(['tool_search'], { actions: ['contribute-context'] }),
     ],
-    tools: declareTools([TOOL_SEARCH]),
-    emits: [{ event: 'tool-result', supplies: ['call_id', 'name', 'output'] }],
+    emit: [toolResult({ loaded: optional('array<string>') })],
   },
   handlers: {
     'user-message': async (ctx) => {
@@ -61,7 +59,7 @@ definePlugin({
     },
     'session-started': (ctx) => offerTools(ctx, [TOOL_SEARCH]),
     'config-applied': (ctx) => offerTools(ctx, [TOOL_SEARCH]),
-    'tool-call': async (ctx) => {
+    'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (name !== 'tool_search') return;
       const context = await ctx.host.query('context', { session_id: ctx.sessionId });

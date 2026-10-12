@@ -16,12 +16,23 @@ class Ctx:
     def __init__(self, plugin, req):
         self.plugin = plugin
         self.event = req["event"]
+        # Projected delivery: exactly the keys (and slots) the subscription declared.
         self.payload = self.event.get("payload", {})
-        self.context = self.event.get("context") or []
+        self.slots = self.event.get("slots") or {}
+        self.subscription = req.get("subscription")
         self.session_id = self.event["session_id"]
         self.invocation_id = req["invocation_id"]
         self.config = plugin.config
         self.result = {"contributions": []}
+
+    @property
+    def context(self):
+        """The `context` slot (only when the subscription requested it)."""
+        if "context" not in self.slots:
+            raise RuntimeError(
+                f"read the context on {self.event['event_name']}, but the subscription "
+                f"({self.subscription}) does not request the `context` slot (receives.slots.context)")
+        return self.slots["context"] or []
 
     def publish(self, event_name, payload=None, ui=None, lane=None, target_session=None):
         return self.plugin.request("publish", {
@@ -31,6 +42,13 @@ class Ctx:
 
     def add(self, slot, value):
         self.result["contributions"].append({"op": "add", "slot": slot, "value": value})
+
+    def returns(self, **keys):
+        """Blocking subscribers: hand keys back to the chain (declared in `returns`)."""
+        self.result.setdefault("returns", {}).update(keys)
+
+    def veto(self, reason):
+        self.result["veto"] = reason
 
     def slot(self, name):
         return [c["value"] for c in self.context if c.get("slot") == name]
@@ -65,13 +83,25 @@ class Plugin:
             raise RuntimeError(msg["error"]["message"])
         return msg.get("result")
 
+    def handler_for(self, name, subscription):
+        """Exact event name, the subscription's pattern, a matching family (`tool-call/*`), or '*'."""
+        if name in self.handlers:
+            return self.handlers[name]
+        if subscription in self.handlers:
+            return self.handlers[subscription]
+        families = sorted((k for k in self.handlers if k != "*" and k.endswith("*")
+                           and name.startswith(k[:-1]) and len(name) > len(k) - 1), key=len, reverse=True)
+        return self.handlers[families[0]] if families else self.handlers.get("*")
+
     def _invoke(self, rid, req):
         name = req["event"]["event_name"]
-        handler = self.handlers.get(name) or self.handlers.get("*")
+        handler = self.handler_for(name, req.get("subscription"))
         ctx = Ctx(self, req)
         try:
             if handler:
                 handler(ctx)
+            if not ctx.result["contributions"]:
+                del ctx.result["contributions"]
             self.send({"id": rid, "result": ctx.result})
         except Exception as e:  # noqa: BLE001 - report every failure to the runtime
             traceback.print_exc(file=sys.stderr)

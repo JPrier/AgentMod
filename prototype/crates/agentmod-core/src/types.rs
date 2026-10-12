@@ -6,7 +6,8 @@ use serde_json::Value;
 /// JSON object used for payloads and plugin configuration.
 pub type Object = serde_json::Map<String, Value>;
 
-/// Dispatch lane. The priority lane wins only the "what's next" decision.
+/// Dispatch lane. The interrupt lane wins only the "what's next" decision: it
+/// is dispatched before ordinary queued work at the next pipeline boundary.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
 )]
@@ -14,7 +15,7 @@ pub type Object = serde_json::Map<String, Value>;
 pub enum Lane {
     #[default]
     Normal,
-    Priority,
+    Interrupt,
 }
 
 /// Subscriber mode inside a pipeline.
@@ -23,7 +24,7 @@ pub enum Lane {
 )]
 #[serde(rename_all = "kebab-case")]
 pub enum Mode {
-    /// Runs sequentially in declared order; may contribute, transform, or veto.
+    /// Runs sequentially in phase order; may return keys, contribute, or veto.
     #[default]
     Blocking,
     /// Observes the settled event; read-only, cannot veto.
@@ -72,8 +73,6 @@ pub struct EventRecord {
     pub lane: Lane,
     pub cause: Cause,
     pub origin: Origin,
-    /// Causal depth from the nearest root; bounded at runtime.
-    pub depth: u32,
     pub payload: Value,
     /// Optional UI hint attachment (versioned vocabulary, rendered by frontends).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,7 +106,8 @@ pub enum ContextOp {
     Restore { to_sequence: u64 },
 }
 
-/// Full envelope delivered to a plugin invocation.
+/// What a plugin invocation receives: the envelope plus exactly the keys and
+/// slots its subscription declared (compiler.md §3.2, projected delivery).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {
     pub event_id: String,
@@ -117,17 +117,19 @@ pub struct Envelope {
     pub cause: Cause,
     pub lane: Lane,
     pub arrived_at: u64,
-    pub depth: u32,
+    /// The declared keys (optional ones only when present), plus every other
+    /// key when the subscription opted into `unlisted_keys`.
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<Value>,
-    /// Session context as of dispatch (omitted when the subscriber opts out).
+    /// The session slots the subscription requested, as of dispatch (absent
+    /// when it requested none). `context` holds the attributed context items.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub context: Option<Vec<ContextItem>>,
+    pub slots: Option<serde_json::Map<String, Value>>,
 }
 
 /// Provenance stamp bound at handshake and recorded on every invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
 pub struct Stamp {
     pub binary: String,
     pub config: String,

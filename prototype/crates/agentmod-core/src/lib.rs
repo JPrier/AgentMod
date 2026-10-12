@@ -2,8 +2,11 @@
 //!
 //! The deterministic kernel of the AgentMod High-Level Design prototype.
 //!
-//! * [`compiler`] — config-compiled event bus: manifests' demand/supply
-//!   declarations are validated into per-definition pipelines.
+//! * [`shape`] / [`manifest`] — typed shapes; plugin manifests and session
+//!   definitions (compiler.md §3–§4).
+//! * [`compiler`] — manifests plus a definition in, one compiled graph out:
+//!   the routing table and the session's revision (§5–§6), checked against
+//!   the versioned [`core_manifest`].
 //! * [`kernel`] — per-session serial dispatch over two FIFO lanes, publish
 //!   classification (pipeline output vs cited deferred publish vs
 //!   `start-session`), dispatcher commands, live config apply, recovery.
@@ -20,11 +23,14 @@
 
 pub mod compiler;
 pub mod context;
+pub mod core_manifest;
+mod embed;
 pub mod kernel;
 pub mod manifest;
 pub mod metrics;
 pub mod projection;
 pub mod record;
+pub mod shape;
 pub mod stream;
 pub mod types;
 

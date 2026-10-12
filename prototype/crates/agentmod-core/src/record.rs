@@ -77,7 +77,8 @@ pub enum Command {
 pub enum Body {
     SessionCreated {
         definition: String,
-        config: String,
+        /// The revision (compiled graph) the session runs under.
+        revision: String,
         cause: Cause,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fork_of: Option<LogRef>,
@@ -99,12 +100,22 @@ pub enum Body {
         event_id: String,
         plugin: String,
         mode: Mode,
+        /// The subscription (event pattern) the compiled edge came from.
+        #[serde(default)]
+        subscription: String,
+        /// Position in the event's blocking chain (blocking), or 0.
         position: usize,
+        /// The blocking subscriber's phase.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<String>,
         stamp: Stamp,
-        /// Input state: the payload as this subscriber saw it.
+        /// The revision this invocation ran under.
+        #[serde(default)]
+        revision: String,
+        /// Input state: exactly what was delivered (the projected payload).
         payload: Value,
-        /// Keyed dispatch: the key value that selected this plugin as the
-        /// event's one owner (e.g. the tool name). Absent for observers.
+        /// Family handler dispatch: the member that selected this plugin as
+        /// its one handler (e.g. the tool name). Absent for other edges.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         route: Option<String>,
     },
@@ -117,8 +128,9 @@ pub enum Body {
     InvocationCompleted {
         invocation_id: String,
         outcome: Outcome,
+        /// Blocking subscribers: the keys returned to the chain.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        transform: Option<Value>,
+        returns: Option<Value>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         contributions: Vec<ContextOp>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -148,11 +160,29 @@ pub enum Body {
         state: DispatchState,
     },
     ConfigApplied {
-        config: String,
+        revision: String,
         previous: String,
         /// True when applied to this session only (a per-session layer).
         #[serde(default)]
         scoped: bool,
+    },
+    /// Behaviour contradicted a compiled declaration (compiler.md §7): a hard
+    /// failure, recorded against the exact declaration it violated.
+    Breach {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invocation_id: Option<String>,
+        plugin: String,
+        stamp: Stamp,
+        revision: String,
+        /// The compiled declaration violated (kind, event, key, shape, …).
+        declaration: Value,
+        /// The value actually observed.
+        observed: Value,
+        reason: String,
+        /// What the runtime did about it.
+        reaction: String,
     },
 }
 
@@ -173,6 +203,7 @@ impl Body {
             Body::CrossSessionSent { .. } => "cross-session-sent",
             Body::DispatcherCommand { .. } => "dispatcher-command",
             Body::ConfigApplied { .. } => "config-applied",
+            Body::Breach { .. } => "breach",
         }
     }
 }

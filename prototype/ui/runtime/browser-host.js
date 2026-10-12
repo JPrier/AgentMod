@@ -33,6 +33,13 @@ async function sha256(text) {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
 }
 
+/** A config as shown to users and posted back: no source locations. */
+function withoutSources(config) {
+  if (!config) return config;
+  const { sources, ...rest } = config;
+  return rest;
+}
+
 function stampOf(name, cfg) {
   return `${name}|${cfg.binary_hash}|${JSON.stringify(cfg.config ?? null)}`;
 }
@@ -267,6 +274,11 @@ export class BrowserRuntime {
     if (this.store) {
       stored = await this.store.loadAll();
       for (const c of stored.compilations) {
+        // Revisions compiled at start-session or apply are stored next to the configs.
+        if (c.standalone_revision) {
+          J(this.kernel.install_revision(JSON.stringify(c.standalone_revision)));
+          continue;
+        }
         if (!c.ok) continue;
         J(this.kernel.install(JSON.stringify(c)));
         this.compilations.set(c.hash, c);
@@ -365,10 +377,9 @@ export class BrowserRuntime {
   }
 
   ensureProc(plugin, stamp) {
-    for (const hash of J(this.kernel.configs_in_use())) {
-      const comp = this.compilation(hash);
-      if (comp?.stamps?.[plugin]?.binary === stamp.binary && comp.stamps[plugin].config === stamp.config) {
-        const cfg = comp.config.plugins[plugin];
+    // The plugin instance a revision in use names, by its stamp.
+    for (const [name, st, cfg] of J(this.kernel.plugins_in_use())) {
+      if (name === plugin && st.binary === stamp.binary && st.config === stamp.config) {
         const recent = (this.crashes.get(stampOf(plugin, cfg)) || []).filter((t) => Date.now() - t < 60000).length;
         if (recent >= 5) throw new Error(`plugin \`${plugin}\` is crash-looping`);
         return this.ensureProcByConfig(plugin, cfg);
@@ -393,6 +404,11 @@ export class BrowserRuntime {
     if (!effects?.length) return;
     const appended = [];
     for (const fx of effects) {
+      if (fx.type === 'save-revision') {
+        // Sessions reference revisions; persist one before the records naming it.
+        this.durableTail = (this.durableTail || Promise.resolve()).then(() => this.store?.putCompilation({ hash: `revision:${fx.revision.revision}`, standalone_revision: fx.revision }));
+        continue;
+      }
       if (fx.type !== 'append') continue;
       const r = fx.record;
       if (!this.records.has(r.session_id)) this.records.set(r.session_id, []);
@@ -485,7 +501,7 @@ export class BrowserRuntime {
         .then(fn)
         .then(
           (r) => r !== undefined && msg.id !== undefined && proc.reply(msg.id, r),
-          (e) => msg.id !== undefined && proc.reply(msg.id, null, { code: e.code ?? -32001, message: e.message }),
+          (e) => msg.id !== undefined && proc.reply(msg.id, null, { code: e.code ?? -32001, message: e.message, ...(e.data ? { data: e.data } : {}) }),
         );
     };
     const params = msg.params || {};
@@ -567,10 +583,7 @@ export class BrowserRuntime {
     }
     if (!this.applying) {
       const inUse = new Set();
-      for (const h of J(this.kernel.configs_in_use())) {
-        const c = this.compilation(h);
-        for (const [n, p] of Object.entries(c?.config?.plugins || {})) if (!p.disabled) inUse.add(stampOf(n, p));
-      }
+      for (const [n, , p] of J(this.kernel.plugins_in_use())) if (!p.disabled) inUse.add(stampOf(n, p));
       for (const p of this.procs) {
         if (!p.draining && p.ready && p.invocations.size === 0 && !inUse.has(p.key)) {
           p.draining = true;
@@ -602,14 +615,16 @@ export class BrowserRuntime {
   }
 
   startAs(plugin, params) {
-    const req = { plugin, definition: params.definition };
+    const req = { plugin, definition: params.definition || '' };
+    if (params.spec) req.spec = params.spec;
     if (params.invocation_id) req.invocation_id = params.invocation_id;
     if (params.initial) req.initial = params.initial;
     if (params.fork_from) req.fork_from = params.fork_from;
     const out = J(this.kernel.start_session(JSON.stringify(req), Date.now()));
     this.execute(out.effects);
-    if (!out.session_id) throw new Error(out.error);
-    return { session_id: out.session_id };
+    // Every start compiles first; a failed compile creates no session.
+    if (!out.session_id) throw Object.assign(new Error(out.error), out.diagnostics?.length ? { code: -32011, data: { diagnostics: out.diagnostics } } : {});
+    return { session_id: out.session_id, revision: out.revision };
   }
 
   command(sessionId, command, by = PAGE) {
@@ -641,14 +656,16 @@ export class BrowserRuntime {
         return J(this.hub.snapshots(session_id || ''));
       case 'session-metrics':
         return J(session_metrics(JSON.stringify(recs())));
-      case 'routes':
-        return { routes: J(this.kernel.routes(session_id)) };
+      case 'handlers':
+        return { families: J(this.kernel.families(session_id)), revision: J(this.kernel.status(session_id))?.revision ?? null };
+      case 'revision':
+        return J(this.kernel.session_revision(session_id));
       case 'metrics':
         return { host: this.counters, streams: J(this.hub.counters()), stream_clients: this.streamClients.size };
       case 'graph':
         return J(this.kernel.active());
       case 'config':
-        return { hash: this.kernel.active_hash(), config: J(this.kernel.active())?.config, installed: [...this.compilations.keys()], host: 'browser', durable: this.durable, storage_blocked: this.storeBlocked ?? null };
+        return { hash: this.kernel.active_hash(), config: withoutSources(J(this.kernel.active())?.config), installed: [...this.compilations.keys()], host: 'browser', durable: this.durable, storage_blocked: this.storeBlocked ?? null };
       case 'services': {
         const comp = J(this.kernel.active());
         return Object.entries(comp?.manifests || {})
@@ -717,11 +734,17 @@ export class BrowserRuntime {
     }
     const { hash } = J(this.kernel.install(JSON.stringify(comp)));
     this.compilations.set(hash, comp);
+    await this.store?.putCompilation(comp);
     const out = J(this.kernel.apply_config(hash, JSON.stringify(scope), Date.now()));
-    this.journal.push({ at: Date.now(), kind: 'config-applied', detail: { hash, scope, skipped: out.skipped || [] } });
     this.execute(out.effects);
-    if (out.error) throw new Error(out.error);
-    return { ...summary, skipped: out.skipped || [] };
+    if (out.error) {
+      // Rejected whole: those sessions keep their revision.
+      const rejected = { hash, ok: false, error: out.error, diagnostics: out.diagnostics || [] };
+      this.journal.push({ at: Date.now(), kind: 'config-rejected', detail: rejected });
+      return rejected;
+    }
+    this.journal.push({ at: Date.now(), kind: 'config-applied', detail: { hash, scope, revisions: out.revisions || {} } });
+    return { ...summary, revisions: out.revisions || {} };
   }
 
   // ------------------------------------------------------------------
@@ -835,8 +858,8 @@ export class BrowserRuntime {
     return this.startAs(PAGE, { definition, initial, fork_from });
   }
 
-  async sendMessage(id, text, lane = 'normal') {
-    return this.publishAs(PAGE, { event_name: 'user-message', payload: { text }, cite: this.citeFor(id), lane, ui: { v: 1, kind: 'text', role: 'user', text } });
+  async sendMessage(id, text) {
+    return this.publishAs(PAGE, { event_name: 'user-message', payload: { text }, cite: this.citeFor(id), ui: { v: 1, kind: 'text', role: 'user', text } });
   }
 
   async uiAction(id, reply_to, action, values = {}) {
@@ -844,7 +867,7 @@ export class BrowserRuntime {
   }
 
   async contextEdit(id, ops) {
-    return this.publishAs(PAGE, { event_name: 'context-edit', payload: { ops }, cite: this.citeFor(id), lane: 'priority' });
+    return this.publishAs(PAGE, { event_name: 'context-edit', payload: { ops }, cite: this.citeFor(id) });
   }
 
   async sendCommand(id, command) {

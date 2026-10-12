@@ -60,7 +60,7 @@ function runPlugin(config) {
   const call = (method, params) => new Promise((resolve) => { const n = id++; pending.set(n, resolve); child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: n, method, params }) + '\n'); });
   let seq = 0;
   const tool = async (session, name, args) => {
-    await call('invoke', { invocation_id: `${session}/i${++seq}`, attempt: 1, mode: 'async', event: { event_id: `${session}/e${seq}`, session_id: session, event_name: 'tool-call', sequence: seq, payload: { call_id: `c${seq}`, name, args } } });
+    await call('invoke', { invocation_id: `${session}/i${++seq}`, attempt: 1, mode: 'async', subscription: `tool-call/${name}`, event: { event_id: `${session}/e${seq}`, session_id: session, event_name: `tool-call/${name}`, sequence: seq, payload: { call_id: `c${seq}`, name, args } } });
     return results[results.length - 1];
   };
   return { child, call, tool };

@@ -27,7 +27,7 @@ function runPlugin(file, config) {
     else if (msg.method === undefined) { pending.get(msg.id)?.(msg); pending.delete(msg.id); }
   });
   const call = (method, params) => new Promise((resolve) => { const n = id++; pending.set(n, resolve); child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: n, method, params }) + '\n'); });
-  const ev = (event_name, payload, n) => ({ event_id: `s1/e${n}`, session_id: 's1', event_name, sequence: n, payload, context: [] });
+  const ev = (event_name, payload, n) => ({ event_id: `s1/e${n}`, session_id: 's1', event_name, sequence: n, payload, slots: { context: [] } });
   return { child, call, publishes, ev, init: () => call('initialize', { protocol: 'agentmod/0.1', plugin: path.basename(path.dirname(file)), config }) };
 }
 
@@ -62,7 +62,7 @@ test('mcp-bridge plugin: offers deferred tools, answers calls, labels results un
     const started = await p.call('invoke', { invocation_id: 'i1', attempt: 1, mode: 'blocking', event: p.ev('session-started', {}, 1) });
     const offered = started.result.contributions.filter((c) => c.slot === 'tools').map((c) => c.value.name);
     assert.deepEqual(offered, ['mcp__fx__echo', 'mcp__fx__note']);
-    await p.call('invoke', { invocation_id: 'i2', attempt: 1, mode: 'async', event: p.ev('tool-call', { call_id: 'c1', name: 'mcp__fx__echo', args: { text: 'yo' } }, 2) });
+    await p.call('invoke', { invocation_id: 'i2', attempt: 1, mode: 'async', event: p.ev('tool-call/mcp__fx__echo', { call_id: 'c1', name: 'mcp__fx__echo', args: { text: 'yo' } }, 2) });
     const res = p.publishes.find((x) => x.event_name === 'tool-result').payload;
     assert.equal(res.trust, 'external');
     assert.deepEqual(res.mcp, { server: 'fx', tool: 'echo' });
@@ -105,7 +105,7 @@ test('web-fetch plugin: fetches, pages, refuses private hosts unless allowed', a
   const run = async (config, args) => {
     const p = runPlugin(path.join(here, '..', 'plugins', 'web-fetch', 'main.js'), config);
     await p.init();
-    await p.call('invoke', { invocation_id: 'i1', attempt: 1, mode: 'async', event: p.ev('tool-call', { call_id: 'c', name: 'web_fetch', args }, 1) });
+    await p.call('invoke', { invocation_id: 'i1', attempt: 1, mode: 'async', event: p.ev('tool-call/web_fetch', { call_id: 'c', name: 'web_fetch', args }, 1) });
     p.child.kill();
     return p.publishes.find((x) => x.event_name === 'tool-result').payload;
   };

@@ -10,11 +10,13 @@
 //          bound to the call's action digest.
 // The human's answer is a `ui-action` from an approver plugin (a frontend).
 // Policy is evaluated *again* when the answer arrives — a deny added while the
-// question was open wins — and the approved call is re-published with the
-// digest, then checked once more on its way through this plugin, immediately
-// before execution. Text in a tool result cannot approve anything: only events
-// published by configured approver plugins count, and the kernel blocks
-// undeclared publishes.
+// question was open wins — and it publishes `approval-granted` (with the
+// digest); the loop re-publishes the call citing that grant, and the call is
+// checked once more on its way through this plugin, immediately before
+// execution: only a grant this plugin published, for this exact action,
+// counts. Text in a tool result cannot approve anything: only events published
+// by configured approver plugins count, and the kernel blocks undeclared
+// publishes.
 //
 // Visibility: on every model-request it contributes `tool-policy` { hidden },
 // the tools this session can never use (child allowlist, read-only mode,
@@ -28,7 +30,7 @@
 //   session_mode, session_rules   for per-session config layers
 //   approvers       plugins whose ui-actions count as human answers (default ["web-ui"])
 //   defaults        false to drop the built-in rules (sdk/policy.js DEFAULT_RULES)
-import { definePlugin } from '../sdk/agentmod.js';
+import { definePlugin, key, optional, TOOL_CALL_KEYS, toolResult, withContext } from '../sdk/agentmod.js';
 import { DEFAULT_RULES, actionDigest, decide, explain, factsOf, grantFor, hiddenTools, stricterMode } from '../sdk/policy.js';
 
 const delegations = new Map(); // session -> delegation (immutable once recorded)
@@ -75,16 +77,16 @@ definePlugin({
     name: 'policy',
     version: '0.1.0',
     description: 'Layered tool policy: deny > ask > allow across scopes, explained decisions, digest-bound approvals, tool visibility.',
-    consumes: [
-      { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'blocking' },
-      { event: 'ui-action', demands: ['reply_to', 'action'], mode: 'async', context: false },
-      { event: 'model-request', demands: ['turn'], mode: 'blocking' },
+    subscribe: [
+      { event: 'tool-call/*', mode: 'blocking', actions: ['veto'], receives: withContext({ ...TOOL_CALL_KEYS }) },
+      { event: 'ui-action', mode: 'async', actions: ['contribute-context'], receives: { reply_to: key('string'), action: key('string') } },
+      { event: 'model-request', mode: 'blocking', actions: ['contribute-context'], receives: withContext({ turn: key('string') }) },
     ],
-    emits: [
-      { event: 'policy-decision', supplies: ['call_id', 'effect'] },
-      { event: 'approval-requested', supplies: ['call_id', 'name', 'args', 'tool_call'] },
-      { event: 'tool-call', supplies: ['call_id', 'name', 'args', 'approved'] },
-      { event: 'tool-result', supplies: ['call_id', 'name', 'output'] },
+    emit: [
+      { event: 'policy-decision', keys: { call_id: key('string'), effect: key('"allow" | "ask" | "deny"'), tool: optional('string'), rule: optional('string'), scope: optional('string'), reason: optional('string'), explanation: optional('string'), digest: optional('string') } },
+      { event: 'approval-requested', keys: { call_id: key('string'), name: key('string'), args: key('object'), tool_call: key('object'), digest: optional('string') } },
+      { event: 'approval-granted', keys: { call_id: key('string'), name: key('string'), args: key('object'), approved: key('object') } },
+      toolResult({ approval_ref: optional('string'), policy: optional('object') }),
     ],
     config_schema: { mode: 'auto | default | ask | read-only', rules: [], user_rules: [], session_mode: null, session_rules: [], approvers: ['web-ui'], defaults: true },
   },
@@ -100,17 +102,17 @@ definePlugin({
         ctx.add('tool-policy', { hidden, mode: pol.mode });
       }
     },
-    'tool-call': async (ctx) => {
+    'tool-call/*': async (ctx) => {
       const call = ctx.payload;
       const pol = await policyFor(ctx, ctx.context);
       const f = factsOf(call.name, call.args || {}, specOf(ctx.context, call.name));
       const digest = await actionDigest(call.name, call.args || {});
-      // A re-published approved call counts only if *this plugin* published it
-      // for this exact action.
+      // A re-published approved call counts only if it cites a grant *this
+      // plugin* published, for this exact action.
       let approved = false;
-      if (call.approved) {
-        const me = await ctx.host.query('event', { session_id: ctx.sessionId, event_id: ctx.event.event_id });
-        approved = me?.origin?.plugin === ctx.plugin.instance && call.approved.digest === digest;
+      if (call.approved?.grant) {
+        const grant = await ctx.host.query('event', { session_id: ctx.sessionId, event_id: call.approved.grant });
+        approved = grant?.event_name === 'approval-granted' && grant.origin?.plugin === ctx.plugin.instance && grant.payload?.call_id === call.call_id && grant.payload?.approved?.digest === digest && call.approved.digest === digest;
       }
       const d = decide(f, { ...pol, approved });
       const quiet = d.effect === 'allow' && d.winner.scope === 'mode' && f.readOnly;
@@ -143,7 +145,7 @@ definePlugin({
       if (!approvers.includes(answer?.origin?.plugin)) return;
       // Idempotence: one answer per request.
       const view = await ctx.host.query('session', { session_id: ctx.sessionId });
-      const done = view.events.some((e) => (e.event_name === 'tool-call' && e.payload.approved?.ref === reply_to) || (e.event_name === 'tool-result' && e.payload.approval_ref === reply_to));
+      const done = view.events.some((e) => (e.event_name === 'approval-granted' && e.payload.approved?.ref === reply_to) || (e.event_name === 'tool-result' && e.payload.approval_ref === reply_to));
       if (done) return;
       const call = req.payload.tool_call;
       if (action === 'deny') {
@@ -163,7 +165,7 @@ definePlugin({
         return;
       }
       if (action === 'approve-session' && now.grantable !== false) ctx.add('policy-grants', grantFor(f, reply_to));
-      await ctx.publish('tool-call', { ...call, approved: { by: 'user', ref: reply_to, digest, session: action === 'approve-session' } }, { ui: { v: 1, kind: 'tool', name: call.name, args: call.args, call_id: call.call_id, status: 'approved' } });
+      await ctx.publish('approval-granted', { call_id: call.call_id, name: call.name, args: call.args || {}, approved: { by: 'user', ref: reply_to, digest, session: action === 'approve-session' } });
     },
   },
 });

@@ -98,7 +98,7 @@ pub fn session_metrics(records: &[Record]) -> Value {
                 }
                 if let Some(t) = turns.last_mut() {
                     t.events += 1;
-                    if event.event_name == "tool-call" && event.payload.get("approved").is_none() {
+                    if is_tool_call(&event.event_name) && event.payload.get("approved").is_none() {
                         t.tool_calls += 1;
                     }
                 }
@@ -123,14 +123,14 @@ pub fn session_metrics(records: &[Record]) -> Value {
                     Mode::Async => add(&mut m, "async_invocations", 1.0),
                 }
                 let name = event_names.get(event_id).cloned().unwrap_or_default();
-                if name == "tool-call" {
+                if is_tool_call(&name) {
                     add(&mut m, "tool_call_invocations", 1.0);
                     if route.is_some() {
-                        add(&mut m, "exact_owner_dispatches", 1.0);
+                        add(&mut m, "exact_handler_dispatches", 1.0);
                     } else if *mode == Mode::Async {
-                        // Delivered to a plugin that was not selected as owner:
-                        // a broadcast candidate (or a pure observer).
-                        add(&mut m, "candidate_dispatches", 1.0);
+                        // Delivered to a plugin that is not the member's handler:
+                        // a family observer.
+                        add(&mut m, "observer_dispatches", 1.0);
                     }
                 }
                 inv_event.insert(invocation_id.clone(), name);
@@ -142,17 +142,20 @@ pub fn session_metrics(records: &[Record]) -> Value {
             Body::InvocationCompleted {
                 invocation_id,
                 outcome,
-                transform,
+                returns,
                 contributions,
                 published,
             } => {
                 let noop = *outcome == Outcome::Ok
-                    && transform.is_none()
+                    && returns.is_none()
                     && contributions.is_empty()
                     && published.is_empty();
                 if noop {
                     add(&mut m, "noop_invocations", 1.0);
-                    if inv_event.get(invocation_id).map(String::as_str) == Some("tool-call") {
+                    if inv_event
+                        .get(invocation_id)
+                        .is_some_and(|n| is_tool_call(n))
+                    {
                         add(&mut m, "noop_tool_dispatches", 1.0);
                     }
                 }
@@ -161,6 +164,7 @@ pub fn session_metrics(records: &[Record]) -> Value {
                 }
             }
             Body::InvocationRetried { .. } => add(&mut m, "invocation_retries", 1.0),
+            Body::Breach { .. } => add(&mut m, "breaches", 1.0),
             _ => {}
         }
     }
@@ -223,7 +227,7 @@ pub fn session_metrics(records: &[Record]) -> Value {
                 }
                 turn_i += 1;
             }
-            "tool-call" if p.get("approved").is_none() => {
+            n if is_tool_call(n) && p.get("approved").is_none() => {
                 add(&mut m, "tool_calls", 1.0);
                 if p.get("name").and_then(Value::as_str) == Some("delegate") {
                     add(&mut m, "child_agent_calls", 1.0);
@@ -328,4 +332,9 @@ fn max_schema(view: &crate::projection::SessionView) -> f64 {
         .filter(|e| e.event_name == "model-response")
         .map(|e| num(e.payload.pointer("/metrics/tool_schema_tokens")))
         .fold(0.0, f64::max)
+}
+
+/// A tool call: a member of the `tool-call/*` family.
+fn is_tool_call(name: &str) -> bool {
+    name.starts_with("tool-call/")
 }

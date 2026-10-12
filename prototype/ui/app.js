@@ -97,12 +97,22 @@ function withSettings(config) {
 
 const modelProviders = () => (state.services || []).filter((s) => s.provides?.includes('model'));
 
-/** The provider a definition uses (the first subscriber that provides a model). */
+/** The provider a definition uses (the first of its plugins that provides a model). */
 function providerOf(cfg, definition) {
   const names = new Set(modelProviders().map((s) => s.plugin));
-  const def = cfg?.definitions?.[definition] || Object.values(cfg?.definitions || {}).find((d) => d.subscribers.some((x) => names.has(x.plugin)));
-  return def?.subscribers.find((x) => names.has(x.plugin))?.plugin;
+  const has = (d) => Object.keys(d?.plugins || {}).find((p) => names.has(p));
+  const def = cfg?.definitions?.[definition] && has(cfg.definitions[definition]) ? cfg.definitions[definition] : Object.values(cfg?.definitions || {}).find(has);
+  return has(def);
 }
+
+/** Does a definition run this plugin? */
+const runs = (cfg, definition, plugin) => !!cfg?.definitions?.[definition]?.plugins?.[plugin];
+
+/** Is a plugin a member of a compiled definition on this host (not disabled)? */
+const compiledMember = (definition, plugin) => {
+  const m = state.graph?.definitions?.[definition]?.plugins?.[plugin];
+  return !!m && m.member !== false;
+};
 
 const describeModel = (m) => {
   const price = (v) => `$${(v * 1e6).toFixed(v * 1e6 < 1 ? 2 : 1)}`;
@@ -227,7 +237,12 @@ async function applyProvider({ provider, values }) {
   const providers = new Set(modelProviders().map((s) => s.plugin));
   const current = providerOf(cfg, state.view?.definition);
   if (current && provider !== current) {
-    for (const def of Object.values(cfg.definitions || {})) def.subscribers = def.subscribers.map((x) => (x.plugin === current && providers.has(provider) ? { ...x, plugin: provider } : x));
+    for (const def of Object.values(cfg.definitions || {})) {
+      if (def.plugins?.[current] && providers.has(provider)) {
+        def.plugins[provider] = def.plugins[current];
+        delete def.plugins[current];
+      }
+    }
   }
   cfg.plugins[provider].config = { ...(cfg.plugins[provider].config || {}), ...values };
   if (state.host === 'browser') {
@@ -505,9 +520,9 @@ async function newSession(definition, text, fork_from) {
   }
 }
 
-async function send(text, steer) {
+async function send(text) {
   if (!text.trim() || !state.selected) return;
-  await act(() => state.client.sendMessage(state.selected, text, steer ? 'priority' : 'normal'));
+  await act(() => state.client.sendMessage(state.selected, text));
 }
 
 async function command(cmd) {
@@ -683,9 +698,9 @@ function chat() {
   const st = v.status?.activity || (v.state === 'halted' ? 'halted' : 'idle');
   const head = h('div.chat-head',
     h('h1', v.title || (v.definition === 'chat' ? 'New chat' : v.definition)),
-    h('span.sub', `${v.session_id} · ${v.definition} · config ${v.config.slice(0, 8)}`),
+    h('span.sub', { title: 'The revision (compiled graph) this session runs under' }, `${v.session_id} · ${v.definition} · revision ${v.revision.slice(0, 8)}`),
     h('span.state.' + st, st),
-    v.status && (v.status.queued_priority + v.status.queued_normal) > 0 && h('span.sub', `${v.status.queued_normal + v.status.queued_priority} queued`),
+    v.status && (v.status.queued_interrupt + v.status.queued_normal) > 0 && h('span.sub', `${v.status.queued_normal + v.status.queued_interrupt} queued`),
     modeControl(v),
     h('div.controls',
       h('button.btn.small', { onclick: () => command('soft-stop'), disabled: !['running', 'idle'].includes(st), title: 'Finish the running pipeline, then park' }, 'Soft stop'),
@@ -705,8 +720,7 @@ const MODES = [['auto', 'Auto: allow unless a rule denies/asks'], ['default', 'D
 
 function modeControl(v) {
   const cfg = state.config?.config;
-  const subs = cfg?.definitions?.[v.definition]?.subscribers || [];
-  if (!subs.some((s) => s.plugin === 'policy') || !cfg?.plugins?.policy) return null;
+  if (!runs(cfg, v.definition, 'policy') || !cfg?.plugins?.policy) return null;
   const pc = cfg.plugins.policy.config || {};
   const current = pc.session_mode || pc.mode || 'default';
   return h('label.mode', { title: 'Permission mode for this session: a session-scoped config apply, recorded in its log' }, 'Mode ',
@@ -727,9 +741,9 @@ const SANDBOX = 'linux-sandbox';
 
 /** Status line for sessions whose definition includes the in-browser Linux sandbox. */
 function sandboxNotice(v) {
-  const configured = state.config?.config?.definitions?.[v.definition]?.subscribers?.some((s) => s.plugin === SANDBOX);
+  const configured = runs(state.config?.config, v.definition, SANDBOX);
   if (!configured) return null;
-  const active = state.graph?.definitions?.[v.definition]?.plugins?.includes(SANDBOX);
+  const active = compiledMember(v.definition, SANDBOX);
   if (!active) {
     return h('div.notice', h('b', 'Linux sandbox unavailable on this host. '),
       'It runs only in the in-browser runtime (CheerpX needs a browser); this runtime disabled it, so the coding tools are missing here.');
@@ -751,7 +765,7 @@ function sandboxNotice(v) {
 }
 
 function suggestions(v) {
-  if (state.graph?.definitions?.[v?.definition]?.plugins?.includes(SANDBOX)) {
+  if (compiledMember(v?.definition, SANDBOX)) {
     const s = [
       'What languages and build tools are installed in the sandbox?',
       'Write a C program that prints the first 20 primes, compile it with gcc, and run it',
@@ -769,10 +783,9 @@ function suggestions(v) {
 function composer(v) {
   const ta = h('textarea#composer', { rows: 1, placeholder: 'Message the agent', 'aria-label': 'Message', oninput: (e) => autosize(e.target),
     onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.form.requestSubmit(); } } });
-  const steer = h('input', { type: 'checkbox', id: 'steer' });
-  const form = h('form', { onsubmit: (e) => { e.preventDefault(); const t = ta.value; ta.value = ''; composerDraft = ''; send(t, steer.checked); } },
+  const form = h('form', { onsubmit: (e) => { e.preventDefault(); const t = ta.value; ta.value = ''; composerDraft = ''; send(t); } },
     ta, h('button.btn.primary', { type: 'submit' }, 'Send'),
-    h('div.opts', h('label', steer, 'Steer: send on the priority lane'), h('span', v.definition === 'chat' ? 'Shift+Enter for a new line' : '')));
+    h('div.opts', h('span', v.definition === 'chat' ? 'Shift+Enter for a new line' : '')));
   return h('div.composer', form);
 }
 
@@ -800,12 +813,14 @@ function threadItems(v) {
   // A stream also ends when its invocation closes (completed, failed, or cancelled by a hard stop).
   for (const e of v.events) for (const i of e.invocations) if (i.outcome) finalized.add(i.invocation_id);
   const chunked = new Set(v.events.filter((e) => e.event_name === 'stream-chunk').map((e) => e.payload.stream_id));
+  // A response the loop re-publishes as an assistant message renders once, from that message.
+  const replaced = new Set(v.events.filter((e) => e.event_name === 'assistant-message' && e.ui?.replaces_stream).map((e) => e.ui.replaces_stream));
   const controls = (v.control || []).filter((c) => c.kind === 'hard-stop' || c.kind === 'soft-stop' || c.kind === 'config-applied');
   let ci = 0;
   const controlNote = (c) =>
     c.kind === 'hard-stop' ? h('div.sys.bad', `Hard stop by ${c.detail.by} at record #${c.sequence}.`)
       : c.kind === 'soft-stop' ? h('div.sys', `Soft stop by ${c.detail.by} at record #${c.sequence}.`)
-        : h('div.sys', `Config ${c.detail.config.slice(0, 8)} applied at record #${c.sequence}${c.detail.scoped ? ' (this session only)' : ''}.`);
+        : h('div.sys', `Revision ${c.detail.revision.slice(0, 8)} applied at record #${c.sequence}${c.detail.scoped ? ' (this session only)' : ''}.`);
 
   for (const e of v.events) {
     while (ci < controls.length && controls[ci].sequence < e.sequence) out.push(controlNote(controls[ci++]));
@@ -826,7 +841,7 @@ function threadItems(v) {
         h('button.linkish.branch', { title: 'Start a new session from the context just before this message (its own log; with an isolated workspace for coding sessions)', onclick: () => branchFrom(e.sequence - 1) }, 'branch here'),
         changed && h('span.note', 'Redacted by a transformer before any later plugin saw it'),
         e.status === 'vetoed' && h('span.note', `Vetoed: ${e.settlement.reason}`),
-        e.lane === 'priority' && h('span.note', 'Sent on the priority lane')));
+        e.lane === 'interrupt' && h('span.note', 'Sent on the interrupt lane')));
       continue;
     }
     if (name === 'stream-chunk' && ui?.kind === 'stream-chunk') {
@@ -851,7 +866,7 @@ function threadItems(v) {
     if (name === 'model-response') {
       const s = streams.get(e.payload.stream_id);
       if (s) s.el.classList.remove('streaming');
-      else if (e.payload.text) out.push(h('div.msg.assistant', { html: markdown(e.payload.text) }));
+      else if (e.payload.text && !replaced.has(e.payload.stream_id)) out.push(h('div.msg.assistant', { html: markdown(e.payload.text) }));
       continue;
     }
     if (name === 'assistant-message') {
@@ -862,7 +877,7 @@ function threadItems(v) {
       } else out.push(h('div.msg.assistant', { html: markdown(e.payload.text) }));
       continue;
     }
-    if (name === 'tool-call') {
+    if (name.startsWith('tool-call/')) {
       const id = e.payload.call_id;
       let t = tools.get(id);
       if (!t) {
@@ -875,7 +890,13 @@ function threadItems(v) {
       else if (e.status === 'delivered') setPill(t.status, 'running', 'blk');
       continue;
     }
-    if (name === 'tool-result') {
+    if (name === 'tool-call-rejected' && !tools.has(e.payload.call_id)) {
+      // Answered by the loop before dispatch (bad arguments, unknown tool, no handler).
+      const t = { status: h('span.pill', 'rejected'), res: h('span.res') };
+      tools.set(e.payload.call_id, t);
+      out.push(h('div.tool', h('span.name', e.payload.name), h('span.args', ''), t.status, t.res));
+    }
+    if (name === 'tool-result' || name === 'tool-call-rejected') {
       const t = tools.get(e.payload.call_id);
       if (t) {
         setPill(t.status, e.payload.policy?.effect === 'deny' ? 'denied by policy' : e.payload.error ? 'failed' : 'done', e.payload.error ? 'bad' : 'ok');
@@ -1019,7 +1040,7 @@ function hotPathSection(row, n) {
     row('records · bytes', `${n(m.records)} · ${n(m.record_bytes)}`),
     row('events · pipelines', `${n(m.events)} (${n(m.semantic_events)} semantic) · ${n(m.pipeline_starts)}`),
     row('plugin invocations', `${n(m.plugin_invocations)} (${n(m.blocking_invocations)} blocking, ${n(m.async_invocations)} async, ${n(m.noop_invocations)} no-op)`),
-    row('tool dispatch', `${n(m.exact_owner_dispatches)} to owners, ${n(m.candidate_dispatches)} broadcast; ${r.plugin_invocations_per_tool_call ?? '-'} invocations per call`),
+    row('tool dispatch', `${n(m.exact_handler_dispatches)} to handlers, ${n(m.observer_dispatches)} to observers; ${r.plugin_invocations_per_tool_call ?? '-'} invocations per call`),
     row('streams', `${n(m.stream_provider_events)} provider events → ${n(m.stream_live_frames)} live frames (${r.live_frames_per_provider_event ?? '-'} per event)`),
     row('per model response', `${r.canonical_events_per_model_response ?? '-'} events, ${r.records_per_model_response ?? '-'} records`),
     row('journal bytes / useful byte', r.journal_bytes_per_useful_output_byte ?? '-'),
@@ -1091,10 +1112,11 @@ function pipelinePane() {
   const rows = evs.map((e) => eventRow(v, e));
   const hidden = v.events.length - evs.length;
   return [
-    h('p.help', `${v.records} records in ${v.session_id}. Each row is an event; the chips are its pipeline: blocking subscribers in declared order, then async observers. Click a row for its full record.`),
+    h('p.help', `${v.records} records in ${v.session_id} (revision ${v.revision.slice(0, 8)}). Each row is an event; the chips are the edges it took in the compiled graph: blocking subscribers in phase order, then async observers and the family handler (H). Click a row for its full record.`),
     tools,
     hidden ? h('p.help', `${hidden} stream chunks hidden.`) : null,
     rows,
+    (v.breaches || []).map((b) => h('div.blocked', { title: JSON.stringify(b.declaration) }, h('b', `#${b.sequence} breach `), `${b.plugin}: ${b.reason} (${b.reaction}; declaration: ${b.declaration?.kind} ${b.declaration?.event || b.declaration?.subscription || ''})`)),
     (v.blocked || []).map((b) => h('div.blocked', h('b', `#${b.sequence} blocked `), `${b.plugin} → ${b.event_name}: ${b.reason}`)),
   ];
 }
@@ -1104,13 +1126,13 @@ function eventRow(v, e) {
   const invs = e.invocations.filter((i) => !(state.hideFrontend && i.plugin === 'web-ui'));
   const blocking = invs.filter((i) => i.mode === 'blocking');
   const asyncs = invs.filter((i) => i.mode === 'async');
-  const chip = (i) => h('span.chip.' + (i.mode === 'blocking' ? 'b' : 'a') + (outcomeClass(i) ? '.' + outcomeClass(i) : ''), { title: `${i.invocation_id} · ${i.outcome?.status || 'running'}${i.attempts > 1 ? ` · attempt ${i.attempts}` : ''}` }, i.plugin + (i.attempts > 1 ? ` ×${i.attempts}` : ''));
+  const chip = (i) => h('span.chip.' + (i.mode === 'blocking' ? 'b' : 'a') + (outcomeClass(i) ? '.' + outcomeClass(i) : ''), { title: `${i.invocation_id} · ${i.phase ? `phase ${i.phase} · ` : ''}${i.route ? `handler of ${i.route} · ` : ''}${i.subscription ? `via ${i.subscription} · ` : ''}${i.outcome?.status || 'running'}${i.attempts > 1 ? ` · attempt ${i.attempts}` : ''}` }, (i.phase ? `${i.phase}:` : '') + i.plugin + (i.route ? ' (H)' : '') + (i.attempts > 1 ? ` ×${i.attempts}` : ''));
   const chain = [];
   blocking.forEach((i, n) => { if (n) chain.push(h('span.arrow', '→')); chain.push(chip(i)); });
   if (asyncs.length) { if (blocking.length) chain.push(h('span.fork', '⋮')); asyncs.forEach((i) => chain.push(chip(i))); }
   const statusKind = { delivered: 'ok', vetoed: 'bad', failed: 'bad', aborted: 'bad', running: 'blk', queued: 'wait' }[e.status];
   return h('div.ev' + (open ? '.open' : ''), { id: `ev-${e.event_id}`, onclick: (ev) => { if (ev.target.closest('button, a, pre')) return; toggle(e.event_id); } },
-    h('div.ev-head', h('span.ev-seq', `#${e.sequence}`), h('span.ev-name', e.event_name), e.lane === 'priority' && h('span.ev-lane', 'priority'), h('span.ev-status', h('span.pill.' + (statusKind || ''), e.status))),
+    h('div.ev-head', h('span.ev-seq', `#${e.sequence}`), h('span.ev-name', e.event_name), e.lane === 'interrupt' && h('span.ev-lane', 'interrupt'), h('span.ev-status', h('span.pill.' + (statusKind || ''), e.status))),
     chain.length ? h('div.chain', chain) : null,
     open && eventDetail(v, e));
 }
@@ -1206,35 +1228,52 @@ function contextPane() {
   ];
 }
 
+/** Diagnostics with where they trace to. */
+function diagnosticRows(list) {
+  return list.length ? list.map((x) => h('div.diag.' + x.severity, h('b', x.code), ' ', h('span.mono', `${x.source ? `${x.source.file}:${x.source.line} ` : ''}${[x.event, x.key && `key ${x.key}`, (x.plugins || []).join(', ')].filter(Boolean).join(' / ')}`), ' ', x.message)) : h('p.help', 'None.');
+}
+
 function graphPane() {
   const g = state.graph;
   if (!g) return h('p.help', 'No compiled config.');
   const defs = Object.keys(g.definitions);
   const name = state.graphDef && g.definitions[state.graphDef] ? state.graphDef : defs[0];
-  const d = g.definitions[name];
-  const plugins = [...new Set([...d.plugins, ...d.edges.filter((x) => x.kind === 'external').map((x) => x.from), 'core'])];
-  const events = [...new Set(d.edges.map((x) => (x.kind === 'consumes' ? x.from : x.to)).filter((x) => x !== '*'))].sort();
-  const cell = (ev, p) => {
-    const em = d.edges.find((x) => (x.kind === 'emits' || x.kind === 'external') && x.from === p && x.to === ev);
-    const pipe = d.pipelines[ev] || d.fallback;
-    const bi = pipe.blocking.findIndex((s) => s.plugin === p);
-    const as = pipe.async.some((s) => s.plugin === p);
+  const r = g.definitions[name];
+  if (!r) return h('p.help', 'No definitions compiled on this host.');
+  const { edges, routes } = r.graph;
+  const plugins = ['core', ...Object.keys(r.plugins)];
+  const classes = [...new Set(routes.map((x) => x.class))].sort();
+  const cell = (cls, p) => {
     const parts = [];
-    if (em) parts.push(h('span.cell-e', { title: `emits ${em.keys.join(', ')}${em.deferred ? ' (deferred allowed)' : ''}` }, em.deferred ? 'E*' : 'E'));
-    if (bi >= 0) parts.push(h('span.cell-b', { title: `blocking, position ${bi + 1}` }, `B${bi + 1}`));
-    if (as) parts.push(h('span.cell-a', { title: 'async observer' }, 'A'));
+    const out = routes.filter((x) => x.class === cls && x.from === p);
+    if (out.length) {
+      const e = out.map((x) => [...(x.blocking || []), ...(x.asyncs || []), ...(x.handler != null ? [x.handler] : [])].map((i) => edges[i])).flat()[0];
+      const label = `E${e?.deferred ? '*' : ''}${e?.lane === 'interrupt' ? '!' : ''}`;
+      parts.push(h('span.cell-e', { title: `emits ${cls}${e?.deferred ? ' (deferred allowed)' : ''}${e?.lane === 'interrupt' ? ' on the interrupt lane' : ''}; keys: ${Object.keys(e?.supply || {}).join(', ') || 'none'}` }, label));
+    }
+    const ins = edges.filter((e) => e.event === cls && e.to === p);
+    const b = ins.find((e) => e.mode === 'blocking');
+    if (b) parts.push(h('span.cell-b', { title: `blocking, phase ${b.position.phase}, chain position ${b.position.chain + 1}; receives ${Object.keys(b.supply).join(', ') || 'envelope only'}` }, `${b.position.phase}:${b.position.chain + 1}`));
+    if (ins.some((e) => e.handler)) parts.push(h('span.cell-a', { title: 'the one handler of this family member' }, 'H'));
+    else if (ins.some((e) => e.mode === 'async')) parts.push(h('span.cell-a', { title: 'async' }, 'A'));
     return h('td', parts);
   };
+  const rp = r.report;
+  const section = (title, items, help) => items.length > 0 && [h('h3', title), help && h('p.help', help), items.map((x) => h('div.diag', x))];
   return [
     h('div.pane-tools', h('label', 'Definition ', h('select', { onchange: (e) => { state.graphDef = e.target.value; render(); } }, defs.map((x) => h('option', { selected: x === name }, x))))),
-    h('p.help', `Compiled config ${g.hash}. The graph is a compile-time artifact: every consumer is matched to an emitter and every demanded key to a supplied one. E = emits (E* may publish deferred), B1… = blocking position, A = async.`),
-    h('div.matrix-wrap', h('table.matrix', h('thead', h('tr', h('th', ''), plugins.map((p) => h('th', p)))), h('tbody', events.map((ev) => h('tr', h('th', ev), plugins.map((p) => cell(ev, p))))))),
-    d.cycles.length > 0 && h('p.help', { style: 'margin-top:10px' }, `Cycles (bounded at runtime by max causal depth ${g.config.runtime.max_causal_depth}): ${d.cycles.map((c) => c.join(' → ')).join('; ')}`),
+    h('p.help', `Revision ${r.revision} of \`${name}\` (runtime ${r.runtime}). The compiled graph is the routing table: each edge is "when A emits X, B is a destination", with its mode, phase position, lane and the keys it carries. E = emits (E* deferred allowed, E! interrupt lane), phase:n = blocking position, A = async, H = the family member's one handler.`),
+    r.definition.phases?.length ? h('p.help', `Phases: ${r.definition.phases.join(' → ')}`) : null,
+    h('div.matrix-wrap', h('table.matrix', h('thead', h('tr', h('th', ''), plugins.map((p) => h('th', p)))), h('tbody', classes.map((c) => h('tr', h('th', c), plugins.map((p) => cell(c, p))))))),
     h('h3', 'Diagnostics'),
-    g.diagnostics.length ? g.diagnostics.map((x) => h('div.diag.' + x.severity, h('b', x.code), ' ', x.message)) : h('p.help', 'None.'),
-    h('h3', 'External surface'),
-    h('p.help', 'Every way into the deployment: plugins holding deferred-publish, start-session, cross-session, control, or observe.'),
-    g.surface.map((s) => h('div.diag', h('b', s.plugin), ` ${s.capability}${s.deferred_events?.length ? ` (${s.deferred_events.join(', ')})` : ''}`)),
+    diagnosticRows(r.diagnostics.filter((x) => x.severity !== 'info')),
+    section('Event families', Object.entries(rp.families || {}).flatMap(([f, hs]) => [...Object.entries(hs.members || {}), ...Object.entries(hs.subfamilies || {})].map(([m, p]) => `${f} · ${m} → ${p}`)), 'Each member has exactly one handler; a member nobody handles becomes dispatch-failed.'),
+    section('Cycles', (rp.cycles || []).map((c) => c.join(' → ')), 'Legal (agent loops are cycles). The core has no depth limit; bounding loops is plugin policy.'),
+    section('Fixed orders', rp.fixed_orders || [], 'No observable tie, so the compiler ordered these by name.'),
+    section('Capabilities', Object.entries(rp.capabilities || {}).map(([c, ps]) => `${c}: ${ps.join(', ')}`)),
+    section('Interrupt', rp.interrupt || []),
+    section('Unlisted keys', rp.unlisted_keys || [], 'These subscriptions receive undeclared keys untyped, outside the compiler\'s guarantee.'),
+    section('External surface', Object.entries(rp.external_surface || {}).map(([k, v]) => `${k}: ${v.join('; ')}`), 'Every way into this session: deferred and rootless entry points, inbound and outbound events.'),
   ];
 }
 
@@ -1247,16 +1286,21 @@ function draft() {
 
 function presets(cfg) {
   const has = (n) => !!cfg.plugins?.[n];
-  const chatSubs = () => cfg.definitions.chat.subscribers;
+  const chat = () => cfg.definitions.chat.plugins;
   return [
     has('approval-gate') && ['Approve every tool', () => { cfg.plugins['approval-gate'].config = { require: '*' }; return 'approval-gate guards every tool'; }],
     has('heartbeat') && ['Heartbeat every 5 s', () => { cfg.plugins.heartbeat.config = { ...(cfg.plugins.heartbeat.config || {}), every_seconds: 5 }; return 'heartbeat fires every 5 s into its journal session'; }],
-    has('redactor') && ['Remove redactor', () => { cfg.definitions.chat.subscribers = chatSubs().filter((s) => s.plugin !== 'redactor'); return 'redactor removed from chat'; }],
-    ['Break it (unknown plugin)', () => { chatSubs().push({ plugin: 'does-not-exist' }); return 'added a subscriber that does not exist; apply to see the whole config rejected'; }],
+    has('redactor') && ['Remove redactor', () => { delete chat().redactor; return 'redactor removed from chat'; }],
+    ['Break it (unknown plugin)', () => { chat()['does-not-exist'] = {}; return 'added a plugin that does not exist; apply to see the whole config rejected'; }],
   ].filter(Boolean);
 }
 
 const openPlugins = new Set();
+
+/** A JSON editor for one part of a definition. */
+function jsonField(label, value, onValue) {
+  return h('label.json-field', h('span.help', label), h('textarea', { 'aria-label': label, spellcheck: 'false', onchange: (e) => { try { onValue(JSON.parse(e.target.value || '{}')); e.target.style.borderColor = ''; } catch { e.target.style.borderColor = 'var(--bad)'; } } }, JSON.stringify(value ?? {}, null, 2)));
+}
 
 function configPane() {
   if (!state.config?.config) return h('p.help', 'No config.');
@@ -1265,10 +1309,12 @@ function configPane() {
   const defName = state.view?.definition && cfg.definitions[state.view.definition] ? state.view.definition : Object.keys(cfg.definitions)[0];
   const def = cfg.definitions[defName];
   const manifests = state.graph?.manifests || {};
-  const members = def.subscribers;
-  const move = (i, d) => { const j = i + d; if (j < 0 || j >= members.length) return; [members[i], members[j]] = [members[j], members[i]]; render(); };
-  const notMembers = Object.keys(cfg.plugins).filter((p) => !members.some((m) => m.plugin === p));
+  def.plugins ||= {};
+  def.phases ||= [];
+  const members = Object.keys(def.plugins);
+  const notMembers = Object.keys(cfg.plugins).filter((p) => !def.plugins[p]);
   const addSel = h('select', { 'aria-label': 'Plugin to add' }, notMembers.map((p) => h('option', p)));
+  const blocking = (p) => (manifests[p]?.subscribe || []).filter((x) => x.mode === 'blocking').map((x) => x.event);
 
   const apply = async (scope) => {
     const r = await act(() => state.client.applyConfig(cfg, scope));
@@ -1276,24 +1322,28 @@ function configPane() {
     state.applyResult = r;
     if (r.ok) {
       state.draftConfig = null;
-      toast(scope.kind === 'session' ? `Applied to ${scope.session_id} at its next event boundary.` : 'Applied. Sessions switch at their next event boundary; nothing restarts.');
-    } else toast('Rejected whole: nothing changed. See the diagnostics.', true);
+      toast(scope.kind === 'session' ? `Applied to ${scope.session_id} at its next event boundary.` : 'Applied. Sessions switch to their new revision at their next event boundary; nothing restarts.');
+    } else toast('Rejected whole: no session changed. See the diagnostics.', true);
     await refreshAll();
     render();
   };
 
   return [
-    h('p.help', `Active config ${state.config.hash}. Changes compile first; a config that fails is rejected whole. Applied configs take effect at each session's next event boundary while sessions keep running. Every invocation records the code and config hashes it ran with.`),
+    h('p.help', `Active config ${state.config.hash}. Changes compile first; anything that fails is rejected whole and sessions keep their revision. A successful apply gives each targeted session a new revision at its next event boundary while it keeps running. Every invocation records the revision, code and config hashes it ran with.`),
     h('div.presets', presets(cfg).map(([label, fn]) => h('button.btn.small', { onclick: () => { toast(fn()); render(); } }, label))),
     h('h3', `Definition: ${defName}`),
-    h('p.help', 'Blocking subscribers run in this order. Mode overrides each plugin\'s default.'),
-    members.map((m, i) => h('div.member',
-      h('span.mono', String(i + 1)),
-      h('span.mono', m.plugin),
-      h('select', { 'aria-label': `Mode for ${m.plugin}`, onchange: (e) => { if (e.target.value) m.mode = e.target.value; else delete m.mode; } },
-        h('option', { value: '' }, 'default'), h('option', { value: 'blocking', selected: m.mode === 'blocking' }, 'blocking'), h('option', { value: 'async', selected: m.mode === 'async' }, 'async')),
-      h('span.mv', h('button.btn.small.ghost', { onclick: () => move(i, -1), 'aria-label': 'Move up' }, '↑'), h('button.btn.small.ghost', { onclick: () => move(i, 1), 'aria-label': 'Move down' }, '↓'), h('button.btn.small.ghost', { onclick: () => { members.splice(i, 1); render(); }, 'aria-label': `Remove ${m.plugin}` }, '✕')))),
-    notMembers.length > 0 && h('div.inline-form', h('div.r', addSel, h('button.btn', { onclick: () => { members.push({ plugin: addSel.value }); render(); } }, 'Add to definition'))),
+    h('label.inline', 'Phases ', h('input', { 'aria-label': 'Phases', value: def.phases.join(', '), onchange: (e) => { def.phases = e.target.value.split(',').map((x) => x.trim()).filter(Boolean); render(); } })),
+    h('p.help', 'Every blocking subscriber needs a phase; blocking subscribers run in phase order. Where two in one phase could affect each other, order them below.'),
+    members.map((p) => h('div.member',
+      h('span.mono', p),
+      blocking(p).length ? h('select', { 'aria-label': `Phase for ${p}`, title: `blocking on ${blocking(p).join(', ')}`, onchange: (e) => { if (e.target.value) def.plugins[p].phase = e.target.value; else delete def.plugins[p].phase; } },
+        h('option', { value: '' }, '(no phase)'), def.phases.map((ph) => h('option', { value: ph, selected: def.plugins[p].phase === ph }, ph))) : h('span.help', 'async only'),
+      def.plugins[p].phases && h('span.help', `per event: ${Object.entries(def.plugins[p].phases).map(([ev, ph]) => `${ev} → ${ph}`).join(', ')}`),
+      h('span.mv', h('button.btn.small.ghost', { onclick: () => { delete def.plugins[p]; render(); }, 'aria-label': `Remove ${p}` }, '✕')))),
+    notMembers.length > 0 && h('div.inline-form', h('div.r', addSel, h('button.btn', { onclick: () => { def.plugins[addSel.value] = {}; render(); } }, 'Add to definition'))),
+    jsonField('Tie-breaks: { event: { phase: [plugins in order] } }', def.order, (v) => { def.order = v; }),
+    jsonField('Handler picks for event families: { "tool-call/<member>": plugin }', def.handlers, (v) => { def.handlers = v; }),
+    jsonField('Inbound events (from other sessions): { event: { key: { shape } } }', def.inbound, (v) => { def.inbound = v; }),
     h('h3', 'Plugins'),
     Object.entries(cfg.plugins).map(([name, p]) => {
       const ta = h('textarea', { 'aria-label': `${name} config`, spellcheck: 'false', onchange: (e) => { try { p.config = JSON.parse(e.target.value || 'null'); e.target.style.borderColor = ''; } catch { e.target.style.borderColor = 'var(--bad)'; } } }, JSON.stringify(p.config ?? {}, null, 2));
@@ -1301,8 +1351,9 @@ function configPane() {
         h('div.body', ta, h('span.help', `${(manifests[name]?.capabilities || []).join(', ') || 'no capabilities'} · ${p.module || p.command?.join(' ')}`)));
     }),
     state.applyResult && h('div', h('h3', state.applyResult.ok ? `Applied ${state.applyResult.hash}` : 'Rejected'),
-      (state.applyResult.diagnostics || []).filter((x) => x.severity !== 'info').map((x) => h('div.diag.' + x.severity, h('b', x.code), ' ', x.message)),
-      state.applyResult.skipped?.length > 0 && h('p.help', `Skipped (definition missing): ${state.applyResult.skipped.join(', ')}`)),
+      state.applyResult.error && h('p.help', state.applyResult.error),
+      diagnosticRows((state.applyResult.diagnostics || []).filter((x) => x.severity !== 'info')),
+      state.applyResult.revisions && Object.keys(state.applyResult.revisions).length > 0 && h('p.help', `New revisions: ${Object.entries(state.applyResult.revisions).map(([s2, r]) => `${s2} → ${r.slice(0, 8)}`).join(', ')}`)),
     h('div.apply-bar',
       h('button.btn.primary', { onclick: () => apply({ kind: 'global' }) }, 'Apply to all sessions'),
       sid && h('button.btn', { onclick: () => apply({ kind: 'session', session_id: sid }) }, `Apply to ${sid} only`),

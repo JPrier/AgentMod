@@ -87,17 +87,91 @@ export function sleep(ms, signal) {
   });
 }
 
-/** Read context items of one slot (values only). */
+/** Read context items of one section (values only). */
 export function slot(context, name) {
   return (context || []).filter((c) => c.slot === name).map((c) => c.value);
+}
+
+// ---------------------------------------------------------------------------
+// Manifest helpers: shapes (compiler.md §3.1).
+// ---------------------------------------------------------------------------
+
+/** A required key of a shape (`string`, `array<object>`, `"ok" | "error"`, …). */
+export const key = (shape, extra = {}) => ({ shape, ...extra });
+/** An optional key. */
+export const optional = (shape, extra = {}) => ({ shape, optional: true, ...extra });
+
+/** The default `context` slot, requested like a key (`receives.slots`). */
+export const CONTEXT = { context: key('array<object>') };
+
+/** Receives for a subscription that reads the context slot, plus `keys`. */
+export const withContext = (keys = {}) => ({ ...keys, slots: CONTEXT });
+
+/** Keys every tool call carries (`tool-call/<name>`, emitted by the loop plugin). */
+export const TOOL_CALL_KEYS = {
+  call_id: key('string'),
+  name: key('string'),
+  args: key('object'),
+  approved: optional('object'),
+};
+
+/** Keys every tool result carries; tools may add more (they pass untyped). */
+export const TOOL_RESULT_KEYS = {
+  call_id: key('string'),
+  name: key('string'),
+  output: key('string'),
+  error: optional('bool'),
+};
+
+/** Keys of a provider's canonical `model-response`. */
+export const MODEL_RESPONSE_KEYS = {
+  text: key('string'),
+  stream_id: key('string'),
+  tool_calls: optional('array<object>'),
+  model: optional('string'),
+  provider: optional('string'),
+  usage: optional('object'),
+  metrics: optional('object'),
+};
+
+/** The `tool-result` emit declaration (extra keys may be declared in `more`). */
+export const toolResult = (more = {}) => ({ event: 'tool-result', keys: { ...TOOL_RESULT_KEYS, ...more } });
+
+/**
+ * Subscriptions that make this plugin the handler of these tools: one
+ * `tool-call/<name>` member (or `tool-call/<prefix>*` sub-family) each, async.
+ * The compiler checks there is exactly one handler per member.
+ */
+export function toolCalls(names, extra = {}) {
+  return [...names].map((n) => ({ event: `tool-call/${n}`, mode: 'async', receives: { ...TOOL_CALL_KEYS }, ...extra }));
+}
+
+/**
+ * The subscriptions a tool plugin uses to offer its tool specs: at session
+ * start and after a config apply it reads the context slot and contributes to
+ * its `tools` section. Blocking, so the tools are in context before the next
+ * event runs; a definition gives them a phase and an order.
+ */
+export function offerSubscriptions() {
+  return [
+    { event: 'session-started', mode: 'blocking', actions: ['contribute-context'], receives: withContext() },
+    { event: 'config-applied', mode: 'blocking', actions: ['contribute-context'], receives: withContext() },
+  ];
+}
+
+/** Does a pattern (`tool-call/*`, `tool-call/mcp__x__*`, exact) match a name? */
+export function patternMatches(pattern, name) {
+  if (pattern === '*') return true;
+  if (pattern.endsWith('*')) return name.startsWith(pattern.slice(0, -1)) && name.length > pattern.length - 1;
+  return pattern === name;
 }
 
 /**
  * Define and start a plugin.
  *
  * @param {object} spec
- * @param {object} spec.manifest  name, version, consumes, emits, transforms, capabilities
- * @param {Record<string, Function>} spec.handlers  event name (or '*') -> async (ctx) => result
+ * @param {object} spec.manifest  name, version, subscribe, emit, capabilities, outbound, sink
+ * @param {Record<string, Function>} spec.handlers  event name, family pattern (`tool-call/*`), or '*' -> async (ctx) => result
  * @param {Function} [spec.validate] async (config, {env}) => void; throw to refuse the handshake
  * @param {Function} [spec.init]   async (plugin) => void, after the handshake
  * @param {Function} [spec.onRecord] (record) => void, for plugins that `watch`
@@ -150,8 +224,10 @@ class Plugin {
   get host() {
     return {
       query: (what, args = {}) => this.request('query', { what, ...args }),
-      startSession: ({ definition, initial, invocationId, forkFrom }) =>
-        this.request('start_session', { definition, initial, invocation_id: invocationId, fork_from: forkFrom }),
+      /** Start a session from a definition (by name, or a `spec` written now). A
+       *  definition that fails to compile rejects with `error.data.diagnostics`. */
+      startSession: ({ definition, spec, initial, invocationId, forkFrom }) =>
+        this.request('start_session', { definition, spec, initial, invocation_id: invocationId, fork_from: forkFrom }),
       publishDeferred: (event_name, payload = {}, opts = {}) =>
         this.request('publish', { event_name, payload, cite: opts.cite, ui: opts.ui, lane: opts.lane, target_session: opts.targetSession }),
       command: (session_id, command) => this.request('command', { session_id, command }),
@@ -172,7 +248,7 @@ class Plugin {
       const p = this.pending.get(msg.id);
       if (!p) return;
       this.pending.delete(msg.id);
-      if (msg.error) p.reject(Object.assign(new Error(msg.error.message), { code: msg.error.code }));
+      if (msg.error) p.reject(Object.assign(new Error(msg.error.message), { code: msg.error.code, data: msg.error.data }));
       else p.resolve(msg.result);
       return;
     }
@@ -251,19 +327,38 @@ class Plugin {
     }
   }
 
+  /** The handler for an event: exact name, the subscription's pattern, a matching family, or '*'. */
+  handlerFor(name, subscription) {
+    const hs = this.spec.handlers || {};
+    if (hs[name]) return hs[name];
+    if (subscription && hs[subscription]) return hs[subscription];
+    const fam = Object.keys(hs).filter((k) => k !== '*' && k.endsWith('*') && patternMatches(k, name)).sort((a, b) => b.length - a.length)[0];
+    return fam ? hs[fam] : hs['*'];
+  }
+
   async invoke(req) {
     const ev = req.event;
-    const handler = this.spec.handlers?.[ev.event_name] ?? this.spec.handlers?.['*'];
+    const handler = this.handlerFor(ev.event_name, req.subscription);
     const result = { contributions: [] };
-    if (!handler) return result;
+    if (!handler) {
+      this.log(`no handler for \`${ev.event_name}\` (subscription \`${req.subscription}\`)`);
+      return {};
+    }
     const abort = new AbortController();
     this.aborts.set(req.invocation_id, abort);
     const plugin = this;
+    const slots = ev.slots;
+    const noContext = () => {
+      throw new Error(`\`${this.name}\` read the context on \`${ev.event_name}\`, but its subscription (${req.subscription || ev.event_name}) does not request the \`context\` slot (receives.slots.context)`);
+    };
     const ctx = {
       plugin,
       event: ev,
       payload: ev.payload,
-      context: ev.context || [],
+      /** The `context` slot (only when the subscription requested it). */
+      get context() { return slots && 'context' in slots ? slots.context || [] : noContext(); },
+      slots: slots || {},
+      subscription: req.subscription,
       sessionId: ev.session_id,
       invocationId: req.invocation_id,
       attempt: req.attempt,
@@ -274,7 +369,7 @@ class Plugin {
       host: this.host,
       log: (...a) => this.log(...a),
       sleep: (ms) => sleep(ms, abort.signal),
-      slot: (name) => slot(ev.context, name),
+      slot: (name) => slot(ctx.context, name),
       /** Publish as output of this invocation. */
       publish: (event_name, payload = {}, opts = {}) =>
         this.request('publish', {
@@ -292,7 +387,8 @@ class Plugin {
       restore: (to_sequence) => result.contributions.push({ op: 'restore', to_sequence }),
       contribute: (op) => result.contributions.push(op),
       veto: (reason) => { result.veto = reason; },
-      transform: (payload) => { result.transform = payload; },
+      /** Blocking subscribers: hand keys back to the chain (declared in `returns`). */
+      returns: (keys) => { result.returns = { ...(result.returns || {}), ...keys }; },
       /** A provider stream for this invocation (see sdk/stream.js). */
       stream: (opts) => createStreamWriter(ctx, opts),
     };
@@ -300,9 +396,10 @@ class Plugin {
       const ret = await handler(ctx);
       if (ret && typeof ret === 'object') {
         if (ret.contributions) result.contributions.push(...ret.contributions);
-        if (ret.transform) result.transform = ret.transform;
+        if (ret.returns) result.returns = { ...(result.returns || {}), ...ret.returns };
         if (ret.veto) result.veto = ret.veto;
       }
+      if (!result.contributions.length) delete result.contributions;
       return result;
     } catch (e) {
       if (abort.signal.aborted) return { contributions: [], error: 'cancelled' };
@@ -335,38 +432,20 @@ export function toolSpec(name, description, parameters = {}, opts = {}) {
 
 /**
  * Contribute this plugin's tool descriptions unless already present
- * (used on session-started and config-applied). A tool the plugin's manifest
- * does not declare is not offered: every offered tool has a compiled owner.
+ * (used on session-started and config-applied). A tool the plugin does not
+ * subscribe to as a `tool-call/<name>` member is not offered: every offered
+ * tool has a compiled handler.
  */
 export function offerTools(ctx, tools) {
   const present = new Set(ctx.slot('tools').map((t) => t?.name));
-  const declared = ctx.plugin?.manifest?.tools;
-  const owns = (name) => !declared || declared.some((d) => d.name === name || (d.name.endsWith('*') && name.startsWith(d.name.slice(0, -1))));
+  const subs = (ctx.plugin?.manifest?.subscribe || []).map((s) => s.event).filter((e) => e.startsWith('tool-call/'));
+  const handles = (name) => !ctx.plugin?.manifest || subs.some((p) => patternMatches(p, `tool-call/${name}`) && p !== 'tool-call/*');
   for (const t of tools) {
     if (present.has(t.name)) continue;
-    if (!owns(t.name)) {
-      ctx.log(`not offering \`${t.name}\`: it is not declared in this plugin's manifest tools`);
+    if (!handles(t.name)) {
+      ctx.log(`not offering \`${t.name}\`: this plugin does not subscribe to \`tool-call/${t.name}\``);
       continue;
     }
     ctx.add('tools', t);
   }
-}
-
-/** Manifest `tools` declarations from tool specs (ownership + schema, compile-time). */
-export function declareTools(specs) {
-  return specs.map((t) => ({
-    name: t.name,
-    ...(t.parameters && Object.keys(t.parameters).length ? { parameters: t.parameters } : {}),
-    ...(t.required?.length ? { required: t.required } : {}),
-    ...(t.tier ? { tier: t.tier } : {}),
-  }));
-}
-
-/**
- * The consume entry that makes a plugin the compiled owner of these tools: the
- * kernel routes each `tool-call` to exactly the plugin whose keyed values
- * contain its name (a value ending in `*` owns a family, e.g. `mcp__github__*`).
- */
-export function ownTools(names, extra = {}) {
-  return { event: 'tool-call', demands: ['call_id', 'name', 'args'], mode: 'async', context: false, keyed: { key: 'name', values: [...names] }, ...extra };
 }

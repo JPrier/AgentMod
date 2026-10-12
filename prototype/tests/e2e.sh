@@ -45,7 +45,7 @@ curl -s $B/sessions | py "assert any(s['definition']=='worker' and s['parent']==
 echo "4. hot apply and whole-config rejection"
 CONF=$(curl -s $B/config | py "c=d['config']; c['plugins']['approval-gate']['config']={'require':'*'}; print(json.dumps({'config':c}))")
 curl -s -XPOST $B/config/apply -d "$CONF" | py "assert d['ok']" || fail "apply"
-BAD=$(curl -s $B/config | py "c=d['config']; c['definitions']['chat']['subscribers'].append({'plugin':'ghost'}); print(json.dumps({'config':c}))")
+BAD=$(curl -s $B/config | py "c=d['config']; c['definitions']['chat']['plugins']['ghost']={}; print(json.dumps({'config':c}))")
 curl -s -XPOST $B/config/apply -d "$BAD" | py "assert not d['ok'] and any(x['code']=='unknown-plugin' for x in d['diagnostics'])" || fail "rejection"
 
 echo "5. hard stop mid-stream"
@@ -140,7 +140,7 @@ wait_for $T "assert len([e for e in d['events'] if e['event_name']=='workspace-r
 grep -q "return a + b;" "$DATA/ws/calc.js" || fail "undoing the rewind failed"
 
 echo "11. branch from before the fix: an isolated workspace at that point"
-SEQ=$(ev $T "print([e['sequence'] for e in d['events'] if e['event_name']=='tool-call' and e['payload']['name']=='apply_patch'][0]-1)")
+SEQ=$(ev $T "print([e['sequence'] for e in d['events'] if e['event_name']=='tool-call/apply_patch'][0]-1)")
 BR=$(python3 -c "import json; print(json.dumps({'definition':'coder','text':'script:peek','fork_from':{'session_id':'$T','sequence':$SEQ}}))" | curl -s -XPOST $B/sessions -d @- | py "print(d['session_id'])")
 wait_for $BR "assert any(e['event_name']=='assistant-message' and 'branch sees' in e['payload']['text'] for e in d['events'])" 200
 ev $BR "
@@ -165,7 +165,7 @@ curl -s -XPOST $B/config/apply -d "$CONF" | py "assert d['ok']" || fail "apply d
 AR2=$(ev $N2 "print([e['event_id'] for e in d['events'] if e['event_name']=='approval-requested'][-1])")
 curl -s -XPOST $B/sessions/$N2/actions -d "{\"reply_to\":\"$AR2\",\"action\":\"approve\"}" >/dev/null
 wait_for $N2 "assert any(e['event_name']=='tool-result' and 'policy changed while the approval was pending' in e['payload']['output'] for e in d['events'])" 100
-ev $N2 "assert not any(e['event_name']=='tool-call' and e['payload'].get('approved') for e in d['events'])" || fail "denied call ran"
+ev $N2 "assert not any(e['event_name'].startswith('tool-call/') and e['payload'].get('approved') for e in d['events'])" || fail "denied call ran"
 
 echo "13. ask_user is a recorded continuation; the user's next message answers it"
 Q=$(newsess coder 'script:ask')
@@ -201,7 +201,7 @@ assert any(p['payload']['scope'] in ('child','mode') for p in tp)" || fail "chil
 test ! -f "$DATA/ws/nope.txt" || fail "forbidden write happened"
 B2=$(newsess coder 'script:bad')
 wait_for $B2 "assert any(e['event_name']=='assistant-message' and 'recovered' in e['payload']['text'] for e in d['events'])" 100
-ev $B2 "assert any(e['event_name']=='tool-result' and 'There is no tool named' in e['payload']['output'] for e in d['events'])" || fail "unknown tool"
+ev $B2 "assert any(e['event_name']=='tool-call-rejected' and 'There is no tool named' in e['payload']['output'] for e in d['events'])" || fail "unknown tool"
 
 echo "16. provider hot swap mid-session: the next model request uses the new provider"
 H=$(newsess coder 'first turn on the original provider')
@@ -209,7 +209,7 @@ wait_for $H "assert any(e['event_name']=='assistant-message' for e in d['events'
 SWAP=$(curl -s $B/config | py "
 c=d['config']
 for df in c['definitions'].values():
-    df['subscribers']=[{'plugin':'openai-model'} if s['plugin']=='openrouter-model' else s for s in df['subscribers']]
+    if 'openrouter-model' in df['plugins']: df['plugins']['openai-model']=df['plugins'].pop('openrouter-model')
 c['plugins']['openai-model']['config']={'base_url':'http://127.0.0.1:8766/api/v1','api_key':'test-key','model':'mock/swapped'}
 print(json.dumps({'config':c}))")
 curl -s -XPOST $B/config/apply -d "$SWAP" | py "assert d['ok'], d" || fail "provider swap apply"
@@ -225,7 +225,7 @@ assert r[-1]['model']=='mock/swapped' and r[-1]['provider']=='openai-compatible'
 BACK=$(curl -s $B/config | py "
 c=d['config']
 for df in c['definitions'].values():
-    df['subscribers']=[{'plugin':'openrouter-model'} if s['plugin']=='openai-model' else s for s in df['subscribers']]
+    if 'openai-model' in df['plugins']: df['plugins']['openrouter-model']=df['plugins'].pop('openai-model')
 print(json.dumps({'config':c}))")
 curl -s -XPOST $B/config/apply -d "$BACK" | py "assert d['ok']" || fail "swap back"
 
@@ -245,7 +245,7 @@ curl -s -XPOST $B/sessions/$PB/actions -d "{\"reply_to\":\"$AR\",\"action\":\"ap
 wait_for $PB "assert any(e['event_name']=='assistant-message' and 'batch done: 4 results' in e['payload']['text'] for e in d['events'])" 150
 ev $PB "
 assert sum(1 for e in d['events'] if e['event_name']=='model-request')==2
-calls=[e for e in d['events'] if e['event_name']=='tool-call']  # incl. the approved re-publish
+calls=[e for e in d['events'] if e['event_name'].startswith('tool-call/')]  # incl. the approved re-publish
 owners=[i['plugin'] for e in calls for i in e['invocations'] if i.get('route')]
 assert owners==['local-workspace']*4, owners
 assert all(len([i for i in e['invocations'] if i['mode']=='async'])<=1 for e in calls), 'unrelated plugins invoked'" || fail "batch settlement"

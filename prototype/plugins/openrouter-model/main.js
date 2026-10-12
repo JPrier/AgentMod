@@ -15,7 +15,7 @@
 //   max_context_tokens   override the context budget (default: 75% of the model's window)
 //   fallback_models      models tried in order when the model fails (each a new stream attempt)
 //   stream_retries       retries of a stream that fails after HTTP 200 (default 1)
-import { definePlugin } from '../sdk/agentmod.js';
+import { definePlugin, MODEL_RESPONSE_KEYS, key, withContext } from '../sdk/agentmod.js';
 import { complete, resolveKey } from '../sdk/openai-compat.js';
 import { fetchCatalog, contextBudget } from '../sdk/catalog.js';
 
@@ -27,10 +27,10 @@ definePlugin({
     name: 'openrouter-model',
     version: '0.2.0',
     description: 'OpenRouter provider: any OpenRouter model, streamed, with tool calls.',
-    consumes: [{ event: 'model-request', demands: ['turn'], mode: 'async' }],
+    subscribe: [{ event: 'model-request', mode: 'async', receives: withContext({ turn: key('string') }) }],
     // One canonical event per model turn. Token deltas are not events: they
     // stream to the host's stream hub (sdk/stream.js) for live delivery.
-    emits: [{ event: 'model-response', supplies: ['text', 'stream_id'] }],
+    emit: [{ event: 'model-response', keys: MODEL_RESPONSE_KEYS }],
     // Read-only services frontends can call through the host (not recorded:
     // they change no state; choosing a model is a recorded config apply).
     services: [

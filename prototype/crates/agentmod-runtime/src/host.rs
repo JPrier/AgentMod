@@ -83,6 +83,11 @@ impl Proc {
         }
     }
 
+    fn reply_data(&self, id: &Value, code: i64, message: &str, data: Value) {
+        let msg = json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message, "data": data } });
+        self.handle.send(msg.to_string());
+    }
+
     fn reply(&self, id: &Value, result: Result<Value, (i64, String)>) {
         let msg = match result {
             Ok(r) => json!({ "jsonrpc": "2.0", "id": id, "result": r }),
@@ -221,11 +226,14 @@ impl Host {
             host.kill_all();
             return Ok((host, compilation));
         }
-        // Install stored configs (sessions reference them), then the new one.
+        // Install stored configs and revisions (sessions reference them), then the new one.
         for c in host.store.compilations() {
             if c.ok {
                 let _ = host.kernel.install(c);
             }
+        }
+        for r in host.store.revisions() {
+            host.kernel.install_revision(r);
         }
         host.store.save_compilation(&compilation)?;
         let hash = host.kernel.install(compilation.clone())?;
@@ -608,7 +616,17 @@ impl Host {
                 self.counters.resync_requests += 1;
                 Ok(json!({ "streams": client.map(|c| self.hub.resync(c)).unwrap_or_default() }))
             }
-            "start_session" => self.req_start(&plugin, params),
+            "start_session" => match self.req_start(&plugin, params) {
+                Ok(v) => Ok(v),
+                // A failed compile: the diagnostics travel as error data.
+                Err((code, message, Some(data))) => {
+                    if let (Some(id), Some(p)) = (&id, self.procs.get(&proc)) {
+                        p.reply_data(id, code, &message, data);
+                    }
+                    return None;
+                }
+                Err((code, message, None)) => Err((code, message)),
+            },
             "query" => self.req_query(&params),
             "command" => {
                 if !p.has(Capability::Control) {
@@ -755,9 +773,13 @@ impl Host {
         p.handle.send(note.to_string());
     }
 
-    fn req_start(&mut self, plugin: &str, params: Value) -> Result<Value, (i64, String)> {
+    fn req_start(
+        &mut self,
+        plugin: &str,
+        params: Value,
+    ) -> Result<Value, (i64, String, Option<Value>)> {
         let mut req: StartRequest =
-            serde_json::from_value(params).map_err(|e| (-32602, e.to_string()))?;
+            serde_json::from_value(params).map_err(|e| (-32602, e.to_string(), None))?;
         plugin.clone_into(&mut req.plugin);
         let mut need: Vec<String> = req
             .invocation_id
@@ -766,13 +788,18 @@ impl Host {
             .collect();
         need.extend(req.fork_from.iter().map(|f| f.session_id.clone()));
         for sid in need {
-            self.ensure_loaded(&sid).map_err(|e| (-32001, e))?;
+            self.ensure_loaded(&sid).map_err(|e| (-32001, e, None))?;
         }
         let out = self.kernel.start_session(&req, now_ms());
         self.execute(out.effects);
         match (out.session_id, out.error) {
-            (Some(sid), _) => Ok(json!({ "session_id": sid })),
-            (None, e) => Err((-32001, e.unwrap_or_default())),
+            (Some(sid), _) => Ok(json!({ "session_id": sid, "revision": out.revision })),
+            (None, e) if !out.diagnostics.is_empty() => Err((
+                -32011,
+                e.unwrap_or_default(),
+                Some(json!({ "diagnostics": out.diagnostics })),
+            )),
+            (None, e) => Err((-32001, e.unwrap_or_default(), None)),
         }
     }
 
@@ -869,10 +896,14 @@ impl Host {
             "streams" => Ok(json!(self.hub.snapshots(
                 Some(sid).filter(|s| !s.is_empty())
             ))),
-            "routes" => Ok(json!({
-                "routes": self.kernel.routes(sid),
-                "revision": self.kernel.status(sid).and_then(|st| self.kernel.config(&st.config).and_then(|c| c.definitions.get(&st.definition)).map(|d| d.routes_revision.clone())),
+            "handlers" => Ok(json!({
+                "families": self.kernel.families(sid),
+                "revision": self.kernel.status(sid).map(|st| st.revision),
             })),
+            "revision" => {
+                let hash = params.get("revision").and_then(Value::as_str).map(str::to_owned).or_else(|| self.kernel.status(sid).map(|st| st.revision));
+                Ok(json!(hash.and_then(|h| self.kernel.revision(&h))))
+            }
             "metrics" => Ok(json!({
                 "host": self.counters,
                 "streams": self.hub.counters,
@@ -889,7 +920,7 @@ impl Host {
             }))),
             "config" => Ok(json!({
                 "hash": self.kernel.active_hash(),
-                "config": self.kernel.active().map(|c| &c.config),
+                "config": self.kernel.active().map(|c| c.config.without_sources()),
                 "installed": self.store.compilations().iter().map(|c| c.hash.clone()).collect::<Vec<_>>(),
                 "host": "native",
             })),
@@ -921,6 +952,12 @@ impl Host {
         let mut dispatch = Vec::new();
         for fx in effects {
             match fx {
+                Effect::SaveRevision { revision } => {
+                    if let Err(e) = self.store.save_revision(&revision) {
+                        eprintln!("agentmod: FATAL saving revision failed: {e}");
+                        std::process::exit(2);
+                    }
+                }
                 Effect::Append { record } => {
                     match self.store.append(&record) {
                         Ok(n) => {
@@ -1039,7 +1076,7 @@ impl Host {
                             .insert(invocation_id, (*id, Instant::now() + CANCEL_GRACE));
                     }
                 }
-                Effect::Append { .. } => {}
+                Effect::Append { .. } | Effect::SaveRevision { .. } => {}
             }
         }
         for r in appended {
@@ -1073,13 +1110,12 @@ impl Host {
                 "plugin `{plugin}` is crash-looping ({recent} exits in the last minute)"
             ));
         }
-        // Find the plugin's config in any installed compilation with this stamp.
-        let hashes = self.kernel.configs_in_use();
-        let cfg = hashes
-            .iter()
-            .filter_map(|h| self.kernel.config(h))
-            .find(|c| c.stamps.get(plugin) == Some(stamp))
-            .and_then(|c| c.config.plugins.get(plugin).cloned())
+        // Find the plugin's config in any revision in use with this stamp.
+        let cfg = self
+            .kernel
+            .plugins_in_use()
+            .get(&(plugin.to_owned(), stamp.clone()))
+            .cloned()
             .ok_or_else(|| {
                 format!(
                     "no configuration for plugin `{plugin}` with stamp {}/{}",
@@ -1226,10 +1262,9 @@ impl Host {
         if self.applies.is_empty() {
             let in_use: BTreeSet<Key> = self
                 .kernel
-                .configs_in_use()
-                .iter()
-                .filter_map(|h| self.kernel.config(h))
-                .flat_map(|c| c.stamps.iter().map(|(n, s)| key(n, s)).collect::<Vec<_>>())
+                .plugins_in_use()
+                .keys()
+                .map(|(n, s)| key(n, s))
                 .collect();
             for p in self.procs.values_mut() {
                 if !p.draining
@@ -1264,8 +1299,14 @@ impl Host {
             .transpose()
             .map_err(|e| format!("invalid scope: {e}"))?
             .unwrap_or(Scope::Global);
-        if let Scope::Session { session_id } = &scope {
-            self.ensure_loaded(session_id)?;
+        match &scope {
+            Scope::Session { session_id } => self.ensure_loaded(session_id)?,
+            Scope::Sessions { session_ids } => {
+                for sid in session_ids {
+                    self.ensure_loaded(sid)?;
+                }
+            }
+            Scope::Global => {}
         }
         stamp_binaries(&mut config, &self.base_dir);
         disable_unrunnable(&mut config);
@@ -1322,18 +1363,24 @@ impl Host {
             match self.kernel.install(compilation) {
                 Ok(hash) => {
                     let out = self.kernel.apply_config(&hash, &a.scope, now_ms());
-                    self.store.journal(
-                        now_ms(),
-                        "config-applied",
-                        &json!({ "hash": hash, "scope": a.scope, "skipped": out.skipped }),
-                    );
-                    let skipped = out.skipped.clone();
                     self.execute(out.effects);
                     match out.error {
-                        Some(e) => Err((-32002, e)),
-                        None => Ok(
-                            json!({ "hash": hash, "ok": true, "skipped": skipped, "diagnostics": summary["diagnostics"] }),
-                        ),
+                        // Rejected whole: those sessions keep their revision.
+                        Some(e) => {
+                            let r = json!({ "hash": hash, "ok": false, "error": e, "diagnostics": out.diagnostics });
+                            self.store.journal(now_ms(), "config-rejected", &r);
+                            Ok(r)
+                        }
+                        None => {
+                            self.store.journal(
+                                now_ms(),
+                                "config-applied",
+                                &json!({ "hash": hash, "scope": a.scope, "revisions": out.revisions }),
+                            );
+                            Ok(
+                                json!({ "hash": hash, "ok": true, "revisions": out.revisions, "diagnostics": summary["diagnostics"] }),
+                            )
+                        }
                     }
                 }
                 Err(e) => Err((-32002, e)),

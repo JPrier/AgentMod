@@ -25,8 +25,8 @@ targets `prototype/` and leaves the root untouched.
 | Deterministic sans-I/O kernel, append-only per-session logs, write-ahead before dispatch | `crates/agentmod-core/src/kernel.rs`, `runtime/src/store.rs` |
 | History-is-truth recovery, orphan retry, idempotent pipeline outputs (`{invocation}.o{n}`) | `Kernel::recover`, `Kernel::retry`, kernel tests incl. randomized replay equivalence |
 | Process-isolated plugins (Node/Python processes natively, Web Workers in the browser) | `runtime/src/host.rs`, `ui/runtime/browser-host.js` |
-| Compiled pipelines with demand/supply validation, blocking veto/transform, async observers | `core/src/compiler.rs` |
-| Live layered config apply (global or per session) at event boundaries, stamped invocations | `Kernel::apply_config` |
+| Compiled pipelines with demand/supply validation, blocking veto/transform, async observers (since replaced by the compiled graph of [compiler.md](compiler.md): typed shapes, `returns`, phases, families) | `core/src/compiler.rs` |
+| Live layered config apply (global or per session) at event boundaries, stamped invocations (now per-session revisions) | `Kernel::apply_config` |
 | Context as attributed ops with `restore` to any earlier sequence (auditable restoration) | `core/src/context.rs` |
 | Session fork (`fork_from`) seeding context from any recorded point | `Kernel::start_session` |
 | Hard stop / soft stop / resume as dispatcher commands | `Kernel::command` |
@@ -85,10 +85,12 @@ The normal loop stays the bundled chat convention:
 
 ```text
 user-message → chat-context → model-request → provider → model-response
-   → tool-call* ─(policy: blocking veto/ask)→ tool plugins → tool-result* → model-request …
+   → tool-call/<name>* ─(policy: blocking veto/ask)→ its one handler → tool-result* → model-request …
 ```
 
-Nothing below adds a kernel concept. The new pieces are:
+Tool calls are the `tool-call/*` event family: each member reaches exactly the
+one plugin that handles it ([hot-paths.md](hot-paths.md) §4). Nothing below
+adds a kernel concept. The new pieces are:
 
 | Piece | Kind | Purpose |
 |---|---|---|
@@ -173,7 +175,7 @@ Workspace instructions are below user and system: they can ask, never authorize.
 1. **Visibility.** The `policy` plugin contributes a `tool-policy` context item
    listing tools that are denied for the session; the projection omits them
    from the model's tool list and from `tool_search`.
-2. **Authorization.** The same plugin is a blocking subscriber on `tool-call`
+2. **Authorization.** The same plugin is a blocking subscriber on the `tool-call/*` family
    and vetoes or asks *regardless* of visibility (a model can still emit a call
    to a hidden tool name).
 3. **Containment.** Execution targets confine paths, strip the environment to an
@@ -195,7 +197,9 @@ the matched rule, its scope, the effect, and the rules it overrode.
 
 An approval binds the **action digest** (SHA-256 of tool name + canonical
 arguments). When the answer arrives, policy is evaluated again against the
-*current* configuration before the call is re-published; a deny added while the
+*current* configuration before it publishes `approval-granted` (the loop then
+re-publishes the call citing that grant, and policy checks the grant and the
+digest again on the way through); a deny added while the
 question was open wins, and a digest mismatch is rejected.
 
 ### 3.5 Lazy capability discovery and tool-schema budget
@@ -306,9 +310,9 @@ reload instead of continuing.
 
 ### 4.5 Observability without a telemetry backend
 
-Control-plane cost (records, events, pipelines, plugin invocations, owner vs
-broadcast dispatch, stream frames, amplification ratios) and the hot-path
-changes behind it — live streams outside the log, compiled tool ownership,
+Control-plane cost (records, events, pipelines, plugin invocations, handler vs
+observer dispatch, stream frames, amplification ratios) and the hot-path
+changes behind it — live streams outside the log, compiled tool handlers,
 batch settlement, turn economy — are in [hot-paths.md](hot-paths.md).
 
 Providers record per-call metrics on `model-response` (latency, time to first

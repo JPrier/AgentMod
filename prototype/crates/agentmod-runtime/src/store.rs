@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use agentmod_core::compiler::Compilation;
+use agentmod_core::compiler::{Compilation, Revision};
 use agentmod_core::record::{Body, Record};
 use agentmod_core::stream::RecoveryOp;
 use agentmod_core::types::{Cause, ContextOp};
@@ -58,7 +58,7 @@ impl Store {
     /// # Errors
     /// I/O failures.
     pub fn open(dir: &Path, spill_threshold: usize) -> Result<Self, String> {
-        for sub in ["sessions", "spill", "configs"] {
+        for sub in ["sessions", "spill", "configs", "revisions"] {
             fs::create_dir_all(dir.join(sub))
                 .map_err(|e| format!("creating {}: {e}", dir.join(sub).display()))?;
         }
@@ -324,6 +324,33 @@ impl Store {
             .collect()
     }
 
+    /// Store a revision sessions reference (compiled at start-session or apply).
+    ///
+    /// # Errors
+    /// I/O failures.
+    pub fn save_revision(&self, r: &Revision) -> Result<(), String> {
+        let p = self
+            .dir
+            .join("revisions")
+            .join(format!("{}.json", r.revision));
+        if p.exists() {
+            return Ok(());
+        }
+        fs::write(p, serde_json::to_vec(r).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    }
+
+    /// Every stored standalone revision.
+    #[must_use]
+    pub fn revisions(&self) -> Vec<Revision> {
+        let Ok(rd) = fs::read_dir(self.dir.join("revisions")) else {
+            return Vec::new();
+        };
+        rd.filter_map(Result::ok)
+            .filter_map(|e| fs::read(e.path()).ok())
+            .filter_map(|b| serde_json::from_slice::<Revision>(&b).ok())
+            .collect()
+    }
+
     /// Append a runtime-level journal entry (config applies, unrecordable refusals).
     pub fn journal(&self, at: u64, kind: &str, detail: &Value) {
         let line = json!({ "at": at, "kind": kind, "detail": detail }).to_string();
@@ -480,7 +507,7 @@ mod tests {
             1,
             Body::SessionCreated {
                 definition: "chat".into(),
-                config: "c".into(),
+                revision: "c".into(),
                 cause: Cause::Root {
                     plugin: "ui".into(),
                 },
@@ -500,7 +527,6 @@ mod tests {
                         plugin: "ui".into(),
                     },
                     origin: Origin::Core,
-                    depth: 0,
                     payload: json!({ "text": big, "small": 1 }),
                     ui: None,
                 },

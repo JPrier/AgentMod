@@ -2,7 +2,7 @@
 // endpoint (OpenAI, Ollama, vLLM, LM Studio...).
 // Config: { base_url, model, api_key_env? (native), api_key? (browser), temperature?, max_context_tokens?,
 //           fallback_models?, stream_retries? }
-import { definePlugin } from '../sdk/agentmod.js';
+import { definePlugin, MODEL_RESPONSE_KEYS, key, withContext } from '../sdk/agentmod.js';
 import { complete, resolveKey } from '../sdk/openai-compat.js';
 import { fetchCatalog } from '../sdk/catalog.js';
 
@@ -13,10 +13,10 @@ definePlugin({
     name: 'openai-model',
     version: '0.2.0',
     description: 'Live OpenAI-compatible chat-completions provider with streaming and tool calls.',
-    consumes: [{ event: 'model-request', demands: ['turn'], mode: 'async' }],
+    subscribe: [{ event: 'model-request', mode: 'async', receives: withContext({ turn: key('string') }) }],
     // One canonical event per model turn. Token deltas are not events: they
     // stream to the host's stream hub (sdk/stream.js) for live delivery.
-    emits: [{ event: 'model-response', supplies: ['text', 'stream_id'] }],
+    emit: [{ event: 'model-response', keys: MODEL_RESPONSE_KEYS }],
     services: [{ name: 'model-catalog', description: 'List models served by the endpoint' }],
     settings: [
       { key: 'base_url', label: 'Endpoint (OpenAI-compatible)', required: true },

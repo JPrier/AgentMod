@@ -1,121 +1,278 @@
-//! Plugin manifests and deployment configuration.
+//! Plugin manifests, session definitions, and the deployment configuration.
 //!
-//! Payload contracts are demand/supply declarations, not schemas: emitters
-//! declare the keys they supply, consumers declare the keys they demand.
+//! A manifest is a plugin's complete declaration of what it receives, returns,
+//! emits, and may call (compiler.md §3). Payload contracts are typed
+//! [`Shape`](crate::shape::Shape)s matched structurally: there is no central
+//! registry, no event ownership, and no dependency between plugins.
+//!
+//! A session definition (§4) lists the plugins a session runs, the phases that
+//! order its blocking subscribers, tie-breaks, handler picks for event
+//! families, the events it accepts from other sessions, and its slots. It
+//! never lists edges: those are compiler output.
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
-use crate::types::{Mode, Stamp, hash_json};
+use crate::shape::{KeyDecl, Keys, Shape};
+use crate::types::{Lane, Mode, Stamp, hash_json};
 
-/// Wildcard event name: subscribe to every pipeline.
+/// Wildcard event pattern: every event.
 pub const WILDCARD: &str = "*";
 
-/// Capabilities form the deployment's complete external surface.
+/// The default slot: the session's assembled context.
+pub const CONTEXT_SLOT: &str = "context";
+
+/// Actions a subscription may declare (names provisional; compiler.md §3.2).
+pub const ACTIONS: &[&str] = &[ACTION_VETO, ACTION_CONTRIBUTE];
+pub const ACTION_VETO: &str = "veto";
+pub const ACTION_CONTRIBUTE: &str = "contribute-context";
+
+/// Plugin-wide runtime powers (compiler.md §3.4). Any call that isn't
+/// declared is declined and recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum Capability {
     /// Publish without an open invocation, citing a standing trigger.
+    #[serde(rename = "deferred-publish")]
     DeferredPublish,
     /// Create new sessions (the sole rootless act).
+    #[serde(rename = "start-session")]
     StartSession,
-    /// Target a session other than the invocation's own.
+    /// Publish to a session other than the invocation's own (`outbound`).
+    #[serde(rename = "cross-session")]
     CrossSession,
-    /// Issue dispatcher commands and apply configuration (frontends).
+    /// Emit on the interrupt lane.
+    #[serde(rename = "interrupt")]
+    Interrupt,
+    /// Queue method: list pending events (declared; not built in this prototype).
+    #[serde(rename = "queue.list")]
+    QueueList,
+    /// Queue method: cancel a pending event (declared; not built in this prototype).
+    #[serde(rename = "queue.cancel")]
+    QueueCancel,
+    /// Session directory lookup (declared; the directory API is deferred).
+    #[serde(rename = "sessions.find")]
+    SessionsFind,
+    /// Session directory read (declared; the directory API is deferred).
+    #[serde(rename = "sessions.read")]
+    SessionsRead,
+    /// Prototype frontends: dispatcher commands, config apply, service calls.
+    #[serde(rename = "control")]
     Control,
-    /// Tail live records of any session (frontends, inspectors).
+    /// Prototype frontends and inspectors: tail live records of any session.
+    #[serde(rename = "observe")]
     Observe,
 }
 
-/// A consumed event with demanded payload keys.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Consume {
-    pub event: String,
-    /// Required payload keys (dotted paths). A trailing `?` marks a key optional.
-    #[serde(default)]
-    pub demands: Vec<String>,
-    /// Default mode; a session definition may override it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<Mode>,
-    /// Whether the assembled context is delivered with the envelope.
-    #[serde(default = "yes")]
-    pub context: bool,
-    /// Keyed dispatch: this consumer owns only the events whose payload `key`
-    /// equals one of `values` (a value ending in `*` is a prefix). The compiler
-    /// turns every keyed consumer of an event into one deterministic owner
-    /// table, and the kernel dispatches each event to exactly the one owner its
-    /// key selects instead of broadcasting it (tool calls → the tool's plugin).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keyed: Option<Keyed>,
-}
-
-/// The values of one payload key a consumer owns (see [`Consume::keyed`]).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Keyed {
-    /// Payload key (dotted path) whose value selects the owner, e.g. `name`.
-    pub key: String,
-    /// Owned values; a trailing `*` makes a value a prefix (`mcp__github__*`).
-    pub values: Vec<String>,
-}
-
-impl Keyed {
-    /// Does this declaration own `value`?
+impl Capability {
     #[must_use]
-    pub fn owns(&self, value: &str) -> bool {
-        self.values.iter().any(|v| match v.strip_suffix('*') {
-            Some(prefix) => value.starts_with(prefix),
-            None => v == value,
-        })
+    pub fn name(self) -> &'static str {
+        match self {
+            Capability::DeferredPublish => "deferred-publish",
+            Capability::StartSession => "start-session",
+            Capability::CrossSession => "cross-session",
+            Capability::Interrupt => "interrupt",
+            Capability::QueueList => "queue.list",
+            Capability::QueueCancel => "queue.cancel",
+            Capability::SessionsFind => "sessions.find",
+            Capability::SessionsRead => "sessions.read",
+            Capability::Control => "control",
+            Capability::Observe => "observe",
+        }
     }
 }
 
-/// A tool a plugin answers, declared at handshake so ownership and schemas are
-/// compile-time facts (the model-facing spec is still contributed to context).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct ToolDecl {
-    /// Exact name, or a prefix ending in `*` for dynamic families (MCP servers).
-    pub name: String,
-    /// JSON-schema `properties` of the arguments (object), when known.
-    #[serde(default, skip_serializing_if = "Value::is_null")]
-    pub parameters: Value,
+// ----------------------------------------------------------------------
+// Event names and patterns.
+// ----------------------------------------------------------------------
+
+/// Does an event pattern match a concrete event name?
+///
+/// Patterns are an exact name, `*` (every event), or a family / sub-family
+/// ending in `*` (`tool-call/*`, `tool-call/mcp__github__*`), which matches
+/// every name with that prefix.
+#[must_use]
+pub fn pattern_matches(pattern: &str, name: &str) -> bool {
+    if pattern == WILDCARD {
+        return true;
+    }
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix) && name.len() > prefix.len(),
+        None => pattern == name,
+    }
+}
+
+/// Is a pattern a family (or sub-family) pattern?
+#[must_use]
+pub fn is_family(pattern: &str) -> bool {
+    pattern != WILDCARD && pattern.ends_with('*')
+}
+
+/// Does pattern `a` match every name pattern `b` matches?
+#[must_use]
+pub fn pattern_contains(a: &str, b: &str) -> bool {
+    if a == WILDCARD {
+        return true;
+    }
+    if b == WILDCARD {
+        return false;
+    }
+    match (a.strip_suffix('*'), b.strip_suffix('*')) {
+        (Some(pa), Some(pb)) => pb.starts_with(pa),
+        (Some(pa), None) => b.starts_with(pa) && b.len() > pa.len(),
+        (None, Some(_)) => false,
+        (None, None) => a == b,
+    }
+}
+
+/// Could some event name match both patterns?
+#[must_use]
+pub fn patterns_overlap(a: &str, b: &str) -> bool {
+    pattern_contains(a, b) || pattern_contains(b, a)
+}
+
+/// Why an event name or pattern is malformed, if it is.
+#[must_use]
+pub fn pattern_error(pattern: &str, emit: bool) -> Option<String> {
+    if pattern.is_empty() {
+        return Some("empty event name".into());
+    }
+    if pattern == WILDCARD {
+        return emit.then(|| {
+            "emits are declared events or declared families, never open wildcards".into()
+        });
+    }
+    let stars = pattern.matches('*').count();
+    if stars > 1 || (stars == 1 && !pattern.ends_with('*')) {
+        return Some(format!(
+            "`{pattern}`: `*` may only end a family pattern (`family/*`, `family/prefix*`)"
+        ));
+    }
+    if stars == 1 && !pattern.contains('/') {
+        return Some(format!(
+            "`{pattern}`: a family pattern names its family first (`{}/*`)",
+            pattern.trim_end_matches('*')
+        ));
+    }
+    if pattern.chars().any(char::is_whitespace) {
+        return Some(format!("`{pattern}`: event names contain no whitespace"));
+    }
+    None
+}
+
+// ----------------------------------------------------------------------
+// The manifest.
+// ----------------------------------------------------------------------
+
+/// What a subscription needs: payload keys plus requested session slots.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Receives {
+    pub keys: Keys,
+    pub slots: Keys,
+}
+
+impl Serialize for Receives {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = serde_json::Map::new();
+        for (k, v) in &self.keys {
+            m.insert(
+                k.clone(),
+                serde_json::to_value(v).map_err(serde::ser::Error::custom)?,
+            );
+        }
+        if !self.slots.is_empty() {
+            m.insert(
+                "slots".into(),
+                serde_json::to_value(&self.slots).map_err(serde::ser::Error::custom)?,
+            );
+        }
+        m.serialize(s)
+    }
+}
+
+impl<'de> Deserialize<'de> for Receives {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let mut m = BTreeMap::<String, Value>::deserialize(d)?;
+        let slots = match m.remove("slots") {
+            Some(v) => serde_json::from_value(v).map_err(D::Error::custom)?,
+            None => Keys::new(),
+        };
+        let mut keys = Keys::new();
+        for (k, v) in m {
+            let decl: KeyDecl = serde_json::from_value(v)
+                .map_err(|e| D::Error::custom(format!("receives.{k}: {e}")))?;
+            keys.insert(k, decl);
+        }
+        Ok(Receives { keys, slots })
+    }
+}
+
+impl Receives {
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty() && self.slots.is_empty()
+    }
+}
+
+/// One subscription: an event, a family, or `*`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Subscription {
+    pub event: String,
+    pub mode: Mode,
+    /// Runtime calls scoped to this event's pipeline (`veto`, `contribute-context`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub required: Vec<String>,
-    /// `core` or `deferred` (documentation; the projection reads the context spec).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tier: Option<String>,
+    pub actions: Vec<String>,
+    /// Also receive every undeclared key, untyped and outside the compiler's guarantee.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unlisted_keys: bool,
+    /// The demand: keys (and slots) this subscriber needs.
+    #[serde(default, skip_serializing_if = "Receives::is_empty")]
+    pub receives: Receives,
+    /// Blocking only: keys handed back to the chain (overwrite or add; never remove).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub returns: Keys,
 }
 
-fn yes() -> bool {
-    true
+impl Subscription {
+    #[must_use]
+    pub fn has_action(&self, action: &str) -> bool {
+        self.actions.iter().any(|a| a == action)
+    }
+
+    #[must_use]
+    pub fn wildcard(&self) -> bool {
+        self.event == WILDCARD
+    }
 }
 
-/// An emitted event with supplied payload keys.
+/// One emitted event or event family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Emit {
+pub struct EmitDecl {
     pub event: String,
-    #[serde(default)]
-    pub supplies: Vec<String>,
-    /// May this event be published without an open invocation?
-    #[serde(default)]
+    /// `interrupt` requires the interrupt capability.
+    #[serde(default, skip_serializing_if = "is_normal")]
+    pub lane: Lane,
+    /// May be published without an open invocation (requires deferred-publish).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
+    /// Families only: every member must have exactly one handling subscriber.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exactly_one_handler: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: Keys,
 }
 
-/// A blocking transformer's declaration for one event.
+fn is_normal(l: &Lane) -> bool {
+    *l == Lane::Normal
+}
+
+/// A cross-session event a plugin may send (requires cross-session).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Transform {
+pub struct OutboundDecl {
     pub event: String,
-    /// Keys preserved from the incoming payload; `["*"]` preserves everything.
-    #[serde(default = "preserve_all")]
-    pub preserves: Vec<String>,
-    /// Keys the transform adds.
-    #[serde(default)]
-    pub adds: Vec<String>,
-}
-
-fn preserve_all() -> Vec<String> {
-    vec![WILDCARD.to_owned()]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: Keys,
 }
 
 /// Everything a plugin declares at handshake.
@@ -125,14 +282,17 @@ pub struct Manifest {
     pub version: String,
     #[serde(default)]
     pub description: String,
-    #[serde(default)]
-    pub consumes: Vec<Consume>,
-    #[serde(default)]
-    pub emits: Vec<Emit>,
-    #[serde(default)]
-    pub transforms: Vec<Transform>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscribe: Vec<Subscription>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emit: Vec<EmitDecl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<Capability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbound: Vec<OutboundDecl>,
+    /// The plugin's effect lies outside the bus (a frontend, a log exporter).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sink: bool,
     /// Free-form description of accepted configuration (documentation only).
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub config_schema: Value,
@@ -151,9 +311,6 @@ pub struct Manifest {
     /// Host devices the plugin uses (browser runtime; enforced by that host).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub devices: Vec<String>,
-    /// Tools this plugin answers (validated by the compiler; see [`ToolDecl`]).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<ToolDecl>,
 }
 
 impl Manifest {
@@ -162,14 +319,21 @@ impl Manifest {
         self.capabilities.contains(&cap)
     }
 
+    /// The emit declaration covering a concrete event name: the exact
+    /// declaration if any, else the most specific matching family.
     #[must_use]
-    pub fn emit(&self, event: &str) -> Option<&Emit> {
-        self.emits.iter().find(|e| e.event == event)
+    pub fn emit_for(&self, name: &str) -> Option<&EmitDecl> {
+        self.emit.iter().find(|e| e.event == name).or_else(|| {
+            self.emit
+                .iter()
+                .filter(|e| is_family(&e.event) && pattern_matches(&e.event, name))
+                .max_by_key(|e| e.event.len())
+        })
     }
 
     #[must_use]
-    pub fn transform(&self, event: &str) -> Option<&Transform> {
-        self.transforms.iter().find(|t| t.event == event)
+    pub fn outbound_for(&self, name: &str) -> Option<&OutboundDecl> {
+        self.outbound.iter().find(|o| o.event == name)
     }
 
     /// Does the manifest declare this service?
@@ -181,8 +345,12 @@ impl Manifest {
     }
 }
 
+// ----------------------------------------------------------------------
+// Deployment: plugin instances and session definitions.
+// ----------------------------------------------------------------------
+
 /// One configured plugin instance.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct PluginConfig {
     /// Command line for process hosts (native runtime).
     #[serde(default)]
@@ -228,33 +396,105 @@ impl PluginConfig {
 }
 
 /// A plugin's participation in a session definition.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Subscriber {
-    pub plugin: String,
-    /// Overrides every consume's default mode for this plugin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct DefPlugin {
+    /// Phase of every blocking subscription of this plugin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<Mode>,
+    pub phase: Option<String>,
+    /// Per-event phase overrides (`{ "model-request" = "prep" }`); keys are the
+    /// subscription's event pattern.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phases: BTreeMap<String, String>,
+    /// Embedded workflow: use this session definition as the plugin, inlined
+    /// under the entry's name as namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+    /// Embedded workflows: slots of the workflow mapped to the parent's
+    /// (`{ context = "context" }`); unmapped slots are namespaced.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slots: BTreeMap<String, String>,
 }
 
-/// A named session definition: which plugins participate, in what order.
+/// The receive/emit interface of a definition used as an embedded workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Interface {
+    /// Parent events the workflow receives (keys it needs).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub receives: BTreeMap<String, Keys>,
+    /// Events the workflow emits to its parent (keys it sends).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub emits: BTreeMap<String, Keys>,
+}
+
+impl Interface {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.receives.is_empty() && self.emits.is_empty()
+    }
+}
+
+/// A named session definition (or a reusable fragment of one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Definition {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
-    /// Declared order: blocking subscribers run in this order.
-    pub subscribers: Vec<Subscriber>,
-    /// Explicit owners for keyed dispatch, `{ event: { value: plugin } }`, to
-    /// resolve two plugins claiming the same key value (e.g. the same tool).
+    /// The runtime version this definition targets; selects the core manifest.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub runtime: String,
+    /// Fragments merged into this definition before compilation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include: Vec<String>,
+    /// Ordered phase names; blocking subscribers run in phase order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub phases: Vec<String>,
+    /// The plugins the session runs.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, DefPlugin>,
+    /// Tie-breaks: `order[event][phase] = [plugins in order]`. The event key is
+    /// an event name, a family pattern (`tool-call/*`), or a family name
+    /// (`tool-call`, covering all its members).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub route_owners: BTreeMap<String, BTreeMap<String, String>>,
+    pub order: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    /// Handler picks for `exactly_one_handler` families: member or sub-family
+    /// pattern → plugin.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub handlers: BTreeMap<String, String>,
+    /// Events accepted from other sessions, with their shapes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inbound: BTreeMap<String, Keys>,
+    /// Named, typed session state. `context` is the default slot.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slots: Keys,
+    /// Promote warnings to errors.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deny_warnings: bool,
+    /// Declared interface: this definition may be embedded as a plugin.
+    #[serde(default, skip_serializing_if = "Interface::is_empty")]
+    pub interface: Interface,
+}
+
+impl Definition {
+    /// The definition's slots, with the default `context` slot unless replaced.
+    #[must_use]
+    pub fn effective_slots(&self) -> Keys {
+        let mut slots = self.slots.clone();
+        slots
+            .entry(CONTEXT_SLOT.to_owned())
+            .or_insert_with(default_context_slot);
+        slots
+    }
+}
+
+/// Shape of the default `context` slot: the attributed context items.
+#[must_use]
+pub fn default_context_slot() -> KeyDecl {
+    KeyDecl::required(Shape::Array(Box::new(Shape::Object(None))))
 }
 
 /// Core runtime settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeSettings {
-    /// Runtime bound on causal chains (recursion bounding for cyclic graphs).
-    #[serde(default = "default_depth")]
-    pub max_causal_depth: u32,
     /// Payloads larger than this spill to content-addressed files.
     #[serde(default = "default_spill")]
     pub spill_threshold_bytes: usize,
@@ -266,9 +506,6 @@ pub struct RuntimeSettings {
     pub streaming: crate::stream::StreamSettings,
 }
 
-fn default_depth() -> u32 {
-    256
-}
 fn default_spill() -> usize {
     16 * 1024
 }
@@ -279,11 +516,23 @@ fn default_attempts() -> u32 {
 impl Default for RuntimeSettings {
     fn default() -> Self {
         Self {
-            max_causal_depth: default_depth(),
             spill_threshold_bytes: default_spill(),
             max_attempts: default_attempts(),
             streaming: crate::stream::StreamSettings::default(),
         }
+    }
+}
+
+/// Where a part of the configuration was written (diagnostics trace to it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceRef {
+    pub file: String,
+    pub line: usize,
+}
+
+impl std::fmt::Display for SourceRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.file, self.line)
     }
 }
 
@@ -296,4 +545,105 @@ pub struct DeploymentConfig {
     pub plugins: BTreeMap<String, PluginConfig>,
     #[serde(default)]
     pub definitions: BTreeMap<String, Definition>,
+    /// Reusable partial definitions, merged in through `include`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fragments: BTreeMap<String, Definition>,
+    /// Source locations by config path (`definitions.coder.plugins.policy`),
+    /// filled by the loader; not part of any hash.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sources: BTreeMap<String, SourceRef>,
+}
+
+impl DeploymentConfig {
+    /// The config without source locations (for hashing and round trips).
+    #[must_use]
+    pub fn without_sources(&self) -> DeploymentConfig {
+        DeploymentConfig {
+            sources: BTreeMap::new(),
+            ..self.clone()
+        }
+    }
+
+    /// The most specific recorded source location for a config path.
+    #[must_use]
+    pub fn source(&self, path: &str) -> Option<&SourceRef> {
+        let mut p = path;
+        loop {
+            if let Some(s) = self.sources.get(p) {
+                return Some(s);
+            }
+            p = p.rsplit_once('.').map(|(a, _)| a)?;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn patterns() {
+        assert!(pattern_matches("*", "x"));
+        assert!(pattern_matches("tool-call/*", "tool-call/read_file"));
+        assert!(!pattern_matches("tool-call/*", "tool-call/"));
+        assert!(!pattern_matches("tool-call/*", "tool-result"));
+        assert!(pattern_matches(
+            "tool-call/mcp__gh__*",
+            "tool-call/mcp__gh__x"
+        ));
+        assert!(pattern_contains("tool-call/*", "tool-call/mcp__gh__*"));
+        assert!(!pattern_contains("tool-call/mcp__gh__*", "tool-call/*"));
+        assert!(patterns_overlap("tool-call/mcp__*", "tool-call/mcp__gh__x"));
+        assert!(!patterns_overlap("tool-call/a", "tool-call/b"));
+        assert!(pattern_error("*", true).is_some());
+        assert!(pattern_error("*", false).is_none());
+        assert!(pattern_error("a*b", false).is_some());
+        assert!(pattern_error("tools*", false).is_some());
+        assert!(pattern_error("tool-call/*", true).is_none());
+    }
+
+    #[test]
+    fn manifest_json_round_trip() {
+        let m: Manifest = serde_json::from_value(json!({
+            "name": "p", "version": "1",
+            "subscribe": [{
+                "event": "model-request", "mode": "blocking", "actions": ["contribute-context"],
+                "receives": { "model": { "shape": "string" }, "slots": { "context": { "shape": "array<object>" } } },
+                "returns": { "temperature": { "shape": "number" } }
+            }],
+            "emit": [{ "event": "tool-call/*", "exactly_one_handler": true, "keys": { "call_id": { "shape": "string" } } }],
+            "capabilities": ["interrupt", "sessions.find"],
+            "outbound": [{ "event": "answer", "keys": { "text": { "shape": "string" } } }],
+            "sink": true
+        }))
+        .unwrap();
+        assert_eq!(m.subscribe[0].receives.slots.len(), 1);
+        assert!(m.emit_for("tool-call/x").is_some());
+        assert!(m.emit_for("tool-result").is_none());
+        let back: Manifest = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        assert!(
+            serde_json::from_value::<Manifest>(
+                json!({ "name": "p", "version": "1", "subscribe": [{ "event": "x" }] })
+            )
+            .is_err(),
+            "mode is required"
+        );
+    }
+
+    #[test]
+    fn definition_from_toml_shape() {
+        let d: Definition = serde_json::from_value(json!({
+            "runtime": "0.1", "phases": ["guard", "loop"],
+            "plugins": { "policy": { "phase": "guard", "phases": { "model-request": "loop" } }, "web-ui": {} },
+            "order": { "tool-call": { "guard": ["policy", "approval-gate"] } },
+            "handlers": { "tool-call/read_file": "local-workspace" },
+            "inbound": { "subagent-result": { "call_id": { "shape": "string" } } },
+            "deny_warnings": true
+        }))
+        .unwrap();
+        assert_eq!(d.effective_slots()["context"], default_context_slot());
+        assert_eq!(d.plugins["policy"].phases["model-request"], "loop");
+    }
 }

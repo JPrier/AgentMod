@@ -1,34 +1,27 @@
-//! The compiler: walks every declared subscription and emission and produces a
-//! validated per-definition graph. The graph is a compile-time artifact, never
-//! an executor — dispatch only looks up the compiled pipeline for an event name.
+//! The compiler (compiler.md §5–§6): manifests plus one flattened session
+//! definition in, one compiled graph out. The graph is also the routing table
+//! the runtime dispatches from; its content hash is the session's revision.
+//!
+//! Deterministic: the same manifests, definition, and runtime version produce
+//! the same graph and the same diagnostics, byte for byte.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::core_manifest::{BOUNDARY, core_manifest};
 use crate::manifest::{
-    Capability, DeploymentConfig, Emit, Keyed, Manifest, PluginConfig, Transform, WILDCARD,
+    ACTION_CONTRIBUTE, ACTION_VETO, ACTIONS, Capability, DefPlugin, Definition, DeploymentConfig,
+    EmitDecl, Manifest, PluginConfig, SourceRef, Subscription, WILDCARD, is_family,
+    pattern_contains, pattern_error, pattern_matches,
 };
-use crate::types::{Mode, Stamp, hash_json, lookup};
+use crate::shape::{KeyDecl, Keys, MismatchKind, compatible, keys_mismatches};
+use crate::types::{Lane, Mode, Stamp, hash_json};
 
-/// Core lifecycle events and the keys they supply.
-pub const CORE_EVENTS: &[(&str, &[&str])] = &[
-    ("session-started", &["definition"]),
-    ("config-applied", &["config"]),
-    // A keyed event found no owner, or its owner's invocation failed (so the
-    // loop that waits on an answer can be told instead of waiting forever).
-    (
-        DISPATCH_FAILED,
-        &["reason", "event_id", "event_name", "key", "payload"],
-    ),
-];
-
-/// Core event published when keyed dispatch cannot deliver an answerable result.
-pub const DISPATCH_FAILED: &str = "dispatch-failed";
-
-/// The emitter name used for core lifecycle events in the graph.
-pub const CORE: &str = "core";
+// ----------------------------------------------------------------------
+// Output types.
+// ----------------------------------------------------------------------
 
 /// Diagnostic severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -39,159 +32,311 @@ pub enum Severity {
     Info,
 }
 
-/// A compiler finding.
+/// A compiler finding: what, where it was written, and who is involved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub code: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<String>,
+    /// The config path the finding traces to (`definitions.coder.plugins.policy`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plugin: Option<String>,
+    pub path: Option<String>,
+    /// The file and line that path was written at, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<SourceRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
+    /// Dotted key path inside the payload (`args.path`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<String>,
     pub message: String,
 }
 
-/// One subscriber slot in a compiled pipeline.
+impl Diagnostic {
+    /// One-line location: `file:line definitions.x / event / key / plugins`.
+    #[must_use]
+    pub fn location(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(s) = &self.source {
+            parts.push(s.to_string());
+        }
+        if let Some(p) = self.path.as_ref().or(self.definition.as_ref()) {
+            parts.push(p.clone());
+        }
+        if let Some(e) = &self.event {
+            parts.push(e.clone());
+        }
+        if let Some(k) = &self.key {
+            parts.push(format!("key `{k}`"));
+        }
+        if !self.plugins.is_empty() {
+            parts.push(self.plugins.join(", "));
+        }
+        parts.join(" / ")
+    }
+}
+
+/// Where a blocking edge runs in its event's chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Slot {
-    pub plugin: String,
-    pub mode: Mode,
-    /// Position in the definition's declared order.
-    pub position: usize,
-    pub demands: Vec<String>,
-    pub context: bool,
-    pub wildcard: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transform: Option<Transform>,
+pub struct Position {
+    pub phase: String,
+    pub phase_index: usize,
+    /// Position inside the phase (from a tie-break list, else by plugin name).
+    pub rank: usize,
+    /// Position in the whole blocking chain of this event class.
+    pub chain: usize,
 }
 
-/// Compiled pipeline for one event name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct Pipeline {
-    pub blocking: Vec<Slot>,
-    /// Observers: every delivered event reaches all of them.
-    #[serde(rename = "async")]
-    pub asyncs: Vec<Slot>,
-    /// Keyed owners: each delivered event reaches exactly the one owner its key
-    /// selects (compiled from [`Keyed`] consumers; never a runtime scan).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routed: Option<RouteTable>,
+/// How an emitter reaches the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Via {
+    /// A member plugin's declared emit.
+    Emit,
+    /// The core manifest (boundary node).
+    Core,
+    /// An inbound cross-session event (boundary node).
+    Inbound,
+    /// A possible `start-session` initial event from a plugin outside the session.
+    StartSession,
 }
 
-impl Pipeline {
-    /// The slot a plugin occupies in this pipeline (blocking, observer, or owner).
-    #[must_use]
-    pub fn slot_of(&self, plugin: &str) -> Option<&Slot> {
-        self.blocking
-            .iter()
-            .chain(&self.asyncs)
-            .find(|s| s.plugin == plugin)
-            .or_else(|| self.routed.as_ref().and_then(|r| r.slot_of(plugin)))
-    }
-}
-
-/// A prefix-owned family of key values (`mcp__github__*`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PrefixRoute {
-    pub prefix: String,
-    pub slot: Slot,
-}
-
-/// Deterministic owner table for one keyed event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct RouteTable {
-    /// Payload key whose value selects the owner.
-    pub key: String,
-    pub exact: BTreeMap<String, Slot>,
-    /// Longest prefix wins; overlaps between owners are rejected at compile time.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub prefixes: Vec<PrefixRoute>,
-}
-
-impl RouteTable {
-    /// The owner of a key value.
-    #[must_use]
-    pub fn owner(&self, value: &str) -> Option<&Slot> {
-        self.exact.get(value).or_else(|| {
-            self.prefixes
-                .iter()
-                .filter(|p| value.starts_with(&p.prefix))
-                .max_by_key(|p| p.prefix.len())
-                .map(|p| &p.slot)
-        })
-    }
-
-    /// The owner selected by an event payload, with the key value.
-    #[must_use]
-    pub fn route<'a>(&'a self, payload: &Value) -> (Option<String>, Option<&'a Slot>) {
-        let value = lookup(payload, &self.key).and_then(Value::as_str);
-        (value.map(str::to_owned), value.and_then(|v| self.owner(v)))
-    }
-
-    fn slot_of(&self, plugin: &str) -> Option<&Slot> {
-        self.exact
-            .values()
-            .chain(self.prefixes.iter().map(|p| &p.slot))
-            .find(|s| s.plugin == plugin)
-    }
-
-    /// Every owned value (prefixes keep their `*`), with its owner.
-    #[must_use]
-    pub fn entries(&self) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = self
-            .exact
-            .iter()
-            .map(|(v, s)| (v.clone(), s.plugin.clone()))
-            .collect();
-        out.extend(
-            self.prefixes
-                .iter()
-                .map(|p| (format!("{}*", p.prefix), p.slot.plugin.clone())),
-        );
-        out
-    }
-}
-
-/// Edge in the compiled graph (for inspection UIs).
+/// One edge: *when `from` emits `event`, `to` is a destination*.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Edge {
     pub from: String,
+    /// The event class: a concrete event, a family member, a sub-family, or
+    /// the family itself (members no narrower subscription names).
+    pub event: String,
+    /// The emitter's declaration this class belongs to.
+    pub emit: String,
     pub to: String,
-    /// `emits` (plugin → event) or `consumes` (event → plugin).
-    pub kind: String,
+    /// The subscriber's event pattern.
+    pub subscription: String,
+    pub mode: Mode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<Mode>,
+    pub position: Option<Position>,
+    pub lane: Lane,
+    /// Keys and shapes present when the event reaches `to` (after earlier returns).
+    pub supply: Keys,
+    /// Slots delivered with the event.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slots: Vec<String>,
+    /// The one handler of this member of an `exactly_one_handler` family.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub handler: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
+    pub via: Via,
+}
+
+/// Node kind in the compiled graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NodeKind {
+    Boundary,
+    Plugin,
+    /// A plugin outside the session that may start it with an initial event.
+    External,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Node {
+    pub name: String,
+    pub kind: NodeKind,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sink: bool,
+}
+
+/// The per-event view of the graph: one class's ordered destinations.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    pub from: String,
+    pub emit: String,
+    pub class: String,
+    /// Edge indices of the blocking chain, in run order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub keys: Vec<String>,
+    pub blocking: Vec<usize>,
+    /// Edge indices started together once the chain settles.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asyncs: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handler: Option<usize>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exactly_one_handler: bool,
 }
 
-/// One compiled session definition.
+/// The compiled graph: nodes, edges, and the routes the runtime reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub struct CompiledDefinition {
-    pub description: String,
-    pub plugins: Vec<String>,
-    /// Explicit pipelines keyed by event name (wildcards already placed).
-    pub pipelines: BTreeMap<String, Pipeline>,
-    /// Pipeline used for events with no explicit subscribers (wildcards only).
-    pub fallback: Pipeline,
+pub struct Graph {
+    pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
-    /// Event cycles (legal; bounded at runtime by max causal depth).
-    pub cycles: Vec<Vec<String>>,
-    /// Content hash of every route table: the routing revision this config
-    /// compiled (changes only when ownership changes).
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub routes_revision: String,
+    pub routes: Vec<Route>,
 }
 
-impl CompiledDefinition {
-    /// The pipeline an event name dispatches through.
+impl Graph {
+    /// The route of a concrete event published by `from`, under its emit
+    /// declaration `emit`: the most specific class matching the name.
     #[must_use]
-    pub fn pipeline(&self, event: &str) -> &Pipeline {
-        self.pipelines.get(event).unwrap_or(&self.fallback)
+    pub fn route(&self, from: &str, emit: &str, name: &str) -> Option<&Route> {
+        self.routes
+            .iter()
+            .filter(|r| r.from == from && r.emit == emit && class_matches(&r.class, name))
+            .max_by_key(|r| class_specificity(&r.class))
+    }
+
+    #[must_use]
+    pub fn edge(&self, i: usize) -> &Edge {
+        &self.edges[i]
+    }
+}
+
+fn class_matches(class: &str, name: &str) -> bool {
+    class == name || (is_family(class) && pattern_matches(class, name))
+}
+
+fn class_specificity(class: &str) -> (bool, usize) {
+    (!is_family(class), class.len())
+}
+
+/// A member plugin of a compiled definition (everything the runtime needs).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Member {
+    pub manifest: Manifest,
+    pub stamp: Stamp,
+    pub config: PluginConfig,
+    /// False for external starters (they emit into the session but are never invoked).
+    #[serde(default = "yes", skip_serializing_if = "Clone::clone")]
+    pub member: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// A compiled event family with one handler per member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FamilyHandlers {
+    /// Exact member → handling plugin.
+    pub members: BTreeMap<String, String>,
+    /// Sub-family pattern → handling plugin.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subfamilies: BTreeMap<String, String>,
+}
+
+impl FamilyHandlers {
+    /// The handler of a concrete member name, if one is compiled.
+    #[must_use]
+    pub fn handler(&self, name: &str) -> Option<&str> {
+        self.members.get(name).map(String::as_str).or_else(|| {
+            self.subfamilies
+                .iter()
+                .filter(|(p, _)| pattern_matches(p, name))
+                .max_by_key(|(p, _)| p.len())
+                .map(|(_, h)| h.as_str())
+        })
+    }
+}
+
+/// The compile report's information sections (compiler.md §6, "Info").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Report {
+    /// Plugin cycles (strongly connected components), sorted.
+    pub cycles: Vec<Vec<String>>,
+    /// Capability → plugins holding it.
+    pub capabilities: BTreeMap<String, Vec<String>>,
+    /// Interrupt-lane emits (`plugin: event`) and interrupt capability holders.
+    pub interrupt: Vec<String>,
+    /// `plugin: event` subscriptions that receive unlisted keys untyped.
+    pub unlisted_keys: Vec<String>,
+    /// The external surface: deferred and rootless entry points, inbound and outbound events.
+    pub external_surface: BTreeMap<String, Vec<String>>,
+    /// Blocking orders the compiler fixed by plugin name (no observable tie).
+    pub fixed_orders: Vec<String>,
+    /// `exactly_one_handler` families and their compiled handlers.
+    pub families: BTreeMap<String, FamilyHandlers>,
+}
+
+/// One compiled session definition: the unit a session runs under.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct Revision {
+    /// Content hash of the graph and its diagnostics.
+    pub revision: String,
+    /// The definition's name (or `inline:<hash>` for a definition passed to start-session).
+    pub name: String,
+    pub description: String,
+    pub runtime: String,
+    pub ok: bool,
+    /// The flattened definition that was compiled.
+    pub definition: Definition,
+    pub plugins: BTreeMap<String, Member>,
+    pub graph: Graph,
+    pub diagnostics: Vec<Diagnostic>,
+    pub report: Report,
+}
+
+impl Revision {
+    #[must_use]
+    pub fn errors(&self) -> Vec<&Diagnostic> {
+        self.diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn manifest(&self, plugin: &str) -> Option<&Manifest> {
+        self.plugins.get(plugin).map(|m| &m.manifest)
+    }
+
+    #[must_use]
+    pub fn is_member(&self, plugin: &str) -> bool {
+        self.plugins.get(plugin).is_some_and(|m| m.member)
+    }
+
+    /// The core manifest this revision was compiled against.
+    #[must_use]
+    pub fn core(&self) -> Manifest {
+        core_manifest(&self.runtime).unwrap_or_default()
+    }
+
+    /// The emit declaration of `emitter` covering `name` (the boundary's core
+    /// events and inbound declarations included).
+    #[must_use]
+    pub fn emit_decl(&self, emitter: &str, name: &str) -> Option<EmitDecl> {
+        if emitter == BOUNDARY {
+            if let Some(e) = self.core().emit_for(name) {
+                return Some(e.clone());
+            }
+            return self.definition.inbound.get(name).map(|keys| EmitDecl {
+                event: name.to_owned(),
+                lane: Lane::Normal,
+                deferred: false,
+                exactly_one_handler: false,
+                keys: keys.clone(),
+            });
+        }
+        self.manifest(emitter)?.emit_for(name).cloned()
+    }
+
+    /// The route an event takes: by emitter and concrete name.
+    #[must_use]
+    pub fn route(&self, emitter: &str, name: &str) -> Option<(EmitDecl, Option<&Route>)> {
+        let decl = self.emit_decl(emitter, name)?;
+        let r = self.graph.route(emitter, &decl.event, name);
+        Some((decl, r))
+    }
+
+    /// The subscription an edge was compiled from.
+    #[must_use]
+    pub fn subscription(&self, edge: &Edge) -> Option<&Subscription> {
+        self.manifest(&edge.to)?
+            .subscribe
+            .iter()
+            .find(|s| s.event == edge.subscription && s.mode == edge.mode)
     }
 }
 
@@ -204,16 +349,18 @@ pub struct SurfaceEntry {
     pub deferred_events: Vec<String>,
 }
 
-/// The compile output artifact; reused by apply-time revalidation.
+/// The compile output for a whole deployment config: every definition compiled.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Compilation {
-    /// Content hash of config + manifests; identifies this compiled config.
+    /// Content hash of config + manifests; identifies this deployment config.
     pub hash: String,
     pub ok: bool,
     pub config: DeploymentConfig,
     pub manifests: BTreeMap<String, Manifest>,
     pub stamps: BTreeMap<String, Stamp>,
-    pub definitions: BTreeMap<String, CompiledDefinition>,
+    /// Definition name → its compiled revision.
+    pub definitions: BTreeMap<String, Revision>,
+    /// Deployment-level findings plus every definition's, in report order.
     pub diagnostics: Vec<Diagnostic>,
     pub surface: Vec<SurfaceEntry>,
 }
@@ -233,466 +380,530 @@ impl Compilation {
     }
 }
 
-struct Ctx<'a> {
-    diags: Vec<Diagnostic>,
-    def: Option<&'a str>,
+// ----------------------------------------------------------------------
+// Diagnostics context.
+// ----------------------------------------------------------------------
+
+struct Diags<'a> {
+    out: Vec<Diagnostic>,
+    seen: BTreeSet<String>,
+    def: Option<String>,
+    config: &'a DeploymentConfig,
+    /// Config path prefix of the definition being compiled (`definitions.coder`).
+    base: String,
 }
 
-impl Ctx<'_> {
-    fn push(
-        &mut self,
-        severity: Severity,
-        code: &str,
-        plugin: Option<&str>,
-        event: Option<&str>,
-        message: String,
-    ) {
-        self.diags.push(Diagnostic {
-            severity,
-            code: code.to_owned(),
-            definition: self.def.map(str::to_owned),
-            plugin: plugin.map(str::to_owned),
-            event: event.map(str::to_owned),
+struct D<'s> {
+    sev: Severity,
+    code: &'s str,
+    path: Option<String>,
+    event: Option<&'s str>,
+    key: Option<String>,
+    plugins: Vec<String>,
+}
+
+impl<'a> Diags<'a> {
+    fn new(config: &'a DeploymentConfig) -> Self {
+        Self {
+            out: Vec::new(),
+            seen: BTreeSet::new(),
+            def: None,
+            config,
+            base: String::new(),
+        }
+    }
+
+    fn at(&self, sub: &str) -> String {
+        if sub.is_empty() {
+            self.base.clone()
+        } else if self.base.is_empty() {
+            sub.to_owned()
+        } else {
+            format!("{}.{sub}", self.base)
+        }
+    }
+
+    fn push(&mut self, d: D<'_>, message: String) {
+        let path = d
+            .path
+            .or_else(|| (!self.base.is_empty()).then(|| self.base.clone()));
+        let source = path.as_deref().and_then(|p| self.config.source(p)).cloned();
+        let mut plugins = d.plugins;
+        plugins.sort();
+        plugins.dedup();
+        let diag = Diagnostic {
+            severity: d.sev,
+            code: d.code.to_owned(),
+            definition: self.def.clone(),
+            path,
+            source,
+            event: d.event.map(str::to_owned),
+            key: d.key,
+            plugins,
             message,
-        });
+        };
+        let id = serde_json::to_string(&diag).unwrap_or_default();
+        if self.seen.insert(id) {
+            self.out.push(diag);
+        }
+    }
+
+    fn err(
+        &mut self,
+        code: &str,
+        path: Option<String>,
+        event: Option<&str>,
+        plugins: &[&str],
+        msg: String,
+    ) {
+        self.push(
+            D {
+                sev: Severity::Error,
+                code,
+                path,
+                event,
+                key: None,
+                plugins: plugins.iter().map(|p| (*p).to_owned()).collect(),
+            },
+            msg,
+        );
+    }
+
+    fn warn(
+        &mut self,
+        code: &str,
+        path: Option<String>,
+        event: Option<&str>,
+        plugins: &[&str],
+        msg: String,
+    ) {
+        self.push(
+            D {
+                sev: Severity::Warning,
+                code,
+                path,
+                event,
+                key: None,
+                plugins: plugins.iter().map(|p| (*p).to_owned()).collect(),
+            },
+            msg,
+        );
+    }
+
+    fn info(
+        &mut self,
+        code: &str,
+        path: Option<String>,
+        event: Option<&str>,
+        plugins: &[&str],
+        msg: String,
+    ) {
+        self.push(
+            D {
+                sev: Severity::Info,
+                code,
+                path,
+                event,
+                key: None,
+                plugins: plugins.iter().map(|p| (*p).to_owned()).collect(),
+            },
+            msg,
+        );
     }
 }
 
-fn strip_optional(key: &str) -> Option<&str> {
-    key.strip_suffix('?')
+fn sort_diags(diags: &mut [Diagnostic]) {
+    diags.sort_by(|a, b| {
+        a.severity
+            .cmp(&b.severity)
+            .then(a.definition.cmp(&b.definition))
+            .then(a.code.cmp(&b.code))
+            .then(a.event.cmp(&b.event))
+            .then(a.plugins.cmp(&b.plugins))
+            .then(a.key.cmp(&b.key))
+            .then(a.message.cmp(&b.message))
+    });
 }
 
-/// Does a supplied key set cover a demanded key? Supplying `a` covers `a.b`;
-/// supplying `a.b` covers a demand for `a` (the object exists).
-fn covers(supply: &BTreeSet<String>, demand: &str) -> bool {
-    supply.iter().any(|s| {
-        s == demand || demand.starts_with(&format!("{s}.")) || s.starts_with(&format!("{demand}."))
-    })
+// ----------------------------------------------------------------------
+// Plugin-level checks (manifest consistency, capabilities, actions).
+// ----------------------------------------------------------------------
+
+fn check_manifest(dx: &mut Diags<'_>, name: &str, m: &Manifest, path: Option<String>) {
+    let p = || path.clone();
+    if name == BOUNDARY {
+        dx.err(
+            "reserved-name",
+            p(),
+            None,
+            &[name],
+            format!("`{BOUNDARY}` is the runtime's boundary node; a plugin cannot use that name"),
+        );
+    }
+    let mut seen = BTreeSet::new();
+    for e in &m.emit {
+        if let Some(why) = pattern_error(&e.event, true) {
+            dx.err(
+                "invalid-event",
+                p(),
+                Some(&e.event),
+                &[name],
+                format!("`{name}` emit: {why}"),
+            );
+            continue;
+        }
+        if !seen.insert(e.event.as_str()) {
+            dx.err(
+                "duplicate-emit",
+                p(),
+                Some(&e.event),
+                &[name],
+                format!("`{name}` declares emit `{}` twice", e.event),
+            );
+        }
+        if e.exactly_one_handler && !is_family(&e.event) {
+            dx.err("invalid-family", p(), Some(&e.event), &[name], format!("`{name}`: `exactly_one_handler` applies to families (`{}/*`), not to the single event `{}`", e.event, e.event));
+        }
+        if e.deferred && !m.has(Capability::DeferredPublish) {
+            dx.err(
+                "missing-capability",
+                p(),
+                Some(&e.event),
+                &[name],
+                format!(
+                    "`{name}` flags `{}` deferred but lacks the deferred-publish capability",
+                    e.event
+                ),
+            );
+        }
+        if e.lane == Lane::Interrupt && !m.has(Capability::Interrupt) {
+            dx.err(
+                "missing-capability",
+                p(),
+                Some(&e.event),
+                &[name],
+                format!(
+                    "`{name}` emits `{}` on the interrupt lane but lacks the interrupt capability",
+                    e.event
+                ),
+            );
+        }
+    }
+    for (i, a) in m.emit.iter().enumerate() {
+        for b in &m.emit[i + 1..] {
+            if a.event != b.event
+                && is_family(&a.event)
+                && is_family(&b.event)
+                && crate::manifest::patterns_overlap(&a.event, &b.event)
+            {
+                dx.err(
+                    "duplicate-emit",
+                    p(),
+                    Some(&a.event),
+                    &[name],
+                    format!(
+                        "`{name}` declares overlapping families `{}` and `{}`",
+                        a.event, b.event
+                    ),
+                );
+            }
+        }
+    }
+    for o in &m.outbound {
+        if let Some(why) = pattern_error(&o.event, true)
+            .or_else(|| is_family(&o.event).then(|| "outbound events are single events".into()))
+        {
+            dx.err(
+                "invalid-event",
+                p(),
+                Some(&o.event),
+                &[name],
+                format!("`{name}` outbound: {why}"),
+            );
+        }
+        if !m.has(Capability::CrossSession) {
+            dx.err(
+                "missing-capability",
+                p(),
+                Some(&o.event),
+                &[name],
+                format!(
+                    "`{name}` declares outbound `{}` but lacks the cross-session capability",
+                    o.event
+                ),
+            );
+        }
+    }
+    let mut subs = BTreeSet::new();
+    for s in &m.subscribe {
+        if let Some(why) = pattern_error(&s.event, false) {
+            dx.err(
+                "invalid-event",
+                p(),
+                Some(&s.event),
+                &[name],
+                format!("`{name}` subscription: {why}"),
+            );
+            continue;
+        }
+        if !subs.insert((s.event.as_str(), s.mode)) {
+            dx.err(
+                "duplicate-subscription",
+                p(),
+                Some(&s.event),
+                &[name],
+                format!("`{name}` subscribes to `{}` twice", s.event),
+            );
+        }
+        for a in &s.actions {
+            if !ACTIONS.contains(&a.as_str()) {
+                dx.err(
+                    "unknown-action",
+                    p(),
+                    Some(&s.event),
+                    &[name],
+                    format!(
+                        "`{name}` declares unknown action `{a}` (known: {})",
+                        ACTIONS.join(", ")
+                    ),
+                );
+            }
+        }
+        if s.mode == Mode::Async {
+            if s.has_action(ACTION_VETO) {
+                dx.err("invalid-action", p(), Some(&s.event), &[name], format!("`{name}` is an async subscriber of `{}` and declares `veto`; async subscribers cannot veto", s.event));
+            }
+            if !s.returns.is_empty() {
+                dx.err("invalid-action", p(), Some(&s.event), &[name], format!("`{name}` is an async subscriber of `{}` and declares `returns`; only blocking subscribers return keys", s.event));
+            }
+        }
+        if s.receives.keys.contains_key("slots") {
+            dx.err(
+                "invalid-key",
+                p(),
+                Some(&s.event),
+                &[name],
+                "`slots` is reserved in `receives` for slot requests".into(),
+            );
+        }
+    }
 }
 
-/// Walk a supply set through one transformer.
-fn walk_transform(supply: &BTreeSet<String>, t: &Transform) -> BTreeSet<String> {
-    let mut out: BTreeSet<String> = if t.preserves.iter().any(|p| p == WILDCARD) {
-        supply.clone()
-    } else {
-        supply
-            .iter()
-            .filter(|k| {
-                t.preserves
-                    .iter()
-                    .any(|p| covers(&BTreeSet::from([p.clone()]), k))
-            })
-            .cloned()
-            .collect()
+// ----------------------------------------------------------------------
+// Flattening (fragments) and the compile entry points.
+// ----------------------------------------------------------------------
+
+/// Merge a definition's fragments into it. Diagnostics trace to the fragment.
+fn flatten(dx: &mut Diags<'_>, name: &str, def: &Definition) -> Definition {
+    if def.include.is_empty() {
+        return def.clone();
+    }
+    let mut out = Definition {
+        description: def.description.clone(),
+        deny_warnings: def.deny_warnings,
+        interface: def.interface.clone(),
+        ..Default::default()
     };
-    out.extend(t.adds.iter().cloned());
+    let mut phases_from: Option<(String, Vec<String>)> = None;
+    let mut parts: Vec<(String, &Definition)> = Vec::new();
+    for f in &def.include {
+        match dx.config.fragments.get(f) {
+            Some(frag) => {
+                if !frag.include.is_empty() {
+                    dx.err(
+                        "nested-fragment",
+                        Some(format!("fragments.{f}.include")),
+                        None,
+                        &[],
+                        format!(
+                            "fragment `{f}` includes other fragments; includes are one level deep"
+                        ),
+                    );
+                }
+                parts.push((format!("fragments.{f}"), frag));
+            }
+            None => dx.err(
+                "unknown-fragment",
+                Some(dx.at("include")),
+                None,
+                &[],
+                format!("`{name}` includes unknown fragment `{f}`"),
+            ),
+        }
+    }
+    parts.push((format!("definitions.{name}"), def));
+    for (from, part) in parts {
+        if !part.runtime.is_empty() {
+            if !out.runtime.is_empty() && out.runtime != part.runtime {
+                dx.err(
+                    "conflicting-runtime",
+                    Some(format!("{from}.runtime")),
+                    None,
+                    &[],
+                    format!(
+                        "`{from}` targets runtime {} but another part targets {}",
+                        part.runtime, out.runtime
+                    ),
+                );
+            } else {
+                out.runtime.clone_from(&part.runtime);
+            }
+        }
+        if !part.phases.is_empty() {
+            match &phases_from {
+                Some((other, list)) if *list != part.phases => {
+                    dx.err("conflicting-phases", Some(format!("{from}.phases")), None, &[], format!("`{from}` declares phases [{}] but `{other}` declares [{}]; a flattened definition has one phase list", part.phases.join(", "), list.join(", ")));
+                }
+                Some(_) => {}
+                None => {
+                    phases_from = Some((from.clone(), part.phases.clone()));
+                    out.phases.clone_from(&part.phases);
+                }
+            }
+        }
+        for (p, entry) in &part.plugins {
+            match out.plugins.get(p) {
+                Some(prev) if prev != entry => dx.err(
+                    "conflicting-plugin",
+                    Some(format!("{from}.plugins.{p}")),
+                    None,
+                    &[p],
+                    format!("`{p}` is configured differently in `{from}` and an earlier part"),
+                ),
+                _ => {
+                    out.plugins.insert(p.clone(), entry.clone());
+                }
+            }
+        }
+        for (ev, phases) in &part.order {
+            for (ph, list) in phases {
+                let slot = out.order.entry(ev.clone()).or_default();
+                match slot.get(ph) {
+                    Some(prev) if prev != list => dx.err("conflicting-order", Some(format!("{from}.order")), Some(ev), &[], format!("tie-break for `{ev}` phase `{ph}` differs between `{from}` and an earlier part")),
+                    _ => {
+                        slot.insert(ph.clone(), list.clone());
+                    }
+                }
+            }
+        }
+        for (k, v) in &part.handlers {
+            match out.handlers.get(k) {
+                Some(prev) if prev != v => dx.err(
+                    "conflicting-handler",
+                    Some(format!("{from}.handlers")),
+                    Some(k),
+                    &[prev, v],
+                    format!("handler pick for `{k}` differs between `{from}` and an earlier part"),
+                ),
+                _ => {
+                    out.handlers.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        for (k, v) in &part.inbound {
+            match out.inbound.get(k) {
+                Some(prev) if prev != v => dx.err(
+                    "conflicting-inbound",
+                    Some(format!("{from}.inbound.{k}")),
+                    Some(k),
+                    &[],
+                    format!(
+                        "inbound `{k}` is declared differently in `{from}` and an earlier part"
+                    ),
+                ),
+                _ => {
+                    out.inbound.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        for (k, v) in &part.slots {
+            match out.slots.get(k) {
+                Some(prev) if prev != v => dx.err(
+                    "conflicting-slot",
+                    Some(format!("{from}.slots.{k}")),
+                    None,
+                    &[],
+                    format!("slot `{k}` is declared differently in `{from}` and an earlier part"),
+                ),
+                _ => {
+                    out.slots.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        out.deny_warnings |= part.deny_warnings;
+    }
     out
 }
 
 /// Compile a deployment config against the manifests obtained at handshake.
 #[must_use]
 pub fn compile(config: &DeploymentConfig, manifests: &BTreeMap<String, Manifest>) -> Compilation {
-    let mut cx = Ctx {
-        diags: Vec::new(),
-        def: None,
-    };
+    let mut dx = Diags::new(config);
     let active: BTreeMap<&String, &PluginConfig> =
         config.plugins.iter().filter(|(_, p)| !p.disabled).collect();
-
-    // Plugin-level checks.
-    for name in active.keys() {
+    for (name, pc) in &active {
+        let path = Some(format!("plugins.{name}"));
         let Some(m) = manifests.get(*name) else {
-            cx.push(
-                Severity::Error,
+            dx.err(
                 "missing-manifest",
-                Some(name),
+                path,
                 None,
+                &[name],
                 format!("plugin `{name}` produced no manifest (failed to start or handshake?)"),
             );
             continue;
         };
-        let mut seen = BTreeSet::new();
-        for e in &m.emits {
-            if e.event == WILDCARD {
-                cx.push(
-                    Severity::Error,
-                    "emit-wildcard",
-                    Some(name),
-                    None,
-                    "emit-wildcards do not exist; declare each emitted event".into(),
-                );
-            }
-            if !seen.insert(&e.event) {
-                cx.push(
-                    Severity::Error,
-                    "duplicate-emit",
-                    Some(name),
-                    Some(&e.event),
-                    format!("`{}` is declared twice in emits", e.event),
-                );
-            }
-            if e.deferred && !m.has(Capability::DeferredPublish) {
-                cx.push(Severity::Error, "missing-capability", Some(name), Some(&e.event), format!("`{}` is flagged deferred but the plugin lacks the deferred-publish capability", e.event));
-            }
-        }
-        for c in &m.consumes {
-            if c.event == WILDCARD && c.demands.iter().any(|d| strip_optional(d).is_none()) {
-                cx.push(
-                    Severity::Error,
-                    "wildcard-demand",
-                    Some(name),
-                    Some(WILDCARD),
-                    "wildcard consumers may demand nothing beyond the envelope".into(),
-                );
-            }
-        }
-        check_tools(&mut cx, name, m);
-        if let Some(want) = active[*name].version.as_deref()
+        if let Some(want) = pc.version.as_deref()
             && m.version != want
             && !m.version.starts_with(&format!("{want}."))
         {
-            cx.push(
-                Severity::Error,
-                "plugin-version-unavailable",
-                Some(name),
-                None,
-                format!(
-                    "the config requires `{name}` version {want}, but the running plugin reports {}",
-                    m.version
-                ),
-            );
+            dx.err("plugin-version-unavailable", path.clone(), None, &[name], format!("the config requires `{name}` version {want}, but the running plugin reports {}", m.version));
         }
-        for t in &m.transforms {
-            if !m.consumes.iter().any(|c| c.event == t.event) {
-                cx.push(
-                    Severity::Error,
-                    "transform-unconsumed",
-                    Some(name),
-                    Some(&t.event),
-                    format!(
-                        "transform declared for `{}` which the plugin does not consume",
-                        t.event
-                    ),
-                );
-            }
-        }
+        check_manifest(&mut dx, name, m, path);
     }
-
     let mut definitions = BTreeMap::new();
+    let deployment = std::mem::take(&mut dx.out);
+    let mut all = deployment.clone();
     for (def_name, def) in &config.definitions {
-        cx.def = Some(def_name);
-        let first_diag = cx.diags.len();
+        let rev = compile_definition(def_name, def, config, manifests);
         // A host disables plugins it cannot run (a worker-only plugin natively,
-        // a process-only one in the browser). A definition that is broken only
-        // because of that is unavailable on this host, not a configuration error.
+        // a process-only one in the browser). A definition broken only because
+        // of that is unavailable on this host, not a configuration error.
         let host_scoped = def
-            .subscribers
-            .iter()
-            .any(|s| config.plugins.get(&s.plugin).is_some_and(|p| p.disabled));
-        let mut cd = CompiledDefinition {
-            description: def.description.clone(),
-            ..Default::default()
-        };
-        let mut members: Vec<(usize, &str, &Manifest, Option<Mode>)> = Vec::new();
-        let mut seen = BTreeSet::new();
-        for (pos, sub) in def.subscribers.iter().enumerate() {
-            if !seen.insert(sub.plugin.as_str()) {
-                cx.push(
-                    Severity::Error,
-                    "duplicate-subscriber",
-                    Some(&sub.plugin),
-                    None,
-                    format!("`{}` listed twice", sub.plugin),
-                );
-                continue;
-            }
-            match config.plugins.get(&sub.plugin) {
-                None => cx.push(
-                    Severity::Error,
-                    "unknown-plugin",
-                    Some(&sub.plugin),
-                    None,
-                    format!("definition references unknown plugin `{}`", sub.plugin),
-                ),
-                Some(p) if p.disabled => cx.push(
-                    Severity::Info,
-                    "disabled-plugin",
-                    Some(&sub.plugin),
-                    None,
-                    format!("`{}` is disabled on this host and skipped", sub.plugin),
-                ),
-                Some(_) => {
-                    if let Some(m) = manifests.get(&sub.plugin) {
-                        members.push((pos, sub.plugin.as_str(), m, sub.mode));
-                        cd.plugins.push(sub.plugin.clone());
-                    }
-                }
-            }
-        }
-
-        // Emitters per event: members, core lifecycle, plus outside plugins that can
-        // reach this session (start-session initial events, cross-session publishes).
-        let mut emitters: BTreeMap<String, Vec<(String, Emit)>> = BTreeMap::new();
-        for (ev, keys) in CORE_EVENTS {
-            emitters.entry((*ev).to_owned()).or_default().push((
-                CORE.to_owned(),
-                Emit {
-                    event: (*ev).to_owned(),
-                    supplies: keys.iter().map(|k| (*k).to_owned()).collect(),
-                    deferred: false,
-                },
-            ));
-        }
-        let member_names: BTreeSet<&str> = members.iter().map(|m| m.1).collect();
-        for (name, m) in manifests.iter().filter(|(n, _)| active.contains_key(n)) {
-            let inside = member_names.contains(name.as_str());
-            let reaches = m.has(Capability::StartSession) || m.has(Capability::CrossSession);
-            if inside || reaches {
-                for e in &m.emits {
-                    emitters
-                        .entry(e.event.clone())
-                        .or_default()
-                        .push((name.clone(), e.clone()));
-                }
-            }
-            for e in m.emits.iter().filter(|_| inside) {
-                cd.edges.push(Edge {
-                    from: name.clone(),
-                    to: e.event.clone(),
-                    kind: "emits".into(),
-                    mode: None,
-                    deferred: e.deferred,
-                    keys: e.supplies.clone(),
-                });
-            }
-            if !inside && reaches {
-                for e in &m.emits {
-                    cd.edges.push(Edge {
-                        from: name.clone(),
-                        to: e.event.clone(),
-                        kind: "external".into(),
-                        mode: None,
-                        deferred: e.deferred,
-                        keys: e.supplies.clone(),
-                    });
-                }
-            }
-        }
-        for (ev, keys) in CORE_EVENTS {
-            cd.edges.push(Edge {
-                from: CORE.into(),
-                to: (*ev).into(),
-                kind: "emits".into(),
-                mode: None,
-                deferred: false,
-                keys: keys.iter().map(|k| (*k).to_owned()).collect(),
-            });
-        }
-
-        // Build slots per event name.
-        let mut wildcard_slots: Vec<Slot> = Vec::new();
-        let mut explicit: BTreeMap<String, Vec<Slot>> = BTreeMap::new();
-        let mut keyed: BTreeMap<String, Vec<(Slot, Keyed)>> = BTreeMap::new();
-        for (pos, name, m, override_mode) in &members {
-            for c in &m.consumes {
-                let mode = override_mode.or(c.mode).unwrap_or_default();
-                if let Some(k) = &c.keyed {
-                    if c.event == WILDCARD || mode != Mode::Async {
-                        cx.push(
-                            Severity::Error,
-                            "keyed-consumer",
-                            Some(name),
-                            Some(&c.event),
-                            "keyed (owner) consumers must name an event and run async: they execute, they do not gate".into(),
-                        );
-                        continue;
-                    }
-                    cd.edges.push(Edge {
-                        from: c.event.clone(),
-                        to: (*name).to_owned(),
-                        kind: "owns".into(),
-                        mode: Some(mode),
-                        deferred: false,
-                        keys: k.values.clone(),
-                    });
-                    keyed.entry(c.event.clone()).or_default().push((
-                        Slot {
-                            plugin: (*name).to_owned(),
-                            mode,
-                            position: *pos,
-                            demands: c.demands.clone(),
-                            context: c.context,
-                            wildcard: false,
-                            transform: None,
-                        },
-                        k.clone(),
-                    ));
-                    continue;
-                }
-                let transform = m.transform(&c.event).cloned();
-                if transform.is_some() && mode == Mode::Async {
-                    cx.push(
-                        Severity::Error,
-                        "async-transform",
-                        Some(name),
-                        Some(&c.event),
-                        "a transform requires blocking mode; async subscribers are read-only"
-                            .into(),
-                    );
-                }
-                let slot = Slot {
-                    plugin: (*name).to_owned(),
-                    mode,
-                    position: *pos,
-                    demands: c.demands.clone(),
-                    context: c.context,
-                    wildcard: c.event == WILDCARD,
-                    transform: if mode == Mode::Blocking {
-                        transform
-                    } else {
-                        None
-                    },
-                };
-                cd.edges.push(Edge {
-                    from: c.event.clone(),
-                    to: (*name).to_owned(),
-                    kind: "consumes".into(),
-                    mode: Some(mode),
-                    deferred: false,
-                    keys: c.demands.clone(),
-                });
-                if c.event == WILDCARD {
-                    wildcard_slots.push(slot);
-                } else {
-                    explicit.entry(c.event.clone()).or_default().push(slot);
-                }
-            }
-        }
-
-        let place = |mut slots: Vec<Slot>| -> Pipeline {
-            slots.extend(wildcard_slots.iter().cloned());
-            slots.sort_by_key(|s| (s.position, s.wildcard));
-            let (blocking, asyncs) = slots.into_iter().partition(|s| s.mode == Mode::Blocking);
-            Pipeline {
-                blocking,
-                asyncs,
-                routed: None,
-            }
-        };
-        cd.fallback = place(Vec::new());
-        let def_owners = &def.route_owners;
-        let mut routes: BTreeMap<String, RouteTable> = BTreeMap::new();
-        for (event, owners) in &keyed {
-            explicit.entry(event.clone()).or_default();
-            let table = build_routes(&mut cx, event, owners, def_owners.get(event));
-            routes.insert(event.clone(), table);
-        }
-        for (event, pins) in def_owners {
-            if !keyed.contains_key(event) {
-                for (value, plugin) in pins {
-                    cx.push(Severity::Error, "stale-route-owner", Some(plugin), Some(event), format!("route_owners pins `{value}` to `{plugin}`, but no member of this definition owns keyed `{event}` events"));
-                }
-            }
-        }
-
-        for (event, slots) in explicit {
-            let mut pipeline = place(slots);
-            pipeline.routed = routes.remove(&event);
-            if let Some(r) = &pipeline.routed {
-                for s in pipeline.asyncs.iter().filter(|s| !s.wildcard) {
-                    cx.push(Severity::Info, "unkeyed-consumer", Some(&s.plugin), Some(&event), format!("`{}` observes every `{event}` (it is not one of the keyed owners of `{}`); declare `keyed` values if it executes some of them", s.plugin, r.key));
-                }
-            }
-            let owner_slots: Vec<Slot> = keyed
-                .get(&event)
-                .map(|v| v.iter().map(|(s, _)| s.clone()).collect())
+            .plugins
+            .keys()
+            .any(|p| config.plugins.get(p).is_some_and(|c| c.disabled));
+        if host_scoped && !rev.ok {
+            let first = rev
+                .errors()
+                .first()
+                .map(|d| d.message.clone())
                 .unwrap_or_default();
-            // Dead listener: an explicit consumer of an event nobody can emit.
-            let ems = emitters.get(&event).cloned().unwrap_or_default();
-            if ems.is_empty() {
-                for s in pipeline
-                    .blocking
-                    .iter()
-                    .chain(&pipeline.asyncs)
-                    .chain(&owner_slots)
-                    .filter(|s| !s.wildcard)
-                {
-                    cx.push(Severity::Error, "dead-listener", Some(&s.plugin), Some(&event), format!("`{}` consumes `{event}` but no configured plugin emits it; this pipeline can never fire", s.plugin));
-                }
-            }
-            // Starved consumer: walk supply through the blocking transform chain.
-            for (emitter, emit) in &ems {
-                let base: BTreeSet<String> = emit.supplies.iter().cloned().collect();
-                let mut supply = base.clone();
-                for s in &pipeline.blocking {
-                    check_demands(&mut cx, s, &supply, emitter, &event);
-                    if let Some(t) = &s.transform {
-                        supply = walk_transform(&supply, t);
-                    }
-                }
-                for s in pipeline.asyncs.iter().chain(&owner_slots) {
-                    check_demands(&mut cx, s, &supply, emitter, &event);
-                }
-            }
-            cd.pipelines.insert(event, pipeline);
+            let mut d2 = Diags::new(config);
+            d2.def = Some(def_name.clone());
+            d2.base = format!("definitions.{def_name}");
+            d2.warn("definition-unavailable", None, None, &[], format!("`{def_name}` cannot run on this host (its disabled plugins leave it incomplete: {first}); skipped"));
+            all.extend(d2.out);
+            continue;
         }
-        let tables: BTreeMap<&String, &RouteTable> = cd
-            .pipelines
-            .iter()
-            .filter_map(|(e, p)| p.routed.as_ref().map(|r| (e, r)))
-            .collect();
-        if !tables.is_empty() {
-            cd.routes_revision = hash_json(&json!(tables))[..12].to_owned();
-        }
-
-        cd.cycles = find_cycles(&members);
-        for cycle in &cd.cycles {
-            cx.push(
-                Severity::Info,
-                "cycle",
-                None,
-                cycle.first().map(String::as_str),
-                format!(
-                    "event cycle {} is bounded at runtime by max_causal_depth={}",
-                    cycle.join(" → "),
-                    config.runtime.max_causal_depth
-                ),
-            );
-        }
-        if host_scoped {
-            let broken: Vec<Diagnostic> = cx.diags[first_diag..]
-                .iter()
-                .filter(|d| d.severity == Severity::Error)
-                .cloned()
-                .collect();
-            if let Some(first) = broken.first() {
-                cx.diags.retain(|d| {
-                    d.definition.as_deref() != Some(def_name.as_str())
-                        || d.severity != Severity::Error
-                });
-                cx.push(
-                    Severity::Warning,
-                    "definition-unavailable",
-                    None,
-                    None,
-                    format!(
-                        "`{def_name}` cannot run on this host (its disabled plugins leave it incomplete: {}); skipped",
-                        first.message
-                    ),
-                );
-                continue;
-            }
-        }
-        definitions.insert(def_name.clone(), cd);
+        // Plugin-level findings are already reported once for the deployment.
+        let dup = |d: &Diagnostic| {
+            deployment.iter().any(|x| {
+                x.code == d.code
+                    && x.event == d.event
+                    && x.plugins == d.plugins
+                    && x.message == d.message
+            })
+        };
+        all.extend(rev.diagnostics.iter().filter(|d| !dup(d)).cloned());
+        definitions.insert(def_name.clone(), rev);
     }
-    cx.def = None;
-
-    // External surface: every capability holder.
+    sort_diags(&mut all);
     let mut surface = Vec::new();
     for (name, m) in manifests.iter().filter(|(n, _)| active.contains_key(n)) {
         for cap in &m.capabilities {
             let deferred_events = if *cap == Capability::DeferredPublish {
-                m.emits
+                m.emit
                     .iter()
                     .filter(|e| e.deferred)
                     .map(|e| e.event.clone())
@@ -707,277 +918,1230 @@ pub fn compile(config: &DeploymentConfig, manifests: &BTreeMap<String, Manifest>
             });
         }
     }
-
     let stamps: BTreeMap<String, Stamp> = active
         .iter()
         .map(|(n, p)| ((*n).clone(), p.stamp()))
         .collect();
-    let used: BTreeMap<&String, &Manifest> = manifests
+    let used: BTreeMap<String, Manifest> = manifests
         .iter()
         .filter(|(n, _)| config.plugins.contains_key(*n))
+        .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let hash = hash_json(&json!({ "config": config, "manifests": used, "stamps": stamps }))[..16]
+    let hash = hash_json(
+        &json!({ "config": config.without_sources(), "manifests": used, "stamps": stamps }),
+    )[..16]
         .to_owned();
-    cx.diags.sort_by(|a, b| {
-        a.severity
-            .cmp(&b.severity)
-            .then(a.code.cmp(&b.code))
-            .then(a.definition.cmp(&b.definition))
-            .then(a.plugin.cmp(&b.plugin))
-            .then(a.event.cmp(&b.event))
-    });
-    let ok = !cx.diags.iter().any(|d| d.severity == Severity::Error);
+    let ok = !all.iter().any(|d| d.severity == Severity::Error);
     Compilation {
         hash,
         ok,
         config: config.clone(),
-        manifests: used
-            .into_iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        manifests: used,
         stamps,
         definitions,
-        diagnostics: cx.diags,
+        diagnostics: all,
         surface,
     }
 }
 
-/// Validate a plugin's tool declarations against its own consumes.
-fn check_tools(cx: &mut Ctx<'_>, name: &str, m: &Manifest) {
-    let mut seen = BTreeSet::new();
-    for t in &m.tools {
-        if !seen.insert(t.name.as_str()) {
-            cx.push(
-                Severity::Error,
-                "duplicate-tool",
-                Some(name),
-                None,
-                format!("tool `{}` is declared twice", t.name),
-            );
-        }
-        if !(t.parameters.is_null() || t.parameters.is_object()) {
-            cx.push(
-                Severity::Error,
-                "invalid-tool-schema",
-                Some(name),
-                None,
-                format!(
-                    "tool `{}`: parameters must be an object of properties",
-                    t.name
-                ),
-            );
-            continue;
-        }
-        let missing: Vec<&str> = t
-            .required
-            .iter()
-            .filter(|r| t.parameters.get(r.as_str()).is_none())
-            .map(String::as_str)
-            .collect();
-        if !missing.is_empty() {
-            cx.push(
-                Severity::Error,
-                "invalid-tool-schema",
-                Some(name),
-                None,
-                format!(
-                    "tool `{}` requires [{}] which its parameters do not define",
-                    t.name,
-                    missing.join(", ")
-                ),
-            );
-        }
-    }
-    // A plugin that declares tools and owns keyed events must own each tool.
-    let keyed: Vec<&Keyed> = m.consumes.iter().filter_map(|c| c.keyed.as_ref()).collect();
-    if keyed.is_empty() && !m.tools.is_empty() {
-        cx.push(Severity::Error, "missing-route-owner", Some(name), None, format!("`{name}` declares tools ({}) but owns no keyed event, so nothing would route them to it", m.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")));
-    }
-    if let [k] = keyed.as_slice() {
-        for t in &m.tools {
-            if !k.owns(&t.name) && !k.values.contains(&t.name) {
-                cx.push(Severity::Error, "undeclared-tool-route", Some(name), None, format!("tool `{}` is declared but `{name}` does not own it in its keyed consume (values: {})", t.name, k.values.join(", ")));
+/// Compile one definition (a named one, or one passed to `start-session`).
+#[must_use]
+pub fn compile_definition(
+    name: &str,
+    def: &Definition,
+    config: &DeploymentConfig,
+    manifests: &BTreeMap<String, Manifest>,
+) -> Revision {
+    let mut dx = Diags::new(config);
+    dx.def = Some(name.to_owned());
+    dx.base = if config.definitions.contains_key(name) {
+        format!("definitions.{name}")
+    } else {
+        format!("start-session.{name}")
+    };
+    let flat = flatten(&mut dx, name, def);
+    let flat = crate::embed::inline_workflows(
+        &mut EmbedCx { dx: &mut dx },
+        name,
+        &flat,
+        config,
+        manifests,
+    );
+    let mut c = DefCompiler::new(&mut dx, &flat, config, manifests);
+    c.run();
+    let (graph, report, plugins) = (c.graph, c.report, c.plugins);
+    let mut diags = std::mem::take(&mut dx.out);
+    if flat.deny_warnings {
+        for d in &mut diags {
+            if d.severity == Severity::Warning {
+                d.severity = Severity::Error;
+                d.message = format!("{} (deny_warnings)", d.message);
             }
         }
+    }
+    sort_diags(&mut diags);
+    let ok = !diags.iter().any(|d| d.severity == Severity::Error);
+    let core = core_manifest(&flat.runtime);
+    let unsourced: Vec<Diagnostic> = diags
+        .iter()
+        .map(|d| Diagnostic {
+            source: None,
+            ..d.clone()
+        })
+        .collect();
+    let mut def_hashed = flat.clone();
+    def_hashed.description = String::new();
+    let revision = hash_json(&json!({
+        "runtime": flat.runtime,
+        "core": core,
+        "definition": def_hashed,
+        "plugins": plugins,
+        "graph": graph,
+        "diagnostics": unsourced,
+    }))[..16]
+        .to_owned();
+    Revision {
+        revision,
+        name: name.to_owned(),
+        description: flat.description.clone(),
+        runtime: flat.runtime.clone(),
+        ok,
+        definition: flat,
+        plugins,
+        graph,
+        diagnostics: diags,
+        report,
     }
 }
 
-/// Compile the owner table of one keyed event, rejecting ambiguity.
-fn build_routes(
-    cx: &mut Ctx<'_>,
-    event: &str,
-    owners: &[(Slot, Keyed)],
-    pins: Option<&BTreeMap<String, String>>,
-) -> RouteTable {
-    let key = owners[0].1.key.clone();
-    for (slot, k) in owners.iter().filter(|(_, k)| k.key != key) {
-        cx.push(
-            Severity::Error,
-            "route-key-mismatch",
-            Some(&slot.plugin),
-            Some(event),
-            format!(
-                "`{}` keys `{event}` by `{}` but other owners key it by `{key}`",
-                slot.plugin, k.key
-            ),
-        );
+/// Context handed to the embedded-workflow inliner.
+pub(crate) struct EmbedCx<'x, 'a> {
+    dx: &'x mut Diags<'a>,
+}
+
+impl EmbedCx<'_, '_> {
+    pub(crate) fn error(
+        &mut self,
+        code: &str,
+        path: &str,
+        event: Option<&str>,
+        plugins: &[&str],
+        msg: String,
+    ) {
+        let p = self.dx.at(path);
+        self.dx.err(code, Some(p), event, plugins, msg);
     }
-    // Every claim: value -> claimants (exact and prefix claims kept apart).
-    let mut exact: BTreeMap<String, Vec<&Slot>> = BTreeMap::new();
-    let mut prefix: BTreeMap<String, Vec<&Slot>> = BTreeMap::new();
-    for (slot, k) in owners {
-        for v in &k.values {
-            match v.strip_suffix('*') {
-                Some(p) => prefix.entry(p.to_owned()).or_default().push(slot),
-                None => exact.entry(v.clone()).or_default().push(slot),
-            }
+}
+
+// ----------------------------------------------------------------------
+// The per-definition compiler.
+// ----------------------------------------------------------------------
+
+/// One emitter declaration feeding the session.
+#[derive(Clone)]
+struct Emitter {
+    from: String,
+    decl: EmitDecl,
+    via: Via,
+}
+
+struct SubRef<'m> {
+    plugin: String,
+    sub: &'m Subscription,
+}
+
+struct DefCompiler<'x, 'a, 'm> {
+    dx: &'x mut Diags<'a>,
+    def: &'m Definition,
+    config: &'m DeploymentConfig,
+    manifests: &'m BTreeMap<String, Manifest>,
+    members: BTreeMap<String, &'m Manifest>,
+    core: Option<Manifest>,
+    graph: Graph,
+    report: Report,
+    plugins: BTreeMap<String, Member>,
+    /// (plugin, subscription event, mode) → fed?
+    fed: BTreeMap<(String, String, Mode), bool>,
+}
+
+impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
+    fn new(
+        dx: &'x mut Diags<'a>,
+        def: &'m Definition,
+        config: &'m DeploymentConfig,
+        manifests: &'m BTreeMap<String, Manifest>,
+    ) -> Self {
+        Self {
+            dx,
+            def,
+            config,
+            manifests,
+            members: BTreeMap::new(),
+            core: None,
+            graph: Graph::default(),
+            report: Report::default(),
+            plugins: BTreeMap::new(),
+            fed: BTreeMap::new(),
         }
     }
-    let empty = BTreeMap::new();
-    let pins = pins.unwrap_or(&empty);
-    for (value, plugin) in pins {
-        let claimed = exact
-            .get(value)
-            .into_iter()
-            .chain(prefix.get(value.trim_end_matches('*')))
-            .flatten()
-            .any(|s| &s.plugin == plugin)
-            || prefix.iter().any(|(p, ss)| {
-                value.starts_with(p.as_str()) && ss.iter().any(|s| &s.plugin == plugin)
-            });
-        if !claimed {
-            cx.push(Severity::Error, "stale-route-owner", Some(plugin), Some(event), format!("route_owners pins `{event}` `{value}` to `{plugin}`, which does not own it in this definition (stale or disabled plugin?)"));
-        }
+
+    fn at(&self, sub: &str) -> Option<String> {
+        Some(self.dx.at(sub))
     }
-    let pick = |cx: &mut Ctx<'_>, value: &str, claimants: &[&Slot]| -> Option<Slot> {
-        let mut distinct: Vec<&Slot> = Vec::new();
-        for s in claimants {
-            if !distinct.iter().any(|d| d.plugin == s.plugin) {
-                distinct.push(s);
-            }
+
+    fn run(&mut self) {
+        self.resolve();
+        if self.core.is_none() {
+            return;
         }
-        if let Some(plugin) = pins.get(value) {
-            return distinct
-                .iter()
-                .find(|s| &s.plugin == plugin)
-                .map(|s| (*s).clone());
-        }
-        if distinct.len() > 1 {
-            let names: Vec<&str> = distinct.iter().map(|s| s.plugin.as_str()).collect();
-            cx.push(Severity::Error, "duplicate-route-owner", Some(names[1]), Some(event), format!("`{event}` `{value}` is owned by more than one plugin ({}); remove one or pin it with route_owners", names.join(", ")));
-            return None;
-        }
-        distinct.first().map(|s| (*s).clone())
-    };
-    let mut table = RouteTable {
-        key,
-        ..Default::default()
-    };
-    for (value, claimants) in &exact {
-        // An exact value also claimed through another plugin's prefix is ambiguous.
-        let mut all: Vec<&Slot> = claimants.clone();
-        for (p, ss) in &prefix {
-            if value.starts_with(p.as_str()) {
-                all.extend(
-                    ss.iter()
-                        .copied()
-                        .filter(|s| !claimants.iter().any(|c| c.plugin == s.plugin)),
+        let emitters = self.emitters();
+        self.check_self_subscription();
+        self.check_phases();
+        self.check_slots();
+        self.build(&emitters);
+        self.check_handler_picks();
+        self.analyse(&emitters);
+        self.report_sections(&emitters);
+    }
+
+    /// Resolve: the core manifest for the target runtime and every member's manifest.
+    fn resolve(&mut self) {
+        let def = self.def;
+        if def.runtime.is_empty() {
+            let p = self.at("runtime");
+            self.dx.err("missing-runtime", p, None, &[], format!("a session definition names the runtime version it targets (`runtime = \"{}\"`)", crate::core_manifest::RUNTIME_VERSION));
+        } else {
+            self.core = core_manifest(&def.runtime);
+            if self.core.is_none() {
+                let p = self.at("runtime");
+                self.dx.err(
+                    "unknown-runtime",
+                    p,
+                    None,
+                    &[],
+                    format!(
+                        "runtime {} is not supported by this build (supported: {})",
+                        def.runtime,
+                        crate::core_manifest::SUPPORTED_RUNTIMES.join(", ")
+                    ),
                 );
             }
         }
-        if let Some(slot) = pick(cx, value, &all) {
-            table.exact.insert(value.clone(), slot);
+        let mut seen_phase = BTreeSet::new();
+        for ph in &def.phases {
+            if !seen_phase.insert(ph) {
+                let p = self.at("phases");
+                self.dx.err(
+                    "duplicate-phase",
+                    p,
+                    None,
+                    &[],
+                    format!("phase `{ph}` is listed twice"),
+                );
+            }
         }
-    }
-    let prefixes: Vec<&String> = prefix.keys().collect();
-    for (p, claimants) in &prefix {
-        let mut all: Vec<&Slot> = claimants.clone();
-        for other in prefixes
-            .iter()
-            .filter(|o| **o != p && (o.starts_with(p.as_str()) || p.starts_with(o.as_str())))
-        {
-            all.extend(
-                prefix[*other]
-                    .iter()
-                    .copied()
-                    .filter(|s| !claimants.iter().any(|c| c.plugin == s.plugin)),
-            );
+        for name in def.plugins.keys() {
+            let path = self.at(&format!("plugins.{name}"));
+            match self.config.plugins.get(name) {
+                None => self.dx.err(
+                    "unknown-plugin",
+                    path,
+                    None,
+                    &[name],
+                    format!("definition references unknown plugin `{name}`"),
+                ),
+                Some(p) if p.disabled => self.dx.info(
+                    "disabled-plugin",
+                    path,
+                    None,
+                    &[name],
+                    format!("`{name}` is disabled on this host and skipped"),
+                ),
+                Some(pc) => match self.manifests.get(name) {
+                    Some(m) => {
+                        check_manifest(self.dx, name, m, Some(format!("plugins.{name}")));
+                        self.members.insert(name.clone(), m);
+                        self.plugins.insert(
+                            name.clone(),
+                            Member {
+                                manifest: m.clone(),
+                                stamp: pc.stamp(),
+                                config: pc.clone(),
+                                member: true,
+                            },
+                        );
+                    }
+                    None => self.dx.err(
+                        "missing-manifest",
+                        path,
+                        None,
+                        &[name],
+                        format!(
+                            "plugin `{name}` produced no manifest (failed to start or handshake?)"
+                        ),
+                    ),
+                },
+            }
         }
-        if let Some(slot) = pick(cx, &format!("{p}*"), &all) {
-            table.prefixes.push(PrefixRoute {
-                prefix: p.clone(),
-                slot,
-            });
-        }
-    }
-    table
-}
-
-fn check_demands(
-    cx: &mut Ctx<'_>,
-    slot: &Slot,
-    supply: &BTreeSet<String>,
-    emitter: &str,
-    event: &str,
-) {
-    let missing: Vec<&str> = slot
-        .demands
-        .iter()
-        .filter(|d| strip_optional(d).is_none() && !covers(supply, d))
-        .map(String::as_str)
-        .collect();
-    if !missing.is_empty() {
-        cx.push(
-            Severity::Error,
-            "starved-consumer",
-            Some(&slot.plugin),
-            Some(event),
-            format!("`{}` demands [{}] on `{event}` but emitter `{emitter}` (after upstream transforms) does not supply them", slot.plugin, missing.join(", ")),
-        );
-    }
-}
-
-/// Strongly connected components of the event graph (consume E → emit F).
-fn find_cycles(members: &[(usize, &str, &Manifest, Option<Mode>)]) -> Vec<Vec<String>> {
-    let mut graph: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for (_, _, m, _) in members {
-        for c in m.consumes.iter().filter(|c| c.event != WILDCARD) {
-            for e in &m.emits {
-                graph
-                    .entry(c.event.clone())
-                    .or_default()
-                    .insert(e.event.clone());
+        // External starters: plugins outside the session holding start-session.
+        for (name, pc) in self.config.plugins.iter().filter(|(_, p)| !p.disabled) {
+            if self.members.contains_key(name) {
+                continue;
+            }
+            if let Some(m) = self
+                .manifests
+                .get(name)
+                .filter(|m| m.has(Capability::StartSession))
+            {
+                self.plugins.insert(
+                    name.clone(),
+                    Member {
+                        manifest: m.clone(),
+                        stamp: pc.stamp(),
+                        config: pc.clone(),
+                        member: false,
+                    },
+                );
             }
         }
     }
-    // Tarjan's algorithm, iterative over sorted nodes for determinism.
+
+    /// Every emitter declaration feeding this session.
+    fn emitters(&mut self) -> Vec<Emitter> {
+        let mut out = Vec::new();
+        if let Some(core) = &self.core {
+            for e in &core.emit {
+                out.push(Emitter {
+                    from: BOUNDARY.into(),
+                    decl: e.clone(),
+                    via: Via::Core,
+                });
+            }
+        }
+        for (ev, keys) in &self.def.inbound {
+            let path = self.at(&format!("inbound.{ev}"));
+            if let Some(why) = pattern_error(ev, true)
+                .or_else(|| is_family(ev).then(|| "inbound events are single events".into()))
+            {
+                self.dx.err(
+                    "invalid-event",
+                    path,
+                    Some(ev),
+                    &[],
+                    format!("inbound: {why}"),
+                );
+                continue;
+            }
+            if self.core.as_ref().is_some_and(|c| c.emit_for(ev).is_some()) {
+                self.dx.err(
+                    "invalid-event",
+                    path,
+                    Some(ev),
+                    &[],
+                    format!("`{ev}` is a core event; it cannot also be inbound"),
+                );
+                continue;
+            }
+            out.push(Emitter {
+                from: BOUNDARY.into(),
+                decl: EmitDecl {
+                    event: ev.clone(),
+                    lane: Lane::Normal,
+                    deferred: false,
+                    exactly_one_handler: false,
+                    keys: keys.clone(),
+                },
+                via: Via::Inbound,
+            });
+        }
+        for (name, m) in &self.members {
+            for e in m
+                .emit
+                .iter()
+                .filter(|e| pattern_error(&e.event, true).is_none())
+            {
+                out.push(Emitter {
+                    from: name.clone(),
+                    decl: e.clone(),
+                    via: Via::Emit,
+                });
+            }
+        }
+        for (name, member) in self.plugins.iter().filter(|(_, m)| !m.member) {
+            for e in member
+                .manifest
+                .emit
+                .iter()
+                .filter(|e| pattern_error(&e.event, true).is_none() && !is_family(&e.event))
+            {
+                out.push(Emitter {
+                    from: name.clone(),
+                    decl: e.clone(),
+                    via: Via::StartSession,
+                });
+            }
+        }
+        out
+    }
+
+    fn subs(&self) -> Vec<SubRef<'m>> {
+        let mut out = Vec::new();
+        for (name, m) in &self.members {
+            for s in m
+                .subscribe
+                .iter()
+                .filter(|s| pattern_error(&s.event, false).is_none())
+            {
+                out.push(SubRef {
+                    plugin: name.clone(),
+                    sub: s,
+                });
+            }
+        }
+        out
+    }
+
+    /// A plugin emits and subscribes to the same event name, including through a family.
+    fn check_self_subscription(&mut self) {
+        let members: Vec<(String, &'m Manifest)> =
+            self.members.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for (name, m) in members {
+            for s in m.subscribe.iter().filter(|s| !s.wildcard()) {
+                for e in &m.emit {
+                    if crate::manifest::patterns_overlap(&s.event, &e.event) {
+                        let path = self.at(&format!("plugins.{name}"));
+                        let via = if s.event == e.event {
+                            String::new()
+                        } else {
+                            format!(
+                                " (through `{}`)",
+                                if is_family(&e.event) {
+                                    &e.event
+                                } else {
+                                    &s.event
+                                }
+                            )
+                        };
+                        self.dx.err("self-subscription", path, Some(&s.event), &[&name], format!("`{name}` subscribes to `{}` and emits `{}`{via}: a plugin may not consume its own emits; emit a different event and let another plugin react to it", s.event, e.event));
+                    }
+                }
+            }
+        }
+    }
+
+    fn phase_of(&self, plugin: &str, sub: &Subscription) -> Option<&'m str> {
+        let entry: &'m DefPlugin = self.def.plugins.get(plugin)?;
+        entry
+            .phases
+            .get(&sub.event)
+            .or(entry.phase.as_ref())
+            .map(String::as_str)
+    }
+
+    fn check_phases(&mut self) {
+        let def = self.def;
+        for sr in self.subs() {
+            if sr.sub.mode != Mode::Blocking {
+                continue;
+            }
+            let path = self.at(&format!("plugins.{}", sr.plugin));
+            match self.phase_of(&sr.plugin, sr.sub) {
+                None => self.dx.err("missing-phase", path, Some(&sr.sub.event), &[&sr.plugin], format!("`{}` is a blocking subscriber of `{}` but has no phase; set `phase` for the plugin (or `phases.\"{}\"` for this event) in the definition", sr.plugin, sr.sub.event, sr.sub.event)),
+                Some(ph) if !def.phases.iter().any(|p| p == ph) => self.dx.err("unknown-phase", path, Some(&sr.sub.event), &[&sr.plugin], format!("`{}` is assigned phase `{ph}`, which is not in the definition's phases [{}]", sr.plugin, def.phases.join(", "))),
+                Some(_) => {}
+            }
+        }
+        for (plugin, entry) in &def.plugins {
+            let Some(m) = self.members.get(plugin) else {
+                continue;
+            };
+            for ev in entry.phases.keys() {
+                if !m
+                    .subscribe
+                    .iter()
+                    .any(|s| &s.event == ev && s.mode == Mode::Blocking)
+                {
+                    let path = self.at(&format!("plugins.{plugin}"));
+                    self.dx.err("stale-phase", path, Some(ev), &[plugin], format!("phase override for `{ev}`, but `{plugin}` has no blocking subscription to `{ev}`"));
+                }
+            }
+        }
+    }
+
+    fn check_slots(&mut self) {
+        let slots = self.def.effective_slots();
+        for sr in self.subs() {
+            for (slot, want) in &sr.sub.receives.slots {
+                let path = self.at(&format!("plugins.{}", sr.plugin));
+                match slots.get(slot) {
+                    None => self.dx.err("unknown-slot", path, Some(&sr.sub.event), &[&sr.plugin], format!("`{}` requests slot `{slot}` on `{}`, which the definition does not declare (slots: {})", sr.plugin, sr.sub.event, slots.keys().cloned().collect::<Vec<_>>().join(", "))),
+                    Some(have) => {
+                        if let Err(e) = compatible(&have.shape, &want.shape, slot) {
+                            self.dx.push(D { sev: Severity::Error, code: "shape-mismatch", path, event: Some(&sr.sub.event), key: Some(format!("slots.{}", e.path)), plugins: vec![sr.plugin.clone()] }, format!("slot `{slot}` is `{}` in the definition but `{}` requests `{}` ({e})", have.shape, sr.plugin, want.shape));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The classes an emitter declaration splits into.
+    fn classes(&self, e: &Emitter, subs: &[SubRef<'m>]) -> Vec<String> {
+        if !is_family(&e.decl.event) {
+            return vec![e.decl.event.clone()];
+        }
+        let fam = &e.decl.event;
+        let mut out: BTreeSet<String> = BTreeSet::from([fam.clone()]);
+        for sr in subs {
+            let p = &sr.sub.event;
+            if p != fam && p != WILDCARD && pattern_contains(fam, p) {
+                out.insert(p.clone());
+            }
+        }
+        if e.decl.exactly_one_handler {
+            for k in self.def.handlers.keys() {
+                if k != fam && pattern_contains(fam, k) {
+                    out.insert(k.clone());
+                }
+            }
+        }
+        out.into_iter().collect()
+    }
+
+    /// The tie-break list that orders `class` in `phase`.
+    fn order_list(&self, class: &str, emit: &str, phase: &str) -> Option<&'m Vec<String>> {
+        self.order_entry(class, emit, phase).map(|(_, l)| l)
+    }
+
+    /// The tie-break list for `class` in `phase`, with the event key it is written under.
+    fn order_entry(
+        &self,
+        class: &str,
+        emit: &str,
+        phase: &str,
+    ) -> Option<(&'m str, &'m Vec<String>)> {
+        let order: &'m BTreeMap<String, BTreeMap<String, Vec<String>>> = &self.def.order;
+        let base = emit.strip_suffix("/*");
+        let mut keys: Vec<&str> = vec![class];
+        if is_family(emit) {
+            keys.push(emit);
+        }
+        if let Some(b) = base {
+            keys.push(b);
+        }
+        for k in keys {
+            if let Some((key, by_phase)) = order.get_key_value(k)
+                && let Some(l) = by_phase.get(phase)
+            {
+                return Some((key.as_str(), l));
+            }
+        }
+        order
+            .iter()
+            .filter(|(k, _)| {
+                (is_family(k) && pattern_contains(k, class)) || class.starts_with(&format!("{k}/"))
+            })
+            .max_by_key(|(k, _)| k.len())
+            .and_then(|(k, p)| p.get(phase).map(|l| (k.as_str(), l)))
+    }
+
+    /// Listed in the definition but disabled on this host (skipped, not stale).
+    fn host_disabled(&self, plugin: &str) -> bool {
+        self.def.plugins.contains_key(plugin)
+            && self.config.plugins.get(plugin).is_some_and(|p| p.disabled)
+    }
+
+    fn wildcard_subscribers(&self) -> BTreeSet<String> {
+        self.members
+            .iter()
+            .filter(|(_, m)| m.subscribe.iter().any(Subscription::wildcard))
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
+
+    fn build(&mut self, emitters: &[Emitter]) {
+        let subs = self.subs();
+        let wild = self.wildcard_subscribers();
+        for sr in &subs {
+            self.fed.insert(
+                (sr.plugin.clone(), sr.sub.event.clone(), sr.sub.mode),
+                false,
+            );
+        }
+        let mut fixed: BTreeSet<String> = BTreeSet::new();
+        for e in emitters {
+            for class in self.classes(e, &subs) {
+                // Destinations of this class, by the expansion rules.
+                let mut dests: Vec<&SubRef<'m>> = Vec::new();
+                for sr in &subs {
+                    let p = &sr.sub.event;
+                    if sr.sub.wildcard() {
+                        // A wildcard subscriber never receives its own plugin's emits,
+                        // nor events emitted by any wildcard subscriber.
+                        if sr.plugin == e.from || wild.contains(&e.from) {
+                            continue;
+                        }
+                    } else if !pattern_contains(p, &class) || sr.plugin == e.from {
+                        continue;
+                    }
+                    dests.push(sr);
+                }
+                // Family handlers: narrower-than-family async subscriptions.
+                let mut handler_idx: Option<usize> = None;
+                if e.decl.exactly_one_handler {
+                    let cands: Vec<usize> = dests
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, d)| is_handler_sub(&e.decl.event, d.sub))
+                        .map(|(i, _)| i)
+                        .collect();
+                    let pick = self.pick_for(&class, &e.decl.event);
+                    let chosen = if cands.len() > 1 {
+                        match pick {
+                            Some((key, plugin)) => match cands
+                                .iter()
+                                .find(|i| dests[**i].plugin == plugin)
+                            {
+                                Some(i) => Some(*i),
+                                None => {
+                                    let names: Vec<&str> =
+                                        cands.iter().map(|i| dests[*i].plugin.as_str()).collect();
+                                    let path = self.at(&format!("handlers.{key}"));
+                                    let mut ps = names.clone();
+                                    ps.push(plugin);
+                                    self.dx.err("stale-handler-pick", path, Some(&class), &ps, format!("the handler pick for `{key}` names `{plugin}`, but the possible handlers of `{class}` are {}", names.join(", ")));
+                                    None
+                                }
+                            },
+                            None => {
+                                let names: Vec<&str> =
+                                    cands.iter().map(|i| dests[*i].plugin.as_str()).collect();
+                                let path = self.at("handlers");
+                                self.dx.err("missing-handler-pick", path, Some(&class), &names, format!("`{class}` (family `{}`, exactly one handler) has {} possible handlers ({}); pick one: `handlers.\"{class}\" = \"{}\"`", e.decl.event, names.len(), names.join(", "), names[0]));
+                                None
+                            }
+                        }
+                    } else {
+                        cands.first().copied()
+                    };
+                    // Possible handlers that were not chosen get no edge for this class.
+                    let losers: BTreeSet<usize> = cands
+                        .iter()
+                        .copied()
+                        .filter(|i| Some(*i) != chosen)
+                        .collect();
+                    let chosen_plugin = chosen.map(|i| dests[i].plugin.clone());
+                    dests = dests
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(i, _)| !losers.contains(i))
+                        .map(|(_, d)| d)
+                        .collect();
+                    handler_idx = chosen_plugin.and_then(|p| {
+                        dests
+                            .iter()
+                            .position(|d| d.plugin == p && is_handler_sub(&e.decl.event, d.sub))
+                    });
+                    if let Some(i) = handler_idx {
+                        self.report
+                            .families
+                            .entry(e.decl.event.clone())
+                            .or_default()
+                            .insert(&class, &dests[i].plugin);
+                    }
+                }
+                // Order the blocking chain.
+                let mut blocking: Vec<(usize, usize, String, usize)> = Vec::new(); // (phase_idx, listed rank, plugin, dest idx)
+                for (i, d) in dests
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.sub.mode == Mode::Blocking)
+                {
+                    let Some(ph) = self.phase_of(&d.plugin, d.sub) else {
+                        continue;
+                    };
+                    let Some(pi) = self.def.phases.iter().position(|p| p == ph) else {
+                        continue;
+                    };
+                    let listed = self
+                        .order_list(&class, &e.decl.event, ph)
+                        .and_then(|l| l.iter().position(|x| *x == d.plugin))
+                        .unwrap_or(usize::MAX);
+                    blocking.push((pi, listed, d.plugin.clone(), i));
+                }
+                blocking.sort();
+                self.check_ties(e, &class, &dests, &blocking, &mut fixed);
+                self.check_tie_lists(&class, &e.decl.event, &dests);
+                // Walk supply through the chain and lay down the edges.
+                let mut supply = e.decl.keys.clone();
+                let mut route = Route {
+                    from: e.from.clone(),
+                    emit: e.decl.event.clone(),
+                    class: class.clone(),
+                    blocking: Vec::new(),
+                    asyncs: Vec::new(),
+                    handler: None,
+                    exactly_one_handler: e.decl.exactly_one_handler,
+                };
+                let mut rank_in_phase: BTreeMap<usize, usize> = BTreeMap::new();
+                for (chain, (pi, _, _, di)) in blocking.iter().enumerate() {
+                    let d = dests[*di];
+                    let r = rank_in_phase.entry(*pi).or_default();
+                    let position = Position {
+                        phase: self.def.phases[*pi].clone(),
+                        phase_index: *pi,
+                        rank: *r,
+                        chain,
+                    };
+                    *r += 1;
+                    self.check_receives(e, &class, d, &supply);
+                    let idx = self.push_edge(e, &class, d, Some(position), &supply, false);
+                    route.blocking.push(idx);
+                    supply = self.walk_returns(e, &class, d, supply);
+                }
+                for (i, d) in dests
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, d)| d.sub.mode == Mode::Async)
+                {
+                    self.check_receives(e, &class, d, &supply);
+                    let is_handler = handler_idx == Some(i);
+                    let idx = self.push_edge(e, &class, d, None, &supply, is_handler);
+                    if is_handler {
+                        route.handler = Some(idx);
+                    } else {
+                        route.asyncs.push(idx);
+                    }
+                }
+                if !route.blocking.is_empty()
+                    || !route.asyncs.is_empty()
+                    || route.handler.is_some()
+                    || route.exactly_one_handler
+                {
+                    self.graph.routes.push(route);
+                }
+            }
+        }
+        for f in fixed {
+            self.report.fixed_orders.push(f);
+        }
+    }
+
+    fn pick_for(&self, class: &str, family: &str) -> Option<(&'m str, &'m str)> {
+        self.def
+            .handlers
+            .iter()
+            .filter(|(k, _)| {
+                pattern_contains(family, k)
+                    && (k.as_str() == class || (is_family(k) && pattern_contains(k, class)))
+            })
+            .max_by_key(|(k, _)| (!is_family(k), k.len()))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    fn check_handler_picks(&mut self) {
+        let handlers = self.def.handlers.clone();
+        for (k, plugin) in &handlers {
+            if self.host_disabled(plugin) {
+                continue;
+            }
+            let path = self.at(&format!("handlers.{k}"));
+            let resolved =
+                self.report.families.values().any(|f| {
+                    f.members.get(k) == Some(plugin) || f.subfamilies.get(k) == Some(plugin)
+                });
+            let mentioned = self
+                .graph
+                .routes
+                .iter()
+                .any(|r| r.exactly_one_handler && pattern_contains(&r.emit, k));
+            if !mentioned {
+                self.dx.err("stale-handler-pick", path, Some(k), &[plugin], format!("handler pick `{k}` → `{plugin}`, but no member of this definition emits an exactly-one-handler family containing `{k}`"));
+            } else if !resolved
+                && !self
+                    .dx
+                    .out
+                    .iter()
+                    .any(|d| d.code == "stale-handler-pick" && d.event.as_deref() == Some(k))
+            {
+                self.dx.err("stale-handler-pick", path, Some(k), &[plugin], format!("handler pick `{k}` → `{plugin}`, but `{plugin}` is not a possible handler of `{k}` in this definition (disabled, or not subscribed to it)"));
+            }
+        }
+    }
+
+    /// Observable ties inside a phase (compiler.md §6).
+    fn check_ties(
+        &mut self,
+        e: &Emitter,
+        class: &str,
+        dests: &[&SubRef<'m>],
+        blocking: &[(usize, usize, String, usize)],
+        fixed: &mut BTreeSet<String>,
+    ) {
+        for (i, a) in blocking.iter().enumerate() {
+            for b in &blocking[i + 1..] {
+                if a.0 != b.0 {
+                    continue;
+                }
+                let both_listed = a.1 != usize::MAX && b.1 != usize::MAX;
+                let (sa, sb) = (dests[a.3].sub, dests[b.3].sub);
+                let reason = tie_reason(sa, sb)
+                    .or_else(|| tie_reason(sb, sa))
+                    .or_else(|| {
+                        if sa.has_action(ACTION_CONTRIBUTE) && sb.has_action(ACTION_CONTRIBUTE) {
+                            Some("both contribute context".to_owned())
+                        } else if sa.has_action(ACTION_VETO) || sb.has_action(ACTION_VETO) {
+                            let who = if sa.has_action(ACTION_VETO) {
+                                &a.2
+                            } else {
+                                &b.2
+                            };
+                            Some(format!("`{who}` can veto"))
+                        } else {
+                            None
+                        }
+                    });
+                let phase = &self.def.phases[a.0];
+                match reason {
+                    Some(why) if !both_listed => {
+                        let path = self.at("order");
+                        self.dx.err("observable-tie", path, Some(class), &[&a.2, &b.2], format!("`{}` and `{}` are both in phase `{phase}` for `{class}` and {why}; order them: `order.\"{}\".{phase} = [\"{}\", \"{}\"]`", a.2, b.2, if is_family(&e.decl.event) { e.decl.event.trim_end_matches("/*") } else { class }, a.2, b.2));
+                    }
+                    None if !both_listed => {
+                        fixed.insert(format!(
+                            "{class} [{phase}]: {} before {} (no observable tie; by name)",
+                            a.2, b.2
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Tie-break lists that name a plugin with no blocking edge there.
+    fn check_tie_lists(&mut self, class: &str, emit: &str, dests: &[&SubRef<'m>]) {
+        let phases: Vec<String> = self.def.phases.clone();
+        for ph in phases {
+            let Some((key, list)) = self.order_entry(class, emit, &ph) else {
+                continue;
+            };
+            for p in list {
+                if self.host_disabled(p) {
+                    continue;
+                }
+                let present = dests.iter().any(|d| {
+                    d.plugin == *p
+                        && d.sub.mode == Mode::Blocking
+                        && self.phase_of(&d.plugin, d.sub) == Some(ph.as_str())
+                });
+                let anywhere = self.members.contains_key(p);
+                let path = self.at(&format!("order.{key}.{ph}"));
+                if !anywhere {
+                    self.dx.err("stale-tie-break", path, Some(class), &[p], format!("tie-break for `{class}` phase `{ph}` names `{p}`, which is not a plugin of this definition"));
+                } else if !present && dests.iter().any(|d| d.plugin == *p) {
+                    self.dx.err("stale-tie-break", path, Some(class), &[p], format!("tie-break for `{class}` phase `{ph}` names `{p}`, which is not a blocking subscriber of `{class}` in phase `{ph}`"));
+                }
+            }
+        }
+        for (ev, by_phase) in &self.def.order {
+            for ph in by_phase.keys() {
+                if !self.def.phases.contains(ph) {
+                    let path = self.at("order");
+                    self.dx.err("unknown-phase", path, Some(ev), &[], format!("tie-break for `{ev}` names phase `{ph}`, which is not in the definition's phases"));
+                }
+            }
+        }
+    }
+
+    fn check_receives(&mut self, e: &Emitter, class: &str, d: &SubRef<'m>, supply: &Keys) {
+        for mm in keys_mismatches(supply, &d.sub.receives.keys, "") {
+            let code = match mm.kind {
+                MismatchKind::Missing { .. } => "starved-consumer",
+                MismatchKind::Incompatible { .. } => "shape-mismatch",
+            };
+            let path = self.at(&format!("plugins.{}", d.plugin));
+            self.dx.push(
+                D {
+                    sev: Severity::Error,
+                    code,
+                    path,
+                    event: Some(class),
+                    key: Some(mm.path.clone()),
+                    plugins: vec![e.from.clone(), d.plugin.clone()],
+                },
+                format!(
+                    "on the `{} → {}` edge for `{class}`: {mm}",
+                    e.from, d.plugin
+                ),
+            );
+        }
+    }
+
+    fn walk_returns(&mut self, e: &Emitter, class: &str, d: &SubRef<'m>, mut supply: Keys) -> Keys {
+        for (k, r) in &d.sub.returns {
+            match supply.get(k) {
+                Some(have) => {
+                    if let Err(mm) = compatible(&r.shape, &have.shape, k) {
+                        let path = self.at(&format!("plugins.{}", d.plugin));
+                        self.dx.push(D { sev: Severity::Error, code: "returns-shape-conflict", path, event: Some(class), key: Some(mm.path.clone()), plugins: vec![e.from.clone(), d.plugin.clone()] }, format!("`{}` returns `{k}` as `{}`, but `{}` supplies it as `{}` on `{class}`; a return keeps the key's shape", d.plugin, r.shape, e.from, have.shape));
+                    } else if !r.optional {
+                        // Always returned: from here on the key is present, with the returned shape.
+                        supply.insert(k.clone(), KeyDecl::required(r.shape.clone()));
+                    }
+                }
+                None => {
+                    supply.insert(k.clone(), r.clone());
+                }
+            }
+        }
+        supply
+    }
+
+    fn push_edge(
+        &mut self,
+        e: &Emitter,
+        class: &str,
+        d: &SubRef<'m>,
+        position: Option<Position>,
+        supply: &Keys,
+        handler: bool,
+    ) -> usize {
+        if let Some(f) = self
+            .fed
+            .get_mut(&(d.plugin.clone(), d.sub.event.clone(), d.sub.mode))
+        {
+            *f = true;
+        }
+        self.graph.edges.push(Edge {
+            from: e.from.clone(),
+            event: class.to_owned(),
+            emit: e.decl.event.clone(),
+            to: d.plugin.clone(),
+            subscription: d.sub.event.clone(),
+            mode: d.sub.mode,
+            position,
+            lane: e.decl.lane,
+            supply: supply.clone(),
+            slots: d.sub.receives.slots.keys().cloned().collect(),
+            handler,
+            deferred: e.decl.deferred,
+            via: e.via,
+        });
+        self.graph.edges.len() - 1
+    }
+
+    /// Connectivity, reachability, and cycles.
+    fn analyse(&mut self, emitters: &[Emitter]) {
+        // Nodes.
+        self.graph.nodes.push(Node {
+            name: BOUNDARY.into(),
+            kind: NodeKind::Boundary,
+            sink: false,
+        });
+        for (name, m) in &self.plugins {
+            self.graph.nodes.push(Node {
+                name: name.clone(),
+                kind: if m.member {
+                    NodeKind::Plugin
+                } else {
+                    NodeKind::External
+                },
+                sink: m.manifest.sink,
+            });
+        }
+        // Never fires / unfed subscriptions.
+        let members: Vec<(String, &'m Manifest)> =
+            self.members.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        for (name, m) in &members {
+            let path = self.at(&format!("plugins.{name}"));
+            let subs: Vec<&Subscription> = m
+                .subscribe
+                .iter()
+                .filter(|s| pattern_error(&s.event, false).is_none())
+                .collect();
+            let fed: Vec<bool> = subs
+                .iter()
+                .map(|s| {
+                    self.fed
+                        .get(&(name.clone(), s.event.clone(), s.mode))
+                        .copied()
+                        .unwrap_or(false)
+                })
+                .collect();
+            if !fed.iter().any(|f| *f) {
+                let list: Vec<&str> = subs.iter().map(|s| s.event.as_str()).collect();
+                self.dx.err("never-fires", path, None, &[name], if list.is_empty() {
+                    format!("`{name}` subscribes to nothing, so it can never be invoked in this session")
+                } else {
+                    format!("`{name}` never fires: nothing in this definition emits any event it subscribes to ({})", list.join(", "))
+                });
+                continue;
+            }
+            for (s, f) in subs.iter().zip(&fed) {
+                if !f {
+                    self.dx.warn("unfed-subscription", path.clone(), Some(&s.event), &[name], format!("`{name}` subscribes to `{}`, which nothing in this definition emits and no `inbound` declares", s.event));
+                }
+            }
+        }
+        // No effect.
+        for (name, m) in &members {
+            let consumed = self.graph.edges.iter().any(|e| e.from == *name);
+            let returns = m.subscribe.iter().any(|s| !s.returns.is_empty());
+            let actions = m.subscribe.iter().any(|s| !s.actions.is_empty());
+            let outbound = !m.outbound.is_empty();
+            if !(consumed || returns || actions || outbound || m.sink) {
+                let path = self.at(&format!("plugins.{name}"));
+                self.dx.warn("no-effect", path, None, &[name], format!("`{name}` has no effect here: none of its emits is consumed, it returns no keys, declares no actions, sends nothing outbound, and is not a `sink`"));
+            }
+        }
+        // Reachability from roots.
+        let mut reached: BTreeSet<String> = BTreeSet::new();
+        let mut queue: VecDeque<String> = VecDeque::new();
+        let starters: BTreeSet<String> = self
+            .plugins
+            .iter()
+            .filter(|(_, m)| m.manifest.has(Capability::StartSession))
+            .map(|(n, _)| n.clone())
+            .collect();
+        for e in &self.graph.edges {
+            let root = e.from == BOUNDARY
+                || e.deferred
+                || e.via == Via::StartSession
+                || starters.contains(&e.from);
+            if root && reached.insert(e.to.clone()) {
+                queue.push_back(e.to.clone());
+            }
+        }
+        while let Some(p) = queue.pop_front() {
+            for e in self.graph.edges.iter().filter(|e| e.from == p) {
+                if reached.insert(e.to.clone()) {
+                    queue.push_back(e.to.clone());
+                }
+            }
+        }
+        let island: Vec<String> = members
+            .iter()
+            .map(|(n, _)| n.clone())
+            .filter(|n| !reached.contains(n) && self.graph.edges.iter().any(|e| e.to == *n))
+            .collect();
+        if !island.is_empty() {
+            let names: Vec<&str> = island.iter().map(String::as_str).collect();
+            let path = self.at("plugins");
+            self.dx.warn("unreachable-island", path, None, &names, format!("{} feed{} each other, but no root (core event, start-session initial event, inbound event, or deferred emit) reaches {}", names.join(", "), if names.len() == 1 { "s" } else { "" }, if names.len() == 1 { "it" } else { "them" }));
+        }
+        // Cycles (information) and interrupt-only cycles (warning).
+        let all: Vec<(String, String)> = self
+            .graph
+            .edges
+            .iter()
+            .filter(|e| e.from != BOUNDARY && self.is_member(&e.from))
+            .map(|e| (e.from.clone(), e.to.clone()))
+            .collect();
+        let cycles = scc(&all);
+        for c in &cycles {
+            let names: Vec<&str> = c.iter().map(String::as_str).collect();
+            let path = self.at("plugins");
+            self.dx.info("cycle", path, None, &names, format!("cycle {}: legal (agent loops are cycles); termination is a plugin's business, not the core's", c.join(" → ")));
+        }
+        self.report.cycles = cycles;
+        let interrupt: Vec<(String, String)> = self
+            .graph
+            .edges
+            .iter()
+            .filter(|e| e.lane == Lane::Interrupt && e.from != BOUNDARY && self.is_member(&e.from))
+            .map(|e| (e.from.clone(), e.to.clone()))
+            .collect();
+        for c in scc(&interrupt) {
+            let names: Vec<&str> = c.iter().map(String::as_str).collect();
+            let path = self.at("plugins");
+            self.dx.warn(
+                "interrupt-cycle",
+                path,
+                None,
+                &names,
+                format!(
+                    "cycle {} consists only of interrupt-lane edges; it can starve the normal lane",
+                    c.join(" → ")
+                ),
+            );
+        }
+        let _ = emitters;
+    }
+
+    fn is_member(&self, name: &str) -> bool {
+        self.members.contains_key(name)
+    }
+
+    fn report_sections(&mut self, emitters: &[Emitter]) {
+        let mut caps: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, m) in &self.plugins {
+            for c in &m.manifest.capabilities {
+                caps.entry(c.name().to_owned())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+        let mut interrupt = Vec::new();
+        for e in emitters.iter().filter(|e| e.decl.lane == Lane::Interrupt) {
+            interrupt.push(format!("{}: {} (interrupt lane)", e.from, e.decl.event));
+        }
+        for p in caps.get("interrupt").cloned().unwrap_or_default() {
+            interrupt.push(format!("{p}: holds the interrupt capability"));
+        }
+        let mut unlisted = Vec::new();
+        for (name, m) in &self.members {
+            for s in m.subscribe.iter().filter(|s| s.unlisted_keys) {
+                unlisted.push(format!("{name}: {}", s.event));
+            }
+        }
+        let mut surface: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, m) in &self.plugins {
+            if m.manifest.has(Capability::DeferredPublish) {
+                let evs: Vec<String> = m
+                    .manifest
+                    .emit
+                    .iter()
+                    .filter(|e| e.deferred)
+                    .map(|e| e.event.clone())
+                    .collect();
+                surface
+                    .entry("deferred-publish".into())
+                    .or_default()
+                    .push(format!("{name}: {}", evs.join(", ")));
+            }
+            if m.manifest.has(Capability::StartSession) {
+                surface
+                    .entry("start-session".into())
+                    .or_default()
+                    .push(name.clone());
+            }
+            for o in &m.manifest.outbound {
+                surface
+                    .entry("outbound".into())
+                    .or_default()
+                    .push(format!("{name}: {}", o.event));
+            }
+        }
+        for ev in self.def.inbound.keys() {
+            surface
+                .entry("inbound".into())
+                .or_default()
+                .push(ev.clone());
+        }
+        for (p, list) in &caps {
+            let names: Vec<&str> = list.iter().map(String::as_str).collect();
+            let path = self.at("plugins");
+            self.dx.info(
+                "capability",
+                path,
+                None,
+                &names,
+                format!("capability `{p}` held by {}", list.join(", ")),
+            );
+        }
+        for u in &unlisted {
+            let path = self.at("plugins");
+            let plugin = u.split(':').next().unwrap_or_default().to_owned();
+            self.dx.info(
+                "unlisted-keys",
+                path,
+                None,
+                &[&plugin],
+                format!("{u} receives unlisted keys untyped (outside the compiler's guarantee)"),
+            );
+        }
+        for i in &interrupt {
+            let path = self.at("plugins");
+            self.dx.info("interrupt", path, None, &[], i.clone());
+        }
+        for (k, v) in &surface {
+            let path = self.at("plugins");
+            self.dx.info(
+                "external-surface",
+                path,
+                None,
+                &[],
+                format!("{k}: {}", v.join("; ")),
+            );
+        }
+        self.report.capabilities = caps;
+        self.report.interrupt = interrupt;
+        self.report.unlisted_keys = unlisted;
+        self.report.external_surface = surface;
+    }
+}
+
+impl FamilyHandlers {
+    fn insert(&mut self, class: &str, plugin: &str) {
+        if is_family(class) {
+            self.subfamilies.insert(class.to_owned(), plugin.to_owned());
+        } else {
+            self.members.insert(class.to_owned(), plugin.to_owned());
+        }
+    }
+}
+
+/// Is a subscription a member handler for an `exactly_one_handler` family?
+/// Handlers are async subscriptions narrower than the family (a member or a
+/// sub-family); subscribers of the whole family are observers.
+fn is_handler_sub(family: &str, s: &Subscription) -> bool {
+    s.mode == Mode::Async
+        && s.event != family
+        && !s.wildcard()
+        && pattern_contains(family, &s.event)
+}
+
+/// Does `a` return a key `b` receives or returns (or, with unlisted keys, any key)?
+fn tie_reason(a: &Subscription, b: &Subscription) -> Option<String> {
+    for k in a.returns.keys() {
+        if b.receives.keys.contains_key(k) {
+            return Some(format!("one returns `{k}`, which the other receives"));
+        }
+        if b.returns.contains_key(k) {
+            return Some(format!("both return `{k}`"));
+        }
+    }
+    if !a.returns.is_empty() && b.unlisted_keys {
+        return Some("one returns keys and the other receives unlisted keys".into());
+    }
+    None
+}
+
+/// Strongly connected components with more than one node (Tarjan), sorted.
+fn scc(edges: &[(String, String)]) -> Vec<Vec<String>> {
+    let mut graph: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for (a, b) in edges {
+        graph.entry(a).or_default().insert(b);
+        graph.entry(b).or_default();
+    }
     struct T<'g> {
-        g: &'g BTreeMap<String, BTreeSet<String>>,
+        g: &'g BTreeMap<&'g str, BTreeSet<&'g str>>,
         index: usize,
-        idx: BTreeMap<String, usize>,
-        low: BTreeMap<String, usize>,
-        stack: Vec<String>,
-        on: BTreeSet<String>,
+        idx: BTreeMap<&'g str, usize>,
+        low: BTreeMap<&'g str, usize>,
+        stack: Vec<&'g str>,
+        on: BTreeSet<&'g str>,
         out: Vec<Vec<String>>,
     }
-    fn strong(t: &mut T<'_>, v: &str) {
-        t.idx.insert(v.to_owned(), t.index);
-        t.low.insert(v.to_owned(), t.index);
+    fn strong<'g>(t: &mut T<'g>, v: &'g str) {
+        t.idx.insert(v, t.index);
+        t.low.insert(v, t.index);
         t.index += 1;
-        t.stack.push(v.to_owned());
-        t.on.insert(v.to_owned());
-        let next: Vec<String> =
+        t.stack.push(v);
+        t.on.insert(v);
+        let next: Vec<&'g str> =
             t.g.get(v)
-                .map(|s| s.iter().cloned().collect())
+                .map(|s| s.iter().copied().collect())
                 .unwrap_or_default();
         for w in next {
-            if !t.idx.contains_key(&w) {
-                strong(t, &w);
-                let lw = t.low[&w];
+            if !t.idx.contains_key(w) {
+                strong(t, w);
+                let lw = t.low[w];
                 let lv = t.low.get_mut(v).expect("visited");
                 *lv = (*lv).min(lw);
-            } else if t.on.contains(&w) {
-                let iw = t.idx[&w];
+            } else if t.on.contains(w) {
+                let iw = t.idx[w];
                 let lv = t.low.get_mut(v).expect("visited");
                 *lv = (*lv).min(iw);
             }
@@ -985,15 +2149,13 @@ fn find_cycles(members: &[(usize, &str, &Manifest, Option<Mode>)]) -> Vec<Vec<St
         if t.low[v] == t.idx[v] {
             let mut comp = Vec::new();
             while let Some(w) = t.stack.pop() {
-                t.on.remove(&w);
-                let done = w == v;
-                comp.push(w);
-                if done {
+                t.on.remove(w);
+                comp.push(w.to_owned());
+                if w == v {
                     break;
                 }
             }
-            let self_loop = comp.len() == 1 && t.g.get(v).is_some_and(|s| s.contains(v));
-            if comp.len() > 1 || self_loop {
+            if comp.len() > 1 {
                 comp.sort();
                 t.out.push(comp);
             }
@@ -1008,10 +2170,10 @@ fn find_cycles(members: &[(usize, &str, &Manifest, Option<Mode>)]) -> Vec<Vec<St
         on: BTreeSet::new(),
         out: Vec::new(),
     };
-    let nodes: Vec<String> = graph.keys().cloned().collect();
+    let nodes: Vec<&str> = graph.keys().copied().collect();
     for n in nodes {
-        if !t.idx.contains_key(&n) {
-            strong(&mut t, &n);
+        if !t.idx.contains_key(n) {
+            strong(&mut t, n);
         }
     }
     t.out.sort();
@@ -1024,340 +2186,8 @@ pub fn summary(c: &Compilation) -> Value {
     json!({
         "hash": c.hash,
         "ok": c.ok,
-        "definitions": c.definitions.keys().collect::<Vec<_>>(),
+        "definitions": c.definitions.iter().map(|(k, r)| (k.clone(), json!({ "revision": r.revision, "ok": r.ok }))).collect::<BTreeMap<_, _>>(),
         "errors": c.errors().len(),
         "diagnostics": c.diagnostics,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::manifest::{Consume, Definition, Subscriber};
-
-    fn consume(event: &str, demands: &[&str]) -> Consume {
-        Consume {
-            event: event.into(),
-            demands: demands.iter().map(|s| (*s).into()).collect(),
-            mode: None,
-            context: true,
-            keyed: None,
-        }
-    }
-    fn emit(event: &str, supplies: &[&str]) -> Emit {
-        Emit {
-            event: event.into(),
-            supplies: supplies.iter().map(|s| (*s).into()).collect(),
-            deferred: false,
-        }
-    }
-    fn manifest(name: &str, consumes: Vec<Consume>, emits: Vec<Emit>) -> Manifest {
-        Manifest {
-            name: name.into(),
-            version: "1".into(),
-            description: String::new(),
-            consumes,
-            emits,
-            transforms: vec![],
-            capabilities: vec![],
-            config_schema: Value::Null,
-            ..Default::default()
-        }
-    }
-    fn setup(
-        ms: Vec<Manifest>,
-        subs: &[(&str, Option<Mode>)],
-    ) -> (DeploymentConfig, BTreeMap<String, Manifest>) {
-        let mut cfg = DeploymentConfig::default();
-        for m in &ms {
-            cfg.plugins.insert(
-                m.name.clone(),
-                PluginConfig {
-                    command: vec![],
-                    module: None,
-                    config: Value::Null,
-                    timeout_ms: None,
-                    binary_hash: None,
-                    disabled: false,
-                    version: None,
-                },
-            );
-        }
-        cfg.definitions.insert(
-            "d".into(),
-            Definition {
-                description: String::new(),
-                subscribers: subs
-                    .iter()
-                    .map(|(p, m)| Subscriber {
-                        plugin: (*p).into(),
-                        mode: *m,
-                    })
-                    .collect(),
-                ..Default::default()
-            },
-        );
-        (cfg, ms.into_iter().map(|m| (m.name.clone(), m)).collect())
-    }
-    fn codes(c: &Compilation) -> Vec<String> {
-        c.diagnostics.iter().map(|d| d.code.clone()).collect()
-    }
-
-    #[test]
-    fn valid_chain_compiles_in_declared_order() {
-        let a = manifest(
-            "a",
-            vec![consume("session-started", &["definition"])],
-            vec![emit("x", &["k"])],
-        );
-        let b = manifest("b", vec![consume("x", &["k"])], vec![]);
-        let c = manifest("c", vec![consume("x", &[])], vec![]);
-        let (cfg, ms) = setup(vec![a, b, c], &[("c", None), ("a", None), ("b", None)]);
-        let out = compile(&cfg, &ms);
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let p = out.definitions["d"].pipeline("x");
-        assert_eq!(
-            p.blocking
-                .iter()
-                .map(|s| s.plugin.as_str())
-                .collect::<Vec<_>>(),
-            vec!["c", "b"]
-        );
-    }
-
-    #[test]
-    fn a_definition_left_incomplete_by_host_disabled_plugins_is_skipped() {
-        let a = manifest(
-            "a",
-            vec![consume("session-started", &[])],
-            vec![emit("x", &["k"])],
-        );
-        let b = manifest("b", vec![consume("x", &["k"])], vec![]);
-        let (mut cfg, ms) = setup(vec![a, b], &[("a", None), ("b", None)]);
-        let healthy = cfg.definitions["d"].clone();
-        cfg.definitions.insert("ok".into(), healthy);
-        cfg.plugins.get_mut("a").unwrap().disabled = true;
-        cfg.definitions
-            .get_mut("ok")
-            .unwrap()
-            .subscribers
-            .retain(|s| s.plugin == "b");
-        let out = compile(&cfg, &ms);
-        // `d` lost its only emitter of `x` to the host: unavailable, not an error.
-        assert!(
-            codes(&out).contains(&"definition-unavailable".to_owned()),
-            "{:?}",
-            out.diagnostics
-        );
-        assert!(!out.definitions.contains_key("d"));
-        // `ok` has no disabled plugin, so the same dead listener is still an error.
-        assert!(!out.ok);
-        assert!(
-            out.diagnostics
-                .iter()
-                .any(|d| d.code == "dead-listener" && d.definition.as_deref() == Some("ok"))
-        );
-        cfg.definitions.remove("ok");
-        let out = compile(&cfg, &ms);
-        assert!(out.ok, "{:?}", out.diagnostics);
-    }
-
-    #[test]
-    fn dead_listener_is_an_error() {
-        let b = manifest("b", vec![consume("never", &[])], vec![]);
-        let (cfg, ms) = setup(vec![b], &[("b", None)]);
-        let out = compile(&cfg, &ms);
-        assert!(!out.ok);
-        assert!(codes(&out).contains(&"dead-listener".to_owned()));
-    }
-
-    #[test]
-    fn starved_consumer_is_an_error_and_optional_keys_are_not() {
-        let a = manifest(
-            "a",
-            vec![consume("session-started", &[])],
-            vec![emit("x", &["k"])],
-        );
-        let b = manifest("b", vec![consume("x", &["k", "missing", "maybe?"])], vec![]);
-        let (cfg, ms) = setup(vec![a, b], &[("a", None), ("b", None)]);
-        let out = compile(&cfg, &ms);
-        let d: Vec<_> = out
-            .diagnostics
-            .iter()
-            .filter(|d| d.code == "starved-consumer")
-            .collect();
-        assert_eq!(d.len(), 1);
-        assert!(d[0].message.contains("missing"));
-        assert!(!d[0].message.contains("maybe"));
-    }
-
-    #[test]
-    fn transforms_change_supply_for_downstream_only() {
-        let a = manifest(
-            "a",
-            vec![consume("session-started", &[])],
-            vec![emit("x", &["k", "drop"])],
-        );
-        let mut t = manifest("t", vec![consume("x", &[])], vec![]);
-        t.transforms = vec![Transform {
-            event: "x".into(),
-            preserves: vec!["k".into()],
-            adds: vec!["new".into()],
-        }];
-        let early = manifest("early", vec![consume("x", &["drop"])], vec![]);
-        let late = manifest("late", vec![consume("x", &["new", "k"])], vec![]);
-        let late_bad = manifest("late-bad", vec![consume("x", &["drop"])], vec![]);
-        let (cfg, ms) = setup(
-            vec![a, t, early, late, late_bad],
-            &[
-                ("a", None),
-                ("early", None),
-                ("t", None),
-                ("late", None),
-                ("late-bad", Some(Mode::Async)),
-            ],
-        );
-        let out = compile(&cfg, &ms);
-        let starved: Vec<_> = out
-            .diagnostics
-            .iter()
-            .filter(|d| d.code == "starved-consumer")
-            .map(|d| d.plugin.clone().unwrap())
-            .collect();
-        assert_eq!(starved, vec!["late-bad".to_owned()]);
-    }
-
-    #[test]
-    fn async_transform_and_wildcard_demands_rejected() {
-        let a = manifest(
-            "a",
-            vec![consume("session-started", &[])],
-            vec![emit("x", &[])],
-        );
-        let mut t = manifest("t", vec![consume("x", &[])], vec![]);
-        t.transforms = vec![Transform {
-            event: "x".into(),
-            preserves: vec!["*".into()],
-            adds: vec![],
-        }];
-        let w = manifest("w", vec![consume("*", &["k"])], vec![]);
-        let (cfg, ms) = setup(
-            vec![a, t, w],
-            &[("a", None), ("t", Some(Mode::Async)), ("w", None)],
-        );
-        let out = compile(&cfg, &ms);
-        let c = codes(&out);
-        assert!(c.contains(&"async-transform".to_owned()));
-        assert!(c.contains(&"wildcard-demand".to_owned()));
-    }
-
-    #[test]
-    fn wildcard_placed_by_position_in_every_pipeline() {
-        let a = manifest(
-            "a",
-            vec![consume("session-started", &[])],
-            vec![emit("x", &[])],
-        );
-        let w = manifest(
-            "w",
-            vec![Consume {
-                event: "*".into(),
-                demands: vec![],
-                mode: Some(Mode::Async),
-                context: false,
-                keyed: None,
-            }],
-            vec![],
-        );
-        let (cfg, ms) = setup(vec![a, w], &[("w", None), ("a", None)]);
-        let out = compile(&cfg, &ms);
-        assert!(out.ok, "{:?}", out.diagnostics);
-        let d = &out.definitions["d"];
-        assert_eq!(d.pipeline("x").asyncs[0].plugin, "w");
-        assert_eq!(d.pipeline("unlisted").asyncs[0].plugin, "w");
-        assert_eq!(d.pipeline("session-started").blocking[0].plugin, "a");
-    }
-
-    #[test]
-    fn deferred_without_capability_and_emit_wildcard_rejected() {
-        let mut a = manifest(
-            "a",
-            vec![],
-            vec![
-                Emit {
-                    event: "x".into(),
-                    supplies: vec![],
-                    deferred: true,
-                },
-                emit("*", &[]),
-            ],
-        );
-        a.capabilities = vec![];
-        let (cfg, ms) = setup(vec![a], &[("a", None)]);
-        let c = codes(&compile(&cfg, &ms));
-        assert!(c.contains(&"missing-capability".to_owned()));
-        assert!(c.contains(&"emit-wildcard".to_owned()));
-    }
-
-    #[test]
-    fn cycles_are_reported_as_info() {
-        let a = manifest(
-            "a",
-            vec![consume("session-started", &[]), consume("y", &[])],
-            vec![emit("x", &[])],
-        );
-        let b = manifest("b", vec![consume("x", &[])], vec![emit("y", &[])]);
-        let (cfg, ms) = setup(vec![a, b], &[("a", None), ("b", None)]);
-        let out = compile(&cfg, &ms);
-        assert!(out.ok);
-        assert_eq!(
-            out.definitions["d"].cycles,
-            vec![vec!["x".to_owned(), "y".to_owned()]]
-        );
-    }
-
-    #[test]
-    fn external_starters_count_as_emitters() {
-        let mut ui = manifest("ui", vec![], vec![emit("user-message", &["text"])]);
-        ui.capabilities = vec![Capability::StartSession];
-        let chat = manifest("chat", vec![consume("user-message", &["text"])], vec![]);
-        let (mut cfg, ms) = setup(vec![ui, chat], &[("chat", None)]);
-        let out = compile(&cfg, &ms);
-        assert!(out.ok, "{:?}", out.diagnostics);
-        // Without the capability it becomes a dead listener.
-        let mut ms2 = ms.clone();
-        ms2.get_mut("ui").unwrap().capabilities.clear();
-        assert!(!compile(&cfg, &ms2).ok);
-        // Unknown and missing plugins are errors.
-        cfg.definitions
-            .get_mut("d")
-            .unwrap()
-            .subscribers
-            .push(Subscriber {
-                plugin: "ghost".into(),
-                mode: None,
-            });
-        assert!(codes(&compile(&cfg, &ms)).contains(&"unknown-plugin".to_owned()));
-    }
-
-    #[test]
-    fn hash_is_stable_and_config_sensitive() {
-        let a = manifest("a", vec![consume("session-started", &[])], vec![]);
-        let (mut cfg, ms) = setup(vec![a], &[("a", None)]);
-        let h1 = compile(&cfg, &ms).hash;
-        assert_eq!(h1, compile(&cfg, &ms).hash);
-        cfg.plugins.get_mut("a").unwrap().config = json!({"x": 1});
-        assert_ne!(h1, compile(&cfg, &ms).hash);
-    }
-
-    #[test]
-    fn covers_nested_keys() {
-        let s: BTreeSet<String> = ["a".into(), "b.c".into()].into();
-        assert!(covers(&s, "a"));
-        assert!(covers(&s, "a.x"));
-        assert!(covers(&s, "b"));
-        assert!(covers(&s, "b.c"));
-        assert!(!covers(&s, "b.d"));
-        assert!(!covers(&s, "ab"));
-    }
 }

@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use crate::core_manifest::{BOUNDARY, core_manifest};
 use crate::manifest::{
     ACTION_CONTRIBUTE, ACTION_VETO, ACTIONS, Capability, DefPlugin, Definition, DeploymentConfig,
-    EmitDecl, Manifest, PluginConfig, SourceRef, Subscription, is_family, pattern_contains,
-    pattern_error, pattern_matches,
+    EmitDecl, Manifest, PluginConfig, SourceRef, Subscription, is_family, normal_only,
+    pattern_contains, pattern_error, pattern_matches,
 };
 use crate::shape::{KeyDecl, Keys, MismatchKind, Shape, compatible, keys_mismatches};
 use crate::types::{Lane, Mode, Stamp, hash_json};
@@ -119,7 +119,8 @@ pub struct Edge {
     pub mode: Mode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<Position>,
-    pub lane: Lane,
+    /// The lanes a publish of this event may use (the emit's declaration).
+    pub lanes: Vec<Lane>,
     /// Keys and shapes present when the event reaches `to` (after earlier returns).
     pub supply: Keys,
     /// Slots delivered with the event.
@@ -228,7 +229,8 @@ pub struct ResolvedEmit {
     /// The family emit this member was resolved from (`tool-call/*`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub family: Option<String>,
-    pub lane: Lane,
+    /// The lanes a publish may choose from.
+    pub lanes: Vec<Lane>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
     /// The keys the event carries. For a family member, every open `object`
@@ -248,7 +250,7 @@ impl ResolvedEmit {
     pub fn decl(&self) -> EmitDecl {
         EmitDecl {
             event: self.event.clone(),
-            lane: self.lane,
+            lanes: self.lanes.clone(),
             deferred: self.deferred,
             keys: self.keys.clone(),
         }
@@ -337,7 +339,7 @@ impl Revision {
                 Some(e) => e.clone(),
                 None => EmitDecl {
                     event: name.to_owned(),
-                    lane: Lane::Normal,
+                    lanes: normal_only(),
                     deferred: false,
                     keys: self.definition.inbound.get(name)?.clone(),
                 },
@@ -345,7 +347,7 @@ impl Revision {
             return Some(ResolvedEmit {
                 event: name.to_owned(),
                 family: None,
-                lane: decl.lane,
+                lanes: decl.lanes,
                 deferred: decl.deferred,
                 keys: decl.keys,
                 subscribers: Vec::new(),
@@ -613,14 +615,27 @@ fn check_manifest(dx: &mut Diags<'_>, name: &str, m: &Manifest, path: Option<Str
                 ),
             );
         }
-        if e.lane == Lane::Interrupt && !m.has(Capability::Interrupt) {
+        if e.may_interrupt() && !m.has(Capability::Interrupt) {
             dx.err(
                 "missing-capability",
                 p(),
                 Some(&e.event),
                 &[name],
                 format!(
-                    "`{name}` emits `{}` on the interrupt lane but lacks the interrupt capability",
+                    "`{name}` allows `{}` on the interrupt lane but lacks the interrupt capability",
+                    e.event
+                ),
+            );
+        }
+        let mut lanes = BTreeSet::new();
+        if e.lanes.is_empty() || !e.lanes.iter().all(|l| lanes.insert(*l)) {
+            dx.err(
+                "invalid-lanes",
+                p(),
+                Some(&e.event),
+                &[name],
+                format!(
+                    "`{name}` emit `{}`: `lanes` lists each lane at most once, and at least one",
                     e.event
                 ),
             );
@@ -1284,7 +1299,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                 from: BOUNDARY.into(),
                 decl: EmitDecl {
                     event: ev.clone(),
-                    lane: Lane::Normal,
+                    lanes: normal_only(),
                     deferred: false,
                     keys: keys.clone(),
                 },
@@ -1355,7 +1370,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                 .push(ResolvedEmit {
                     event: e.decl.event.clone(),
                     family: e.family.clone(),
-                    lane: e.decl.lane,
+                    lanes: e.decl.lanes.clone(),
                     deferred: e.decl.deferred,
                     keys: e.decl.keys.clone(),
                     subscribers,
@@ -1425,7 +1440,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                 from: emitter.to_owned(),
                 decl: EmitDecl {
                     event: member.to_owned(),
-                    lane: family.lane,
+                    lanes: family.lanes.clone(),
                     deferred: family.deferred,
                     keys,
                 },
@@ -1905,7 +1920,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
             subscription: d.sub.event.clone(),
             mode: d.sub.mode,
             position,
-            lane: e.decl.lane,
+            lanes: e.decl.lanes.clone(),
             supply: supply.clone(),
             slots: d.sub.receives.slots.keys().cloned().collect(),
             deferred: e.decl.deferred,
@@ -2032,7 +2047,9 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
             .graph
             .edges
             .iter()
-            .filter(|e| e.lane == Lane::Interrupt && e.from != BOUNDARY && self.is_member(&e.from))
+            .filter(|e| {
+                e.lanes.contains(&Lane::Interrupt) && e.from != BOUNDARY && self.is_member(&e.from)
+            })
             .map(|e| (e.from.clone(), e.to.clone()))
             .collect();
         for c in scc(&interrupt) {
@@ -2044,7 +2061,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                 None,
                 &names,
                 format!(
-                    "cycle {} consists only of interrupt-lane edges; it can starve the normal lane",
+                    "cycle {} consists only of edges that may use the interrupt lane; it can starve the normal lane",
                     c.join(" → ")
                 ),
             );
@@ -2066,8 +2083,17 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
             }
         }
         let mut interrupt = Vec::new();
-        for e in emitters.iter().filter(|e| e.decl.lane == Lane::Interrupt) {
-            interrupt.push(format!("{}: {} (interrupt lane)", e.from, e.decl.event));
+        let mut seen = BTreeSet::new();
+        for e in emitters.iter().filter(|e| e.decl.may_interrupt()) {
+            let lanes = if e.decl.lanes == [Lane::Interrupt] {
+                "interrupt lane"
+            } else {
+                "may use the interrupt lane"
+            };
+            let line = format!("{}: {} ({lanes})", e.from, e.declared());
+            if seen.insert(line.clone()) {
+                interrupt.push(line);
+            }
         }
         for p in caps.get("interrupt").cloned().unwrap_or_default() {
             interrupt.push(format!("{p}: holds the interrupt capability"));

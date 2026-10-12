@@ -320,7 +320,7 @@ fn row_undeclared_actions_and_capabilities() {
         "ui": ui(),
         "a": { "subscribe": [{ "event": "go", "mode": "async", "actions": ["veto"] }], "sink": true },
         "b": { "subscribe": [{ "event": "go", "mode": "async", "actions": ["explode"], "returns": { "x": k(S) } }], "sink": true },
-        "c": { "subscribe": [{ "event": "go", "mode": "async" }], "emit": [{ "event": "later", "deferred": true }, { "event": "now", "lane": "interrupt" }], "outbound": [{ "event": "out" }] }
+        "c": { "subscribe": [{ "event": "go", "mode": "async" }], "emit": [{ "event": "later", "deferred": true }, { "event": "now", "lanes": ["normal", "interrupt"] }], "outbound": [{ "event": "out" }] }
     });
     let (c, ..) = build(
         &ms,
@@ -396,19 +396,32 @@ fn row_an_unreachable_island_is_a_warning() {
 fn row_an_interrupt_only_cycle_is_a_warning() {
     let ms = json!({
         "ui": ui(),
-        "p": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "b", "mode": "async" }], "emit": [{ "event": "a", "lane": "interrupt" }], "capabilities": ["interrupt"] },
-        "q": { "subscribe": [{ "event": "a", "mode": "async" }], "emit": [{ "event": "b", "lane": "interrupt" }], "capabilities": ["interrupt"] }
+        "p": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "b", "mode": "async" }], "emit": [{ "event": "a", "lanes": ["interrupt"] }], "capabilities": ["interrupt"] },
+        "q": { "subscribe": [{ "event": "a", "mode": "async" }], "emit": [{ "event": "b", "lanes": ["normal", "interrupt"] }], "capabilities": ["interrupt"] }
     });
     let (c, ..) = build(&ms, base_def(json!({ "ui": {}, "p": {}, "q": {} })));
+    // Every edge of the cycle *may* use the interrupt lane (q's `b` may also be
+    // queued normally): still a starvation risk.
     let d = one(&c, "interrupt-cycle");
     assert_eq!(d.plugins, vec!["p", "q"]);
+    let interrupt = &rev(&c).report.interrupt;
+    assert!(interrupt.iter().any(|x| x == "p: a (interrupt lane)"));
     assert!(
-        rev(&c)
-            .report
-            .interrupt
+        interrupt
             .iter()
-            .any(|x| x == "p: a (interrupt lane)")
+            .any(|x| x == "q: b (may use the interrupt lane)")
     );
+    // The edges carry the lanes their emit allows.
+    let b = rev(&c).graph.edges.iter().find(|e| e.event == "b").unwrap();
+    assert_eq!(
+        serde_json::to_value(&b.lanes).unwrap(),
+        json!(["normal", "interrupt"])
+    );
+    // A cycle with one edge that can only use the normal lane is no risk.
+    let mut ms = ms;
+    ms["q"]["emit"][0]["lanes"] = json!(["normal"]);
+    let (c, ..) = build(&ms, base_def(json!({ "ui": {}, "p": {}, "q": {} })));
+    assert!(find(&c, "interrupt-cycle").is_empty());
 }
 
 #[test]

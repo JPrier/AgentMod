@@ -883,8 +883,9 @@ export class BrowserRuntime {
     return this.startAs(PAGE, { definition, initial, fork_from });
   }
 
-  async sendMessage(id, text) {
-    return this.publishAs(PAGE, { event_name: 'user-message', payload: { text }, cite: this.citeFor(id), ui: { v: 1, kind: 'text', role: 'user', text } });
+  /** A user message, steered (interrupt lane) or queued (normal lane). */
+  async sendMessage(id, text, lane = 'normal') {
+    return this.publishAs(PAGE, { event_name: 'user-message', payload: { text }, cite: this.citeFor(id), lane, ui: { v: 1, kind: 'text', role: 'user', text } });
   }
 
   async uiAction(id, reply_to, action, values = {}) {
@@ -892,7 +893,7 @@ export class BrowserRuntime {
   }
 
   async contextEdit(id, ops) {
-    return this.publishAs(PAGE, { event_name: 'context-edit', payload: { ops }, cite: this.citeFor(id) });
+    return this.publishAs(PAGE, { event_name: 'context-edit', payload: { ops }, cite: this.citeFor(id), lane: 'interrupt' });
   }
 
   async sendCommand(id, command) {

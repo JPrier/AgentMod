@@ -109,10 +109,12 @@ async function route(req, res) {
       if (sub === 'commands') return send(res, 200, await plugin.host.command(sid, b.command));
       const cite = await citeFor(sid);
       if (sub === 'messages') {
-        return send(res, 200, await plugin.host.publishDeferred('user-message', { text: b.text }, { cite, ui: { v: 1, kind: 'text', role: 'user', text: b.text } }));
+        // Steer (interrupt lane) or queue (normal lane): the same event.
+        const lane = b.lane === 'interrupt' ? 'interrupt' : 'normal';
+        return send(res, 200, await plugin.host.publishDeferred('user-message', { text: b.text }, { cite, lane, ui: { v: 1, kind: 'text', role: 'user', text: b.text } }));
       }
       if (sub === 'actions') return send(res, 200, await plugin.host.publishDeferred('ui-action', { reply_to: b.reply_to, action: b.action, values: b.values || {} }, { cite }));
-      if (sub === 'context-edit') return send(res, 200, await plugin.host.publishDeferred('context-edit', { ops: b.ops || [] }, { cite }));
+      if (sub === 'context-edit') return send(res, 200, await plugin.host.publishDeferred('context-edit', { ops: b.ops || [] }, { cite, lane: 'interrupt' }));
     }
   }
   return null;

@@ -104,7 +104,9 @@ pub struct PublishRequest {
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<Value>,
-    /// Defaults to the emit declaration's lane; a different lane is a breach.
+    /// The lane this publish uses: one of the lanes the emit declares
+    /// (anything else is a breach). It may be omitted only when the emit
+    /// declares exactly one lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<Lane>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1510,23 +1512,36 @@ impl Kernel {
             return self.breach_block(&source, req, json!({ "kind": "emit", "plugin": req.plugin, "event": req.event_name, "declared": manifest.emit.iter().map(|e| &e.event).collect::<Vec<_>>(), "resolved": declared }), format!("undeclared emit `{}` (resolved emit set: {})", req.event_name, if declared.is_empty() { "nothing".to_owned() } else { declared.join(", ") }), now);
         };
         let decl = resolved.decl();
-        let decl_json = json!({ "kind": "emit", "plugin": req.plugin, "event": decl.event, "family": resolved.family, "lane": decl.lane, "deferred": decl.deferred, "keys": decl.keys });
+        let decl_json = json!({ "kind": "emit", "plugin": req.plugin, "event": decl.event, "family": resolved.family, "lanes": decl.lanes, "deferred": decl.deferred, "keys": decl.keys });
         if deferred && !(decl.deferred && manifest.has(Capability::DeferredPublish)) {
             return self.breach_block(&source, req, decl_json, format!("`{}` may not be published deferred (invocation closed or absent; the emit is not declared `deferred`)", req.event_name), now);
         }
-        let lane = req.lane.unwrap_or(decl.lane);
-        if lane != decl.lane {
-            return self.breach_block(
-                &source,
-                req,
-                decl_json,
-                format!(
-                    "`{}` is declared on the {:?} lane but was published on the {lane:?} lane",
-                    decl.event, decl.lane
-                ),
-                now,
-            );
-        }
+        // The publisher chooses the lane, from the lanes the emit declares.
+        let lane = match (req.lane, decl.lanes.as_slice()) {
+            (Some(l), lanes) if lanes.contains(&l) => l,
+            (None, [only]) => *only,
+            (chosen, lanes) => {
+                let names: Vec<String> = lanes
+                    .iter()
+                    .map(|l| format!("{l:?}").to_lowercase())
+                    .collect();
+                let why = match chosen {
+                    Some(l) => format!(
+                        "`{}` was published on the {} lane, which its emit does not declare (lanes: {})",
+                        decl.event,
+                        format!("{l:?}").to_lowercase(),
+                        names.join(", ")
+                    ),
+                    None => format!(
+                        "`{}` may be published on {} lanes ({}); a publish must choose its lane",
+                        decl.event,
+                        lanes.len(),
+                        names.join(", ")
+                    ),
+                };
+                return self.breach_block(&source, req, decl_json, why, now);
+            }
+        };
         if let Err(e) = check_keys(
             req.payload.as_object().unwrap_or(&Map::new()),
             &decl.keys,

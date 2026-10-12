@@ -90,6 +90,13 @@ try {
   await page.keyboard.press('Enter');
   await waitText('The tool returned: Saved');
   await new Promise((r) => setTimeout(r, 1500));
+  // Steer: the same user message, published on the interrupt lane.
+  await page.click('#steer');
+  await page.type('#composer', 'steer: say hello');
+  await page.keyboard.press('Enter');
+  await waitText('Steered: sent on the interrupt lane');
+  await page.click('#steer'); // back to queueing
+  await new Promise((r) => setTimeout(r, 1500));
   // Inspector tabs.
   for (const [i, tab] of ['Context', 'Graph', 'Config', 'Log', 'Pipeline'].entries()) {
     const btns = await page.$$('.tabs button');

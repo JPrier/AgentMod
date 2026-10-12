@@ -29,8 +29,8 @@ fn manifests() -> BTreeMap<String, Manifest> {
         "ui": {
             "subscribe": [{ "event": "*", "mode": "async" }],
             "emit": [
-                { "event": "user-message", "deferred": true, "keys": { "text": k(S) } },
-                { "event": "steer", "deferred": true, "lane": "interrupt", "keys": { "text": k(S) } }
+                { "event": "user-message", "deferred": true, "lanes": ["normal", "interrupt"], "keys": { "text": k(S) } },
+                { "event": "note", "deferred": true, "keys": { "text": k(S) } }
             ],
             "capabilities": ["start-session", "deferred-publish", "interrupt", "control", "observe"],
             "sink": true
@@ -44,8 +44,7 @@ fn manifests() -> BTreeMap<String, Manifest> {
         "chat": {
             "subscribe": [
                 { "event": "user-message", "mode": "blocking", "actions": ["contribute-context"], "receives": { "text": k(S) } },
-                { "event": "model-response", "mode": "blocking", "actions": ["contribute-context"], "receives": { "text": k(S) } },
-                { "event": "steer", "mode": "blocking", "actions": ["contribute-context"], "receives": { "text": k(S) } }
+                { "event": "model-response", "mode": "blocking", "actions": ["contribute-context"], "receives": { "text": k(S) } }
             ],
             "emit": [
                 { "event": "model-request", "keys": { "turn": k(S) } },
@@ -137,7 +136,7 @@ fn behave(sim: &mut Sim, plugin: &str, req: &InvokeRequest) -> InvocationResult 
         {
             result.veto = Some("policy".into());
         }
-        ("chat", "user-message" | "steer") => {
+        ("chat", "user-message") => {
             result.contributions = vec![ContextOp::Add {
                 slot: "messages".into(),
                 value: json!({ "role": "user", "content": ev.payload["text"] }),
@@ -243,14 +242,16 @@ fn user(sim: &Sim, sid: &str, text: &str) -> PublishRequest {
         event_name: "user-message".into(),
         payload: json!({ "text": text }),
         ui: None,
-        lane: None,
+        // Queue: the normal lane.
+        lane: Some(Lane::Normal),
         target_session: None,
     }
 }
 
+/// The same user message, steered: published on the interrupt lane.
 fn steer(sim: &Sim, sid: &str, text: &str) -> PublishRequest {
     PublishRequest {
-        event_name: "steer".into(),
+        lane: Some(Lane::Interrupt),
         ..user(sim, sid, text)
     }
 }
@@ -511,7 +512,7 @@ fn publish_classification_blocks_and_breaches_are_recorded() {
         event_name: "user-message".into(),
         payload: json!({ "text": "hi" }),
         ui: None,
-        lane: None,
+        lane: Some(Lane::Normal),
         target_session: None,
     };
     // No invocation, no citation.
@@ -563,15 +564,15 @@ fn publish_classification_blocks_and_breaches_are_recorded() {
         .unwrap_err()
         .contains("expected string")
     );
-    // Wrong lane: a breach.
+    // No lane where the emit declares two: a breach (the publisher chooses).
     assert!(
         sim.publish(PublishRequest {
             cite: Some(cite.clone()),
-            lane: Some(Lane::Interrupt),
+            lane: None,
             ..base.clone()
         })
         .unwrap_err()
-        .contains("lane")
+        .contains("must choose its lane")
     );
     // Bad UI hint.
     assert!(
@@ -646,7 +647,7 @@ fn interrupt_lane_wins_next_but_never_interrupts() {
         .filter_map(|e| {
             e.payload["text"]
                 .as_str()
-                .filter(|_| e.event_name == "user-message" || e.event_name == "steer")
+                .filter(|_| e.event_name == "user-message")
                 .map(str::to_owned)
         })
         .collect();
@@ -661,6 +662,71 @@ fn interrupt_lane_wins_next_but_never_interrupts() {
         .filter(|t| ["first", "second", "urgent"].contains(&t.as_str()))
         .collect();
     assert_eq!(dispatched, vec!["first", "urgent", "second"]);
+    // One event on two lanes: the envelope says which, and the same
+    // subscribers handle both the same way.
+    let lanes: Vec<(String, Lane)> = view
+        .events
+        .iter()
+        .filter(|e| e.event_name == "user-message")
+        .map(|e| (e.payload["text"].as_str().unwrap_or("").to_owned(), e.lane))
+        .collect();
+    assert_eq!(
+        lanes,
+        vec![
+            ("first".into(), Lane::Normal),
+            ("second".into(), Lane::Normal),
+            ("urgent".into(), Lane::Interrupt)
+        ]
+    );
+    let subscribers = |text: &str| -> Vec<String> {
+        let ev = view
+            .events
+            .iter()
+            .find(|e| e.payload["text"] == text)
+            .unwrap();
+        ev.invocations.iter().map(|i| i.plugin.clone()).collect()
+    };
+    assert_eq!(subscribers("urgent"), subscribers("second"));
+}
+
+#[test]
+fn a_publish_chooses_its_lane_from_the_ones_its_emit_declares() {
+    let mut sim = new_sim(&config(CHAT));
+    let sid = start(&mut sim, "chat", None);
+    run(&mut sim);
+    let cite = ui_cite(&sim, &sid);
+    let note = |lane| PublishRequest {
+        plugin: "ui".into(),
+        invocation_id: None,
+        cite: Some(cite.clone()),
+        event_name: "note".into(),
+        payload: json!({ "text": "n" }),
+        ui: None,
+        lane,
+        target_session: None,
+    };
+    // `note` declares only the normal lane: omitting the lane picks it.
+    let id = sim.publish(note(None)).unwrap();
+    // Any other lane is a hard failure, recorded against the declaration.
+    let err = sim.publish(note(Some(Lane::Interrupt))).unwrap_err();
+    assert!(err.contains("which its emit does not declare"), "{err}");
+    let breach = sim.breaches(&sid).pop().unwrap();
+    assert_eq!(breach["declaration"]["lanes"], json!(["normal"]));
+    assert_eq!(breach["observed"]["lane"], "interrupt");
+    // The envelope delivered to subscribers carries the lane used.
+    sim.publish(steer(&sim, &sid, "now")).unwrap();
+    let delivered = sim
+        .pending
+        .iter()
+        .find(|(_, _, r)| r.event.payload.get("text") == Some(&json!("now")))
+        .map(|(_, _, r)| r.event.lane);
+    assert_eq!(delivered, Some(Lane::Interrupt));
+    run(&mut sim);
+    let view = project(sim.log(&sid));
+    assert_eq!(
+        view.events.iter().find(|e| e.event_id == id).unwrap().lane,
+        Lane::Normal
+    );
 }
 
 #[test]
@@ -1032,12 +1098,24 @@ fn fork_seeds_context_and_restore_is_an_append() {
     run(&mut sim);
     assert_eq!(sim.k.context(&fork).unwrap().len(), 2);
     assert!(sim.kinds(&fork).contains(&"context-seeded".to_owned()));
-    // Restore in the original session via a contribution; history keeps both states.
+    // Restore in the original session via a contribution (on a steered user
+    // message); history keeps both states.
     sim.publish(steer(&sim, &sid, "restore")).unwrap();
     while let Some((plugin, _, req)) = sim.pending.pop_front() {
         let mut r = InvocationResult::default();
-        if plugin == "chat" {
-            r.contributions = vec![ContextOp::Restore { to_sequence: mid }];
+        match plugin.as_str() {
+            "chat" if req.event.event_name == "user-message" => {
+                r.contributions = vec![ContextOp::Restore { to_sequence: mid }];
+            }
+            "redact" => {
+                r.returns = Some(
+                    json!({ "text": "restore", "redacted": false })
+                        .as_object()
+                        .cloned()
+                        .unwrap(),
+                );
+            }
+            _ => {}
         }
         sim.complete(&req.invocation_id, r);
     }

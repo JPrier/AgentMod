@@ -264,9 +264,11 @@ impl Subscription {
 #[serde(deny_unknown_fields)]
 pub struct EmitDecl {
     pub event: String,
-    /// `interrupt` requires the interrupt capability.
-    #[serde(default, skip_serializing_if = "is_normal")]
-    pub lane: Lane,
+    /// The lanes a publish of this event may choose from (compiler.md §3.3);
+    /// each publish picks one. Allowing `interrupt` requires the interrupt
+    /// capability.
+    #[serde(default = "normal_only", skip_serializing_if = "is_normal_only")]
+    pub lanes: Vec<Lane>,
     /// May be published without an open invocation (requires deferred-publish).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
@@ -274,8 +276,22 @@ pub struct EmitDecl {
     pub keys: Keys,
 }
 
-fn is_normal(l: &Lane) -> bool {
-    *l == Lane::Normal
+/// The default lanes of an emit: the normal lane only.
+#[must_use]
+pub fn normal_only() -> Vec<Lane> {
+    vec![Lane::Normal]
+}
+
+fn is_normal_only(l: &[Lane]) -> bool {
+    l == [Lane::Normal]
+}
+
+impl EmitDecl {
+    /// May a publish of this event use the interrupt lane?
+    #[must_use]
+    pub fn may_interrupt(&self) -> bool {
+        self.lanes.contains(&Lane::Interrupt)
+    }
 }
 
 /// A cross-session event a plugin may send (requires cross-session).
@@ -653,6 +669,27 @@ mod tests {
         .unwrap();
         assert_eq!(d.effective_slots()["context"], default_context_slot());
         assert_eq!(d.plugins["policy"].phases["model-request"], "loop");
+    }
+
+    #[test]
+    fn emits_declare_lanes_defaulting_to_normal() {
+        let m: Manifest = serde_json::from_value(json!({ "name": "p", "version": "1", "emit": [
+            { "event": "a" },
+            { "event": "user-message", "lanes": ["normal", "interrupt"] }
+        ] }))
+        .unwrap();
+        assert_eq!(m.emit[0].lanes, vec![Lane::Normal]);
+        assert!(!m.emit[0].may_interrupt());
+        assert!(m.emit[1].may_interrupt());
+        let back = serde_json::to_value(&m).unwrap();
+        assert!(
+            back["emit"][0].get("lanes").is_none(),
+            "the default is not written out"
+        );
+        assert!(
+            serde_json::from_value::<Manifest>(json!({ "name": "p", "version": "1", "emit": [{ "event": "a", "lane": "interrupt" }] })).is_err(),
+            "the single `lane` field is gone"
+        );
     }
 
     #[test]

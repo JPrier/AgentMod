@@ -10,10 +10,12 @@ export const WEB_UI_MANIFEST = {
   // even the `tool-call/*` family, which it renders from the records.
   subscribe: [{ event: 'session-started', mode: 'async' }],
   emit: [
-    { event: 'user-message', deferred: true, keys: { text: { shape: 'string' }, attachments: { shape: 'array<object>', optional: true } } },
+    // One event, two lanes: the user chooses per message whether it steers
+    // (interrupt lane) or queues (normal lane).
+    { event: 'user-message', deferred: true, lanes: ['normal', 'interrupt'], keys: { text: { shape: 'string' }, attachments: { shape: 'array<object>', optional: true } } },
     { event: 'ui-action', deferred: true, keys: { reply_to: { shape: 'string' }, action: { shape: 'string' }, values: { shape: 'object', optional: true } } },
     // Operator edits of the context jump the queue: the interrupt lane.
-    { event: 'context-edit', deferred: true, lane: 'interrupt', keys: { ops: { shape: 'array<object>' } } },
+    { event: 'context-edit', deferred: true, lanes: ['interrupt'], keys: { ops: { shape: 'array<object>' } } },
   ],
   capabilities: ['deferred-publish', 'start-session', 'interrupt', 'control', 'observe'],
   // Its effect is outside the bus: rendering for a human.

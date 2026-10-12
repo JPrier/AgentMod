@@ -520,10 +520,19 @@ async function newSession(definition, text, fork_from) {
   }
 }
 
-async function send(text) {
+/**
+ * Send a user message. It is one event published on one of two lanes: steer
+ * (interrupt lane: it runs before already-queued work, at the next pipeline
+ * boundary) or queue (normal lane: it waits its turn). The plugins that
+ * handle user messages treat both the same.
+ */
+async function send(text, steer) {
   if (!text.trim() || !state.selected) return;
-  await act(() => state.client.sendMessage(state.selected, text));
+  await act(() => state.client.sendMessage(state.selected, text, steer ? 'interrupt' : 'normal'));
 }
+
+/** The composer's steer choice, kept across renders. */
+let steerNext = false;
 
 async function command(cmd) {
   const labels = { 'soft-stop': 'Soft stop: the running pipeline finishes, then the session parks.', 'hard-stop': 'Hard stop: in-flight invocations were cancelled.', resume: 'Resumed.' };
@@ -783,9 +792,12 @@ function suggestions(v) {
 function composer(v) {
   const ta = h('textarea#composer', { rows: 1, placeholder: 'Message the agent', 'aria-label': 'Message', oninput: (e) => autosize(e.target),
     onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.form.requestSubmit(); } } });
-  const form = h('form', { onsubmit: (e) => { e.preventDefault(); const t = ta.value; ta.value = ''; composerDraft = ''; send(t); } },
+  const steer = h('input', { type: 'checkbox', id: 'steer', checked: steerNext, onchange: (e) => { steerNext = e.target.checked; } });
+  const form = h('form', { onsubmit: (e) => { e.preventDefault(); const t = ta.value; ta.value = ''; composerDraft = ''; send(t, steer.checked); } },
     ta, h('button.btn.primary', { type: 'submit' }, 'Send'),
-    h('div.opts', h('span', v.definition === 'chat' ? 'Shift+Enter for a new line' : '')));
+    h('div.opts',
+      h('label', { title: 'Steer: the message is published on the interrupt lane and runs before already-queued work, at the next pipeline boundary. Unchecked, it queues on the normal lane and waits its turn.' }, steer, 'Steer (interrupt lane) — otherwise it queues'),
+      h('span', v.definition === 'chat' ? 'Shift+Enter for a new line' : '')));
   return h('div.composer', form);
 }
 
@@ -841,7 +853,7 @@ function threadItems(v) {
         h('button.linkish.branch', { title: 'Start a new session from the context just before this message (its own log; with an isolated workspace for coding sessions)', onclick: () => branchFrom(e.sequence - 1) }, 'branch here'),
         changed && h('span.note', 'Redacted by a transformer before any later plugin saw it'),
         e.status === 'vetoed' && h('span.note', `Vetoed: ${e.settlement.reason}`),
-        e.lane === 'interrupt' && h('span.note', 'Sent on the interrupt lane')));
+        e.lane === 'interrupt' && h('span.note', 'Steered: sent on the interrupt lane')));
       continue;
     }
     if (name === 'stream-chunk' && ui?.kind === 'stream-chunk') {
@@ -1248,8 +1260,9 @@ function graphPane() {
     const out = routes.filter((x) => x.event === cls && x.from === p);
     if (out.length) {
       const e = out.map((x) => [...(x.blocking || []), ...(x.asyncs || [])].map((i) => edges[i])).flat()[0];
-      const label = `E${e?.deferred ? '*' : ''}${e?.lane === 'interrupt' ? '!' : ''}`;
-      parts.push(h('span.cell-e', { title: `emits ${cls}${e && e.emit !== cls ? ` (resolved from ${e.emit})` : ''}${e?.deferred ? ' (deferred allowed)' : ''}${e?.lane === 'interrupt' ? ' on the interrupt lane' : ''}; keys: ${Object.keys(e?.supply || {}).join(', ') || 'none'}` }, label));
+      const interrupt = (e?.lanes || []).includes('interrupt');
+      const label = `E${e?.deferred ? '*' : ''}${interrupt ? '!' : ''}`;
+      parts.push(h('span.cell-e', { title: `emits ${cls}${e && e.emit !== cls ? ` (resolved from ${e.emit})` : ''}${e?.deferred ? ' (deferred allowed)' : ''}${interrupt ? ` (lanes: ${e.lanes.join(', ')})` : ''}; keys: ${Object.keys(e?.supply || {}).join(', ') || 'none'}` }, label));
     }
     const ins = edges.filter((e) => e.event === cls && e.to === p);
     const b = ins.find((e) => e.mode === 'blocking');
@@ -1261,7 +1274,7 @@ function graphPane() {
   const section = (title, items, help) => items.length > 0 && [h('h3', title), help && h('p.help', help), items.map((x) => h('div.diag', x))];
   return [
     h('div.pane-tools', h('label', 'Definition ', h('select', { onchange: (e) => { state.graphDef = e.target.value; render(); } }, defs.map((x) => h('option', { selected: x === name }, x))))),
-    h('p.help', `Revision ${r.revision} of \`${name}\` (runtime ${r.runtime}). The compiled graph is the routing table: each edge is "when A emits X, B is a destination", with its mode, phase position, lane and the keys it carries. E = emits (E* deferred allowed, E! interrupt lane), phase:n = blocking position, A = async. Family emits (tool-call/*) appear as the concrete members they resolve to.`),
+    h('p.help', `Revision ${r.revision} of \`${name}\` (runtime ${r.runtime}). The compiled graph is the routing table: each edge is "when A emits X, B is a destination", with its mode, phase position, lane and the keys it carries. E = emits (E* deferred allowed, E! may use the interrupt lane), phase:n = blocking position, A = async. Family emits (tool-call/*) appear as the concrete members they resolve to.`),
     r.definition.phases?.length ? h('p.help', `Phases: ${r.definition.phases.join(' → ')}`) : null,
     h('div.matrix-wrap', h('table.matrix', h('thead', h('tr', h('th', ''), plugins.map((p) => h('th', p)))), h('tbody', classes.map((c) => h('tr', h('th', c), plugins.map((p) => cell(c, p))))))),
     h('h3', 'Diagnostics'),

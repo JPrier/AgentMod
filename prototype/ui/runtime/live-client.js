@@ -67,7 +67,7 @@ export class LiveClient {
   getGraph() { return this.req('/api/graph'); }
   getConfig() { return this.req('/api/config'); }
   startSession(body) { return this.req('/api/sessions', body); }
-  sendMessage(id, text) { return this.req(`/api/sessions/${id}/messages`, { text }); }
+  sendMessage(id, text, lane = 'normal') { return this.req(`/api/sessions/${id}/messages`, { text, lane }); }
   uiAction(id, reply_to, action, values = {}) { return this.req(`/api/sessions/${id}/actions`, { reply_to, action, values }); }
   contextEdit(id, ops) { return this.req(`/api/sessions/${id}/context-edit`, { ops }); }
   sendCommand(id, command) { return this.req(`/api/sessions/${id}/commands`, { command }); }

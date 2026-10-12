@@ -2,7 +2,7 @@
 //! runtime (compiler.md §2). The compiler treats it exactly like a plugin's
 //! manifest; the runtime is the graph's boundary node.
 
-use crate::manifest::{EmitDecl, Manifest};
+use crate::manifest::{EmitDecl, Manifest, normal_only};
 use crate::shape::{KeyDecl, Keys, Shape};
 use crate::types::Lane;
 
@@ -49,7 +49,7 @@ pub fn core_manifest(version: &str) -> Option<Manifest> {
         emit: vec![
             EmitDecl {
                 event: SESSION_STARTED.into(),
-                lane: Lane::Normal,
+                lanes: normal_only(),
                 deferred: false,
                 keys: keys(vec![
                     ("definition", key("string")),
@@ -60,7 +60,7 @@ pub fn core_manifest(version: &str) -> Option<Manifest> {
             },
             EmitDecl {
                 event: CONFIG_APPLIED.into(),
-                lane: Lane::Interrupt,
+                lanes: vec![Lane::Interrupt],
                 deferred: false,
                 keys: keys(vec![
                     ("revision", key("string")),
@@ -69,7 +69,7 @@ pub fn core_manifest(version: &str) -> Option<Manifest> {
             },
             EmitDecl {
                 event: INVOCATION_FAILED.into(),
-                lane: Lane::Normal,
+                lanes: normal_only(),
                 deferred: false,
                 keys: keys(vec![
                     ("event_id", key("string")),
@@ -83,7 +83,7 @@ pub fn core_manifest(version: &str) -> Option<Manifest> {
             },
             EmitDecl {
                 event: SESSION_START_FAILED.into(),
-                lane: Lane::Normal,
+                lanes: normal_only(),
                 deferred: false,
                 keys: keys(vec![
                     ("definition", key("string")),

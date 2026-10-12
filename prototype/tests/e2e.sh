@@ -34,6 +34,18 @@ echo "2. tool loop"
 curl -s -XPOST $B/sessions -d '{"definition":"chat","text":"calculate (12+30)*7"}' >/dev/null
 wait_for s0001 "assert any(e['event_name']=='assistant-message' and '294' in e['payload']['text'] for e in d['events'])"
 
+echo "2b. steer and queue: one user-message event on two lanes"
+curl -s -XPOST $B/sessions/s0001/messages -d '{"text":"queued hello","lane":"normal"}' | py "assert d['event_id']" || fail "queue publish"
+wait_for s0001 "assert sum(1 for e in d['events'] if e['event_name']=='assistant-message')>=2"
+curl -s -XPOST $B/sessions/s0001/messages -d '{"text":"steered hello","lane":"interrupt"}' | py "assert d['event_id']" || fail "steer publish"
+wait_for s0001 "assert sum(1 for e in d['events'] if e['event_name']=='assistant-message')>=3"
+curl -s $B/sessions/s0001 | py "
+u=[e for e in d['events'] if e['event_name']=='user-message'][-2:]
+assert [e['lane'] for e in u]==['normal','interrupt'], [e['lane'] for e in u]
+# The plugins that handle user messages treat both lanes alike.
+subs=lambda e: sorted(i['plugin'] for i in e['invocations'])
+assert subs(u[0])==subs(u[1]), (subs(u[0]), subs(u[1]))" || fail "steer lane"
+
 echo "3. approval gate + sub-agent session"
 curl -s -XPOST $B/sessions/s0001/messages -d '{"text":"delegate: summarize the plan"}' >/dev/null
 wait_for s0001 "assert any(e['event_name']=='approval-requested' for e in d['events'])"

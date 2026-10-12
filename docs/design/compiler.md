@@ -4,7 +4,7 @@ Status: Draft for Josh's approval.
 
 Decision ticket: [Subdesign: compiler — manifest validation and demand/supply matching](https://github.com/JPrier/AgentMod/issues/9). Parent: [AgentMod realignment map](https://github.com/JPrier/AgentMod/issues/1). Builds on the [High-Level Design](high-level-design.md) and is tested against the requirements in the [problem statement](problem-statement.md). Terms are defined in [GLOSSARY.md](../../GLOSSARY.md).
 
-This document deliberately revises parts of the High-Level Design; [§12](#12-revisions-to-the-high-level-design) lists each one.
+Where this document changed decisions in the High-Level Design, the HLD has been updated to match; [§12](#12-changes-to-the-high-level-design) lists what changed.
 
 ## 1. Posture
 
@@ -220,7 +220,9 @@ This compiles. The cycle `model-request → model-response → tool-call/* → t
 
 **Rejected: dynamic definition.** An orchestrator calls `start-session` with a definition it wrote moments earlier, and that definition has a starved consumer. No session is created, and the orchestrator receives the diagnostics as an event.
 
-## 12. Revisions to the High-Level Design
+## 12. Changes to the High-Level Design
+
+The High-Level Design has been updated in place for each of these; this list is the record of what changed and why.
 
 1. **Payload contracts are typed shapes.** The HLD's "demand/supply, no schemas" becomes structural **shapes**. There is still no central registry, no event ownership and no dependencies between plugins, but every declared key has a type, and its optional "type tags" become mandatory shapes.
 2. **The transform model is `receives` and `returns`.** Transforms are not "preserves/adds" lists: blocking subscribers declare `returns`, which are applied sequentially. Keys are never removed.

@@ -16,6 +16,7 @@ const SHOTS = process.env.SHOTS_DIR || path.join(here, '..', 'target', 'shots');
 fs.mkdirSync(SHOTS, { recursive: true });
 const mock = spawn(process.execPath, [path.join(here, 'mock-openrouter.mjs'), '8765'], { stdio: 'ignore' });
 let failed = false;
+let failure = '';
 async function chromePath() {
   if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
   for (const p of ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser']) if (fs.existsSync(p)) return p;
@@ -127,6 +128,7 @@ try {
   await shot('09-mobile');
 } catch (e) {
   failed = true;
+  failure = e.message;
   console.log('TEST FAILURE:', e.message);
   await shot('99-failure');
 } finally {
@@ -136,6 +138,12 @@ try {
   mock.kill();
   const real = errors.filter((e) => !/ERR_TUNNEL|ERR_NAME|fonts\.g|status of 401|\[subagent\]/.test(e));
   if (real.length) failed = true;
+  // Surface failures as check annotations so they show on the PR without the raw log.
+  if (process.env.GITHUB_ACTIONS) {
+    const esc = (m) => String(m).slice(0, 2000).replace(/%/g, '%25').replace(/\r/g, '%0D').replace(/\n/g, '%0A');
+    if (failure) console.log(`::error title=browser e2e::${esc(failure)}`);
+    for (const e of real.slice(0, 8)) console.log(`::error title=browser console::${esc(e)}`);
+  }
   console.log(failed ? 'browser e2e: FAILED' : 'browser e2e: all checks passed');
   process.exit(failed ? 1 : 0);
 }

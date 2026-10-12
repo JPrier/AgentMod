@@ -4,7 +4,7 @@
 import { definePlugin, key, withContext, START_INPUT } from '../sdk/agentmod.js';
 
 async function title(ctx, text) {
-  if (!text || ctx.slot('title').length) return;
+  if (!text || ctx.section('title').length) return;
   const words = String(text).replace(/\s+/g, ' ').trim().split(' ');
   const t = words.slice(0, 6).join(' ') + (words.length > 6 ? '…' : '');
   ctx.add('title', t);
@@ -17,8 +17,8 @@ definePlugin({
     version: '0.1.0',
     description: 'Auto-titles a session from its first user message.',
     subscribe: [
-      { event: 'session-started', mode: 'async', actions: ['contribute-context'], receives: withContext({ ...START_INPUT }) },
-      { event: 'user-message', mode: 'async', actions: ['contribute-context'], receives: withContext({ text: key('string') }) },
+      { event: 'session-started', mode: 'async', actions: ['contribute-context'], ...withContext({ ...START_INPUT }) },
+      { event: 'user-message', mode: 'async', actions: ['contribute-context'], ...withContext({ text: key('string') }) },
     ],
     emit: [{ event: 'session-titled', keys: { title: key('string') } }],
   },

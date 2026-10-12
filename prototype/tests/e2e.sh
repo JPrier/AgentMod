@@ -271,7 +271,7 @@ calls=[e for e in d['events'] if e['event_name'].startswith('tool-call/')]  # in
 owners=[i['plugin'] for e in calls for i in e['invocations'] if i['subscription']==e['event_name']]  # member subscribers
 assert owners==['local-workspace']*4, owners
 assert all(len([i for i in e['invocations'] if i['mode']=='async'])<=1 for e in calls), 'unrelated plugins invoked'" || fail "batch settlement"
-curl -s "$B/sessions/$PB/context" | py "assert any(c['slot']=='environment' and 'bash' in c['value']['tools'] for c in d)" || fail "environment facts"
+curl -s "$B/sessions/$PB/context" | py "assert any(c['section']=='environment' and 'bash' in c['value']['tools'] for c in d)" || fail "environment facts"
 SB=$(newsess coder 'script:slowbatch')
 wait_for $SB "assert sum(1 for e in d['events'] if e['event_name']=='tool-result')>=1" 100
 curl -s -XPOST $B/sessions/$SB/commands -d '{"command":"hard-stop"}' | py "assert d['status']['state']=='halted'" || fail "stop during batch"

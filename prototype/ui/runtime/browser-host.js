@@ -708,7 +708,7 @@ export class BrowserRuntime {
     const created = r[0];
     let title = null;
     for (const rec of r) {
-      if (rec.type === 'invocation-completed') for (const c of rec.contributions || []) if (c.op === 'add' && c.slot === 'title') title = c.value;
+      if (rec.type === 'invocation-completed') for (const c of rec.contributions || []) if (c.op === 'add' && c.section === 'title') title = c.value;
     }
     const status = J(this.kernel.status(sid));
     const parent = created.cause?.kind === 'invocation' ? created.cause.invocation_id.split('/')[0] : null;

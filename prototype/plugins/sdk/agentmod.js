@@ -96,9 +96,9 @@ export function startInputOf(view) {
 /** The `receives` key for a `session-started` subscriber that reads the start input. */
 export const START_INPUT = { input: { shape: 'object', optional: true, keys: { text: { shape: 'string', optional: true }, attachments: { shape: 'array<object>', optional: true }, data: { shape: 'object', optional: true } } } };
 
-/** Read context items of one section (values only). */
-export function slot(context, name) {
-  return (context || []).filter((c) => c.slot === name).map((c) => c.value);
+/** Read the context items of one section (values only). */
+export function section(context, name) {
+  return (context || []).filter((c) => c.section === name).map((c) => c.value);
 }
 
 // ---------------------------------------------------------------------------
@@ -110,11 +110,15 @@ export const key = (shape, extra = {}) => ({ shape, ...extra });
 /** An optional key. */
 export const optional = (shape, extra = {}) => ({ shape, optional: true, ...extra });
 
-/** The default `context` slot, requested like a key (`receives.slots`). */
+/** The default `context` slot, requested like a key (`[subscribe.slots]`). */
 export const CONTEXT = { context: key('array<object>') };
 
-/** Receives for a subscription that reads the context slot, plus `keys`. */
-export const withContext = (keys = {}) => ({ ...keys, slots: CONTEXT });
+/**
+ * A subscription that receives `keys` and reads the context slot: spread it
+ * into the subscription (`{ event, mode, ...withContext({ text: key('string') }) }`).
+ * Slots are a sibling of `receives` (compiler.md §3.2).
+ */
+export const withContext = (keys = {}) => ({ receives: keys, slots: CONTEXT });
 
 /** Keys every tool call carries (`tool-call/<name>`, emitted by the loop plugin). */
 export const TOOL_CALL_KEYS = {
@@ -386,7 +390,7 @@ class Plugin {
     const plugin = this;
     const slots = ev.slots;
     const noContext = () => {
-      throw new Error(`\`${this.name}\` read the context on \`${ev.event_name}\`, but its subscription (${req.subscription || ev.event_name}) does not request the \`context\` slot (receives.slots.context)`);
+      throw new Error(`\`${this.name}\` read the context on \`${ev.event_name}\`, but its subscription (${req.subscription || ev.event_name}) does not request the \`context\` slot (slots.context)`);
     };
     const ctx = {
       plugin,
@@ -412,7 +416,8 @@ class Plugin {
       host: this.host,
       log: (...a) => this.log(...a),
       sleep: (ms) => sleep(ms, abort.signal),
-      slot: (name) => slot(ctx.context, name),
+      /** The values of one context section (`messages`, `tools`, …). */
+      section: (name) => section(ctx.context, name),
       /** Publish as output of this invocation. */
       publish: (event_name, payload = {}, opts = {}) =>
         this.request('publish', {
@@ -423,10 +428,10 @@ class Plugin {
           lane: opts.lane,
           target_session: opts.targetSession,
         }),
-      add: (slotName, value) => result.contributions.push({ op: 'add', slot: slotName, value }),
+      add: (name, value) => result.contributions.push({ op: 'add', section: name, value }),
       replace: (id, value) => result.contributions.push({ op: 'replace', id, value }),
       remove: (id) => result.contributions.push({ op: 'remove', id }),
-      clearSlot: (slotName) => result.contributions.push({ op: 'clear-slot', slot: slotName }),
+      clearSection: (name) => result.contributions.push({ op: 'clear-section', section: name }),
       restore: (to_sequence) => result.contributions.push({ op: 'restore', to_sequence }),
       contribute: (op) => result.contributions.push(op),
       veto: (reason) => { result.veto = reason; },

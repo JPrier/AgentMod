@@ -12,7 +12,7 @@ import { evidenceOf, childReport } from '../plugins/sdk/delegation.js';
 import { toolSpecs } from '../plugins/sdk/coding/toolkit.js';
 
 let n = 0;
-const item = (slot, value, plugin = 'p') => ({ id: `s/i${++n}#0`, slot, value, plugin, invocation_id: `s/i${n}` });
+const item = (section, value, plugin = 'p') => ({ id: `s/i${++n}#0`, section, value, plugin, invocation_id: `s/i${n}` });
 const tools = () => [...toolSpecs({ lifecycle: true }), { name: 'update_plan', description: 'plan', parameters: {}, tier: 'core' }, { name: 'tool_search', description: 'find tools.', parameters: {}, tier: 'core' }, { name: 'clock', description: 'legacy untiered tool', parameters: {} }].map((t) => item('tools', t));
 
 test('projection: core tools only, deterministic order, deferred listed in tool_search', () => {

@@ -45,7 +45,7 @@ async function delegationOf(ctx) {
   return delegations.get(ctx.sessionId);
 }
 
-const slotValues = (context, name) => (context || []).filter((c) => c.slot === name).map((c) => c.value);
+const slotValues = (context, name) => (context || []).filter((c) => c.section === name).map((c) => c.value);
 
 /** Everything the engine needs for this session, from config + context + log. */
 async function policyFor(ctx, context) {
@@ -78,9 +78,9 @@ definePlugin({
     version: '0.1.0',
     description: 'Layered tool policy: deny > ask > allow across scopes, explained decisions, digest-bound approvals, tool visibility.',
     subscribe: [
-      { event: 'tool-call/*', mode: 'blocking', actions: ['veto'], receives: withContext({ ...TOOL_CALL_KEYS }) },
+      { event: 'tool-call/*', mode: 'blocking', actions: ['veto'], ...withContext({ ...TOOL_CALL_KEYS }) },
       { event: 'ui-action', mode: 'async', actions: ['contribute-context'], receives: { reply_to: key('string'), action: key('string') } },
-      { event: 'model-request', mode: 'blocking', actions: ['contribute-context'], receives: withContext({ turn: key('string') }) },
+      { event: 'model-request', mode: 'blocking', actions: ['contribute-context'], ...withContext({ turn: key('string') }) },
     ],
     emit: [
       { event: 'policy-decision', keys: { call_id: key('string'), effect: key('"allow" | "ask" | "deny"'), tool: optional('string'), rule: optional('string'), scope: optional('string'), reason: optional('string'), explanation: optional('string'), digest: optional('string') } },
@@ -98,7 +98,7 @@ definePlugin({
       const current = slotValues(ctx.context, 'tool-policy').pop();
       const same = current && JSON.stringify(current.hidden) === JSON.stringify(hidden) && current.mode === pol.mode;
       if (!same) {
-        ctx.clearSlot('tool-policy');
+        ctx.clearSection('tool-policy');
         ctx.add('tool-policy', { hidden, mode: pol.mode });
       }
     },

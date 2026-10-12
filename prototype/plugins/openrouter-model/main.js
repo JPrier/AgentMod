@@ -27,7 +27,7 @@ definePlugin({
     name: 'openrouter-model',
     version: '0.2.0',
     description: 'OpenRouter provider: any OpenRouter model, streamed, with tool calls.',
-    subscribe: [{ event: 'model-request', mode: 'async', receives: withContext({ turn: key('string') }) }],
+    subscribe: [{ event: 'model-request', mode: 'async', ...withContext({ turn: key('string') }) }],
     // One canonical event per model turn. Token deltas are not events: they
     // stream to the host's stream hub (sdk/stream.js) for live delivery.
     emit: [{ event: 'model-response', keys: MODEL_RESPONSE_KEYS }],

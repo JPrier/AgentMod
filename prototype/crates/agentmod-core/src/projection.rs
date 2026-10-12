@@ -220,7 +220,7 @@ pub fn project(records: &[Record]) -> SessionView {
                     inv.contributions.clone_from(contributions);
                     inv.published.clone_from(published);
                     if let Some(title) = contributions.iter().rev().find_map(|c| match c {
-                        ContextOp::Add { slot, value } if slot == "title" => {
+                        ContextOp::Add { section, value } if section == "title" => {
                             value.as_str().map(str::to_owned)
                         }
                         _ => None,

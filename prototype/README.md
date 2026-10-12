@@ -220,7 +220,8 @@ experiments to inform those decisions, not resolutions of them.
   per-session layer. Either is rejected whole if any target's candidate revision fails to compile.
 - **Recursion (#9).** Cycles are legal and reported as info. The core has no recursion or depth
   limit; the `loop-limit` instance of the `budget` plugin bounds each turn's agent loop.
-- **Context.** Contributions are ops (`add`, `replace`, `remove`, `clear-slot`, `restore`) folded
+- **Context.** The `context` slot holds attributed items in named sections (`messages`, `tools`,
+  `plan`, …). Contributions are ops (`add`, `replace`, `remove`, `clear-section`, `restore`) folded
   in log order. `restore` returns context to its state at an earlier record — as a new record,
   so it can itself be undone. Branching copies context into the new log (`context-seeded`).
 - **Redaction.** A blocking subscriber's `returns` change what later subscribers and the settled

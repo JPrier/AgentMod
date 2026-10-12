@@ -60,10 +60,10 @@ impl ContextState {
         let mut added = 0usize;
         for op in ops {
             match op {
-                ContextOp::Add { slot, value } => {
+                ContextOp::Add { section, value } => {
                     items.push(ContextItem {
                         id: format!("{invocation_id}#{added}"),
-                        slot: slot.clone(),
+                        section: section.clone(),
                         value: value.clone(),
                         plugin: plugin.to_owned(),
                         invocation_id: invocation_id.to_owned(),
@@ -78,7 +78,7 @@ impl ContextState {
                     }
                 }
                 ContextOp::Remove { id } => items.retain(|i| &i.id != id),
-                ContextOp::ClearSlot { slot } => items.retain(|i| &i.slot != slot),
+                ContextOp::ClearSection { section } => items.retain(|i| &i.section != section),
                 ContextOp::Restore { to_sequence } => {
                     items = (*self.at(*to_sequence)).clone();
                 }
@@ -127,9 +127,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn add(slot: &str, v: i64) -> ContextOp {
+    fn add(section: &str, v: i64) -> ContextOp {
         ContextOp::Add {
-            slot: slot.into(),
+            section: section.into(),
             value: json!(v),
         }
     }
@@ -165,9 +165,16 @@ mod tests {
             ],
         );
         assert_eq!(c.items().len(), 2);
-        c.apply(4, "s/i4", "q", &[ContextOp::ClearSlot { slot: "m".into() }]);
+        c.apply(
+            4,
+            "s/i4",
+            "q",
+            &[ContextOp::ClearSection {
+                section: "m".into(),
+            }],
+        );
         assert_eq!(c.items().len(), 1);
-        assert_eq!(c.items()[0].slot, "t");
+        assert_eq!(c.items()[0].section, "t");
     }
 
     #[test]

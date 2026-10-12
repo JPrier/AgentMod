@@ -14,8 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::shape::{KeyDecl, Keys, Shape};
@@ -60,10 +59,13 @@ pub enum Capability {
     /// Session directory read (declared; the directory API is deferred).
     #[serde(rename = "sessions.read")]
     SessionsRead,
-    /// Prototype frontends: dispatcher commands, config apply, service calls.
+    /// Dispatcher commands: soft stop, hard stop, resume (compiler.md §3.5).
+    /// The prototype also gates config apply and service calls on it.
     #[serde(rename = "control")]
     Control,
-    /// Prototype frontends and inspectors: tail live records of any session.
+    /// Read a session's records from outside the bus, as a watcher
+    /// (compiler.md §3.5). Watching is reading, not participating: a watcher
+    /// is not a node in the compiled graph.
     #[serde(rename = "observe")]
     Observe,
 }
@@ -168,55 +170,6 @@ pub fn pattern_error(pattern: &str, emit: bool) -> Option<String> {
 // The manifest.
 // ----------------------------------------------------------------------
 
-/// What a subscription needs: payload keys plus requested session slots.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Receives {
-    pub keys: Keys,
-    pub slots: Keys,
-}
-
-impl Serialize for Receives {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut m = serde_json::Map::new();
-        for (k, v) in &self.keys {
-            m.insert(
-                k.clone(),
-                serde_json::to_value(v).map_err(serde::ser::Error::custom)?,
-            );
-        }
-        if !self.slots.is_empty() {
-            m.insert(
-                "slots".into(),
-                serde_json::to_value(&self.slots).map_err(serde::ser::Error::custom)?,
-            );
-        }
-        m.serialize(s)
-    }
-}
-
-impl<'de> Deserialize<'de> for Receives {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let mut m = BTreeMap::<String, Value>::deserialize(d)?;
-        let slots = match m.remove("slots") {
-            Some(v) => serde_json::from_value(v).map_err(D::Error::custom)?,
-            None => Keys::new(),
-        };
-        let mut keys = Keys::new();
-        for (k, v) in m {
-            let decl: KeyDecl = serde_json::from_value(v)
-                .map_err(|e| D::Error::custom(format!("receives.{k}: {e}")))?;
-            keys.insert(k, decl);
-        }
-        Ok(Receives { keys, slots })
-    }
-}
-
-impl Receives {
-    fn is_empty(&self) -> bool {
-        self.keys.is_empty() && self.slots.is_empty()
-    }
-}
-
 /// One subscription: an event, a family, or `*`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -229,9 +182,13 @@ pub struct Subscription {
     /// Also receive every undeclared key, untyped and outside the compiler's guarantee.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unlisted_keys: bool,
-    /// The demand: keys (and slots) this subscriber needs.
-    #[serde(default, skip_serializing_if = "Receives::is_empty")]
-    pub receives: Receives,
+    /// The demand: the payload keys this subscriber needs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub receives: Keys,
+    /// Session slots this subscriber requests, like keys (`[subscribe.slots]`,
+    /// a sibling of `receives`, so no key name is reserved; compiler.md §3.2).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slots: Keys,
     /// Blocking only: keys handed back to the chain (overwrite or add; never remove).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub returns: Keys,
@@ -634,7 +591,8 @@ mod tests {
             "name": "p", "version": "1",
             "subscribe": [{
                 "event": "model-request", "mode": "blocking", "actions": ["contribute-context"],
-                "receives": { "model": { "shape": "string" }, "slots": { "context": { "shape": "array<object>" } } },
+                "receives": { "model": { "shape": "string" }, "slots": { "shape": "integer" } },
+                "slots": { "context": { "shape": "array<object>" } },
                 "returns": { "temperature": { "shape": "number" } }
             }],
             "emit": [{ "event": "tool-call/*", "keys": { "call_id": { "shape": "string" } } }],
@@ -643,7 +601,12 @@ mod tests {
             "sink": true
         }))
         .unwrap();
-        assert_eq!(m.subscribe[0].receives.slots.len(), 1);
+        // Slots are a sibling of `receives`, so `slots` is an ordinary key name.
+        assert_eq!(m.subscribe[0].slots.len(), 1);
+        assert_eq!(
+            m.subscribe[0].receives["slots"].shape.to_string(),
+            "integer"
+        );
         assert!(m.emit_for("tool-call/x").is_some());
         assert!(m.emit_for("tool-result").is_none());
         let back: Manifest = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();

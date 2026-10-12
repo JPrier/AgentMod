@@ -82,7 +82,7 @@ function fakeCtx({ abort } = {}) {
   };
   const ctrl = new AbortController();
   if (abort) abort(ctrl);
-  const ctx = { context: [{ slot: 'messages', value: { role: 'user', content: 'hi' } }], signal: ctrl.signal, invocationId: 's0001/i4', attempt: 1, plugin };
+  const ctx = { context: [{ section: 'messages', value: { role: 'user', content: 'hi' } }], signal: ctrl.signal, invocationId: 's0001/i4', attempt: 1, plugin };
   ctx.stream = (o) => createStreamWriter(ctx, o);
   ctx.frames = () => sent.flatMap((s) => s.params.frames);
   ctx.sent = sent;

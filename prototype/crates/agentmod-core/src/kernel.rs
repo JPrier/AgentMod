@@ -336,7 +336,7 @@ fn project(payload: &Value, sub: &Subscription) -> Value {
         return payload.clone();
     }
     let mut out = Map::new();
-    for k in sub.receives.keys.keys() {
+    for k in sub.receives.keys() {
         if let Some(v) = obj.get(k) {
             out.insert(k.clone(), v.clone());
         }
@@ -665,7 +665,7 @@ impl Kernel {
                             .iter()
                             .find(|x| x.event == *subscription && x.mode == *mode)
                     })
-                    .map(|x| x.receives.slots.keys().cloned().collect())
+                    .map(|x| x.slots.keys().cloned().collect())
                     .unwrap_or_default();
                 let subscription = subscription.clone();
                 s.invocations.insert(
@@ -889,7 +889,7 @@ impl Kernel {
         if let Some(sub) = &sub
             && let Err(e) = check_keys(
                 payload.as_object().unwrap_or(&Map::new()),
-                &sub.receives.keys,
+                &sub.receives,
                 "",
             )
         {
@@ -904,7 +904,7 @@ impl Kernel {
                     event_id: Some(event_id.to_owned()),
                     invocation_id: Some(invocation_id.clone()),
                     plugin: edge.to.clone(),
-                    declaration: json!({ "kind": "receives", "plugin": edge.to, "subscription": edge.subscription, "event": edge.event, "key": e.path, "keys": sub.receives.keys }),
+                    declaration: json!({ "kind": "receives", "plugin": edge.to, "subscription": edge.subscription, "event": edge.event, "key": e.path, "keys": sub.receives }),
                     observed: payload.clone(),
                     reason: reason.clone(),
                     reaction: "invocation-failed",
@@ -1859,7 +1859,7 @@ impl Kernel {
                     }
                 }
                 None => {
-                    let unlisted = !supplied.contains_key(k) && !sub.receives.keys.contains_key(k);
+                    let unlisted = !supplied.contains_key(k) && !sub.receives.contains_key(k);
                     match current.get(k) {
                         Some(old) if sub.unlisted_keys && unlisted => {
                             if kind_of(old) != kind_of(v) {

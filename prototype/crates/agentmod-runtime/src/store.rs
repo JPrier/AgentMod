@@ -384,8 +384,8 @@ fn observe(e: &mut IndexEntry, r: &Record) {
         }
         Body::InvocationCompleted { contributions, .. } => {
             for c in contributions {
-                if let ContextOp::Add { slot, value } = c
-                    && slot == "title"
+                if let ContextOp::Add { section, value } = c
+                    && section == "title"
                 {
                     e.title = value.as_str().map(str::to_owned);
                 }

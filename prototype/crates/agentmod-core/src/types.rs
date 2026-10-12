@@ -82,7 +82,9 @@ pub struct EventRecord {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextItem {
     pub id: String,
-    pub slot: String,
+    /// The named section of the context this item belongs to (`messages`,
+    /// `tools`, `plan`, …). Not a session slot: the whole context is one slot.
+    pub section: String,
     pub value: Value,
     pub plugin: String,
     pub invocation_id: String,
@@ -93,14 +95,14 @@ pub struct ContextItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "kebab-case")]
 pub enum ContextOp {
-    /// Append a new item to a slot.
-    Add { slot: String, value: Value },
+    /// Append a new item to a section.
+    Add { section: String, value: Value },
     /// Replace the value of an existing item (keeps its position).
     Replace { id: String, value: Value },
     /// Remove one item.
     Remove { id: String },
-    /// Remove every item in a slot.
-    ClearSlot { slot: String },
+    /// Remove every item in a section.
+    ClearSection { section: String },
     /// Restore the whole context to its state as of a log sequence number.
     Restore { to_sequence: u64 },
 }

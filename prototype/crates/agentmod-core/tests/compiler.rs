@@ -493,7 +493,11 @@ fn row_info_sections_cycles_capabilities_interrupt_unlisted_and_surface() {
     let (c, ..) = build(&ms, d);
     assert!(c.ok, "{:#?}", c.diagnostics);
     let r = &rev(&c).report;
-    assert_eq!(r.cycles, vec![vec!["p".to_owned(), "q".to_owned()]]);
+    assert_eq!(
+        r.cycles.internal,
+        vec![vec!["p".to_owned(), "q".to_owned()]]
+    );
+    assert!(r.cycles.external_input.is_empty());
     assert_eq!(r.capabilities["cross-session"], vec!["q"]);
     assert!(
         r.interrupt
@@ -530,7 +534,7 @@ fn deny_warnings_promotes_warnings_to_errors() {
 
 #[test]
 fn definitions_name_their_runtime_and_slots_are_typed() {
-    let ms = json!({ "ui": ui(), "p": { "subscribe": [{ "event": "go", "mode": "async", "receives": { "slots": { "context": k("object"), "notes": k("array<string>") } } }], "sink": true } });
+    let ms = json!({ "ui": ui(), "p": { "subscribe": [{ "event": "go", "mode": "async", "slots": { "context": k("object"), "notes": k("array<string>") } }], "sink": true } });
     let (c, ..) = build(&ms, json!({ "plugins": { "ui": {}, "p": {} } }));
     one(&c, "missing-runtime");
     let (c, ..) = build(
@@ -747,13 +751,24 @@ fn example_accepted_chat_loop() {
     let r = rev(&c);
     // web-ui watches the session through `observe`, so it is not in the loop.
     assert_eq!(
-        r.report.cycles,
+        r.report.cycles.internal,
         vec![vec![
             "chat-context".to_owned(),
             "file-tools".to_owned(),
             "openrouter".to_owned(),
         ]]
     );
+    assert!(r.report.cycles.external_input.is_empty());
+    // Watching is not subscribing: the only edge into web-ui is its standing
+    // `session-started` invocation, which its deferred publishes cite.
+    let into_ui: Vec<&str> = r
+        .graph
+        .edges
+        .iter()
+        .filter(|e| e.to == "web-ui")
+        .map(|e| e.event.as_str())
+        .collect();
+    assert_eq!(into_ui, vec!["session-started"]);
     assert!(
         find(&c, "cycle")
             .iter()
@@ -847,6 +862,74 @@ fn example_rejected_observable_tie() {
             .fixed_orders
             .iter()
             .any(|f| f.contains("policy-gate before redactor"))
+    );
+}
+
+/// §4 (gap 9 of #30): a tie-break keyed by a family name applies to every
+/// member the family resolves to.
+#[test]
+fn a_family_tie_break_orders_every_member() {
+    let gate = |name: &str| json!({ "subscribe": [{ "event": "tool-call/*", "mode": "blocking", "actions": ["veto"] }], "emit": [{ "event": format!("{name}-noted") }] });
+    let mut ms = chat_loop_ms();
+    ms["policy-gate"] = gate("policy");
+    ms["redactor"] = gate("redactor");
+    ms["shell"] = json!({ "subscribe": [{ "event": "tool-call/run", "mode": "async", "receives": { "call_id": k(S), "args": k("object") } }], "emit": [{ "event": "tool-result", "keys": { "call_id": k(S), "content": k(S) } }] });
+    let mut d = chat_loop_def();
+    d["phases"] = json!(["guard", "loop"]);
+    d["plugins"]["policy-gate"] = json!({ "phase": "guard" });
+    d["plugins"]["redactor"] = json!({ "phase": "guard" });
+    d["plugins"]["shell"] = json!({});
+    // Against name order, so the tie-break is what decides.
+    d["order"] = json!({ "tool-call": { "guard": ["redactor", "policy-gate"] } });
+    let (c, ..) = build(&ms, d);
+    assert!(c.ok, "{:#?}", c.diagnostics);
+    let g = &rev(&c).graph;
+    for member in ["tool-call/read_file", "tool-call/run"] {
+        let route = g.route("chat-context", member).expect(member);
+        let chain: Vec<&str> = route
+            .blocking
+            .iter()
+            .map(|&i| g.edges[i].to.as_str())
+            .collect();
+        assert_eq!(chain, vec!["redactor", "policy-gate"], "{member}");
+    }
+}
+
+/// §6: cycles are reported split into internal cycles, which can run on
+/// their own, and cycles that close only through external input (a deferred
+/// publish, such as a frontend's user message).
+#[test]
+fn cycles_are_split_into_internal_and_through_external_input() {
+    let ms = json!({
+        // The frontend sends `go` from outside any invocation and reacts to `a`.
+        "ui": { "subscribe": [{ "event": "session-started", "mode": "async" }, { "event": "a", "mode": "async" }], "emit": [{ "event": "go", "deferred": true, "keys": { "text": k(S) } }], "capabilities": ["deferred-publish"], "sink": true },
+        "p": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "b", "mode": "async" }], "emit": [{ "event": "a" }] },
+        "q": { "subscribe": [{ "event": "a", "mode": "async" }], "emit": [{ "event": "b" }] }
+    });
+    let (c, ..) = build(&ms, base_def(json!({ "ui": {}, "p": {}, "q": {} })));
+    assert!(c.ok, "{:#?}", c.diagnostics);
+    let cycles = &rev(&c).report.cycles;
+    assert_eq!(cycles.internal, vec![vec!["p".to_owned(), "q".to_owned()]]);
+    assert_eq!(
+        cycles.external_input,
+        vec![vec!["p".to_owned(), "q".to_owned(), "ui".to_owned()]]
+    );
+    let d = one(&c, "external-input-cycle");
+    assert_eq!(d.severity, Severity::Info);
+    assert_eq!(d.plugins, vec!["p", "q", "ui"]);
+    assert!(find(&c, "cycle").iter().all(|d| d.plugins == ["p", "q"]));
+    // Without q's edge back, only the cycle through external input remains.
+    let mut ms = ms;
+    ms["p"]["subscribe"] = json!([{ "event": "go", "mode": "async" }]);
+    ms["q"]["emit"] = json!([]);
+    ms["q"]["sink"] = json!(true);
+    let (c, ..) = build(&ms, base_def(json!({ "ui": {}, "p": {}, "q": {} })));
+    assert!(c.ok, "{:#?}", c.diagnostics);
+    let cycles = &rev(&c).report.cycles;
+    assert!(cycles.internal.is_empty());
+    assert_eq!(
+        cycles.external_input,
+        vec![vec!["p".to_owned(), "ui".to_owned()]]
     );
 }
 

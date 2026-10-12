@@ -1228,17 +1228,17 @@ function contextPane() {
   const v = state.view;
   if (!v) return h('p.help', 'Select a session.');
   const sid = v.session_id;
-  const slot = h('select', ['system', 'memory', 'messages', 'note'].map((s) => h('option', s)));
+  const section = h('select', { 'aria-label': 'Context section' }, ['system', 'memory', 'messages', 'note'].map((s) => h('option', s)));
   const text = h('input', { placeholder: 'Text to add', 'aria-label': 'Context text' });
   const seq = h('input', { type: 'number', min: 0, placeholder: 'Record #', 'aria-label': 'Record number', style: 'max-width:110px' });
   return [
     h('p.help', 'The context is an attributed fold over contributions in the log. Edits are published as a context-edit event, so every change is a new record and every earlier state stays reconstructable.'),
     v.context.length ? v.context.map((c) => h('div.ctx-item',
-      h('span.ctx-slot', c.slot),
+      h('span.ctx-section', c.section),
       h('span.ctx-val', typeof c.value === 'string' ? c.value : c.value?.content ? `${c.value.role}: ${c.value.content}` : c.value?.name ? `${c.value.name} — ${c.value.description || ''}` : JSON.stringify(c.value), h('span.by', `${c.plugin} · ${c.id}`)),
       h('button.btn.small.ghost', { title: 'Remove this item', onclick: () => act(() => state.client.contextEdit(sid, [{ op: 'remove', id: c.id }]), 'Removed. The model sees the change on its next request.') }, 'Remove'))) : h('p.help', 'Empty.'),
-    h('form.inline-form', { onsubmit: (e) => { e.preventDefault(); if (!text.value.trim()) return; const val = slot.value === 'messages' ? { role: 'user', content: text.value } : text.value; act(() => state.client.contextEdit(sid, [{ op: 'add', slot: slot.value, value: val }]), 'Added to context.'); text.value = ''; } },
-      h('h3', 'Add an item'), h('div.r', slot, text, h('button.btn', { type: 'submit' }, 'Add'))),
+    h('form.inline-form', { onsubmit: (e) => { e.preventDefault(); if (!text.value.trim()) return; const val = section.value === 'messages' ? { role: 'user', content: text.value } : text.value; act(() => state.client.contextEdit(sid, [{ op: 'add', section: section.value, value: val }]), 'Added to context.'); text.value = ''; } },
+      h('h3', 'Add an item'), h('div.r', section, text, h('button.btn', { type: 'submit' }, 'Add'))),
     h('form.inline-form', { onsubmit: (e) => { e.preventDefault(); const n = Number(seq.value); if (!Number.isFinite(n)) return; act(() => state.client.contextEdit(sid, [{ op: 'restore', to_sequence: n }]), `Context restored to record #${n}.`); } },
       h('h3', 'Restore'), h('p.help', 'Set the context to its state as of an earlier record. Restoring again to a later record undoes it.'), h('div.r', seq, h('button.btn', { type: 'submit' }, 'Restore'))),
   ];
@@ -1284,7 +1284,8 @@ function graphPane() {
     h('h3', 'Diagnostics'),
     diagnosticRows(r.diagnostics.filter((x) => x.severity !== 'info')),
     section('Resolved families', Object.entries(rp.families || {}).flatMap(([f, by]) => Object.entries(by).map(([emitter, members]) => `${emitter}: ${f} → ${members.length ? members.join(', ') : '(nothing)'}`)), 'A family emit is resolved into the concrete members this definition\'s plugins subscribe to; the graph holds only those. For tool calls, they are the tools the model is offered.'),
-    section('Cycles', (rp.cycles || []).map((c) => c.join(' → ')), 'Legal (agent loops are cycles). The core has no depth limit; bounding loops is plugin policy.'),
+    section('Internal cycles', (rp.cycles?.internal || []).map((c) => c.join(' → ')), 'Legal (agent loops are cycles), and they can run on their own. The core has no depth limit; bounding loops is plugin policy.'),
+    section('Cycles through external input', (rp.cycles?.external_input || []).map((c) => c.join(' → ')), 'These close only through a deferred publish (a user message, a timer): they turn when something outside the session sends again.'),
     section('Fixed orders', rp.fixed_orders || [], 'No observable tie, so the compiler ordered these by name.'),
     section('Capabilities', Object.entries(rp.capabilities || {}).map(([c, ps]) => `${c}: ${ps.join(', ')}`)),
     section('Interrupt', rp.interrupt || []),

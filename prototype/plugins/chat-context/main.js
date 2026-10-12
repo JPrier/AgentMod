@@ -1,5 +1,5 @@
 // chat-context: the bundled chat convention. Folds user, assistant, and tool
-// messages into the `messages` context slot and drives the agent loop:
+// messages into the `messages` context section and drives the agent loop:
 //   user-message -> model-request -> model-response -> (tool-call* -> tool-result*)* -> assistant-message
 // It keeps no in-memory state: everything it needs is in the delivered context.
 //
@@ -42,7 +42,7 @@ import { definePlugin, key, optional, withContext, START_INPUT, TOOL_CALL_KEYS }
 import { describeParams, suggestTools } from '../sdk/toolargs.js';
 import { conformArgs, toolOfMember } from '../sdk/toolschema.js';
 
-const msgs = (ctx) => ctx.context.filter((c) => c.slot === 'messages');
+const msgs = (ctx) => ctx.context.filter((c) => c.section === 'messages');
 const META_KEYS = ['exit_code', 'timed_out', 'duration_ms', 'truncated', 'checkpoint', 'process_id', 'state', 'sha256', 'diagnostics', 'read_only', 'secrets_used'];
 const CONTRIBUTES = ['contribute-context'];
 
@@ -59,7 +59,7 @@ const toolMembers = (ctx) => new Map(ctx.emits.filter((e) => e.event.startsWith(
 
 /** Write the `tools` section from the resolved emit set (replacing any earlier one). */
 function offerTools(ctx) {
-  ctx.clearSlot('tools');
+  ctx.clearSection('tools');
   for (const member of toolMembers(ctx).values()) ctx.add('tools', toolOfMember(member));
 }
 
@@ -86,14 +86,14 @@ definePlugin({
       { event: 'session-started', mode: 'blocking', actions: CONTRIBUTES, receives: { ...START_INPUT } },
       { event: 'config-applied', mode: 'blocking', actions: CONTRIBUTES },
       { event: 'user-message', mode: 'blocking', actions: CONTRIBUTES, receives: { text: key('string'), attachments: optional('array<object>') } },
-      { event: 'model-response', mode: 'blocking', actions: CONTRIBUTES, receives: withContext({ text: key('string'), tool_calls: optional('array<object>'), stream_id: optional('string') }) },
+      { event: 'model-response', mode: 'blocking', actions: CONTRIBUTES, ...withContext({ text: key('string'), tool_calls: optional('array<object>'), stream_id: optional('string') }) },
       // Tools attach metadata of their own (exit codes, checkpoints, …): kept
       // in the tool message untyped, so this subscription takes unlisted keys.
-      { event: 'tool-result', mode: 'blocking', actions: CONTRIBUTES, unlisted_keys: true, receives: withContext({ call_id: key('string'), name: optional('string'), output: key('string | object'), error: optional('bool') }) },
+      { event: 'tool-result', mode: 'blocking', actions: CONTRIBUTES, unlisted_keys: true, ...withContext({ call_id: key('string'), name: optional('string'), output: key('string | object'), error: optional('bool') }) },
       { event: 'context-edit', mode: 'blocking', actions: CONTRIBUTES, receives: { ops: key('array<object>') } },
       // Any failed invocation, reported by the core: a crashed tool (or a gate
       // that failed) is answered for the model, so a call never leaves it waiting.
-      { event: 'invocation-failed', mode: 'blocking', actions: CONTRIBUTES, receives: withContext({ event_name: key('string'), payload: key('object'), plugin: key('string'), mode: key('"blocking" | "async"'), error: key('string') }) },
+      { event: 'invocation-failed', mode: 'blocking', actions: CONTRIBUTES, ...withContext({ event_name: key('string'), payload: key('object'), plugin: key('string'), mode: key('"blocking" | "async"'), error: key('string') }) },
       { event: 'approval-granted', mode: 'async', receives: { call_id: key('string'), name: key('string'), args: key('object'), approved: key('object') } },
     ],
     emit: [

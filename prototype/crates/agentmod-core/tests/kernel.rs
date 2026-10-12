@@ -52,7 +52,7 @@ fn manifests() -> BTreeMap<String, Manifest> {
             ]
         },
         "model": {
-            "subscribe": [{ "event": "model-request", "mode": "async", "receives": { "turn": k(S), "slots": ctx } }],
+            "subscribe": [{ "event": "model-request", "mode": "async", "receives": { "turn": k(S) }, "slots": ctx }],
             "emit": [{ "event": "model-response", "keys": { "text": k(S) } }]
         },
         "ping": { "subscribe": [{ "event": "pong", "mode": "blocking" }], "emit": [{ "event": "ping" }] },
@@ -138,7 +138,7 @@ fn behave(sim: &mut Sim, plugin: &str, req: &InvokeRequest) -> InvocationResult 
         }
         ("chat", "user-message") => {
             result.contributions = vec![ContextOp::Add {
-                slot: "messages".into(),
+                section: "messages".into(),
                 value: json!({ "role": "user", "content": ev.payload["text"] }),
             }];
             let _ = sim.emit(
@@ -150,7 +150,7 @@ fn behave(sim: &mut Sim, plugin: &str, req: &InvokeRequest) -> InvocationResult 
         }
         ("chat", "model-response") => {
             result.contributions = vec![ContextOp::Add {
-                slot: "messages".into(),
+                section: "messages".into(),
                 value: json!({ "role": "assistant", "content": ev.payload["text"] }),
             }];
             let _ = sim.emit(
@@ -485,7 +485,7 @@ fn async_subscribers_cannot_veto_and_undeclared_actions_are_breaches() {
     sim.run(&mut |s: &mut Sim, p: &str, req: &InvokeRequest| match p {
         "gate" => InvocationResult {
             contributions: vec![ContextOp::Add {
-                slot: "x".into(),
+                section: "x".into(),
                 value: json!(1),
             }],
             ..Default::default()
@@ -499,7 +499,7 @@ fn async_subscribers_cannot_veto_and_undeclared_actions_are_breaches() {
             .unwrap()
             .contains("contribute-context")
     );
-    assert!(view.context.iter().all(|c| c.slot != "x"));
+    assert!(view.context.iter().all(|c| c.section != "x"));
 }
 
 #[test]

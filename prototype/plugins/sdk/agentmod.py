@@ -35,7 +35,7 @@ class Ctx:
         if "context" not in self.slots:
             raise RuntimeError(
                 f"read the context on {self.event['event_name']}, but the subscription "
-                f"({self.subscription}) does not request the `context` slot (receives.slots.context)")
+                f"({self.subscription}) does not request the `context` slot (slots.context)")
         return self.slots["context"] or []
 
     def publish(self, event_name, payload=None, ui=None, lane=None, target_session=None):
@@ -44,8 +44,8 @@ class Ctx:
             "payload": payload or {}, "ui": ui, "lane": lane, "target_session": target_session,
         })
 
-    def add(self, slot, value):
-        self.result["contributions"].append({"op": "add", "slot": slot, "value": value})
+    def add(self, section, value):
+        self.result["contributions"].append({"op": "add", "section": section, "value": value})
 
     def returns(self, **keys):
         """Blocking subscribers: hand keys back to the chain (declared in `returns`)."""
@@ -54,8 +54,9 @@ class Ctx:
     def veto(self, reason):
         self.result["veto"] = reason
 
-    def slot(self, name):
-        return [c["value"] for c in self.context if c.get("slot") == name]
+    def section(self, name):
+        """The values of one context section (`messages`, `tools`, …)."""
+        return [c["value"] for c in self.context if c.get("section") == name]
 
 
 class Plugin:

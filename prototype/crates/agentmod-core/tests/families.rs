@@ -143,7 +143,7 @@ impl Behaviour {
             }
             ("agent", INVOCATION_FAILED) => InvocationResult {
                 contributions: vec![ContextOp::Add {
-                    slot: "answers".into(),
+                    section: "answers".into(),
                     value: json!({ "call": ev.payload["payload"]["call_id"], "error": ev.payload["error"], "plugin": ev.payload["plugin"] }),
                 }],
                 ..Default::default()
@@ -218,7 +218,7 @@ fn answers(sim: &Sim, sid: &str) -> Vec<Value> {
         .context(sid)
         .unwrap()
         .iter()
-        .filter(|c| c.slot == "answers")
+        .filter(|c| c.section == "answers")
         .map(|c| c.value.clone())
         .collect()
 }

@@ -249,8 +249,9 @@ impl ResolvedEmit {
 /// The compile report's information sections (compiler.md §6, "Info").
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Report {
-    /// Plugin cycles (strongly connected components), sorted.
-    pub cycles: Vec<Vec<String>>,
+    /// Plugin cycles (strongly connected components), split by whether they
+    /// close without outside help.
+    pub cycles: Cycles,
     /// Capability → plugins holding it.
     pub capabilities: BTreeMap<String, Vec<String>>,
     /// Interrupt-lane emits (`plugin: event`) and interrupt capability holders.
@@ -263,6 +264,18 @@ pub struct Report {
     pub fixed_orders: Vec<String>,
     /// Resolved families: family emit → emitter → the concrete members.
     pub families: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+}
+
+/// Plugin cycles, split as compiler.md §6 reports them. Each cycle is a
+/// strongly connected component of the plugin graph, its members sorted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Cycles {
+    /// Cycles whose edges are all pipeline outputs: they can run away on their own.
+    pub internal: Vec<Vec<String>>,
+    /// Cycles that close only through external input: an edge that is a
+    /// deferred publish (a frontend's user message, a timer's tick), which
+    /// arrives from outside any invocation.
+    pub external_input: Vec<Vec<String>>,
 }
 
 /// One compiled session definition: the unit a session runs under.
@@ -717,15 +730,6 @@ fn check_manifest(dx: &mut Diags<'_>, name: &str, m: &Manifest, path: Option<Str
             if !s.returns.is_empty() {
                 dx.err("invalid-action", p(), Some(&s.event), &[name], format!("`{name}` is an async subscriber of `{}` and declares `returns`; only blocking subscribers return keys", s.event));
             }
-        }
-        if s.receives.keys.contains_key("slots") {
-            dx.err(
-                "invalid-key",
-                p(),
-                Some(&s.event),
-                &[name],
-                "`slots` is reserved in `receives` for slot requests".into(),
-            );
         }
     }
 }
@@ -1316,7 +1320,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                         mode: sr.sub.mode,
                         description: sr.sub.description.clone(),
                         hints: sr.sub.hints.clone(),
-                        receives: sr.sub.receives.keys.clone(),
+                        receives: sr.sub.receives.clone(),
                     })
                     .collect(),
                 None => Vec::new(),
@@ -1426,8 +1430,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
             }
             let mut merged: Option<(Keys, String)> = None;
             for sr in subscribers {
-                let Some(Shape::Object(Some(nested))) =
-                    sr.sub.receives.keys.get(k).map(|d| &d.shape)
+                let Some(Shape::Object(Some(nested))) = sr.sub.receives.get(k).map(|d| &d.shape)
                 else {
                     continue;
                 };
@@ -1570,7 +1573,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
     fn check_slots(&mut self) {
         let slots = self.def.effective_slots();
         for sr in self.subs() {
-            for (slot, want) in &sr.sub.receives.slots {
+            for (slot, want) in &sr.sub.slots {
                 let path = self.at(&format!("plugins.{}", sr.plugin));
                 match slots.get(slot) {
                     None => self.dx.err("unknown-slot", path, Some(&sr.sub.event), &[&sr.plugin], format!("`{}` requests slot `{slot}` on `{}`, which the definition does not declare (slots: {})", sr.plugin, sr.sub.event, slots.keys().cloned().collect::<Vec<_>>().join(", "))),
@@ -1812,7 +1815,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
     }
 
     fn check_receives(&mut self, e: &Emitter, class: &str, d: &SubRef<'m>, supply: &Keys) {
-        for mm in keys_mismatches(supply, &d.sub.receives.keys, "") {
+        for mm in keys_mismatches(supply, &d.sub.receives, "") {
             let code = match mm.kind {
                 MismatchKind::Missing { .. } => "starved-consumer",
                 MismatchKind::Incompatible { .. } => "shape-mismatch",
@@ -1879,7 +1882,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
             position,
             lanes: e.decl.lanes.clone(),
             supply: supply.clone(),
-            slots: d.sub.receives.slots.keys().cloned().collect(),
+            slots: d.sub.slots.keys().cloned().collect(),
             deferred: e.decl.deferred,
             via: e.via,
         });
@@ -1973,21 +1976,37 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
             let path = self.at("plugins");
             self.dx.warn("unreachable-island", path, None, &names, format!("{} feed{} each other, but no root (core event, inbound event, or deferred emit) reaches {}", names.join(", "), if names.len() == 1 { "s" } else { "" }, if names.len() == 1 { "it" } else { "them" }));
         }
-        // Cycles (information) and interrupt-only cycles (warning).
-        let all: Vec<(String, String)> = self
-            .graph
-            .edges
-            .iter()
-            .filter(|e| e.from != BOUNDARY && self.is_member(&e.from))
-            .map(|e| (e.from.clone(), e.to.clone()))
+        // Cycles (information), split into internal cycles and cycles that
+        // close only through external input (a deferred publish), and
+        // interrupt-only cycles (warning).
+        let plugin_edges = |deferred_too: bool| -> Vec<(String, String)> {
+            self.graph
+                .edges
+                .iter()
+                .filter(|e| e.from != BOUNDARY && self.is_member(&e.from))
+                .filter(|e| deferred_too || !e.deferred)
+                .map(|e| (e.from.clone(), e.to.clone()))
+                .collect()
+        };
+        let internal = scc(&plugin_edges(false));
+        let external_input: Vec<Vec<String>> = scc(&plugin_edges(true))
+            .into_iter()
+            .filter(|c| !internal.contains(c))
             .collect();
-        let cycles = scc(&all);
-        for c in &cycles {
+        for c in &internal {
             let names: Vec<&str> = c.iter().map(String::as_str).collect();
             let path = self.at("plugins");
-            self.dx.info("cycle", path, None, &names, format!("cycle {}: legal (agent loops are cycles); termination is a plugin's business, not the core's", c.join(" → ")));
+            self.dx.info("cycle", path, None, &names, format!("internal cycle {}: legal (agent loops are cycles), and it can run on its own; termination is a plugin's business, not the core's", c.join(" → ")));
         }
-        self.report.cycles = cycles;
+        for c in &external_input {
+            let names: Vec<&str> = c.iter().map(String::as_str).collect();
+            let path = self.at("plugins");
+            self.dx.info("external-input-cycle", path, None, &names, format!("cycle {} passes through external input (a deferred publish): it turns only when something outside the session sends again", c.join(" → ")));
+        }
+        self.report.cycles = Cycles {
+            internal,
+            external_input,
+        };
         let interrupt: Vec<(String, String)> = self
             .graph
             .edges
@@ -2146,7 +2165,7 @@ fn same_shape(a: &Shape, b: &Shape) -> bool {
 /// Does `a` return a key `b` receives or returns (or, with unlisted keys, any key)?
 fn tie_reason(a: &Subscription, b: &Subscription) -> Option<String> {
     for k in a.returns.keys() {
-        if b.receives.keys.contains_key(k) {
+        if b.receives.contains_key(k) {
             return Some(format!("one returns `{k}`, which the other receives"));
         }
         if b.returns.contains_key(k) {

@@ -210,7 +210,18 @@ fn print_revision(name: &str, rev: &agentmod_core::compiler::Revision) {
             }
         }
     };
-    section("cycles", rp.cycles.iter().map(|c| c.join(" → ")).collect());
+    section(
+        "internal cycles",
+        rp.cycles.internal.iter().map(|c| c.join(" → ")).collect(),
+    );
+    section(
+        "cycles through external input",
+        rp.cycles
+            .external_input
+            .iter()
+            .map(|c| c.join(" → "))
+            .collect(),
+    );
     section(
         "families",
         rp.families

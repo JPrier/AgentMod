@@ -48,7 +48,7 @@ test('environment facts are probed once, with versions', async () => {
   const env = await tk.environment();
   assert.ok(env.os && env.arch);
   assert.ok('bash' in env.tools);
-  const p = project([{ slot: 'environment', value: { ...env, network: 'none' } }]);
+  const p = project([{ section: 'environment', value: { ...env, network: 'none' } }]);
   assert.match(p.system, /Environment \(probed once; no need to check again\)/);
   assert.match(p.system, /Network: none\./);
 });
@@ -88,7 +88,7 @@ test('unknown tools: "no such tool", with the closest names', () => {
 
 test('deferred tools are listed with their arguments, so they can be called without a discovery turn', () => {
   const tools = [...toolSpecs({ importRepos: true }), { name: 'tool_search', description: 'Find tools.', parameters: { query: { type: 'string' } }, tier: 'core' }];
-  const ctx = tools.map((t) => ({ slot: 'tools', value: t }));
+  const ctx = tools.map((t) => ({ section: 'tools', value: t }));
   const p = project(ctx);
   const ts = p.tools.find((t) => t.name === 'tool_search');
   assert.match(ts.description, /import_repo\(repo, ref\?, dest\?\)/);

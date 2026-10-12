@@ -1136,12 +1136,7 @@ impl Host {
         let Some(rev) = self.kernel.revision(revision) else {
             return;
         };
-        let members: Vec<Key> = rev
-            .plugins
-            .iter()
-            .filter(|(_, m)| m.member)
-            .map(|(n, m)| key(n, &m.stamp))
-            .collect();
+        let members: Vec<Key> = rev.plugins.iter().map(|(n, m)| key(n, &m.stamp)).collect();
         let procs: Vec<u64> = self
             .procs
             .iter()

@@ -365,7 +365,10 @@
         "subagent": {},
         "titler": {},
         "tool-discovery": {
-          "phase": "intake"
+          "phase": "intake",
+          "phases": {
+            "session-started": "loop"
+          }
         },
         "web-fetch": {},
         "web-ui": {}
@@ -384,6 +387,10 @@
           ]
         },
         "session-started": {
+          "loop": [
+            "chat-context",
+            "tool-discovery"
+          ],
           "offer": [
             "linux-sandbox",
             "local-workspace",
@@ -472,7 +479,10 @@
         "tool-calc": {},
         "tool-clock": {},
         "tool-discovery": {
-          "phase": "intake"
+          "phase": "intake",
+          "phases": {
+            "session-started": "loop"
+          }
         },
         "web-ui": {}
       },
@@ -490,6 +500,10 @@
           ]
         },
         "session-started": {
+          "loop": [
+            "chat-context",
+            "tool-discovery"
+          ],
           "offer": [
             "linux-sandbox",
             "local-workspace"
@@ -589,203 +603,207 @@
     },
     "definitions.coder": {
       "file": "agentmod.toml",
-      "line": 256
+      "line": 260
     },
     "definitions.coder.description": {
       "file": "agentmod.toml",
-      "line": 257
+      "line": 261
     },
     "definitions.coder.inbound.subagent-result": {
       "file": "agentmod.toml",
-      "line": 293
+      "line": 301
     },
     "definitions.coder.inbound.subagent-result.call_id": {
       "file": "agentmod.toml",
-      "line": 294
+      "line": 302
     },
     "definitions.coder.inbound.subagent-result.evidence": {
       "file": "agentmod.toml",
-      "line": 297
+      "line": 305
     },
     "definitions.coder.inbound.subagent-result.text": {
       "file": "agentmod.toml",
-      "line": 295
+      "line": 303
     },
     "definitions.coder.inbound.subagent-result.worker": {
       "file": "agentmod.toml",
-      "line": 296
+      "line": 304
     },
     "definitions.coder.order.config-applied": {
       "file": "agentmod.toml",
-      "line": 283
+      "line": 291
     },
     "definitions.coder.order.config-applied.offer": {
       "file": "agentmod.toml",
-      "line": 284
+      "line": 292
     },
     "definitions.coder.order.model-request": {
       "file": "agentmod.toml",
-      "line": 290
+      "line": 298
     },
     "definitions.coder.order.model-request.guard": {
       "file": "agentmod.toml",
-      "line": 291
+      "line": 299
     },
     "definitions.coder.order.session-started": {
       "file": "agentmod.toml",
-      "line": 280
+      "line": 287
+    },
+    "definitions.coder.order.session-started.loop": {
+      "file": "agentmod.toml",
+      "line": 289
     },
     "definitions.coder.order.session-started.offer": {
       "file": "agentmod.toml",
-      "line": 281
+      "line": 288
     },
     "definitions.coder.order.user-message": {
       "file": "agentmod.toml",
-      "line": 286
+      "line": 294
     },
     "definitions.coder.order.user-message.intake": {
       "file": "agentmod.toml",
-      "line": 287
+      "line": 295
     },
     "definitions.coder.phases": {
       "file": "agentmod.toml",
-      "line": 259
+      "line": 263
     },
     "definitions.coder.plugins": {
       "file": "agentmod.toml",
-      "line": 261
+      "line": 265
     },
     "definitions.coder.plugins.ask-user": {
       "file": "agentmod.toml",
-      "line": 264
+      "line": 268
     },
     "definitions.coder.plugins.browser-control": {
       "file": "agentmod.toml",
-      "line": 278
+      "line": 282
     },
     "definitions.coder.plugins.chat-context": {
       "file": "agentmod.toml",
-      "line": 267
+      "line": 271
     },
     "definitions.coder.plugins.linux-sandbox": {
       "file": "agentmod.toml",
-      "line": 272
+      "line": 276
     },
     "definitions.coder.plugins.local-workspace": {
       "file": "agentmod.toml",
-      "line": 273
+      "line": 277
     },
     "definitions.coder.plugins.loop-limit": {
       "file": "agentmod.toml",
-      "line": 266
+      "line": 270
     },
     "definitions.coder.plugins.mcp-bridge": {
       "file": "agentmod.toml",
-      "line": 277
+      "line": 281
     },
     "definitions.coder.plugins.memory": {
       "file": "agentmod.toml",
-      "line": 275
+      "line": 279
     },
     "definitions.coder.plugins.openrouter-model": {
       "file": "agentmod.toml",
-      "line": 268
+      "line": 272
     },
     "definitions.coder.plugins.plan": {
       "file": "agentmod.toml",
-      "line": 270
+      "line": 274
     },
     "definitions.coder.plugins.policy": {
       "file": "agentmod.toml",
-      "line": 265
+      "line": 269
     },
     "definitions.coder.plugins.redactor": {
       "file": "agentmod.toml",
-      "line": 263
+      "line": 267
     },
     "definitions.coder.plugins.subagent": {
       "file": "agentmod.toml",
-      "line": 274
+      "line": 278
     },
     "definitions.coder.plugins.titler": {
       "file": "agentmod.toml",
-      "line": 269
+      "line": 273
     },
     "definitions.coder.plugins.tool-discovery": {
       "file": "agentmod.toml",
-      "line": 271
+      "line": 275
     },
     "definitions.coder.plugins.web-fetch": {
       "file": "agentmod.toml",
-      "line": 276
+      "line": 280
     },
     "definitions.coder.plugins.web-ui": {
       "file": "agentmod.toml",
-      "line": 262
+      "line": 266
     },
     "definitions.coder.runtime": {
       "file": "agentmod.toml",
-      "line": 258
+      "line": 262
     },
     "definitions.heartbeat": {
       "file": "agentmod.toml",
-      "line": 311
+      "line": 319
     },
     "definitions.heartbeat.description": {
       "file": "agentmod.toml",
-      "line": 312
+      "line": 320
     },
     "definitions.heartbeat.plugins": {
       "file": "agentmod.toml",
-      "line": 315
+      "line": 323
     },
     "definitions.heartbeat.plugins.heartbeat": {
       "file": "agentmod.toml",
-      "line": 317
+      "line": 325
     },
     "definitions.heartbeat.plugins.web-ui": {
       "file": "agentmod.toml",
-      "line": 316
+      "line": 324
     },
     "definitions.heartbeat.runtime": {
       "file": "agentmod.toml",
-      "line": 313
+      "line": 321
     },
     "definitions.minimal": {
       "file": "agentmod.toml",
-      "line": 300
+      "line": 308
     },
     "definitions.minimal.description": {
       "file": "agentmod.toml",
-      "line": 301
+      "line": 309
     },
     "definitions.minimal.phases": {
       "file": "agentmod.toml",
-      "line": 303
+      "line": 311
     },
     "definitions.minimal.plugins": {
       "file": "agentmod.toml",
-      "line": 305
+      "line": 313
     },
     "definitions.minimal.plugins.chat-context": {
       "file": "agentmod.toml",
-      "line": 307
+      "line": 315
     },
     "definitions.minimal.plugins.minimal-shell": {
       "file": "agentmod.toml",
-      "line": 309
+      "line": 317
     },
     "definitions.minimal.plugins.openrouter-minimal": {
       "file": "agentmod.toml",
-      "line": 308
+      "line": 316
     },
     "definitions.minimal.plugins.web-ui": {
       "file": "agentmod.toml",
-      "line": 306
+      "line": 314
     },
     "definitions.minimal.runtime": {
       "file": "agentmod.toml",
-      "line": 302
+      "line": 310
     },
     "definitions.worker": {
       "file": "agentmod.toml",
@@ -797,27 +815,31 @@
     },
     "definitions.worker.order.config-applied": {
       "file": "agentmod.toml",
-      "line": 244
+      "line": 248
     },
     "definitions.worker.order.config-applied.offer": {
       "file": "agentmod.toml",
-      "line": 245
+      "line": 249
     },
     "definitions.worker.order.model-request": {
       "file": "agentmod.toml",
-      "line": 248
+      "line": 252
     },
     "definitions.worker.order.model-request.guard": {
       "file": "agentmod.toml",
-      "line": 249
+      "line": 253
     },
     "definitions.worker.order.session-started": {
       "file": "agentmod.toml",
-      "line": 241
+      "line": 244
+    },
+    "definitions.worker.order.session-started.loop": {
+      "file": "agentmod.toml",
+      "line": 246
     },
     "definitions.worker.order.session-started.offer": {
       "file": "agentmod.toml",
-      "line": 242
+      "line": 245
     },
     "definitions.worker.phases": {
       "file": "agentmod.toml",

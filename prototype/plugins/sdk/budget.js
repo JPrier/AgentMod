@@ -1,14 +1,14 @@
 // Budget arithmetic shared by the `budget` plugin (pure; importable by tests).
 
 // `max_turn_model_requests` bounds one turn's agent loop (model requests since
-// the latest user message): the core has no loop or depth limit, so this
-// plugin is where a runaway loop stops.
+// the latest user message, or since the start input for the first turn): the
+// core has no loop or depth limit, so this plugin is where a runaway loop stops.
 const KEYS = ['max_model_requests', 'max_tool_calls', 'max_output_tokens', 'max_wall_seconds', 'max_turn_model_requests'];
 
-/** Events since the latest user message (the current turn). */
+/** Events since the latest user message, or since the session started (the current turn). */
 export function currentTurn(events) {
   let i = events.length - 1;
-  while (i >= 0 && events[i].event_name !== 'user-message') i--;
+  while (i >= 0 && events[i].event_name !== 'user-message' && events[i].event_name !== 'session-started') i--;
   return events.slice(i + 1);
 }
 

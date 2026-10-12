@@ -201,6 +201,9 @@ test('budgets: tighter of config and delegation; usage from the log', () => {
   assert.equal(next.turn_model_requests, 1);
   assert.match(exceeded({ max_turn_model_requests: 5 }, u), /max_turn_model_requests=5 in this turn/);
   assert.equal(exceeded({ max_turn_model_requests: 5 }, next), null);
+  // The first turn starts at the session's start input, not at a user message.
+  const first = usage([{ event_name: 'session-started', at: 0, payload: { input: { text: 'go' } } }, { event_name: 'model-response', at: 10, payload: {} }]);
+  assert.equal(first.turn_model_requests, 1);
 });
 
 test('plans are validated', () => {

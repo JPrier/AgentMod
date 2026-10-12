@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use agentmod_core::compiler::{Compilation, Revision};
 use agentmod_core::kernel::{
-    Effect, InitialEvent, InvocationResult, InvokeRequest, Kernel, PublishRequest, StartRequest,
+    Effect, InvocationResult, InvokeRequest, Kernel, PublishRequest, StartRequest,
 };
 use agentmod_core::manifest::{Definition, DeploymentConfig, Manifest, PluginConfig};
 use agentmod_core::record::{Body, Record};
@@ -132,18 +132,16 @@ impl Sim {
         }
     }
 
-    /// Start a session of `def` from `plugin`, optionally with an initial event.
-    pub fn start(&mut self, plugin: &str, def: &str, initial: Option<(&str, Value)>) -> String {
+    /// Start a session of `def` from `plugin` (a `start-session` call),
+    /// optionally with an input for `session-started`.
+    pub fn start(&mut self, plugin: &str, def: &str, input: Option<Value>) -> String {
         let req = StartRequest {
             plugin: plugin.into(),
             definition: def.into(),
             spec: None,
             invocation_id: None,
-            initial: initial.map(|(name, payload)| InitialEvent {
-                event_name: name.into(),
-                payload,
-                ui: None,
-            }),
+            input,
+            ui: None,
             fork_from: None,
         };
         self.start_req(&req)

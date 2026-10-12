@@ -459,7 +459,7 @@ export class BrowserRuntime {
   announceRevision(rev) {
     for (const p of this.procs) {
       const m = rev.plugins?.[p.name];
-      if (m && m.member !== false && !p.failed && p.key === stampOf(p.name, m.config)) this.sendEmitSet(p, rev.revision);
+      if (m && !p.failed && p.key === stampOf(p.name, m.config)) this.sendEmitSet(p, rev.revision);
     }
   }
 
@@ -641,7 +641,8 @@ export class BrowserRuntime {
     const req = { plugin, definition: params.definition || '' };
     if (params.spec) req.spec = params.spec;
     if (params.invocation_id) req.invocation_id = params.invocation_id;
-    if (params.initial) req.initial = params.initial;
+    if (params.input) req.input = params.input;
+    if (params.ui) req.ui = params.ui;
     if (params.fork_from) req.fork_from = params.fork_from;
     const out = J(this.kernel.start_session(JSON.stringify(req), Date.now()));
     this.execute(out.effects);
@@ -878,9 +879,11 @@ export class BrowserRuntime {
     return this.query({ what: 'session-metrics', session_id: id });
   }
 
+  /** start-session with the user's first message as the input. */
   async startSession({ definition, text, fork_from }) {
-    const initial = text ? { event_name: 'user-message', payload: { text }, ui: { v: 1, kind: 'text', role: 'user', text } } : undefined;
-    return this.startAs(PAGE, { definition, initial, fork_from });
+    const input = text ? { text } : undefined;
+    const ui = text ? { v: 1, kind: 'text', role: 'user', text } : undefined;
+    return this.startAs(PAGE, { definition, input, ui, fork_from });
   }
 
   /** A user message, steered (interrupt lane) or queued (normal lane). */

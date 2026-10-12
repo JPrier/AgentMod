@@ -88,6 +88,14 @@ export function sleep(ms, signal) {
   });
 }
 
+/** The input a session was started with (`session-started`'s `input`), from a session view. */
+export function startInputOf(view) {
+  return (view?.events || []).find((e) => e.event_name === 'session-started')?.payload?.input || null;
+}
+
+/** The `receives` key for a `session-started` subscriber that reads the start input. */
+export const START_INPUT = { input: { shape: 'object', optional: true, keys: { text: { shape: 'string', optional: true }, attachments: { shape: 'array<object>', optional: true }, data: { shape: 'object', optional: true } } } };
+
 /** Read context items of one section (values only). */
 export function slot(context, name) {
   return (context || []).filter((c) => c.slot === name).map((c) => c.value);
@@ -241,10 +249,16 @@ class Plugin {
   get host() {
     return {
       query: (what, args = {}) => this.request('query', { what, ...args }),
-      /** Start a session from a definition (by name, or a `spec` written now). A
-       *  definition that fails to compile rejects with `error.data.diagnostics`. */
-      startSession: ({ definition, spec, initial, invocationId, forkFrom }) =>
-        this.request('start_session', { definition, spec, initial, invocation_id: invocationId, fork_from: forkFrom }),
+      /**
+       * `start-session`, a runtime call (compiler.md §9): a definition (by
+       * name, or a `spec` written now) and an initial `input` (`{ text,
+       * attachments, data }`). The runtime compiles the definition, creates
+       * the session, and emits `session-started` carrying the input; `ui` is
+       * an optional hint for that event. A definition that fails to compile
+       * creates no session and rejects with `error.data.diagnostics`.
+       */
+      startSession: ({ definition, spec, input, ui, invocationId, forkFrom }) =>
+        this.request('start_session', { definition, spec, input, ui, invocation_id: invocationId, fork_from: forkFrom }),
       publishDeferred: (event_name, payload = {}, opts = {}) =>
         this.request('publish', { event_name, payload, cite: opts.cite, ui: opts.ui, lane: opts.lane, target_session: opts.targetSession }),
       command: (session_id, command) => this.request('command', { session_id, command }),

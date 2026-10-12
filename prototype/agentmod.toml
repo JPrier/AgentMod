@@ -231,15 +231,19 @@ budget = { phase = "guard" }
 chat-context = { phase = "loop" }
 openrouter-model = {}
 plan = {}
-tool-discovery = { phase = "intake" }
+tool-discovery = { phase = "intake", phases = { session-started = "loop" } }
 linux-sandbox = { phase = "offer" }
 local-workspace = { phase = "offer" }
 tool-clock = {}
 tool-calc = {}
 subagent-reporter = {}
 
+# A session's first message is its start input: chat-context writes the
+# session's tools from its resolved tool-call members, then tool-discovery
+# loads the deferred ones that message asks for.
 [definitions.worker.order.session-started]
 offer = ["linux-sandbox", "local-workspace"]
+loop = ["chat-context", "tool-discovery"]
 
 [definitions.worker.order.config-applied]
 offer = ["linux-sandbox", "local-workspace"]
@@ -268,7 +272,7 @@ chat-context = { phase = "loop" }
 openrouter-model = {}
 titler = {}
 plan = {}
-tool-discovery = { phase = "intake" }
+tool-discovery = { phase = "intake", phases = { session-started = "loop" } }
 linux-sandbox = { phase = "offer" }
 local-workspace = { phase = "offer" }
 subagent = {}
@@ -277,8 +281,12 @@ web-fetch = {}
 mcp-bridge = {}
 browser-control = {}
 
+# The start input is the first message: the redactor masks it (intake), then
+# chat-context writes the session's tools and tool-discovery loads the
+# deferred ones it asks for (loop).
 [definitions.coder.order.session-started]
 offer = ["linux-sandbox", "local-workspace", "memory"]
+loop = ["chat-context", "tool-discovery"]
 
 [definitions.coder.order.config-applied]
 offer = ["linux-sandbox", "local-workspace"]

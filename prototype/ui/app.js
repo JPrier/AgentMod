@@ -717,7 +717,7 @@ function chat() {
       h('button.btn.small', { onclick: () => command('resume'), disabled: !['halted', 'parked', 'draining'].includes(st) }, 'Resume')),
   );
   const items = threadItems(v);
-  const empty = !v.events.some((e) => e.event_name === 'user-message');
+  const empty = !v.events.some((e) => e.event_name === 'user-message' || (e.event_name === 'session-started' && e.payload.input?.text));
   const thread = h('div.thread', { 'aria-live': 'polite' },
     h('div.thread-inner', sandboxNotice(v), items, empty && v.definition !== 'heartbeat' && suggestions(v)));
   return h('main.chat', head, thread, composer(v));
@@ -838,12 +838,17 @@ function threadItems(v) {
     while (ci < controls.length && controls[ci].sequence < e.sequence) out.push(controlNote(controls[ci++]));
     const ui = e.ui;
     const name = e.event_name;
-    if (name === 'session-started' && e.payload.parent_session) {
-      out.push(h('div.sys', 'Sub-session started by ', h('button.link', { onclick: () => select(e.payload.parent_session) }, e.payload.parent_session), ' through the delegate tool.'));
-      continue;
-    }
-    if (name === 'session-started' && e.payload.fork_of) {
-      out.push(h('div.sys', `Branched from ${e.payload.fork_of.session_id} at record #${e.payload.fork_of.sequence}; context was copied into this log.`));
+    if (name === 'session-started') {
+      if (e.payload.parent_session) out.push(h('div.sys', 'Sub-session started by ', h('button.link', { onclick: () => select(e.payload.parent_session) }, e.payload.parent_session), ' through the delegate tool.'));
+      else if (e.payload.fork_of) out.push(h('div.sys', `Branched from ${e.payload.fork_of.session_id} at record #${e.payload.fork_of.sequence}; context was copied into this log.`));
+      // The start-session input: the session's first message (or delegated task).
+      const text = e.payload.input?.text;
+      if (text) {
+        const settled = settledPayload(e).input?.text ?? text;
+        out.push(h('div.msg.user', { title: `${e.event_id} · ${e.status} · the session's start input` }, settled,
+          settled !== text && h('span.note', 'Redacted by a transformer before any later plugin saw it'),
+          e.status === 'vetoed' && h('span.note', `Vetoed: ${e.settlement.reason}`)));
+      }
       continue;
     }
     if (name === 'user-message') {
@@ -1183,7 +1188,6 @@ function originText(o) {
   switch (o.kind) {
     case 'pipeline': return `pipeline output of ${o.plugin}`;
     case 'deferred': return h('span', `deferred publish by ${o.plugin}, citing `, h('button.linkish', { onclick: () => jump(o.cites) }, o.cites));
-    case 'start': return `initial event of start-session by ${o.plugin}`;
     case 'cross-session': return h('span', `cross-session publish from `, h('button.linkish', { onclick: () => select(o.from_session) }, o.from_session), ` by ${o.plugin}`);
     default: return 'core lifecycle event';
   }

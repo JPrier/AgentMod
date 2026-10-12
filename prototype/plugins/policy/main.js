@@ -30,17 +30,17 @@
 //   session_mode, session_rules   for per-session config layers
 //   approvers       plugins whose ui-actions count as human answers (default ["web-ui"])
 //   defaults        false to drop the built-in rules (sdk/policy.js DEFAULT_RULES)
-import { definePlugin, key, optional, TOOL_CALL_KEYS, toolResult, withContext } from '../sdk/agentmod.js';
+import { definePlugin, key, optional, startInputOf, TOOL_CALL_KEYS, toolResult, withContext } from '../sdk/agentmod.js';
 import { DEFAULT_RULES, actionDigest, decide, explain, factsOf, grantFor, hiddenTools, stricterMode } from '../sdk/policy.js';
 
 const delegations = new Map(); // session -> delegation (immutable once recorded)
 
 async function delegationOf(ctx) {
   if (!delegations.has(ctx.sessionId)) {
+    // A child's delegation is part of its start input (session-started).
     const view = await ctx.host.query('session', { session_id: ctx.sessionId });
-    const first = view.events.find((e) => e.event_name === 'user-message');
-    if (!first) return null; // not known yet; ask again later
-    delegations.set(ctx.sessionId, first.payload?.delegation || null);
+    if (!view.events.some((e) => e.event_name === 'session-started')) return null; // not known yet; ask again later
+    delegations.set(ctx.sessionId, startInputOf(view)?.data?.delegation || null);
   }
   return delegations.get(ctx.sessionId);
 }

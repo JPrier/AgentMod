@@ -85,8 +85,10 @@ async function route(req, res) {
   if (p === '/api/sessions' && req.method === 'GET') return send(res, 200, await q('sessions'));
   if (p === '/api/sessions' && req.method === 'POST') {
     const b = await readBody(req);
-    const initial = b.text ? { event_name: 'user-message', payload: { text: b.text }, ui: { v: 1, kind: 'text', role: 'user', text: b.text } } : undefined;
-    return send(res, 200, await plugin.host.startSession({ definition: b.definition || 'chat', initial, forkFrom: b.fork_from }));
+    // start-session: the definition and the user's first message as its input.
+    const input = b.text ? { text: b.text } : undefined;
+    const ui = b.text ? { v: 1, kind: 'text', role: 'user', text: b.text } : undefined;
+    return send(res, 200, await plugin.host.startSession({ definition: b.definition || 'chat', input, ui, forkFrom: b.fork_from }));
   }
   if (p === '/api/graph') return send(res, 200, await q('graph'));
   if (p === '/api/services' && req.method === 'GET') return send(res, 200, await q('services'));

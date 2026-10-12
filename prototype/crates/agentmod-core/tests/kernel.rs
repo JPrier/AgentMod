@@ -7,12 +7,12 @@ use std::collections::BTreeMap;
 
 use agentmod_core::compiler::{Compilation, compile};
 use agentmod_core::kernel::{
-    InitialEvent, InvocationResult, InvokeRequest, Kernel, PublishRequest, Scope, StartRequest,
+    InvocationResult, InvokeRequest, Kernel, PublishRequest, Scope, StartRequest,
 };
 use agentmod_core::manifest::{DeploymentConfig, Manifest};
 use agentmod_core::projection::{context_at, project};
 use agentmod_core::record::{Body, Command, DispatchState, Outcome, Record, Settlement};
-use agentmod_core::types::{ContextOp, Lane, LogRef, Mode, Origin};
+use agentmod_core::types::{Cause, ContextOp, Lane, LogRef, Mode, Origin};
 use common::{S, Sim, deployment, k};
 use serde_json::{Value, json};
 
@@ -222,12 +222,14 @@ fn until(sim: &mut Sim, plugin: &str) -> InvokeRequest {
     }
 }
 
+/// Start a session (a `start-session` call); with `text`, the frontend then
+/// sends it as the first user message, citing its standing invocation.
 fn start(sim: &mut Sim, def: &str, text: Option<&str>) -> String {
-    sim.start(
-        "ui",
-        def,
-        text.map(|t| ("user-message", json!({ "text": t }))),
-    )
+    let sid = sim.start("ui", def, None);
+    if let Some(t) = text {
+        sim.publish(user(sim, &sid, t)).unwrap();
+    }
+    sid
 }
 
 fn ui_cite(sim: &Sim, sid: &str) -> String {
@@ -1088,7 +1090,8 @@ fn fork_seeds_context_and_restore_is_an_append() {
             definition: "chat".into(),
             spec: None,
             invocation_id: None,
-            initial: None,
+            input: None,
+            ui: None,
             fork_from: Some(LogRef {
                 session_id: sid.clone(),
                 sequence: mid,
@@ -1170,44 +1173,81 @@ fn idle_sessions_unload_and_reload_on_demand() {
 }
 
 #[test]
-fn start_session_validates_capability_definition_and_initial_event() {
+fn start_session_validates_capability_definition_and_input() {
     let mut sim = new_sim(&config(CHAT));
-    let bad = |plugin: &str, def: &str, payload: Value| StartRequest {
+    let req = |plugin: &str, def: &str, input: Value| StartRequest {
         plugin: plugin.into(),
         definition: def.into(),
         spec: None,
         invocation_id: None,
-        initial: Some(InitialEvent {
-            event_name: "user-message".into(),
-            payload,
-            ui: None,
-        }),
+        input: Some(input),
+        ui: None,
         fork_from: None,
     };
     assert!(
         sim.k
-            .start_session(&bad("chat", "chat", json!({ "text": "x" })), 1)
+            .start_session(&req("chat", "chat", json!({ "text": "x" })), 1)
             .error
             .unwrap()
             .contains("start-session capability")
     );
     assert!(
         sim.k
-            .start_session(&bad("ui", "nope", json!({ "text": "x" })), 1)
+            .start_session(&req("ui", "nope", json!({ "text": "x" })), 1)
             .error
             .unwrap()
             .contains("unknown session definition")
     );
+    // The input has the core manifest's fixed shape.
+    let bad = sim
+        .k
+        .start_session(&req("ui", "chat", json!({ "text": 5 })), 1);
+    assert!(bad.session_id.is_none());
+    assert!(bad.error.unwrap().contains("input.text"));
     assert!(
         sim.k
-            .start_session(&bad("ui", "chat", json!({})), 1)
+            .start_session(&req("ui", "chat", json!("hello")), 1)
             .error
             .unwrap()
             .contains("contradicts")
     );
+    assert!(sim.logs.is_empty(), "no session was created");
     let ok = start(&mut sim, "chat", None);
     assert_eq!(ok, "s0001");
     assert_eq!(start(&mut sim, "chat", None), "s0002");
+}
+
+#[test]
+fn session_started_is_emitted_by_the_core_and_carries_the_input() {
+    let mut sim = new_sim(&config(CHAT));
+    let now = sim.tick();
+    let out = sim.k.start_session(
+        &StartRequest {
+            plugin: "ui".into(),
+            definition: "chat".into(),
+            spec: None,
+            invocation_id: None,
+            input: Some(json!({ "text": "hi", "data": { "from": "a test" } })),
+            ui: Some(json!({ "v": 1, "kind": "text", "role": "user", "text": "hi" })),
+            fork_from: None,
+        },
+        now,
+    );
+    let sid = out.session_id.clone().unwrap();
+    sim.take(out.effects);
+    let view = project(sim.log(&sid));
+    // The session's first and only event so far: nothing else was published
+    // into it by the starter.
+    assert_eq!(sim.events(&sid), vec!["session-started"]);
+    let started = &view.events[0];
+    assert!(matches!(started.origin, Origin::Core));
+    assert!(matches!(&started.cause, Cause::Root { plugin } if plugin == "ui"));
+    assert_eq!(
+        started.payload["input"],
+        json!({ "text": "hi", "data": { "from": "a test" } })
+    );
+    assert_eq!(started.payload["definition"], "chat");
+    assert_eq!(started.ui.as_ref().unwrap()["kind"], "text");
 }
 
 /// Randomized interleavings: after every step, replaying the log into a fresh

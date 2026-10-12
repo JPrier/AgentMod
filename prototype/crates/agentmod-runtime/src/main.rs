@@ -165,7 +165,7 @@ async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
 /// Print one compiled definition: its graph (as routes), and the report sections.
 fn print_revision(name: &str, rev: &agentmod_core::compiler::Revision) {
     let g = &rev.graph;
-    let members = rev.plugins.values().filter(|m| m.member).count();
+    let members = rev.plugins.len();
     println!(
         "definition `{name}` — revision {} — runtime {} — {members} plugin(s){}",
         rev.revision,

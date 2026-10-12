@@ -15,6 +15,8 @@ pub const RUNTIME_VERSION: &str = "0.1";
 /// Runtime versions whose core manifest this build carries.
 pub const SUPPORTED_RUNTIMES: &[&str] = &[RUNTIME_VERSION];
 
+/// The first event of every session, emitted only by the core when a
+/// `start-session` call succeeds; it carries the caller's input (§9).
 pub const SESSION_STARTED: &str = "session-started";
 pub const CONFIG_APPLIED: &str = "config-applied";
 /// A plugin invocation failed (it reported an error, contradicted a
@@ -22,7 +24,8 @@ pub const CONFIG_APPLIED: &str = "config-applied";
 /// the error, so plugins can react (compiler.md §3.4 step 7, §7).
 pub const INVOCATION_FAILED: &str = "invocation-failed";
 /// A `start-session` whose definition failed to compile; delivered to the
-/// calling invocation's session with the diagnostics.
+/// calling invocation's session with the diagnostics (the call's error carries
+/// them too). No session is created.
 pub const SESSION_START_FAILED: &str = "session-start-failed";
 
 fn key(shape: &str) -> KeyDecl {
@@ -34,6 +37,19 @@ fn opt(shape: &str) -> KeyDecl {
 
 fn keys(pairs: Vec<(&str, KeyDecl)>) -> Keys {
     pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+}
+
+/// The fixed shape of a `start-session` input, as `session-started` carries
+/// it: the text a session starts from (a user's first message, a cron job's
+/// prompt, a delegated task), any attachments, and caller-defined structured
+/// data (a delegation record, a parent link). Every key is optional.
+#[must_use]
+pub fn input_shape() -> KeyDecl {
+    KeyDecl::optional(Shape::Object(Some(keys(vec![
+        ("text", opt("string")),
+        ("attachments", opt("array<object>")),
+        ("data", opt("object")),
+    ]))))
 }
 
 /// The core manifest for a runtime version, if this build supports it.
@@ -56,6 +72,7 @@ pub fn core_manifest(version: &str) -> Option<Manifest> {
                     ("revision", key("string")),
                     ("fork_of", opt("object")),
                     ("parent_session", opt("string")),
+                    ("input", input_shape()),
                 ]),
             },
             EmitDecl {

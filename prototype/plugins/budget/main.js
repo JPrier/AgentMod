@@ -5,11 +5,11 @@
 //
 // Bounds come from config ({ max_model_requests, max_tool_calls,
 // max_output_tokens, max_wall_seconds, max_turn_model_requests }) and,
-// tighter, from a delegation's `budget` in the session's first user message.
+// tighter, from a delegation's `budget` in the session's start input.
 // `max_turn_model_requests` is the agent loop's bound per user message: the
 // core has no recursion or depth limit (cycles are legal and reported by the
 // compiler), so loop limits are this plugin's policy.
-import { definePlugin, key, optional } from '../sdk/agentmod.js';
+import { definePlugin, key, optional, startInputOf } from '../sdk/agentmod.js';
 
 import { currentTurn, effectiveBudget, usage, exceeded } from '../sdk/budget.js';
 
@@ -28,7 +28,7 @@ definePlugin({
   handlers: {
     'model-request': async (ctx) => {
       const view = await ctx.host.query('session', { session_id: ctx.sessionId });
-      const delegation = view.events.find((e) => e.event_name === 'user-message')?.payload?.delegation?.budget;
+      const delegation = startInputOf(view)?.data?.delegation?.budget;
       const budget = effectiveBudget(ctx.config, delegation);
       if (!Object.keys(budget).length) return;
       const u = usage(view.events);

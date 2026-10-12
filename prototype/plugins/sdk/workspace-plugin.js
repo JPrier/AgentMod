@@ -120,9 +120,8 @@ export function defineWorkspacePlugin(spec) {
           return { root: normalizePath(recorded.root), mode: recorded.mode, base: recorded.base, gitDir: recorded.git_dir || undefined, recorded: true };
         }
         const view = await ctx.host.query('session', { session_id: sid });
-        const first = view.events.find((e) => e.event_name === 'user-message');
-        const delegation = first?.payload?.delegation;
         const started = view.events.find((e) => e.event_name === 'session-started')?.payload || {};
+        const delegation = started.input?.data?.delegation;
         const cfg = ctx.config ?? {};
         if (delegation && delegation.workspace && delegation.workspace !== 'none') {
           const parent = delegation.parent_session || started.parent_session;

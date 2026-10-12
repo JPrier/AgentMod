@@ -15,9 +15,20 @@
 // deferred tool's declared `intents` (e.g. "import the GitHub repo …" →
 // import_repo) loads it before the first model request, saving the model a
 // discovery turn for an obvious capability.
-import { definePlugin, key, optional, toolCalls, toolResult, withContext } from '../sdk/agentmod.js';
+import { definePlugin, key, optional, toolCalls, toolResult, withContext, START_INPUT } from '../sdk/agentmod.js';
 
 import { TOOL_SEARCH, searchTools, brief } from '../sdk/discovery.js';
+
+/** Load deferred tools whose declared intents the message mentions. */
+function loadByIntent(ctx, message) {
+  const text = String(message || '').toLowerCase();
+  if (!text) return;
+  const tools = ctx.slot('tools');
+  const loaded = new Set(ctx.slot('tools-loaded').flatMap((v) => v?.names || []));
+  const hidden = new Set(ctx.slot('tool-policy').pop()?.hidden || []);
+  const match = tools.filter((t) => t?.tier === 'deferred' && !loaded.has(t.name) && !hidden.has(t.name) && (t.intents || []).some((i) => text.includes(String(i).toLowerCase())));
+  if (match.length) ctx.add('tools-loaded', { names: match.map((t) => t.name), reason: 'intent', event: ctx.event.event_id });
+}
 
 definePlugin({
   manifest: {
@@ -26,20 +37,15 @@ definePlugin({
     description: 'tool_search: find and load deferred tools on demand.',
     subscribe: [
       { event: 'user-message', mode: 'blocking', actions: ['contribute-context'], receives: withContext({ text: key('string') }) },
+      // The first message is the start input.
+      { event: 'session-started', mode: 'blocking', actions: ['contribute-context'], receives: withContext({ ...START_INPUT }) },
       ...toolCalls([TOOL_SEARCH], { actions: ['contribute-context'] }),
     ],
     emit: [toolResult({ loaded: optional('array<string>') })],
   },
   handlers: {
-    'user-message': async (ctx) => {
-      const text = String(ctx.payload.text || '').toLowerCase();
-      if (!text) return;
-      const tools = ctx.slot('tools');
-      const loaded = new Set(ctx.slot('tools-loaded').flatMap((v) => v?.names || []));
-      const hidden = new Set(ctx.slot('tool-policy').pop()?.hidden || []);
-      const match = tools.filter((t) => t?.tier === 'deferred' && !loaded.has(t.name) && !hidden.has(t.name) && (t.intents || []).some((i) => text.includes(String(i).toLowerCase())));
-      if (match.length) ctx.add('tools-loaded', { names: match.map((t) => t.name), reason: 'intent', event: ctx.event.event_id });
-    },
+    'session-started': (ctx) => loadByIntent(ctx, ctx.payload.input?.text),
+    'user-message': (ctx) => loadByIntent(ctx, ctx.payload.text),
     'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (name !== 'tool_search') return;

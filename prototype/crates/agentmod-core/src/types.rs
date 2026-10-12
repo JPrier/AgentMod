@@ -39,7 +39,8 @@ pub enum Cause {
     Invocation { invocation_id: String },
     /// Emitted by the core itself as part of another record (lifecycle events).
     Core { reason: String },
-    /// A true root: a rootless `start-session` by a plugin with no invocation.
+    /// A true root: a `start-session` call by a plugin with no open
+    /// invocation (a user starting a chat, a trigger's first fire).
     Root { plugin: String },
 }
 
@@ -54,9 +55,7 @@ pub enum Origin {
     },
     /// Fresh arrival citing a standing trigger dispatched to the same plugin.
     Deferred { plugin: String, cites: String },
-    /// Initial event carried by `start-session`.
-    Start { plugin: String },
-    /// Core lifecycle event.
+    /// An event the core emits (`session-started`, `invocation-failed`, …).
     Core,
     /// Mirror of an event published from another session.
     CrossSession {

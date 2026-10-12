@@ -51,7 +51,8 @@ export function turnsOf(view) {
   const turns = [];
   let trigger = null;
   for (const e of events) {
-    if (e.event_name === 'user-message') trigger = 'user';
+    // A turn starts at a user message or at the session's start input.
+    if (e.event_name === 'user-message' || (e.event_name === 'session-started' && e.payload?.input?.text)) trigger = 'user';
     if (e.event_name === 'model-request') turns.push({ event_id: e.event_id, sequence: e.sequence, at: e.at, trigger: trigger || 'tools', calls: [], text: '' });
     if (e.event_name === 'model-request') trigger = null;
     if (e.event_name === 'model-response' && turns.length) {

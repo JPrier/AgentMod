@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use agentmod_core::compiler::{
     Compilation, Diagnostic, Revision, Severity, compile, compile_definition,
 };
-use agentmod_core::kernel::{InitialEvent, InvocationResult, InvokeRequest, StartRequest};
+use agentmod_core::kernel::{InvocationResult, InvokeRequest, PublishRequest, StartRequest};
 use agentmod_core::manifest::{DeploymentConfig, Manifest, SourceRef};
 use agentmod_core::projection::project;
 use agentmod_core::record::Body;
@@ -294,6 +294,48 @@ fn row_families_resolve_and_a_member_may_have_several_subscribers() {
         vec!["audit", "gh", "watch"]
     );
     assert!(find(&c, "missing-handler-pick").is_empty());
+}
+
+/// §9: only the core emits `session-started`, so it is a clean root. A
+/// plugin outside the definition that holds `start-session` contributes no
+/// entries (the old "external starters" over-approximation is gone), and a
+/// member may not declare an emit of a core event.
+#[test]
+fn row_session_started_is_a_root_and_only_the_core_emits_core_events() {
+    let ms = json!({
+        "starter": { "emit": [{ "event": "go", "keys": { "text": k(S) } }], "capabilities": ["start-session"], "sink": true },
+        "first": { "subscribe": [{ "event": "session-started", "mode": "blocking", "actions": ["contribute-context"], "receives": { "input": opt("object") } }] },
+        "worker": { "subscribe": [{ "event": "go", "mode": "async", "receives": { "text": k(S) } }], "sink": true }
+    });
+    // `worker` is fed by nothing in this definition: `starter` is not in it.
+    let (c, ..) = build(
+        &ms,
+        base_def(json!({ "first": { "phase": "main" }, "worker": {} })),
+    );
+    let d = one(&c, "never-fires");
+    assert_eq!(d.plugins, vec!["worker"]);
+    let r = rev(&c);
+    assert!(!r.plugins.contains_key("starter"), "no external nodes");
+    assert!(!r.graph.edges.iter().any(|e| e.from == "starter"));
+    // `session-started` reaches its subscriber straight from the boundary node.
+    let (c, ..) = build(&ms, base_def(json!({ "first": { "phase": "main" } })));
+    assert!(c.ok, "{:#?}", c.diagnostics);
+    let e = rev(&c)
+        .graph
+        .edges
+        .iter()
+        .find(|e| e.event == "session-started")
+        .unwrap();
+    assert_eq!(e.from, "core");
+    // A member declaring a core event is an error.
+    let mut ms = ms;
+    ms["starter"]["emit"] = json!([{ "event": "session-started" }]);
+    let (c, ..) = build(
+        &ms,
+        base_def(json!({ "starter": {}, "first": { "phase": "main" } })),
+    );
+    let d = one(&c, "reserved-event");
+    assert_eq!(d.event.as_deref(), Some("session-started"));
 }
 
 #[test]
@@ -837,11 +879,19 @@ fn example_accepted_then_failed_at_runtime_with_a_breach_record() {
     assert!(c.ok, "{:#?}", c.diagnostics);
     let revision = rev(&c).revision.clone();
     let mut sim = Sim::new(c);
-    let sid = sim.start(
-        "web-ui",
-        "d",
-        Some(("user-message", json!({ "text": "hi" }))),
-    );
+    let sid = sim.start("web-ui", "d", None);
+    let cite = sim.first_invocation(&sid, "web-ui");
+    sim.publish(PublishRequest {
+        plugin: "web-ui".into(),
+        invocation_id: None,
+        cite: Some(cite),
+        event_name: "user-message".into(),
+        payload: json!({ "text": "hi" }),
+        ui: None,
+        lane: None,
+        target_session: None,
+    })
+    .unwrap();
     sim.run(&mut |s: &mut Sim, p: &str, req: &InvokeRequest| match (
         p,
         req.event.event_name.as_str(),
@@ -959,7 +1009,7 @@ fn example_rejected_dynamic_definition() {
     let parent = sim.start("ui", "d", None);
     sim.run(&mut |_: &mut Sim, _: &str, _: &InvokeRequest| InvocationResult::default());
     let cite = sim.first_invocation(&parent, "ui");
-    sim.publish(agentmod_core::kernel::PublishRequest {
+    sim.publish(PublishRequest {
         plugin: "ui".into(),
         invocation_id: None,
         cite: Some(cite),
@@ -982,11 +1032,8 @@ fn example_rejected_dynamic_definition() {
                     definition: String::new(),
                     spec: Some(spec),
                     invocation_id: Some(req.invocation_id.clone()),
-                    initial: Some(InitialEvent {
-                        event_name: "go".into(),
-                        payload: json!({ "text": "y" }),
-                        ui: None,
-                    }),
+                    input: Some(json!({ "text": "y" })),
+                    ui: None,
                     fork_from: None,
                 },
                 now,
@@ -1026,7 +1073,8 @@ fn example_rejected_dynamic_definition() {
             definition: String::new(),
             spec: Some(good),
             invocation_id: None,
-            initial: None,
+            input: None,
+            ui: None,
             fork_from: None,
         },
         now,

@@ -100,8 +100,6 @@ pub enum Via {
     Core,
     /// An inbound cross-session event (boundary node).
     Inbound,
-    /// A possible `start-session` initial event from a plugin outside the session.
-    StartSession,
 }
 
 /// One edge: *when `from` emits `event`, `to` is a destination*.
@@ -137,8 +135,6 @@ pub struct Edge {
 pub enum NodeKind {
     Boundary,
     Plugin,
-    /// A plugin outside the session that may start it with an initial event.
-    External,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,13 +192,6 @@ pub struct Member {
     pub manifest: Manifest,
     pub stamp: Stamp,
     pub config: PluginConfig,
-    /// False for external starters (they emit into the session but are never invoked).
-    #[serde(default = "yes", skip_serializing_if = "Clone::clone")]
-    pub member: bool,
-}
-
-fn yes() -> bool {
-    true
 }
 
 /// A subscriber of a concrete family member, as its emitter sees it in the
@@ -312,7 +301,7 @@ impl Revision {
 
     #[must_use]
     pub fn is_member(&self, plugin: &str) -> bool {
-        self.plugins.get(plugin).is_some_and(|m| m.member)
+        self.plugins.contains_key(plugin)
     }
 
     /// The core manifest this revision was compiled against.
@@ -1219,7 +1208,6 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                                 manifest: m.clone(),
                                 stamp: pc.stamp(),
                                 config: pc.clone(),
-                                member: true,
                             },
                         );
                     }
@@ -1235,25 +1223,14 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                 },
             }
         }
-        // External starters: plugins outside the session holding start-session.
-        for (name, pc) in self.config.plugins.iter().filter(|(_, p)| !p.disabled) {
-            if self.members.contains_key(name) {
-                continue;
-            }
-            if let Some(m) = self
-                .manifests
-                .get(name)
-                .filter(|m| m.has(Capability::StartSession))
-            {
-                self.plugins.insert(
-                    name.clone(),
-                    Member {
-                        manifest: m.clone(),
-                        stamp: pc.stamp(),
-                        config: pc.clone(),
-                        member: false,
-                    },
-                );
+        // Only the core emits core events (`session-started` above all: it is
+        // always a clean starting point, compiler.md §9).
+        if let Some(core) = &self.core {
+            for (name, m) in &self.members {
+                for e in m.emit.iter().filter(|e| core.emit_for(&e.event).is_some()) {
+                    let path = self.at(&format!("plugins.{name}"));
+                    self.dx.err("reserved-event", path, Some(&e.event), &[name], format!("`{name}` declares an emit of `{}`, a core event: only the runtime emits core events", e.event));
+                }
             }
         }
     }
@@ -1326,26 +1303,6 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                         via: Via::Emit,
                     });
                 }
-            }
-        }
-        let starters: Vec<(String, Manifest)> = self
-            .plugins
-            .iter()
-            .filter(|(_, m)| !m.member)
-            .map(|(n, m)| (n.clone(), m.manifest.clone()))
-            .collect();
-        for (name, manifest) in starters {
-            for e in manifest
-                .emit
-                .iter()
-                .filter(|e| pattern_error(&e.event, true).is_none() && !is_family(&e.event))
-            {
-                out.push(Emitter {
-                    from: name.clone(),
-                    decl: e.clone(),
-                    family: None,
-                    via: Via::StartSession,
-                });
             }
         }
         // Every plugin's resolved emit set, in event order.
@@ -1940,11 +1897,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
         for (name, m) in &self.plugins {
             self.graph.nodes.push(Node {
                 name: name.clone(),
-                kind: if m.member {
-                    NodeKind::Plugin
-                } else {
-                    NodeKind::External
-                },
+                kind: NodeKind::Plugin,
                 sink: m.manifest.sink,
             });
         }
@@ -1993,20 +1946,12 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
                 self.dx.warn("no-effect", path, None, &[name], format!("`{name}` has no effect here: none of its emits is consumed, it returns no keys, declares no actions, sends nothing outbound, and is not a `sink`"));
             }
         }
-        // Reachability from roots.
+        // Reachability from roots: core events (`session-started` among them:
+        // only the core emits it), inbound events, and deferred emits.
         let mut reached: BTreeSet<String> = BTreeSet::new();
         let mut queue: VecDeque<String> = VecDeque::new();
-        let starters: BTreeSet<String> = self
-            .plugins
-            .iter()
-            .filter(|(_, m)| m.manifest.has(Capability::StartSession))
-            .map(|(n, _)| n.clone())
-            .collect();
         for e in &self.graph.edges {
-            let root = e.from == BOUNDARY
-                || e.deferred
-                || e.via == Via::StartSession
-                || starters.contains(&e.from);
+            let root = e.from == BOUNDARY || e.deferred;
             if root && reached.insert(e.to.clone()) {
                 queue.push_back(e.to.clone());
             }
@@ -2026,7 +1971,7 @@ impl<'x, 'a, 'm> DefCompiler<'x, 'a, 'm> {
         if !island.is_empty() {
             let names: Vec<&str> = island.iter().map(String::as_str).collect();
             let path = self.at("plugins");
-            self.dx.warn("unreachable-island", path, None, &names, format!("{} feed{} each other, but no root (core event, start-session initial event, inbound event, or deferred emit) reaches {}", names.join(", "), if names.len() == 1 { "s" } else { "" }, if names.len() == 1 { "it" } else { "them" }));
+            self.dx.warn("unreachable-island", path, None, &names, format!("{} feed{} each other, but no root (core event, inbound event, or deferred emit) reaches {}", names.join(", "), if names.len() == 1 { "s" } else { "" }, if names.len() == 1 { "it" } else { "them" }));
         }
         // Cycles (information) and interrupt-only cycles (warning).
         let all: Vec<(String, String)> = self

@@ -134,18 +134,12 @@ impl PublishRequest {
     }
 }
 
-/// Initial event carried by `start-session`.
+/// `start-session`: a runtime call, the sole rootless act (compiler.md §9).
+/// The runtime compiles the definition; on success it creates the session
+/// and emits `session-started` into it carrying `input`, in the fixed shape
+/// the core manifest declares. Nothing but the core emits `session-started`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InitialEvent {
-    pub event_name: String,
-    #[serde(default = "empty_object")]
-    pub payload: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ui: Option<Value>,
-}
-
-/// The sole rootless act.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartRequest {
     #[serde(default)]
     pub plugin: String,
@@ -156,10 +150,17 @@ pub struct StartRequest {
     /// config's plugins).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<Definition>,
+    /// The calling invocation, when the start comes from one (the new
+    /// session's cause, and where `session-start-failed` is delivered).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_id: Option<String>,
+    /// The initial input (`text`, `attachments`, `data`), carried by
+    /// `session-started` as its `input` key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial: Option<InitialEvent>,
+    pub input: Option<Value>,
+    /// A UI hint for `session-started` (a frontend shows the first message).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_from: Option<LogRef>,
 }
@@ -320,9 +321,7 @@ const CORE_PLUGIN: &str = "core";
 /// The emitter of an event in the compiled graph.
 fn emitter_of(origin: &Origin) -> String {
     match origin {
-        Origin::Pipeline { plugin, .. }
-        | Origin::Deferred { plugin, .. }
-        | Origin::Start { plugin } => plugin.clone(),
+        Origin::Pipeline { plugin, .. } | Origin::Deferred { plugin, .. } => plugin.clone(),
         Origin::Core | Origin::CrossSession { .. } => BOUNDARY.to_owned(),
     }
 }
@@ -452,7 +451,7 @@ impl Kernel {
         let mut out = BTreeMap::new();
         for h in self.revisions_in_use() {
             if let Some(r) = self.revision(&h) {
-                for (n, m) in r.plugins.iter().filter(|(_, m)| m.member) {
+                for (n, m) in &r.plugins {
                     out.insert((n.clone(), m.stamp.clone()), m.config.clone());
                 }
             }
@@ -1148,8 +1147,7 @@ impl Kernel {
         let Some(config) = self.configs.get(&self.active).cloned() else {
             return fail("no active config".into());
         };
-        let is_core = req.plugin == CORE_PLUGIN;
-        if !is_core {
+        if req.plugin != CORE_PLUGIN {
             let Some(m) = config.manifest(&req.plugin) else {
                 return fail(format!("unknown plugin `{}`", req.plugin));
             };
@@ -1235,26 +1233,31 @@ impl Kernel {
             }
             return out;
         }
-        if let Some(init) = &req.initial
-            && !is_core
+        // `session-started` carries the input in the core manifest's fixed shape.
+        let mut started = json!({ "definition": rev.name, "revision": rev.revision });
+        if let Some(f) = &req.fork_from {
+            started["fork_of"] = json!(f);
+        }
+        if let Some(inv) = &req.invocation_id {
+            started["parent_session"] = json!(session_of(inv));
+        }
+        if let Some(input) = &req.input {
+            started["input"] = input.clone();
+        }
+        let declared = rev
+            .core()
+            .emit_for(SESSION_STARTED)
+            .map(|e| e.keys.clone())
+            .unwrap_or_default();
+        if let Err(e) = check_keys(started.as_object().unwrap_or(&Map::new()), &declared, "") {
+            return fail(format!(
+                "the start-session input contradicts `{SESSION_STARTED}`'s declared shape: {e}"
+            ));
+        }
+        if let Some(ui) = &req.ui
+            && !ui.get("kind").is_some_and(Value::is_string)
         {
-            let Some(decl) = rev.emit_decl(&req.plugin, &init.event_name) else {
-                return fail(format!(
-                    "`{}` does not declare `{}` in its emits",
-                    req.plugin, init.event_name
-                ));
-            };
-            if let Err(e) = init
-                .payload
-                .as_object()
-                .ok_or_else(|| "payload must be a JSON object".to_owned())
-                .and_then(|o| check_keys(o, &decl.keys, "").map_err(|e| e.to_string()))
-            {
-                return fail(format!(
-                    "initial `{}` contradicts `{}`'s emit declaration: {e}",
-                    init.event_name, req.plugin
-                ));
-            }
+            return fail("ui hint must be an object with a string `kind`".into());
         }
         let seeded = match &req.fork_from {
             Some(r) => match self.sessions.get(&r.session_id) {
@@ -1295,41 +1298,18 @@ impl Kernel {
                 fx,
             );
         }
-        let mut started = json!({ "definition": rev.name, "revision": rev.revision });
-        if let Some(f) = &req.fork_from {
-            started["fork_of"] = json!(f);
-        }
-        if let Some(inv) = &req.invocation_id {
-            started["parent_session"] = json!(session_of(inv));
-        }
         self.append_event(
             &sid,
             now,
             SESSION_STARTED,
             started,
-            None,
+            req.ui.clone(),
             Lane::Normal,
-            cause.clone(),
+            cause,
             Origin::Core,
             None,
             fx,
         );
-        if let Some(init) = &req.initial {
-            self.append_event(
-                &sid,
-                now,
-                &init.event_name,
-                init.payload.clone(),
-                init.ui.clone(),
-                Lane::Normal,
-                cause,
-                Origin::Start {
-                    plugin: req.plugin.clone(),
-                },
-                None,
-                fx,
-            );
-        }
         self.advance(&sid, now, fx);
         out.session_id = Some(sid);
         out.revision = Some(rev.revision.clone());

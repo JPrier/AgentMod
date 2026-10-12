@@ -194,8 +194,14 @@ CH=$(curl -s $B/sessions | py "print([s['session_id'] for s in d if s['parent']=
 ev $CH "
 w=[e for e in d['events'] if e['event_name']=='workspace-info'][0]['payload']
 assert w['mode']=='isolated' and 'worktrees/$CH' in w['root'], w
-u=[e for e in d['events'] if e['event_name']=='user-message'][0]['payload']
-assert u['delegation']['tools'] and 'delegate' not in u['delegation']['tools']" || fail "child isolation"
+# The child was started by a start-session call: the core's session-started
+# carries the task and the delegation; nothing else was published into it.
+s=[e for e in d['events'] if e['event_name']=='session-started'][0]
+assert s['origin']['kind']=='core' and s['cause']['kind']=='invocation', s
+u=s['payload']['input']['data']
+assert u['delegation']['tools'] and 'delegate' not in u['delegation']['tools']
+assert u['parent']['session_id']=='$D'
+assert not any(e['event_name']=='user-message' for e in d['events'])" || fail "child isolation"
 ev $D "
 r=[e['payload'] for e in d['events'] if e['event_name']=='tool-result' and e['payload']['name']=='delegate'][0]
 assert r['trust']=='external' and r['evidence']['files_changed']==['greeting.txt'], r

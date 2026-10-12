@@ -3,6 +3,10 @@
 //   user-message -> model-request -> model-response -> (tool-call* -> tool-result*)* -> assistant-message
 // It keeps no in-memory state: everything it needs is in the delivered context.
 //
+// A session starts with the core's `session-started`, which carries the
+// start-session input (compiler.md §9): its text is the first user message
+// (or a delegated task), so this plugin turns it into the first model request.
+//
 // Messages carry their authority (sdk/projection.js): a user message from a
 // frontend is `user`; a task handed down by a delegating agent is `agent`.
 // Tool results keep compact metadata (exit code, checkpoint, trust) and any
@@ -34,7 +38,7 @@
 // Batch settlement: every tool call of one assistant turn is answered before
 // the next model request, which is published exactly once — however many calls
 // there were and in whatever order their results arrive.
-import { definePlugin, key, optional, withContext, TOOL_CALL_KEYS } from '../sdk/agentmod.js';
+import { definePlugin, key, optional, withContext, START_INPUT, TOOL_CALL_KEYS } from '../sdk/agentmod.js';
 import { describeParams, suggestTools } from '../sdk/toolargs.js';
 import { conformArgs, toolOfMember } from '../sdk/toolschema.js';
 
@@ -78,9 +82,10 @@ definePlugin({
     subscribe: [
       // The session's tools are its resolved `tool-call/*` members: written
       // into context at start and whenever a config apply changes them.
-      { event: 'session-started', mode: 'blocking', actions: CONTRIBUTES },
+      // The start input's text is the first message: the first model request.
+      { event: 'session-started', mode: 'blocking', actions: CONTRIBUTES, receives: { ...START_INPUT } },
       { event: 'config-applied', mode: 'blocking', actions: CONTRIBUTES },
-      { event: 'user-message', mode: 'blocking', actions: CONTRIBUTES, receives: { text: key('string'), delegation: optional('object'), parent: optional('object'), attachments: optional('array<object>') } },
+      { event: 'user-message', mode: 'blocking', actions: CONTRIBUTES, receives: { text: key('string'), attachments: optional('array<object>') } },
       { event: 'model-response', mode: 'blocking', actions: CONTRIBUTES, receives: withContext({ text: key('string'), tool_calls: optional('array<object>'), stream_id: optional('string') }) },
       // Tools attach metadata of their own (exit codes, checkpoints, …): kept
       // in the tool message untyped, so this subscription takes unlisted keys.
@@ -100,12 +105,20 @@ definePlugin({
     ],
   },
   handlers: {
-    'session-started': (ctx) => offerTools(ctx),
+    'session-started': async (ctx) => {
+      offerTools(ctx);
+      const input = ctx.payload.input || {};
+      if (typeof input.text !== 'string' || !input.text) return;
+      // A task handed down by a delegating agent carries its parent link.
+      const authority = input.data?.delegation || input.data?.parent ? 'agent' : 'user';
+      ctx.add('messages', { role: 'user', content: input.text, authority, ...(input.attachments?.length ? { attachments: input.attachments } : {}) });
+      await ctx.publish('model-request', { turn: ctx.event.event_id });
+    },
     'config-applied': (ctx) => offerTools(ctx),
     'user-message': async (ctx) => {
+      // The same on either lane (steer or queue).
       const p = ctx.payload;
-      const authority = p.delegation || p.parent ? 'agent' : 'user';
-      ctx.add('messages', { role: 'user', content: p.text, authority, ...(p.attachments?.length ? { attachments: p.attachments } : {}) });
+      ctx.add('messages', { role: 'user', content: p.text, authority: 'user', ...(p.attachments?.length ? { attachments: p.attachments } : {}) });
       await ctx.publish('model-request', { turn: ctx.event.event_id });
     },
     'model-response': async (ctx) => {

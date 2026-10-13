@@ -38,8 +38,6 @@ definePlugin({
     subscribe: [{ event: 'session-started', mode: 'async' }],
     emit: [
       { event: 'heartbeat', deferred: true, keys: { beat: key('integer') } },
-      // The initial event of the agent sessions it starts.
-      { event: 'user-message', keys: { text: key('string') } },
     ],
     // Its journal session is its durable memory; the effect is outside the bus.
     sink: true,
@@ -58,10 +56,11 @@ definePlugin({
         await plugin.host.publishDeferred('heartbeat', { beat: beats }, { cite: st.cite, ui: { v: 1, kind: 'progress', label: `heartbeat #${beats}`, value: null } });
         const k = Number(plugin.config.agent_every || 0);
         if (k && beats % k === 0) {
+          // start-session: the agent session starts from the prompt as its input.
           await plugin.host.startSession({
             definition: plugin.config.agent_definition || 'chat',
             invocationId: st.cite,
-            initial: { event_name: 'user-message', payload: { text: plugin.config.agent_prompt || 'Heartbeat check-in: what time is it?' } },
+            input: { text: plugin.config.agent_prompt || 'Heartbeat check-in: what time is it?' },
           });
         }
       } catch (e) {

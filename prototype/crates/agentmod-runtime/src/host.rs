@@ -64,6 +64,8 @@ struct Proc {
     /// Open invocations on this process with their deadlines.
     invocations: BTreeMap<String, Instant>,
     draining: bool,
+    /// Revisions whose resolved emit set this process has been sent.
+    emit_sets: BTreeSet<String>,
 }
 
 impl Proc {
@@ -112,7 +114,6 @@ struct HostCounters {
     invocations: u64,
     blocking_invocations: u64,
     async_invocations: u64,
-    routed_invocations: u64,
     record_notifications: u64,
     stream_messages: u64,
     stream_frames_in: u64,
@@ -278,6 +279,16 @@ impl Host {
             }
         }
         host.ready = true;
+        // Right after the handshake (once the config compiled): every plugin
+        // learns its resolved emit set under each revision it is a member of.
+        let revisions: Vec<String> = host
+            .kernel
+            .active()
+            .map(|c| c.definitions.values().map(|r| r.revision.clone()).collect())
+            .unwrap_or_default();
+        for rev in revisions {
+            host.announce_revision(&rev);
+        }
         for msg in std::mem::take(&mut host.buffered) {
             host.handle(msg);
         }
@@ -379,6 +390,7 @@ impl Host {
             queued: Vec::new(),
             invocations: BTreeMap::new(),
             draining: false,
+            emit_sets: BTreeSet::new(),
         };
         p.send(
             "initialize",
@@ -896,10 +908,11 @@ impl Host {
             "streams" => Ok(json!(self.hub.snapshots(
                 Some(sid).filter(|s| !s.is_empty())
             ))),
-            "handlers" => Ok(json!({
-                "families": self.kernel.families(sid),
-                "revision": self.kernel.status(sid).map(|st| st.revision),
-            })),
+            "emit-set" => {
+                let rev = params.get("revision").and_then(Value::as_str).map(str::to_owned).or_else(|| self.kernel.status(sid).map(|st| st.revision)).unwrap_or_default();
+                let plugin = params.get("plugin").and_then(Value::as_str).unwrap_or("");
+                Ok(json!({ "revision": rev, "emits": self.kernel.emit_set(&rev, plugin) }))
+            }
             "revision" => {
                 let hash = params.get("revision").and_then(Value::as_str).map(str::to_owned).or_else(|| self.kernel.status(sid).map(|st| st.revision));
                 Ok(json!(hash.and_then(|h| self.kernel.revision(&h))))
@@ -950,6 +963,7 @@ impl Host {
         let mut touched = BTreeSet::new();
         let mut appended = Vec::new();
         let mut dispatch = Vec::new();
+        let mut announced = Vec::new();
         for fx in effects {
             match fx {
                 Effect::SaveRevision { revision } => {
@@ -957,6 +971,7 @@ impl Host {
                         eprintln!("agentmod: FATAL saving revision failed: {e}");
                         std::process::exit(2);
                     }
+                    announced.push(revision.revision.clone());
                 }
                 Effect::Append { record } => {
                     match self.store.append(&record) {
@@ -988,14 +1003,11 @@ impl Host {
         let mut sout = StreamOutput::default();
         for r in &appended {
             match &r.body {
-                Body::InvocationStarted { mode, route, .. } => {
+                Body::InvocationStarted { mode, .. } => {
                     self.counters.invocations += 1;
                     match mode {
                         Mode::Blocking => self.counters.blocking_invocations += 1,
                         Mode::Async => self.counters.async_invocations += 1,
-                    }
-                    if route.is_some() {
-                        self.counters.routed_invocations += 1;
                     }
                 }
                 Body::InvocationCompleted {
@@ -1031,6 +1043,9 @@ impl Host {
         if write_ahead {
             let _ = self.store.flush_index();
         }
+        for rev in announced {
+            self.announce_revision(&rev);
+        }
         for fx in dispatch {
             match fx {
                 Effect::Invoke {
@@ -1042,6 +1057,9 @@ impl Host {
                     let inv = request.invocation_id.clone();
                     match self.ensure_proc(&plugin, &stamp) {
                         Ok(id) => {
+                            // A process learns its emit set before its first
+                            // invocation under any revision.
+                            self.send_emit_set(id, &request.revision);
                             let p = self.procs.get_mut(&id).expect("proc");
                             let timeout =
                                 Duration::from_millis(p.cfg.timeout_ms.unwrap_or(120_000));
@@ -1088,6 +1106,45 @@ impl Host {
                     p.handle.send(note.clone());
                 }
             }
+        }
+    }
+
+    /// Send a process its resolved emit set under `revision`, once
+    /// (compiler.md §3.4 step 4).
+    fn send_emit_set(&mut self, proc: u64, revision: &str) {
+        let Some(p) = self.procs.get(&proc) else {
+            return;
+        };
+        if p.emit_sets.contains(revision) {
+            return;
+        }
+        let Some(emits) = self.kernel.emit_set(revision, &p.name) else {
+            return;
+        };
+        let p = self.procs.get_mut(&proc).expect("proc");
+        p.emit_sets.insert(revision.to_owned());
+        p.send(
+            "emit_set",
+            &json!({ "revision": revision, "emits": emits }),
+            None,
+        );
+    }
+
+    /// A revision was installed: tell every running member process its
+    /// resolved emit set under it.
+    fn announce_revision(&mut self, revision: &str) {
+        let Some(rev) = self.kernel.revision(revision) else {
+            return;
+        };
+        let members: Vec<Key> = rev.plugins.iter().map(|(n, m)| key(n, &m.stamp)).collect();
+        let procs: Vec<u64> = self
+            .procs
+            .iter()
+            .filter(|(_, p)| !p.failed && members.contains(&key(&p.name, &p.stamp)))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in procs {
+            self.send_emit_set(id, revision);
         }
     }
 

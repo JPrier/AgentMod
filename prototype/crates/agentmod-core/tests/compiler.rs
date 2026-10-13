@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use agentmod_core::compiler::{
     Compilation, Diagnostic, Revision, Severity, compile, compile_definition,
 };
-use agentmod_core::kernel::{InitialEvent, InvocationResult, InvokeRequest, StartRequest};
+use agentmod_core::kernel::{InvocationResult, InvokeRequest, PublishRequest, StartRequest};
 use agentmod_core::manifest::{DeploymentConfig, Manifest, SourceRef};
 use agentmod_core::projection::project;
 use agentmod_core::record::Body;
@@ -172,7 +172,7 @@ fn row_observable_ties_name_the_pair_the_event_and_the_reason() {
         let (c, ..) = build(&ms, def);
         assert!(c.ok, "{:#?}", c.diagnostics);
         let r = &rev(&c).graph;
-        let route = r.routes.iter().find(|x| x.class == "go").unwrap();
+        let route = r.routes.iter().find(|x| x.event == "go").unwrap();
         let order: Vec<&str> = route
             .blocking
             .iter()
@@ -243,60 +243,99 @@ fn row_fragments_with_conflicting_phase_lists() {
 }
 
 fn family_ms() -> Value {
-    // Each handler also follows `go`, so losing a pick does not leave it idle.
-    let h = |ev: &str| json!({ "subscribe": [{ "event": ev, "mode": "async" }, { "event": "go", "mode": "async" }], "emit": [{ "event": "tool-result" }] });
+    let h = |ev: &str| json!({ "subscribe": [{ "event": ev, "mode": "async" }], "emit": [{ "event": "tool-result" }] });
     json!({
         "ui": ui(),
-        "loop": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "tool-result", "mode": "async" }], "emit": [{ "event": "tool-call/*", "exactly_one_handler": true, "keys": { "call_id": k(S) } }] },
+        "loop": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "tool-result", "mode": "async" }], "emit": [{ "event": "tool-call/*", "keys": { "call_id": k(S) } }] },
         "local": h("tool-call/read_file"),
         "vm": h("tool-call/read_file"),
-        "mcp": h("tool-call/mcp__*"),
-        "gh": h("tool-call/mcp__gh__*"),
+        "gh": h("tool-call/mcp__gh__issues"),
+        "watch": { "subscribe": [{ "event": "tool-call/mcp__gh__*", "mode": "async" }], "sink": true },
         "audit": { "subscribe": [{ "event": "tool-call/*", "mode": "async" }], "sink": true }
     })
 }
 
+/// §3.3/§3.4: a family emit resolves into the concrete members the
+/// definition's subscribers name; family and sub-family subscriptions only
+/// observe; two subscribers of one member are not an error.
 #[test]
-fn row_exactly_one_handler_members_need_a_pick() {
+fn row_families_resolve_and_a_member_may_have_several_subscribers() {
     let plugins =
-        json!({ "ui": {}, "loop": {}, "local": {}, "vm": {}, "mcp": {}, "gh": {}, "audit": {} });
-    let (c, ..) = build(&family_ms(), base_def(plugins.clone()));
-    let picks = find(&c, "missing-handler-pick");
-    assert_eq!(picks.len(), 2, "{picks:#?}");
-    assert!(
-        picks
-            .iter()
-            .any(|d| d.event.as_deref() == Some("tool-call/read_file")
-                && d.plugins == ["local", "vm"])
-    );
-    assert!(
-        picks
-            .iter()
-            .any(|d| d.event.as_deref() == Some("tool-call/mcp__gh__*")
-                && d.plugins == ["gh", "mcp"])
-    );
-    let mut def = base_def(plugins.clone());
-    def["handlers"] = json!({ "tool-call/read_file": "vm", "tool-call/mcp__gh__*": "gh" });
-    let (c, ..) = build(&family_ms(), def);
+        json!({ "ui": {}, "loop": {}, "local": {}, "vm": {}, "gh": {}, "watch": {}, "audit": {} });
+    let (c, ..) = build(&family_ms(), base_def(plugins));
     assert!(c.ok, "{:#?}", c.diagnostics);
-    let fam = &rev(&c).report.families["tool-call/*"];
-    assert_eq!(fam.handler("tool-call/read_file"), Some("vm"));
-    assert_eq!(fam.handler("tool-call/mcp__gh__issues"), Some("gh"));
-    assert_eq!(fam.handler("tool-call/mcp__fs__ls"), Some("mcp"));
-    // The losing candidate gets no edge for that member; the observer sees every member.
-    let g = &rev(&c).graph;
-    let to: Vec<&str> = g
+    let r = rev(&c);
+    assert_eq!(
+        r.report.families["tool-call/*"]["loop"],
+        vec!["tool-call/mcp__gh__issues", "tool-call/read_file"]
+    );
+    let info = one(&c, "resolved-family");
+    assert_eq!(info.severity, Severity::Info);
+    assert!(
+        info.message.contains("resolved to 2 members"),
+        "{}",
+        info.message
+    );
+    // The graph holds only concrete events.
+    assert!(r.graph.edges.iter().all(|e| !e.event.contains('*')));
+    assert!(r.graph.routes.iter().all(|x| !x.event.contains('*')));
+    let to = |ev: &str| -> Vec<&str> {
+        r.graph
+            .edges
+            .iter()
+            .filter(|e| e.event == ev)
+            .map(|e| e.to.as_str())
+            .collect()
+    };
+    // Both subscribers of read_file run; observers see every member.
+    assert_eq!(to("tool-call/read_file"), vec!["audit", "local", "vm"]);
+    assert_eq!(
+        to("tool-call/mcp__gh__issues"),
+        vec!["audit", "gh", "watch"]
+    );
+    assert!(find(&c, "missing-handler-pick").is_empty());
+}
+
+/// §9: only the core emits `session-started`, so it is a clean root. A
+/// plugin outside the definition that holds `start-session` contributes no
+/// entries (the old "external starters" over-approximation is gone), and a
+/// member may not declare an emit of a core event.
+#[test]
+fn row_session_started_is_a_root_and_only_the_core_emits_core_events() {
+    let ms = json!({
+        "starter": { "emit": [{ "event": "go", "keys": { "text": k(S) } }], "capabilities": ["start-session"], "sink": true },
+        "first": { "subscribe": [{ "event": "session-started", "mode": "blocking", "actions": ["contribute-context"], "receives": { "input": opt("object") } }] },
+        "worker": { "subscribe": [{ "event": "go", "mode": "async", "receives": { "text": k(S) } }], "sink": true }
+    });
+    // `worker` is fed by nothing in this definition: `starter` is not in it.
+    let (c, ..) = build(
+        &ms,
+        base_def(json!({ "first": { "phase": "main" }, "worker": {} })),
+    );
+    let d = one(&c, "never-fires");
+    assert_eq!(d.plugins, vec!["worker"]);
+    let r = rev(&c);
+    assert!(!r.plugins.contains_key("starter"), "no external nodes");
+    assert!(!r.graph.edges.iter().any(|e| e.from == "starter"));
+    // `session-started` reaches its subscriber straight from the boundary node.
+    let (c, ..) = build(&ms, base_def(json!({ "first": { "phase": "main" } })));
+    assert!(c.ok, "{:#?}", c.diagnostics);
+    let e = rev(&c)
+        .graph
         .edges
         .iter()
-        .filter(|e| e.event == "tool-call/read_file")
-        .map(|e| e.to.as_str())
-        .collect();
-    assert_eq!(to, vec!["audit", "vm"]);
-    // A pick naming a plugin that is not a possible handler is stale.
-    let mut def = base_def(plugins);
-    def["handlers"] = json!({ "tool-call/read_file": "audit", "tool-call/mcp__gh__*": "gh" });
-    let (c, ..) = build(&family_ms(), def);
-    one(&c, "stale-handler-pick");
+        .find(|e| e.event == "session-started")
+        .unwrap();
+    assert_eq!(e.from, "core");
+    // A member declaring a core event is an error.
+    let mut ms = ms;
+    ms["starter"]["emit"] = json!([{ "event": "session-started" }]);
+    let (c, ..) = build(
+        &ms,
+        base_def(json!({ "starter": {}, "first": { "phase": "main" } })),
+    );
+    let d = one(&c, "reserved-event");
+    assert_eq!(d.event.as_deref(), Some("session-started"));
 }
 
 #[test]
@@ -323,7 +362,7 @@ fn row_undeclared_actions_and_capabilities() {
         "ui": ui(),
         "a": { "subscribe": [{ "event": "go", "mode": "async", "actions": ["veto"] }], "sink": true },
         "b": { "subscribe": [{ "event": "go", "mode": "async", "actions": ["explode"], "returns": { "x": k(S) } }], "sink": true },
-        "c": { "subscribe": [{ "event": "go", "mode": "async" }], "emit": [{ "event": "later", "deferred": true }, { "event": "now", "lane": "interrupt" }], "outbound": [{ "event": "out" }] }
+        "c": { "subscribe": [{ "event": "go", "mode": "async" }], "emit": [{ "event": "later", "deferred": true }, { "event": "now", "lanes": ["normal", "interrupt"] }], "outbound": [{ "event": "out" }] }
     });
     let (c, ..) = build(
         &ms,
@@ -399,19 +438,32 @@ fn row_an_unreachable_island_is_a_warning() {
 fn row_an_interrupt_only_cycle_is_a_warning() {
     let ms = json!({
         "ui": ui(),
-        "p": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "b", "mode": "async" }], "emit": [{ "event": "a", "lane": "interrupt" }], "capabilities": ["interrupt"] },
-        "q": { "subscribe": [{ "event": "a", "mode": "async" }], "emit": [{ "event": "b", "lane": "interrupt" }], "capabilities": ["interrupt"] }
+        "p": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "b", "mode": "async" }], "emit": [{ "event": "a", "lanes": ["interrupt"] }], "capabilities": ["interrupt"] },
+        "q": { "subscribe": [{ "event": "a", "mode": "async" }], "emit": [{ "event": "b", "lanes": ["normal", "interrupt"] }], "capabilities": ["interrupt"] }
     });
     let (c, ..) = build(&ms, base_def(json!({ "ui": {}, "p": {}, "q": {} })));
+    // Every edge of the cycle *may* use the interrupt lane (q's `b` may also be
+    // queued normally): still a starvation risk.
     let d = one(&c, "interrupt-cycle");
     assert_eq!(d.plugins, vec!["p", "q"]);
+    let interrupt = &rev(&c).report.interrupt;
+    assert!(interrupt.iter().any(|x| x == "p: a (interrupt lane)"));
     assert!(
-        rev(&c)
-            .report
-            .interrupt
+        interrupt
             .iter()
-            .any(|x| x == "p: a (interrupt lane)")
+            .any(|x| x == "q: b (may use the interrupt lane)")
     );
+    // The edges carry the lanes their emit allows.
+    let b = rev(&c).graph.edges.iter().find(|e| e.event == "b").unwrap();
+    assert_eq!(
+        serde_json::to_value(&b.lanes).unwrap(),
+        json!(["normal", "interrupt"])
+    );
+    // A cycle with one edge that can only use the normal lane is no risk.
+    let mut ms = ms;
+    ms["q"]["emit"][0]["lanes"] = json!(["normal"]);
+    let (c, ..) = build(&ms, base_def(json!({ "ui": {}, "p": {}, "q": {} })));
+    assert!(find(&c, "interrupt-cycle").is_empty());
 }
 
 #[test]
@@ -441,7 +493,11 @@ fn row_info_sections_cycles_capabilities_interrupt_unlisted_and_surface() {
     let (c, ..) = build(&ms, d);
     assert!(c.ok, "{:#?}", c.diagnostics);
     let r = &rev(&c).report;
-    assert_eq!(r.cycles, vec![vec!["p".to_owned(), "q".to_owned()]]);
+    assert_eq!(
+        r.cycles.internal,
+        vec![vec!["p".to_owned(), "q".to_owned()]]
+    );
+    assert!(r.cycles.external_input.is_empty());
     assert_eq!(r.capabilities["cross-session"], vec!["q"]);
     assert!(
         r.interrupt
@@ -478,7 +534,7 @@ fn deny_warnings_promotes_warnings_to_errors() {
 
 #[test]
 fn definitions_name_their_runtime_and_slots_are_typed() {
-    let ms = json!({ "ui": ui(), "p": { "subscribe": [{ "event": "go", "mode": "async", "receives": { "slots": { "context": k("object"), "notes": k("array<string>") } } }], "sink": true } });
+    let ms = json!({ "ui": ui(), "p": { "subscribe": [{ "event": "go", "mode": "async", "slots": { "context": k("object"), "notes": k("array<string>") } }], "sink": true } });
     let (c, ..) = build(&ms, json!({ "plugins": { "ui": {}, "p": {} } }));
     one(&c, "missing-runtime");
     let (c, ..) = build(
@@ -667,7 +723,7 @@ fn revisions_are_deterministic_and_content_addressed() {
 
 fn chat_loop_ms() -> Value {
     json!({
-        "web-ui": { "subscribe": [{ "event": "session-started", "mode": "async" }, { "event": "tool-call/*", "mode": "async" }], "emit": [{ "event": "user-message", "deferred": true, "keys": { "text": k(S) } }], "capabilities": ["deferred-publish"], "sink": true },
+        "web-ui": { "subscribe": [{ "event": "session-started", "mode": "async" }], "emit": [{ "event": "user-message", "deferred": true, "keys": { "text": k(S) } }], "capabilities": ["deferred-publish", "observe"], "sink": true },
         "chat-context": {
             "subscribe": [
                 { "event": "user-message", "mode": "blocking", "actions": ["contribute-context"], "receives": { "text": k(S) } },
@@ -676,7 +732,7 @@ fn chat_loop_ms() -> Value {
             ],
             "emit": [
                 { "event": "model-request", "keys": { "model": k(S), "messages": k("array<object>") } },
-                { "event": "tool-call/*", "exactly_one_handler": true, "keys": { "call_id": k(S), "args": k("object") } }
+                { "event": "tool-call/*", "keys": { "call_id": k(S), "args": k("object") } }
             ]
         },
         "openrouter": { "subscribe": [{ "event": "model-request", "mode": "async", "receives": { "model": k(S), "messages": k("array<object>") } }], "emit": [{ "event": "model-response", "keys": { "text": k(S) } }] },
@@ -693,35 +749,49 @@ fn example_accepted_chat_loop() {
     let (c, ..) = build(&chat_loop_ms(), chat_loop_def());
     assert!(c.ok, "{:#?}", c.diagnostics);
     let r = rev(&c);
-    // Plugin-level: web-ui is in it too (it observes the family and emits the user's messages).
+    // web-ui watches the session through `observe`, so it is not in the loop.
     assert_eq!(
-        r.report.cycles,
+        r.report.cycles.internal,
         vec![vec![
             "chat-context".to_owned(),
             "file-tools".to_owned(),
             "openrouter".to_owned(),
-            "web-ui".to_owned()
         ]]
     );
+    assert!(r.report.cycles.external_input.is_empty());
+    // Watching is not subscribing: the only edge into web-ui is its standing
+    // `session-started` invocation, which its deferred publishes cite.
+    let into_ui: Vec<&str> = r
+        .graph
+        .edges
+        .iter()
+        .filter(|e| e.to == "web-ui")
+        .map(|e| e.event.as_str())
+        .collect();
+    assert_eq!(into_ui, vec!["session-started"]);
     assert!(
         find(&c, "cycle")
             .iter()
             .all(|d| d.severity == Severity::Info)
     );
-    // web-ui observes the whole family as an async sink; file-tools handles read_file.
+    // chat-context's `tool-call/*` resolves to read_file, which file-tools subscribes to.
+    assert_eq!(
+        r.report.families["tool-call/*"]["chat-context"],
+        vec!["tool-call/read_file"]
+    );
     let read = r
         .graph
         .routes
         .iter()
-        .find(|x| x.class == "tool-call/read_file")
+        .find(|x| x.event == "tool-call/read_file")
         .unwrap();
-    assert_eq!(r.graph.edge(read.handler.unwrap()).to, "file-tools");
+    assert_eq!(read.emit, "tool-call/*");
     assert_eq!(
         read.asyncs
             .iter()
             .map(|i| r.graph.edge(*i).to.as_str())
             .collect::<Vec<_>>(),
-        vec!["web-ui"]
+        vec!["file-tools"]
     );
 }
 
@@ -795,6 +865,74 @@ fn example_rejected_observable_tie() {
     );
 }
 
+/// §4 (gap 9 of #30): a tie-break keyed by a family name applies to every
+/// member the family resolves to.
+#[test]
+fn a_family_tie_break_orders_every_member() {
+    let gate = |name: &str| json!({ "subscribe": [{ "event": "tool-call/*", "mode": "blocking", "actions": ["veto"] }], "emit": [{ "event": format!("{name}-noted") }] });
+    let mut ms = chat_loop_ms();
+    ms["policy-gate"] = gate("policy");
+    ms["redactor"] = gate("redactor");
+    ms["shell"] = json!({ "subscribe": [{ "event": "tool-call/run", "mode": "async", "receives": { "call_id": k(S), "args": k("object") } }], "emit": [{ "event": "tool-result", "keys": { "call_id": k(S), "content": k(S) } }] });
+    let mut d = chat_loop_def();
+    d["phases"] = json!(["guard", "loop"]);
+    d["plugins"]["policy-gate"] = json!({ "phase": "guard" });
+    d["plugins"]["redactor"] = json!({ "phase": "guard" });
+    d["plugins"]["shell"] = json!({});
+    // Against name order, so the tie-break is what decides.
+    d["order"] = json!({ "tool-call": { "guard": ["redactor", "policy-gate"] } });
+    let (c, ..) = build(&ms, d);
+    assert!(c.ok, "{:#?}", c.diagnostics);
+    let g = &rev(&c).graph;
+    for member in ["tool-call/read_file", "tool-call/run"] {
+        let route = g.route("chat-context", member).expect(member);
+        let chain: Vec<&str> = route
+            .blocking
+            .iter()
+            .map(|&i| g.edges[i].to.as_str())
+            .collect();
+        assert_eq!(chain, vec!["redactor", "policy-gate"], "{member}");
+    }
+}
+
+/// §6: cycles are reported split into internal cycles, which can run on
+/// their own, and cycles that close only through external input (a deferred
+/// publish, such as a frontend's user message).
+#[test]
+fn cycles_are_split_into_internal_and_through_external_input() {
+    let ms = json!({
+        // The frontend sends `go` from outside any invocation and reacts to `a`.
+        "ui": { "subscribe": [{ "event": "session-started", "mode": "async" }, { "event": "a", "mode": "async" }], "emit": [{ "event": "go", "deferred": true, "keys": { "text": k(S) } }], "capabilities": ["deferred-publish"], "sink": true },
+        "p": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "b", "mode": "async" }], "emit": [{ "event": "a" }] },
+        "q": { "subscribe": [{ "event": "a", "mode": "async" }], "emit": [{ "event": "b" }] }
+    });
+    let (c, ..) = build(&ms, base_def(json!({ "ui": {}, "p": {}, "q": {} })));
+    assert!(c.ok, "{:#?}", c.diagnostics);
+    let cycles = &rev(&c).report.cycles;
+    assert_eq!(cycles.internal, vec![vec!["p".to_owned(), "q".to_owned()]]);
+    assert_eq!(
+        cycles.external_input,
+        vec![vec!["p".to_owned(), "q".to_owned(), "ui".to_owned()]]
+    );
+    let d = one(&c, "external-input-cycle");
+    assert_eq!(d.severity, Severity::Info);
+    assert_eq!(d.plugins, vec!["p", "q", "ui"]);
+    assert!(find(&c, "cycle").iter().all(|d| d.plugins == ["p", "q"]));
+    // Without q's edge back, only the cycle through external input remains.
+    let mut ms = ms;
+    ms["p"]["subscribe"] = json!([{ "event": "go", "mode": "async" }]);
+    ms["q"]["emit"] = json!([]);
+    ms["q"]["sink"] = json!(true);
+    let (c, ..) = build(&ms, base_def(json!({ "ui": {}, "p": {}, "q": {} })));
+    assert!(c.ok, "{:#?}", c.diagnostics);
+    let cycles = &rev(&c).report.cycles;
+    assert!(cycles.internal.is_empty());
+    assert_eq!(
+        cycles.external_input,
+        vec![vec!["p".to_owned(), "ui".to_owned()]]
+    );
+}
+
 #[test]
 fn example_rejected_self_subscription() {
     let ms = json!({ "ui": ui(), "summariser": { "subscribe": [{ "event": "go", "mode": "async" }, { "event": "context-updated", "mode": "async" }], "emit": [{ "event": "context-updated" }] } });
@@ -824,11 +962,19 @@ fn example_accepted_then_failed_at_runtime_with_a_breach_record() {
     assert!(c.ok, "{:#?}", c.diagnostics);
     let revision = rev(&c).revision.clone();
     let mut sim = Sim::new(c);
-    let sid = sim.start(
-        "web-ui",
-        "d",
-        Some(("user-message", json!({ "text": "hi" }))),
-    );
+    let sid = sim.start("web-ui", "d", None);
+    let cite = sim.first_invocation(&sid, "web-ui");
+    sim.publish(PublishRequest {
+        plugin: "web-ui".into(),
+        invocation_id: None,
+        cite: Some(cite),
+        event_name: "user-message".into(),
+        payload: json!({ "text": "hi" }),
+        ui: None,
+        lane: None,
+        target_session: None,
+    })
+    .unwrap();
     sim.run(&mut |s: &mut Sim, p: &str, req: &InvokeRequest| match (
         p,
         req.event.event_name.as_str(),
@@ -946,7 +1092,7 @@ fn example_rejected_dynamic_definition() {
     let parent = sim.start("ui", "d", None);
     sim.run(&mut |_: &mut Sim, _: &str, _: &InvokeRequest| InvocationResult::default());
     let cite = sim.first_invocation(&parent, "ui");
-    sim.publish(agentmod_core::kernel::PublishRequest {
+    sim.publish(PublishRequest {
         plugin: "ui".into(),
         invocation_id: None,
         cite: Some(cite),
@@ -969,11 +1115,8 @@ fn example_rejected_dynamic_definition() {
                     definition: String::new(),
                     spec: Some(spec),
                     invocation_id: Some(req.invocation_id.clone()),
-                    initial: Some(InitialEvent {
-                        event_name: "go".into(),
-                        payload: json!({ "text": "y" }),
-                        ui: None,
-                    }),
+                    input: Some(json!({ "text": "y" })),
+                    ui: None,
                     fork_from: None,
                 },
                 now,
@@ -1013,7 +1156,8 @@ fn example_rejected_dynamic_definition() {
             definition: String::new(),
             spec: Some(good),
             invocation_id: None,
-            initial: None,
+            input: None,
+            ui: None,
             fork_from: None,
         },
         now,

@@ -12,7 +12,7 @@ import { evidenceOf, childReport } from '../plugins/sdk/delegation.js';
 import { toolSpecs } from '../plugins/sdk/coding/toolkit.js';
 
 let n = 0;
-const item = (slot, value, plugin = 'p') => ({ id: `s/i${++n}#0`, slot, value, plugin, invocation_id: `s/i${n}` });
+const item = (section, value, plugin = 'p') => ({ id: `s/i${++n}#0`, section, value, plugin, invocation_id: `s/i${n}` });
 const tools = () => [...toolSpecs({ lifecycle: true }), { name: 'update_plan', description: 'plan', parameters: {}, tier: 'core' }, { name: 'tool_search', description: 'find tools.', parameters: {}, tier: 'core' }, { name: 'clock', description: 'legacy untiered tool', parameters: {} }].map((t) => item('tools', t));
 
 test('projection: core tools only, deterministic order, deferred listed in tool_search', () => {
@@ -201,6 +201,9 @@ test('budgets: tighter of config and delegation; usage from the log', () => {
   assert.equal(next.turn_model_requests, 1);
   assert.match(exceeded({ max_turn_model_requests: 5 }, u), /max_turn_model_requests=5 in this turn/);
   assert.equal(exceeded({ max_turn_model_requests: 5 }, next), null);
+  // The first turn starts at the session's start input, not at a user message.
+  const first = usage([{ event_name: 'session-started', at: 0, payload: { input: { text: 'go' } } }, { event_name: 'model-response', at: 10, payload: {} }]);
+  assert.equal(first.turn_model_requests, 1);
 });
 
 test('plans are validated', () => {

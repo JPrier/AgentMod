@@ -57,6 +57,7 @@ class WorkerProc {
     this.nextId = 1;
     this.pending = new Map();
     this.invocations = new Map(); // invocation_id -> deadline
+    this.emitSets = new Set(); // revisions whose resolved emit set this worker was sent
     this.queue = [];
     this.readyWaiters = [];
     const url = new URL(cfg.module, host.base);
@@ -143,7 +144,7 @@ export class BrowserRuntime {
     this.store = store;
     // Live streams: page clients (client id -> callback) and counters.
     this.streamClients = new Map();
-    this.counters = { records: 0, invocations: 0, routed_invocations: 0, stream_messages: 0, stream_frames_in: 0, live_messages_out: 0 };
+    this.counters = { records: 0, invocations: 0, stream_messages: 0, stream_frames_in: 0, live_messages_out: 0 };
   }
 
   // ------------------------------------------------------------------
@@ -200,7 +201,6 @@ export class BrowserRuntime {
     for (const r of records) {
       if (r.type === 'invocation-started') {
         this.counters.invocations++;
-        if (r.route) this.counters.routed_invocations++;
       } else if (r.type === 'invocation-completed' && this.hub.is_open(r.invocation_id)) {
         const s = r.outcome?.status;
         this.streamEffects(J(this.hub.finalize(r.invocation_id, s === 'ok' ? 'complete' : s === 'cancelled' ? 'cancelled' : 'failed')));
@@ -288,6 +288,9 @@ export class BrowserRuntime {
     const { hash } = J(this.kernel.install(JSON.stringify(comp)));
     J(this.kernel.set_active(hash));
     this.compilations.set(hash, comp);
+    // Right after the handshake (once the config compiled): every plugin learns
+    // its resolved emit set under each revision it is a member of.
+    for (const rev of Object.values(comp.definitions || {})) this.announceRevision(rev);
     this.journal.push({ at: Date.now(), kind: 'config-loaded', detail: { hash, durable: !!this.store, persisted: this.store?.persisted ?? null, blocked: this.storeBlocked ?? null } });
     const recovered = [];
     for (const [sid, recs] of [...stored.sessions].sort(([a], [b]) => a.localeCompare(b))) {
@@ -407,6 +410,7 @@ export class BrowserRuntime {
       if (fx.type === 'save-revision') {
         // Sessions reference revisions; persist one before the records naming it.
         this.durableTail = (this.durableTail || Promise.resolve()).then(() => this.store?.putCompilation({ hash: `revision:${fx.revision.revision}`, standalone_revision: fx.revision }));
+        this.announceRevision(fx.revision);
         continue;
       }
       if (fx.type !== 'append') continue;
@@ -442,6 +446,23 @@ export class BrowserRuntime {
     return this.durableTail || Promise.resolve();
   }
 
+  /** Send a worker its resolved emit set under a revision, once (compiler.md §3.4 step 4). */
+  sendEmitSet(proc, revision) {
+    if (proc.emitSets.has(revision)) return;
+    const emits = J(this.kernel.emit_set(revision, proc.name));
+    if (emits == null) return;
+    proc.emitSets.add(revision);
+    proc.send('emit_set', { revision, emits });
+  }
+
+  /** A revision was compiled: tell its running member workers their emit sets. */
+  announceRevision(rev) {
+    for (const p of this.procs) {
+      const m = rev.plugins?.[p.name];
+      if (m && !p.failed && p.key === stampOf(p.name, m.config)) this.sendEmitSet(p, rev.revision);
+    }
+  }
+
   dispatch(fx) {
     const inv = fx.request.invocation_id;
     if (fx.plugin === PAGE) {
@@ -459,6 +480,8 @@ export class BrowserRuntime {
       return;
     }
     proc.invocations.set(inv, Date.now() + (proc.cfg.timeout_ms ?? 120000));
+    // A worker learns its emit set before its first invocation under any revision.
+    this.sendEmitSet(proc, fx.request.revision);
     proc.send('invoke', fx.request, { kind: 'invoke', inv });
   }
 
@@ -618,7 +641,8 @@ export class BrowserRuntime {
     const req = { plugin, definition: params.definition || '' };
     if (params.spec) req.spec = params.spec;
     if (params.invocation_id) req.invocation_id = params.invocation_id;
-    if (params.initial) req.initial = params.initial;
+    if (params.input) req.input = params.input;
+    if (params.ui) req.ui = params.ui;
     if (params.fork_from) req.fork_from = params.fork_from;
     const out = J(this.kernel.start_session(JSON.stringify(req), Date.now()));
     this.execute(out.effects);
@@ -633,7 +657,7 @@ export class BrowserRuntime {
     return { status: out.status };
   }
 
-  query({ what, session_id, event_id, sequence, from }) {
+  query({ what, session_id, event_id, sequence, from, revision: rev, plugin }) {
     const recs = () => {
       const r = this.records.get(session_id);
       if (!r) throw Object.assign(new Error(`unknown session ${session_id}`), { code: -32004 });
@@ -656,8 +680,10 @@ export class BrowserRuntime {
         return J(this.hub.snapshots(session_id || ''));
       case 'session-metrics':
         return J(session_metrics(JSON.stringify(recs())));
-      case 'handlers':
-        return { families: J(this.kernel.families(session_id)), revision: J(this.kernel.status(session_id))?.revision ?? null };
+      case 'emit-set': {
+        const revision = rev || J(this.kernel.status(session_id))?.revision;
+        return { revision, emits: revision ? J(this.kernel.emit_set(revision, plugin || '')) : null };
+      }
       case 'revision':
         return J(this.kernel.session_revision(session_id));
       case 'metrics':
@@ -682,7 +708,7 @@ export class BrowserRuntime {
     const created = r[0];
     let title = null;
     for (const rec of r) {
-      if (rec.type === 'invocation-completed') for (const c of rec.contributions || []) if (c.op === 'add' && c.slot === 'title') title = c.value;
+      if (rec.type === 'invocation-completed') for (const c of rec.contributions || []) if (c.op === 'add' && c.section === 'title') title = c.value;
     }
     const status = J(this.kernel.status(sid));
     const parent = created.cause?.kind === 'invocation' ? created.cause.invocation_id.split('/')[0] : null;
@@ -853,13 +879,16 @@ export class BrowserRuntime {
     return this.query({ what: 'session-metrics', session_id: id });
   }
 
+  /** start-session with the user's first message as the input. */
   async startSession({ definition, text, fork_from }) {
-    const initial = text ? { event_name: 'user-message', payload: { text }, ui: { v: 1, kind: 'text', role: 'user', text } } : undefined;
-    return this.startAs(PAGE, { definition, initial, fork_from });
+    const input = text ? { text } : undefined;
+    const ui = text ? { v: 1, kind: 'text', role: 'user', text } : undefined;
+    return this.startAs(PAGE, { definition, input, ui, fork_from });
   }
 
-  async sendMessage(id, text) {
-    return this.publishAs(PAGE, { event_name: 'user-message', payload: { text }, cite: this.citeFor(id), ui: { v: 1, kind: 'text', role: 'user', text } });
+  /** A user message, steered (interrupt lane) or queued (normal lane). */
+  async sendMessage(id, text, lane = 'normal') {
+    return this.publishAs(PAGE, { event_name: 'user-message', payload: { text }, cite: this.citeFor(id), lane, ui: { v: 1, kind: 'text', role: 'user', text } });
   }
 
   async uiAction(id, reply_to, action, values = {}) {
@@ -867,7 +896,7 @@ export class BrowserRuntime {
   }
 
   async contextEdit(id, ops) {
-    return this.publishAs(PAGE, { event_name: 'context-edit', payload: { ops }, cite: this.citeFor(id) });
+    return this.publishAs(PAGE, { event_name: 'context-edit', payload: { ops }, cite: this.citeFor(id), lane: 'interrupt' });
   }
 
   async sendCommand(id, command) {

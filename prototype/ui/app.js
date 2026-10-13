@@ -520,10 +520,19 @@ async function newSession(definition, text, fork_from) {
   }
 }
 
-async function send(text) {
+/**
+ * Send a user message. It is one event published on one of two lanes: steer
+ * (interrupt lane: it runs before already-queued work, at the next pipeline
+ * boundary) or queue (normal lane: it waits its turn). The plugins that
+ * handle user messages treat both the same.
+ */
+async function send(text, steer) {
   if (!text.trim() || !state.selected) return;
-  await act(() => state.client.sendMessage(state.selected, text));
+  await act(() => state.client.sendMessage(state.selected, text, steer ? 'interrupt' : 'normal'));
 }
+
+/** The composer's steer choice, kept across renders. */
+let steerNext = false;
 
 async function command(cmd) {
   const labels = { 'soft-stop': 'Soft stop: the running pipeline finishes, then the session parks.', 'hard-stop': 'Hard stop: in-flight invocations were cancelled.', resume: 'Resumed.' };
@@ -708,7 +717,7 @@ function chat() {
       h('button.btn.small', { onclick: () => command('resume'), disabled: !['halted', 'parked', 'draining'].includes(st) }, 'Resume')),
   );
   const items = threadItems(v);
-  const empty = !v.events.some((e) => e.event_name === 'user-message');
+  const empty = !v.events.some((e) => e.event_name === 'user-message' || (e.event_name === 'session-started' && e.payload.input?.text));
   const thread = h('div.thread', { 'aria-live': 'polite' },
     h('div.thread-inner', sandboxNotice(v), items, empty && v.definition !== 'heartbeat' && suggestions(v)));
   return h('main.chat', head, thread, composer(v));
@@ -783,9 +792,12 @@ function suggestions(v) {
 function composer(v) {
   const ta = h('textarea#composer', { rows: 1, placeholder: 'Message the agent', 'aria-label': 'Message', oninput: (e) => autosize(e.target),
     onkeydown: (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); e.target.form.requestSubmit(); } } });
-  const form = h('form', { onsubmit: (e) => { e.preventDefault(); const t = ta.value; ta.value = ''; composerDraft = ''; send(t); } },
+  const steer = h('input', { type: 'checkbox', id: 'steer', checked: steerNext, onchange: (e) => { steerNext = e.target.checked; } });
+  const form = h('form', { onsubmit: (e) => { e.preventDefault(); const t = ta.value; ta.value = ''; composerDraft = ''; send(t, steer.checked); } },
     ta, h('button.btn.primary', { type: 'submit' }, 'Send'),
-    h('div.opts', h('span', v.definition === 'chat' ? 'Shift+Enter for a new line' : '')));
+    h('div.opts',
+      h('label', { title: 'Steer: the message is published on the interrupt lane and runs before already-queued work, at the next pipeline boundary. Unchecked, it queues on the normal lane and waits its turn.' }, steer, 'Steer (interrupt lane) — otherwise it queues'),
+      h('span', v.definition === 'chat' ? 'Shift+Enter for a new line' : '')));
   return h('div.composer', form);
 }
 
@@ -826,12 +838,17 @@ function threadItems(v) {
     while (ci < controls.length && controls[ci].sequence < e.sequence) out.push(controlNote(controls[ci++]));
     const ui = e.ui;
     const name = e.event_name;
-    if (name === 'session-started' && e.payload.parent_session) {
-      out.push(h('div.sys', 'Sub-session started by ', h('button.link', { onclick: () => select(e.payload.parent_session) }, e.payload.parent_session), ' through the delegate tool.'));
-      continue;
-    }
-    if (name === 'session-started' && e.payload.fork_of) {
-      out.push(h('div.sys', `Branched from ${e.payload.fork_of.session_id} at record #${e.payload.fork_of.sequence}; context was copied into this log.`));
+    if (name === 'session-started') {
+      if (e.payload.parent_session) out.push(h('div.sys', 'Sub-session started by ', h('button.link', { onclick: () => select(e.payload.parent_session) }, e.payload.parent_session), ' through the delegate tool.'));
+      else if (e.payload.fork_of) out.push(h('div.sys', `Branched from ${e.payload.fork_of.session_id} at record #${e.payload.fork_of.sequence}; context was copied into this log.`));
+      // The start-session input: the session's first message (or delegated task).
+      const text = e.payload.input?.text;
+      if (text) {
+        const settled = settledPayload(e).input?.text ?? text;
+        out.push(h('div.msg.user', { title: `${e.event_id} · ${e.status} · the session's start input` }, settled,
+          settled !== text && h('span.note', 'Redacted by a transformer before any later plugin saw it'),
+          e.status === 'vetoed' && h('span.note', `Vetoed: ${e.settlement.reason}`)));
+      }
       continue;
     }
     if (name === 'user-message') {
@@ -841,7 +858,7 @@ function threadItems(v) {
         h('button.linkish.branch', { title: 'Start a new session from the context just before this message (its own log; with an isolated workspace for coding sessions)', onclick: () => branchFrom(e.sequence - 1) }, 'branch here'),
         changed && h('span.note', 'Redacted by a transformer before any later plugin saw it'),
         e.status === 'vetoed' && h('span.note', `Vetoed: ${e.settlement.reason}`),
-        e.lane === 'interrupt' && h('span.note', 'Sent on the interrupt lane')));
+        e.lane === 'interrupt' && h('span.note', 'Steered: sent on the interrupt lane')));
       continue;
     }
     if (name === 'stream-chunk' && ui?.kind === 'stream-chunk') {
@@ -891,7 +908,7 @@ function threadItems(v) {
       continue;
     }
     if (name === 'tool-call-rejected' && !tools.has(e.payload.call_id)) {
-      // Answered by the loop before dispatch (bad arguments, unknown tool, no handler).
+      // Answered by the loop before dispatch (bad arguments, an unknown tool) or after a failed invocation.
       const t = { status: h('span.pill', 'rejected'), res: h('span.res') };
       tools.set(e.payload.call_id, t);
       out.push(h('div.tool', h('span.name', e.payload.name), h('span.args', ''), t.status, t.res));
@@ -1040,7 +1057,7 @@ function hotPathSection(row, n) {
     row('records · bytes', `${n(m.records)} · ${n(m.record_bytes)}`),
     row('events · pipelines', `${n(m.events)} (${n(m.semantic_events)} semantic) · ${n(m.pipeline_starts)}`),
     row('plugin invocations', `${n(m.plugin_invocations)} (${n(m.blocking_invocations)} blocking, ${n(m.async_invocations)} async, ${n(m.noop_invocations)} no-op)`),
-    row('tool dispatch', `${n(m.exact_handler_dispatches)} to handlers, ${n(m.observer_dispatches)} to observers; ${r.plugin_invocations_per_tool_call ?? '-'} invocations per call`),
+    row('tool dispatch', `${n(m.member_dispatches)} to member subscribers, ${n(m.observer_dispatches)} to observers; ${r.plugin_invocations_per_tool_call ?? '-'} invocations per call`),
     row('streams', `${n(m.stream_provider_events)} provider events → ${n(m.stream_live_frames)} live frames (${r.live_frames_per_provider_event ?? '-'} per event)`),
     row('per model response', `${r.canonical_events_per_model_response ?? '-'} events, ${r.records_per_model_response ?? '-'} records`),
     row('journal bytes / useful byte', r.journal_bytes_per_useful_output_byte ?? '-'),
@@ -1112,7 +1129,7 @@ function pipelinePane() {
   const rows = evs.map((e) => eventRow(v, e));
   const hidden = v.events.length - evs.length;
   return [
-    h('p.help', `${v.records} records in ${v.session_id} (revision ${v.revision.slice(0, 8)}). Each row is an event; the chips are the edges it took in the compiled graph: blocking subscribers in phase order, then async observers and the family handler (H). Click a row for its full record.`),
+    h('p.help', `${v.records} records in ${v.session_id} (revision ${v.revision.slice(0, 8)}). Each row is an event; the chips are the edges it took in the compiled graph: blocking subscribers in phase order, then async subscribers. Click a row for its full record.`),
     tools,
     hidden ? h('p.help', `${hidden} stream chunks hidden.`) : null,
     rows,
@@ -1126,7 +1143,7 @@ function eventRow(v, e) {
   const invs = e.invocations.filter((i) => !(state.hideFrontend && i.plugin === 'web-ui'));
   const blocking = invs.filter((i) => i.mode === 'blocking');
   const asyncs = invs.filter((i) => i.mode === 'async');
-  const chip = (i) => h('span.chip.' + (i.mode === 'blocking' ? 'b' : 'a') + (outcomeClass(i) ? '.' + outcomeClass(i) : ''), { title: `${i.invocation_id} · ${i.phase ? `phase ${i.phase} · ` : ''}${i.route ? `handler of ${i.route} · ` : ''}${i.subscription ? `via ${i.subscription} · ` : ''}${i.outcome?.status || 'running'}${i.attempts > 1 ? ` · attempt ${i.attempts}` : ''}` }, (i.phase ? `${i.phase}:` : '') + i.plugin + (i.route ? ' (H)' : '') + (i.attempts > 1 ? ` ×${i.attempts}` : ''));
+  const chip = (i) => h('span.chip.' + (i.mode === 'blocking' ? 'b' : 'a') + (outcomeClass(i) ? '.' + outcomeClass(i) : ''), { title: `${i.invocation_id} · ${i.phase ? `phase ${i.phase} · ` : ''}${i.subscription ? `via ${i.subscription} · ` : ''}${i.outcome?.status || 'running'}${i.attempts > 1 ? ` · attempt ${i.attempts}` : ''}` }, (i.phase ? `${i.phase}:` : '') + i.plugin + (i.attempts > 1 ? ` ×${i.attempts}` : ''));
   const chain = [];
   blocking.forEach((i, n) => { if (n) chain.push(h('span.arrow', '→')); chain.push(chip(i)); });
   if (asyncs.length) { if (blocking.length) chain.push(h('span.fork', '⋮')); asyncs.forEach((i) => chain.push(chip(i))); }
@@ -1171,7 +1188,6 @@ function originText(o) {
   switch (o.kind) {
     case 'pipeline': return `pipeline output of ${o.plugin}`;
     case 'deferred': return h('span', `deferred publish by ${o.plugin}, citing `, h('button.linkish', { onclick: () => jump(o.cites) }, o.cites));
-    case 'start': return `initial event of start-session by ${o.plugin}`;
     case 'cross-session': return h('span', `cross-session publish from `, h('button.linkish', { onclick: () => select(o.from_session) }, o.from_session), ` by ${o.plugin}`);
     default: return 'core lifecycle event';
   }
@@ -1212,17 +1228,17 @@ function contextPane() {
   const v = state.view;
   if (!v) return h('p.help', 'Select a session.');
   const sid = v.session_id;
-  const slot = h('select', ['system', 'memory', 'messages', 'note'].map((s) => h('option', s)));
+  const section = h('select', { 'aria-label': 'Context section' }, ['system', 'memory', 'messages', 'note'].map((s) => h('option', s)));
   const text = h('input', { placeholder: 'Text to add', 'aria-label': 'Context text' });
   const seq = h('input', { type: 'number', min: 0, placeholder: 'Record #', 'aria-label': 'Record number', style: 'max-width:110px' });
   return [
     h('p.help', 'The context is an attributed fold over contributions in the log. Edits are published as a context-edit event, so every change is a new record and every earlier state stays reconstructable.'),
     v.context.length ? v.context.map((c) => h('div.ctx-item',
-      h('span.ctx-slot', c.slot),
+      h('span.ctx-section', c.section),
       h('span.ctx-val', typeof c.value === 'string' ? c.value : c.value?.content ? `${c.value.role}: ${c.value.content}` : c.value?.name ? `${c.value.name} — ${c.value.description || ''}` : JSON.stringify(c.value), h('span.by', `${c.plugin} · ${c.id}`)),
       h('button.btn.small.ghost', { title: 'Remove this item', onclick: () => act(() => state.client.contextEdit(sid, [{ op: 'remove', id: c.id }]), 'Removed. The model sees the change on its next request.') }, 'Remove'))) : h('p.help', 'Empty.'),
-    h('form.inline-form', { onsubmit: (e) => { e.preventDefault(); if (!text.value.trim()) return; const val = slot.value === 'messages' ? { role: 'user', content: text.value } : text.value; act(() => state.client.contextEdit(sid, [{ op: 'add', slot: slot.value, value: val }]), 'Added to context.'); text.value = ''; } },
-      h('h3', 'Add an item'), h('div.r', slot, text, h('button.btn', { type: 'submit' }, 'Add'))),
+    h('form.inline-form', { onsubmit: (e) => { e.preventDefault(); if (!text.value.trim()) return; const val = section.value === 'messages' ? { role: 'user', content: text.value } : text.value; act(() => state.client.contextEdit(sid, [{ op: 'add', section: section.value, value: val }]), 'Added to context.'); text.value = ''; } },
+      h('h3', 'Add an item'), h('div.r', section, text, h('button.btn', { type: 'submit' }, 'Add'))),
     h('form.inline-form', { onsubmit: (e) => { e.preventDefault(); const n = Number(seq.value); if (!Number.isFinite(n)) return; act(() => state.client.contextEdit(sid, [{ op: 'restore', to_sequence: n }]), `Context restored to record #${n}.`); } },
       h('h3', 'Restore'), h('p.help', 'Set the context to its state as of an earlier record. Restoring again to a later record undoes it.'), h('div.r', seq, h('button.btn', { type: 'submit' }, 'Restore'))),
   ];
@@ -1242,33 +1258,34 @@ function graphPane() {
   if (!r) return h('p.help', 'No definitions compiled on this host.');
   const { edges, routes } = r.graph;
   const plugins = ['core', ...Object.keys(r.plugins)];
-  const classes = [...new Set(routes.map((x) => x.class))].sort();
+  const classes = [...new Set(routes.map((x) => x.event))].sort();
   const cell = (cls, p) => {
     const parts = [];
-    const out = routes.filter((x) => x.class === cls && x.from === p);
+    const out = routes.filter((x) => x.event === cls && x.from === p);
     if (out.length) {
-      const e = out.map((x) => [...(x.blocking || []), ...(x.asyncs || []), ...(x.handler != null ? [x.handler] : [])].map((i) => edges[i])).flat()[0];
-      const label = `E${e?.deferred ? '*' : ''}${e?.lane === 'interrupt' ? '!' : ''}`;
-      parts.push(h('span.cell-e', { title: `emits ${cls}${e?.deferred ? ' (deferred allowed)' : ''}${e?.lane === 'interrupt' ? ' on the interrupt lane' : ''}; keys: ${Object.keys(e?.supply || {}).join(', ') || 'none'}` }, label));
+      const e = out.map((x) => [...(x.blocking || []), ...(x.asyncs || [])].map((i) => edges[i])).flat()[0];
+      const interrupt = (e?.lanes || []).includes('interrupt');
+      const label = `E${e?.deferred ? '*' : ''}${interrupt ? '!' : ''}`;
+      parts.push(h('span.cell-e', { title: `emits ${cls}${e && e.emit !== cls ? ` (resolved from ${e.emit})` : ''}${e?.deferred ? ' (deferred allowed)' : ''}${interrupt ? ` (lanes: ${e.lanes.join(', ')})` : ''}; keys: ${Object.keys(e?.supply || {}).join(', ') || 'none'}` }, label));
     }
     const ins = edges.filter((e) => e.event === cls && e.to === p);
     const b = ins.find((e) => e.mode === 'blocking');
     if (b) parts.push(h('span.cell-b', { title: `blocking, phase ${b.position.phase}, chain position ${b.position.chain + 1}; receives ${Object.keys(b.supply).join(', ') || 'envelope only'}` }, `${b.position.phase}:${b.position.chain + 1}`));
-    if (ins.some((e) => e.handler)) parts.push(h('span.cell-a', { title: 'the one handler of this family member' }, 'H'));
-    else if (ins.some((e) => e.mode === 'async')) parts.push(h('span.cell-a', { title: 'async' }, 'A'));
+    if (ins.some((e) => e.mode === 'async')) parts.push(h('span.cell-a', { title: 'async' }, 'A'));
     return h('td', parts);
   };
   const rp = r.report;
   const section = (title, items, help) => items.length > 0 && [h('h3', title), help && h('p.help', help), items.map((x) => h('div.diag', x))];
   return [
     h('div.pane-tools', h('label', 'Definition ', h('select', { onchange: (e) => { state.graphDef = e.target.value; render(); } }, defs.map((x) => h('option', { selected: x === name }, x))))),
-    h('p.help', `Revision ${r.revision} of \`${name}\` (runtime ${r.runtime}). The compiled graph is the routing table: each edge is "when A emits X, B is a destination", with its mode, phase position, lane and the keys it carries. E = emits (E* deferred allowed, E! interrupt lane), phase:n = blocking position, A = async, H = the family member's one handler.`),
+    h('p.help', `Revision ${r.revision} of \`${name}\` (runtime ${r.runtime}). The compiled graph is the routing table: each edge is "when A emits X, B is a destination", with its mode, phase position, lane and the keys it carries. E = emits (E* deferred allowed, E! may use the interrupt lane), phase:n = blocking position, A = async. Family emits (tool-call/*) appear as the concrete members they resolve to.`),
     r.definition.phases?.length ? h('p.help', `Phases: ${r.definition.phases.join(' → ')}`) : null,
     h('div.matrix-wrap', h('table.matrix', h('thead', h('tr', h('th', ''), plugins.map((p) => h('th', p)))), h('tbody', classes.map((c) => h('tr', h('th', c), plugins.map((p) => cell(c, p))))))),
     h('h3', 'Diagnostics'),
     diagnosticRows(r.diagnostics.filter((x) => x.severity !== 'info')),
-    section('Event families', Object.entries(rp.families || {}).flatMap(([f, hs]) => [...Object.entries(hs.members || {}), ...Object.entries(hs.subfamilies || {})].map(([m, p]) => `${f} · ${m} → ${p}`)), 'Each member has exactly one handler; a member nobody handles becomes dispatch-failed.'),
-    section('Cycles', (rp.cycles || []).map((c) => c.join(' → ')), 'Legal (agent loops are cycles). The core has no depth limit; bounding loops is plugin policy.'),
+    section('Resolved families', Object.entries(rp.families || {}).flatMap(([f, by]) => Object.entries(by).map(([emitter, members]) => `${emitter}: ${f} → ${members.length ? members.join(', ') : '(nothing)'}`)), 'A family emit is resolved into the concrete members this definition\'s plugins subscribe to; the graph holds only those. For tool calls, they are the tools the model is offered.'),
+    section('Internal cycles', (rp.cycles?.internal || []).map((c) => c.join(' → ')), 'Legal (agent loops are cycles), and they can run on their own. The core has no depth limit; bounding loops is plugin policy.'),
+    section('Cycles through external input', (rp.cycles?.external_input || []).map((c) => c.join(' → ')), 'These close only through a deferred publish (a user message, a timer): they turn when something outside the session sends again.'),
     section('Fixed orders', rp.fixed_orders || [], 'No observable tie, so the compiler ordered these by name.'),
     section('Capabilities', Object.entries(rp.capabilities || {}).map(([c, ps]) => `${c}: ${ps.join(', ')}`)),
     section('Interrupt', rp.interrupt || []),

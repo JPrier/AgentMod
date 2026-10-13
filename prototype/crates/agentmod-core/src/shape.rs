@@ -42,11 +42,14 @@ pub enum Shape {
     Union(Vec<Shape>),
 }
 
-/// One declared key: its shape and whether it may be absent.
+/// One declared key: its shape, whether it may be absent, and an optional
+/// description. The description is documentation only (an emitter may show it,
+/// for example in a model's tool schema); compatibility never looks at it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyDecl {
     pub shape: Shape,
     pub optional: bool,
+    pub description: Option<String>,
 }
 
 impl KeyDecl {
@@ -55,6 +58,7 @@ impl KeyDecl {
         Self {
             shape,
             optional: false,
+            description: None,
         }
     }
 
@@ -63,6 +67,7 @@ impl KeyDecl {
         Self {
             shape,
             optional: true,
+            description: None,
         }
     }
 
@@ -74,6 +79,7 @@ impl KeyDecl {
         Ok(Self {
             shape: Shape::parse(shape)?,
             optional,
+            description: None,
         })
     }
 }
@@ -288,12 +294,15 @@ impl Parser<'_> {
 
 /// Serialized form of a key declaration.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawKey {
     shape: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     optional: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     keys: Option<Keys>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
 }
 
 impl Serialize for KeyDecl {
@@ -302,6 +311,7 @@ impl Serialize for KeyDecl {
             shape: self.shape.to_string(),
             optional: self.optional,
             keys: self.shape.object_keys().cloned(),
+            description: self.description.clone(),
         }
         .serialize(s)
     }
@@ -317,6 +327,7 @@ impl<'de> Deserialize<'de> for KeyDecl {
         Ok(KeyDecl {
             shape,
             optional: raw.optional,
+            description: raw.description,
         })
     }
 }

@@ -1,25 +1,35 @@
 // chat-context: the bundled chat convention. Folds user, assistant, and tool
-// messages into the `messages` context slot and drives the agent loop:
+// messages into the `messages` context section and drives the agent loop:
 //   user-message -> model-request -> model-response -> (tool-call* -> tool-result*)* -> assistant-message
 // It keeps no in-memory state: everything it needs is in the delivered context.
+//
+// A session starts with the core's `session-started`, which carries the
+// start-session input (compiler.md §9): its text is the first user message
+// (or a delegated task), so this plugin turns it into the first model request.
 //
 // Messages carry their authority (sdk/projection.js): a user message from a
 // frontend is `user`; a task handed down by a delegating agent is `agent`.
 // Tool results keep compact metadata (exit code, checkpoint, trust) and any
 // attachments (images), so the projection can label and bound them.
 //
-// Tool calls are the `tool-call/<name>` event family, emitted here with
-// exactly one handler per member: the compiler routes each member to the one
-// plugin that subscribes to it (compiler.md §3.3).
+// Tool calls are the `tool-call/*` event family (compiler.md §3.4). This
+// plugin is written before any tool is known, so it declares the family; the
+// compiler resolves it into exactly the members the definition's plugins
+// subscribe to, and the runtime sends this plugin that resolved emit set. The
+// set is the session's tools: at session start and after a config apply this
+// plugin writes the `tools` context section from it (name = member name,
+// argument schema = the member subscriber's `receives`), which is what the
+// model is offered and what tool_search searches.
 //
-// A tool call that cannot be dispatched — malformed JSON arguments, arguments
-// that do not match the tool's schema, or a tool no plugin offers — is
-// answered here, inline: the tool message goes straight into context and a
-// `tool-call-rejected` event records it, so the loop never waits for an answer
-// that will not come. (This plugin consumes `tool-result`, so it never emits
-// one: a plugin may not consume its own emits.) The same holds after
-// dispatch: `dispatch-failed` (a member with no handler, or a handler that
-// failed without answering) is answered inline the same way.
+// A tool call that cannot be published — a name outside the resolved set ("no
+// such tool"), malformed JSON arguments, or arguments that do not fit the
+// member's shape — is answered here, inline: the tool message goes straight
+// into context and a `tool-call-rejected` event records it, so the loop never
+// waits for an answer that will not come. Unknown names are never published:
+// publishing outside the resolved set would be an undeclared emit. (This
+// plugin consumes `tool-result`, so it never emits one: a plugin may not
+// consume its own emits.) After dispatch, a failed invocation reaches this
+// plugin as the core's `invocation-failed` and is answered the same way.
 //
 // Approvals: a gate (policy, approval-gate) vetoes a call and later publishes
 // `approval-granted`; this plugin re-publishes the call with `approved`, and the
@@ -28,10 +38,11 @@
 // Batch settlement: every tool call of one assistant turn is answered before
 // the next model request, which is published exactly once — however many calls
 // there were and in whatever order their results arrive.
-import { definePlugin, key, optional, withContext, TOOL_CALL_KEYS } from '../sdk/agentmod.js';
-import { checkArgs, suggestTools } from '../sdk/toolargs.js';
+import { definePlugin, key, optional, withContext, START_INPUT, TOOL_CALL_KEYS } from '../sdk/agentmod.js';
+import { describeParams, suggestTools } from '../sdk/toolargs.js';
+import { conformArgs, toolOfMember } from '../sdk/toolschema.js';
 
-const msgs = (ctx) => ctx.context.filter((c) => c.slot === 'messages');
+const msgs = (ctx) => ctx.context.filter((c) => c.section === 'messages');
 const META_KEYS = ['exit_code', 'timed_out', 'duration_ms', 'truncated', 'checkpoint', 'process_id', 'state', 'sha256', 'diagnostics', 'read_only', 'secrets_used'];
 const CONTRIBUTES = ['contribute-context'];
 
@@ -39,6 +50,17 @@ const CONTRIBUTES = ['contribute-context'];
 async function answerInline(ctx, call, output, extra = {}) {
   ctx.add('messages', { role: 'tool', call_id: call.call_id, name: call.name, content: output, error: true });
   await ctx.publish('tool-call-rejected', { call_id: call.call_id, name: call.name, output, error: true, ...extra }, { ui: { v: 1, kind: 'tool', name: call.name, call_id: call.call_id, status: 'error', result: extra.dispatch || 'rejected' } });
+}
+
+const TOOL_PREFIX = 'tool-call/';
+
+/** The resolved tool members of this invocation's revision, by tool name. */
+const toolMembers = (ctx) => new Map(ctx.emits.filter((e) => e.event.startsWith(TOOL_PREFIX)).map((e) => [e.event.slice(TOOL_PREFIX.length), e]));
+
+/** Write the `tools` section from the resolved emit set (replacing any earlier one). */
+function offerTools(ctx) {
+  ctx.clearSection('tools');
+  for (const member of toolMembers(ctx).values()) ctx.add('tools', toolOfMember(member));
 }
 
 /** Continue the loop if every call of the latest assistant turn is answered. */
@@ -58,47 +80,74 @@ definePlugin({
     version: '0.3.0',
     description: 'Chat context assembly and the model/tool loop (a convention, not a core concept).',
     subscribe: [
-      { event: 'user-message', mode: 'blocking', actions: CONTRIBUTES, receives: { text: key('string'), delegation: optional('object'), parent: optional('object'), attachments: optional('array<object>') } },
-      { event: 'model-response', mode: 'blocking', actions: CONTRIBUTES, receives: withContext({ text: key('string'), tool_calls: optional('array<object>'), stream_id: optional('string') }) },
+      // The session's tools are its resolved `tool-call/*` members: written
+      // into context at start and whenever a config apply changes them.
+      // The start input's text is the first message: the first model request.
+      { event: 'session-started', mode: 'blocking', actions: CONTRIBUTES, receives: { ...START_INPUT } },
+      { event: 'config-applied', mode: 'blocking', actions: CONTRIBUTES },
+      { event: 'user-message', mode: 'blocking', actions: CONTRIBUTES, receives: { text: key('string'), attachments: optional('array<object>') } },
+      { event: 'model-response', mode: 'blocking', actions: CONTRIBUTES, ...withContext({ text: key('string'), tool_calls: optional('array<object>'), stream_id: optional('string') }) },
       // Tools attach metadata of their own (exit codes, checkpoints, …): kept
       // in the tool message untyped, so this subscription takes unlisted keys.
-      { event: 'tool-result', mode: 'blocking', actions: CONTRIBUTES, unlisted_keys: true, receives: withContext({ call_id: key('string'), name: optional('string'), output: key('string | object'), error: optional('bool') }) },
+      { event: 'tool-result', mode: 'blocking', actions: CONTRIBUTES, unlisted_keys: true, ...withContext({ call_id: key('string'), name: optional('string'), output: key('string | object'), error: optional('bool') }) },
       { event: 'context-edit', mode: 'blocking', actions: CONTRIBUTES, receives: { ops: key('array<object>') } },
-      { event: 'dispatch-failed', mode: 'blocking', actions: CONTRIBUTES, receives: withContext({ reason: key('string'), event_name: key('string'), member: key('string'), payload: key('object'), plugin: optional('string'), error: optional('string'), handled: optional('array<string>') }) },
+      // Any failed invocation, reported by the core: a crashed tool (or a gate
+      // that failed) is answered for the model, so a call never leaves it waiting.
+      { event: 'invocation-failed', mode: 'blocking', actions: CONTRIBUTES, ...withContext({ event_name: key('string'), payload: key('object'), plugin: key('string'), mode: key('"blocking" | "async"'), error: key('string') }) },
       { event: 'approval-granted', mode: 'async', receives: { call_id: key('string'), name: key('string'), args: key('object'), approved: key('object') } },
     ],
     emit: [
       { event: 'model-request', keys: { turn: key('string') } },
-      { event: 'tool-call/*', exactly_one_handler: true, keys: { ...TOOL_CALL_KEYS } },
+      // A family: the compiler resolves it into the tools the definition provides.
+      { event: 'tool-call/*', keys: { ...TOOL_CALL_KEYS } },
       { event: 'tool-call-rejected', keys: { call_id: key('string'), name: key('string'), output: key('string'), error: key('bool'), dispatch: optional('string') } },
       { event: 'assistant-message', keys: { text: key('string'), stream_id: optional('string') } },
     ],
   },
   handlers: {
+    'session-started': async (ctx) => {
+      offerTools(ctx);
+      const input = ctx.payload.input || {};
+      if (typeof input.text !== 'string' || !input.text) return;
+      // A task handed down by a delegating agent carries its parent link.
+      const authority = input.data?.delegation || input.data?.parent ? 'agent' : 'user';
+      ctx.add('messages', { role: 'user', content: input.text, authority, ...(input.attachments?.length ? { attachments: input.attachments } : {}) });
+      await ctx.publish('model-request', { turn: ctx.event.event_id });
+    },
+    'config-applied': (ctx) => offerTools(ctx),
     'user-message': async (ctx) => {
+      // The same on either lane (steer or queue).
       const p = ctx.payload;
-      const authority = p.delegation || p.parent ? 'agent' : 'user';
-      ctx.add('messages', { role: 'user', content: p.text, authority, ...(p.attachments?.length ? { attachments: p.attachments } : {}) });
+      ctx.add('messages', { role: 'user', content: p.text, authority: 'user', ...(p.attachments?.length ? { attachments: p.attachments } : {}) });
       await ctx.publish('model-request', { turn: ctx.event.event_id });
     },
     'model-response': async (ctx) => {
       const calls = Array.isArray(ctx.payload.tool_calls) ? ctx.payload.tool_calls : [];
       ctx.add('messages', { role: 'assistant', content: ctx.payload.text, tool_calls: calls.length ? calls.map(({ call_id, name, args }) => ({ call_id, name, args })) : undefined });
       if (calls.length) {
-        const specs = new Map(ctx.slot('tools').filter((t) => t?.name).map((t) => [t.name, t]));
-        const offered = new Set(specs.keys());
+        // Every name the model writes is checked against the resolved emit set.
+        const members = toolMembers(ctx);
         const rejected = [];
         for (const call of calls) {
-          const reject = call.parse_error ? `Invalid call to \`${call.name}\`: ${call.parse_error}. Call it again with a JSON object of arguments.`
-            : !offered.has(call.name) ? suggestTools(call.name, [...offered])
-            : checkArgs(specs.get(call.name), call.args || {});
+          const member = members.get(call.name);
+          let reject = null;
+          let args = call.args || {};
+          if (call.parse_error) reject = `Invalid call to \`${call.name}\`: ${call.parse_error}. Call it again with a JSON object of arguments.`;
+          else if (!member) reject = suggestTools(call.name, [...members.keys()]);
+          else {
+            const fit = conformArgs(member.keys?.args?.keys, args);
+            if (fit.errors.length) {
+              const spec = toolOfMember(member);
+              reject = `Invalid call to \`${call.name}\`: ${fit.errors.join('; ')}. Its parameters: ${describeParams(spec) || 'none'}.`;
+            } else args = fit.args;
+          }
           if (reject) {
-            await answerInline(ctx, call, reject);
+            await answerInline(ctx, call, reject, member ? {} : { dispatch: 'no-such-tool' });
             rejected.push(call.call_id);
             continue;
           }
-          await ctx.publish(`tool-call/${call.name}`, { call_id: call.call_id, name: call.name, args: call.args || {} }, {
-            ui: { v: 1, kind: 'tool', name: call.name, args: call.args || {}, call_id: call.call_id, status: 'requested' },
+          await ctx.publish(`${TOOL_PREFIX}${call.name}`, { call_id: call.call_id, name: call.name, args }, {
+            ui: { v: 1, kind: 'tool', name: call.name, args, call_id: call.call_id, status: 'requested' },
           });
         }
         // Every call rejected: nothing will answer, so ask the model again now.
@@ -131,18 +180,21 @@ definePlugin({
       if (answered.has(p.call_id)) return; // a duplicate answer: recorded, no second request
       await settle(ctx, [p.call_id], wanted);
     },
-    'dispatch-failed': async (ctx) => {
+    'invocation-failed': async (ctx) => {
       const p = ctx.payload;
-      if (!p.event_name.startsWith('tool-call/')) return;
+      if (!p.event_name.startsWith(TOOL_PREFIX)) return;
       const call = p.payload || {};
       if (!call.call_id) return;
+      // Only a failure that leaves the call unanswered: the tool itself (a
+      // subscriber of the member), or a blocking gate (the pipeline failed, so
+      // the tool never ran). An async observer's failure does not stop the call.
+      const member = toolMembers(ctx).get(call.name);
+      const isTool = (member?.subscribers || []).some((s) => s.plugin === p.plugin);
+      if (p.mode !== 'blocking' && !isTool) return;
       const answered = msgs(ctx).some((m) => m.value.role === 'tool' && m.value.call_id === call.call_id);
-      if (answered) return; // the handler answered before failing
-      const offered = ctx.slot('tools').map((t) => t?.name).filter(Boolean);
-      const output = p.reason === 'handler-failed'
-        ? `The \`${call.name}\` tool failed before returning a result (${p.plugin}: ${String(p.error || 'error').slice(0, 300)}). Retry once if it looks transient; otherwise take another approach.`
-        : suggestTools(call.name, offered, { routed: p.handled });
-      await answerInline(ctx, call, output, { dispatch: p.reason });
+      if (answered) return; // the tool answered before failing
+      const output = `The \`${call.name}\` tool failed before returning a result (${p.plugin}: ${String(p.error || 'error').slice(0, 300)}). Retry once if it looks transient; otherwise take another approach.`;
+      await answerInline(ctx, call, output, { dispatch: 'invocation-failed' });
       await settle(ctx, [call.call_id]);
     },
     'approval-granted': async (ctx) => {

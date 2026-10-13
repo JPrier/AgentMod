@@ -69,12 +69,16 @@ test('linux-sandbox speaks the plugin protocol and answers its tools', async () 
     assert.ok(members.some((c) => c.event === 'tool-call/shell') && members.every((c) => c.mode === 'async' && !c.event.endsWith('*')));
     assert.deepEqual(m.emit.map((e) => e.event), ['tool-result', 'workspace-info', 'workspace-change', 'checkpoint-created', 'workspace-restored', 'process-started', 'process-exited', 'diagnostics', 'workspace-status']);
 
-    const started = await p.call('invoke', { invocation_id: 'i1', attempt: 1, mode: 'blocking', subscription: 'session-started', event: event('session-started', {}, 1) });
-    const adds = started.result.contributions;
-    const offered = adds.filter((c) => c.slot === 'tools').map((c) => c.value);
+    // The tools are the member subscriptions: tier in their hints, argument
+    // schema in `receives.args`.
+    const offered = members.map((c) => ({ name: c.event.slice('tool-call/'.length), tier: c.hints?.tier }));
     assert.deepEqual(offered.filter((t) => t.tier === 'core').map((t) => t.name), ['shell', 'process', 'read_file', 'list_dir', 'search_files', 'search_text', 'apply_patch']);
     assert.deepEqual(offered.filter((t) => t.tier === 'deferred').map((t) => t.name), ['view_image', 'repo_map', 'checkpoints', 'import_repo', 'sandbox_status', 'sandbox_logs', 'sandbox_restart', 'sandbox_stop', 'adopt_changes', 'load_skill']);
-    assert.match(adds.find((c) => c.slot === 'system').value, new RegExp(`Work in ${ws}`));
+    assert.equal(members.find((c) => c.event === 'tool-call/shell').receives.args.keys.command.shape, 'string');
+    const started = await p.call('invoke', { invocation_id: 'i1', attempt: 1, mode: 'blocking', subscription: 'session-started', event: event('session-started', {}, 1) });
+    const adds = started.result.contributions;
+    assert.ok(!adds.some((c) => c.section === 'tools'), 'tools are not contributed by tool plugins');
+    assert.match(adds.find((c) => c.section === 'system').value, new RegExp(`Work in ${ws}`));
 
     const run = await p.call('invoke', { invocation_id: 'i2', attempt: 1, mode: 'async', subscription: 'tool-call/shell', event: event('tool-call/shell', { call_id: 'c1', name: 'shell', args: { command: 'echo hi from the vm' } }, 2) });
     assert.equal(run.result.error, undefined);
@@ -90,7 +94,7 @@ test('linux-sandbox speaks the plugin protocol and answers its tools', async () 
     assert.match(result.output, /hi from the vm/);
     assert.equal(p.publishes[3].ui.kind, 'tool');
     // The first tool call records the session's workspace in context.
-    assert.equal(run.result.contributions.find((c) => c.slot === 'workspace').value.root, ws);
+    assert.equal(run.result.contributions.find((c) => c.section === 'workspace').value.root, ws);
 
     p.publishes.length = 0;
     await p.call('invoke', { invocation_id: 'i3', attempt: 1, mode: 'async', subscription: 'tool-call/apply_patch', event: event('tool-call/apply_patch', { call_id: 'c2', name: 'apply_patch', args: { changes: [{ action: 'create', path: 'a.txt', content: 'one\n' }] } }, 3) });

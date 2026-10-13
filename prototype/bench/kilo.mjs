@@ -223,7 +223,7 @@ const ROWS = [
   ['Plugin invocations', M('plugin_invocations')],
   ['  no-op invocations', M('noop_invocations')],
   ['  tool-call invocations', M('tool_call_invocations')],
-  ['  exact-handler dispatches', M('exact_handler_dispatches')],
+  ['  member-subscriber dispatches', M('member_dispatches')],
   ['  family observer dispatches', M('observer_dispatches')],
   ['Stream provider events', M('stream_provider_events')],
   ['Live frames', M('stream_live_frames')],
@@ -299,7 +299,7 @@ async function main() {
     const checks = [
       ['all runs succeed', results.every((r) => r.success)],
       ['no token fragments in the log', !m.stream_chunk_events],
-      ['every tool call dispatched to exactly one handler', m.exact_handler_dispatches === m.tool_calls && !m.observer_dispatches],
+      ['every tool call reaches exactly its member subscriber', m.member_dispatches === m.tool_calls && !m.observer_dispatches],
       ['≤ 2 plugin invocations per tool call', m.ratios.plugin_invocations_per_tool_call <= 2],
       ['≤ 30 journal records per model response', m.ratios.records_per_model_response <= 30],
       ['≤ 6 canonical events per model response', m.ratios.canonical_events_per_model_response <= 6],

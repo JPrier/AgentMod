@@ -253,10 +253,11 @@ impl WasmKernel {
         self.k.is_loaded(session_id)
     }
 
-    /// Compiled `exactly_one_handler` families of a session's revision.
+    /// A plugin's resolved emit set under an installed revision (`null` when
+    /// the revision is not installed).
     #[must_use]
-    pub fn families(&self, session_id: &str) -> String {
-        out(&self.k.families(session_id))
+    pub fn emit_set(&self, revision: &str, plugin: &str) -> String {
+        out(&self.k.emit_set(revision, plugin))
     }
 
     /// `[plugin, open]` for an invocation, or null.
@@ -402,9 +403,19 @@ mod tests {
         let mut k = WasmKernel::new();
         let h: Value = serde_json::from_str(&k.install(&comp)).unwrap();
         assert!(h["hash"].is_string());
-        let start = k.start_session(&json!({ "plugin": "ui", "definition": "chat", "initial": { "event_name": "user-message", "payload": { "text": "hi" } } }).to_string(), 1000.0);
+        let start = k.start_session(
+            &json!({ "plugin": "ui", "definition": "chat", "input": { "text": "hi" } }).to_string(),
+            1000.0,
+        );
         let s: Value = serde_json::from_str(&start).unwrap();
         assert_eq!(s["session_id"], "s0001");
+        let rev = s["revision"].as_str().unwrap();
+        let set: Value = serde_json::from_str(&k.emit_set(rev, "ui")).unwrap();
+        assert_eq!(set[0]["event"], "user-message");
+        assert_eq!(
+            serde_json::from_str::<Value>(&k.emit_set("nope", "ui")).unwrap(),
+            Value::Null
+        );
         let fx = s["effects"].as_array().unwrap();
         let invoke = fx.iter().find(|e| e["type"] == "invoke").unwrap();
         let inv = invoke["request"]["invocation_id"].as_str().unwrap();

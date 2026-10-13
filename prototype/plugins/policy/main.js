@@ -30,22 +30,22 @@
 //   session_mode, session_rules   for per-session config layers
 //   approvers       plugins whose ui-actions count as human answers (default ["web-ui"])
 //   defaults        false to drop the built-in rules (sdk/policy.js DEFAULT_RULES)
-import { definePlugin, key, optional, TOOL_CALL_KEYS, toolResult, withContext } from '../sdk/agentmod.js';
+import { definePlugin, key, optional, startInputOf, TOOL_CALL_KEYS, toolResult, withContext } from '../sdk/agentmod.js';
 import { DEFAULT_RULES, actionDigest, decide, explain, factsOf, grantFor, hiddenTools, stricterMode } from '../sdk/policy.js';
 
 const delegations = new Map(); // session -> delegation (immutable once recorded)
 
 async function delegationOf(ctx) {
   if (!delegations.has(ctx.sessionId)) {
+    // A child's delegation is part of its start input (session-started).
     const view = await ctx.host.query('session', { session_id: ctx.sessionId });
-    const first = view.events.find((e) => e.event_name === 'user-message');
-    if (!first) return null; // not known yet; ask again later
-    delegations.set(ctx.sessionId, first.payload?.delegation || null);
+    if (!view.events.some((e) => e.event_name === 'session-started')) return null; // not known yet; ask again later
+    delegations.set(ctx.sessionId, startInputOf(view)?.data?.delegation || null);
   }
   return delegations.get(ctx.sessionId);
 }
 
-const slotValues = (context, name) => (context || []).filter((c) => c.slot === name).map((c) => c.value);
+const slotValues = (context, name) => (context || []).filter((c) => c.section === name).map((c) => c.value);
 
 /** Everything the engine needs for this session, from config + context + log. */
 async function policyFor(ctx, context) {
@@ -78,9 +78,9 @@ definePlugin({
     version: '0.1.0',
     description: 'Layered tool policy: deny > ask > allow across scopes, explained decisions, digest-bound approvals, tool visibility.',
     subscribe: [
-      { event: 'tool-call/*', mode: 'blocking', actions: ['veto'], receives: withContext({ ...TOOL_CALL_KEYS }) },
+      { event: 'tool-call/*', mode: 'blocking', actions: ['veto'], ...withContext({ ...TOOL_CALL_KEYS }) },
       { event: 'ui-action', mode: 'async', actions: ['contribute-context'], receives: { reply_to: key('string'), action: key('string') } },
-      { event: 'model-request', mode: 'blocking', actions: ['contribute-context'], receives: withContext({ turn: key('string') }) },
+      { event: 'model-request', mode: 'blocking', actions: ['contribute-context'], ...withContext({ turn: key('string') }) },
     ],
     emit: [
       { event: 'policy-decision', keys: { call_id: key('string'), effect: key('"allow" | "ask" | "deny"'), tool: optional('string'), rule: optional('string'), scope: optional('string'), reason: optional('string'), explanation: optional('string'), digest: optional('string') } },
@@ -98,7 +98,7 @@ definePlugin({
       const current = slotValues(ctx.context, 'tool-policy').pop();
       const same = current && JSON.stringify(current.hidden) === JSON.stringify(hidden) && current.mode === pol.mode;
       if (!same) {
-        ctx.clearSlot('tool-policy');
+        ctx.clearSection('tool-policy');
         ctx.add('tool-policy', { hidden, mode: pol.mode });
       }
     },

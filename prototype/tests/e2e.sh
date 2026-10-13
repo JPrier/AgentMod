@@ -34,6 +34,18 @@ echo "2. tool loop"
 curl -s -XPOST $B/sessions -d '{"definition":"chat","text":"calculate (12+30)*7"}' >/dev/null
 wait_for s0001 "assert any(e['event_name']=='assistant-message' and '294' in e['payload']['text'] for e in d['events'])"
 
+echo "2b. steer and queue: one user-message event on two lanes"
+curl -s -XPOST $B/sessions/s0001/messages -d '{"text":"queued hello","lane":"normal"}' | py "assert d['event_id']" || fail "queue publish"
+wait_for s0001 "assert sum(1 for e in d['events'] if e['event_name']=='assistant-message')>=2"
+curl -s -XPOST $B/sessions/s0001/messages -d '{"text":"steered hello","lane":"interrupt"}' | py "assert d['event_id']" || fail "steer publish"
+wait_for s0001 "assert sum(1 for e in d['events'] if e['event_name']=='assistant-message')>=3"
+curl -s $B/sessions/s0001 | py "
+u=[e for e in d['events'] if e['event_name']=='user-message'][-2:]
+assert [e['lane'] for e in u]==['normal','interrupt'], [e['lane'] for e in u]
+# The plugins that handle user messages treat both lanes alike.
+subs=lambda e: sorted(i['plugin'] for i in e['invocations'])
+assert subs(u[0])==subs(u[1]), (subs(u[0]), subs(u[1]))" || fail "steer lane"
+
 echo "3. approval gate + sub-agent session"
 curl -s -XPOST $B/sessions/s0001/messages -d '{"text":"delegate: summarize the plan"}' >/dev/null
 wait_for s0001 "assert any(e['event_name']=='approval-requested' for e in d['events'])"
@@ -182,8 +194,14 @@ CH=$(curl -s $B/sessions | py "print([s['session_id'] for s in d if s['parent']=
 ev $CH "
 w=[e for e in d['events'] if e['event_name']=='workspace-info'][0]['payload']
 assert w['mode']=='isolated' and 'worktrees/$CH' in w['root'], w
-u=[e for e in d['events'] if e['event_name']=='user-message'][0]['payload']
-assert u['delegation']['tools'] and 'delegate' not in u['delegation']['tools']" || fail "child isolation"
+# The child was started by a start-session call: the core's session-started
+# carries the task and the delegation; nothing else was published into it.
+s=[e for e in d['events'] if e['event_name']=='session-started'][0]
+assert s['origin']['kind']=='core' and s['cause']['kind']=='invocation', s
+u=s['payload']['input']['data']
+assert u['delegation']['tools'] and 'delegate' not in u['delegation']['tools']
+assert u['parent']['session_id']=='$D'
+assert not any(e['event_name']=='user-message' for e in d['events'])" || fail "child isolation"
 ev $D "
 r=[e['payload'] for e in d['events'] if e['event_name']=='tool-result' and e['payload']['name']=='delegate'][0]
 assert r['trust']=='external' and r['evidence']['files_changed']==['greeting.txt'], r
@@ -201,7 +219,11 @@ assert any(p['payload']['scope'] in ('child','mode') for p in tp)" || fail "chil
 test ! -f "$DATA/ws/nope.txt" || fail "forbidden write happened"
 B2=$(newsess coder 'script:bad')
 wait_for $B2 "assert any(e['event_name']=='assistant-message' and 'recovered' in e['payload']['text'] for e in d['events'])" 100
-ev $B2 "assert any(e['event_name']=='tool-call-rejected' and 'There is no tool named' in e['payload']['output'] for e in d['events'])" || fail "unknown tool"
+# The model invented a tool: chat-context answered it from its resolved emit set
+# and never published it (compiler.md §3.4, §11).
+ev $B2 "
+assert any(e['event_name']=='tool-call-rejected' and e['payload']['output'].startswith('no such tool: ') for e in d['events'])
+assert not any(e['event_name']=='tool-call/no_such_tool' for e in d['events'])" || fail "unknown tool"
 
 echo "16. provider hot swap mid-session: the next model request uses the new provider"
 H=$(newsess coder 'first turn on the original provider')
@@ -246,10 +268,10 @@ wait_for $PB "assert any(e['event_name']=='assistant-message' and 'batch done: 4
 ev $PB "
 assert sum(1 for e in d['events'] if e['event_name']=='model-request')==2
 calls=[e for e in d['events'] if e['event_name'].startswith('tool-call/')]  # incl. the approved re-publish
-owners=[i['plugin'] for e in calls for i in e['invocations'] if i.get('route')]
+owners=[i['plugin'] for e in calls for i in e['invocations'] if i['subscription']==e['event_name']]  # member subscribers
 assert owners==['local-workspace']*4, owners
 assert all(len([i for i in e['invocations'] if i['mode']=='async'])<=1 for e in calls), 'unrelated plugins invoked'" || fail "batch settlement"
-curl -s "$B/sessions/$PB/context" | py "assert any(c['slot']=='environment' and 'bash' in c['value']['tools'] for c in d)" || fail "environment facts"
+curl -s "$B/sessions/$PB/context" | py "assert any(c['section']=='environment' and 'bash' in c['value']['tools'] for c in d)" || fail "environment facts"
 SB=$(newsess coder 'script:slowbatch')
 wait_for $SB "assert sum(1 for e in d['events'] if e['event_name']=='tool-result')>=1" 100
 curl -s -XPOST $B/sessions/$SB/commands -d '{"command":"hard-stop"}' | py "assert d['status']['state']=='halted'" || fail "stop during batch"

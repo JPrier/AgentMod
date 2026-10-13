@@ -9,12 +9,12 @@
 //   * it is a branch (`fork_of`) and `fork_workspace` is "isolated" (default);
 // then it gets its own worktree under the parent root's state directory,
 // materialized from the parent's checkpoint at the delegation/fork point.
-// The choice is recorded in the session's `workspace` context slot (so it is
+// The choice is recorded in the session's `workspace` context section (so it is
 // replayable and visible) and announced with a `workspace-info` event.
 //
 // Events:
-//   subscribe  session-started, config-applied   offer tools
-//              tool-call/<tool> (async)           handle our tools (one member each)
+//   subscribe  session-started, config-applied   describe the execution target
+//              tool-call/<tool> (async)           our tools (one member each)
 //              ui-action (async)                  "restore" on a checkpoint event
 //   emit       tool-result                        what the model sees
 //             workspace-info                     root, environment, git state
@@ -23,7 +23,7 @@
 //             process-started / process-exited
 //             diagnostics                        typed compiler/test findings
 //             workspace-status                   target lifecycle (booting, ready, failed)
-import { definePlugin, key, offerTools, optional, TOOL_CALL_KEYS, toolCalls, toolResult, withContext } from './agentmod.js';
+import { definePlugin, key, optional, TOOL_CALL_KEYS, toolCalls, toolResult, withContext } from './agentmod.js';
 import { codingToolkit, toolSpecs } from './coding/toolkit.js';
 import { normalizePath, shq } from './coding/paths.js';
 
@@ -94,7 +94,7 @@ export function defineWorkspacePlugin(spec) {
 
   async function parentRootOf(ctx, sessionId) {
     if (!sessionId) return defaultRoot(ctx);
-    const ws = (await ctx.host.query('context', { session_id: sessionId })).filter((c) => c.slot === 'workspace').pop()?.value;
+    const ws = (await ctx.host.query('context', { session_id: sessionId })).filter((c) => c.section === 'workspace').pop()?.value;
     return ws?.root ? normalizePath(ws.root) : defaultRoot(ctx);
   }
 
@@ -115,14 +115,13 @@ export function defineWorkspacePlugin(spec) {
     const sid = ctx.sessionId;
     if (!sessions.has(sid)) {
       const p = (async () => {
-        const recorded = (await ctx.host.query('context', { session_id: sid })).filter((c) => c.slot === 'workspace').pop()?.value;
+        const recorded = (await ctx.host.query('context', { session_id: sid })).filter((c) => c.section === 'workspace').pop()?.value;
         if (recorded?.root && recorded.session === sid) {
           return { root: normalizePath(recorded.root), mode: recorded.mode, base: recorded.base, gitDir: recorded.git_dir || undefined, recorded: true };
         }
         const view = await ctx.host.query('session', { session_id: sid });
-        const first = view.events.find((e) => e.event_name === 'user-message');
-        const delegation = first?.payload?.delegation;
         const started = view.events.find((e) => e.event_name === 'session-started')?.payload || {};
+        const delegation = started.input?.data?.delegation;
         const cfg = ctx.config ?? {};
         if (delegation && delegation.workspace && delegation.workspace !== 'none') {
           const parent = delegation.parent_session || started.parent_session;
@@ -147,12 +146,10 @@ export function defineWorkspacePlugin(spec) {
     return sessions.get(sid);
   }
 
+  /** At start and after an apply: describe the execution target (the tools themselves are the member subscriptions). */
   function offer(ctx) {
-    const tk = kit(ctx, defaultRoot(ctx));
-    offerTools(ctx, tk.specs);
-    offerTools(ctx, [ADOPT_SPEC, LOAD_SKILL_SPEC]);
     const note = spec.describe(ctx.config ?? {});
-    if (note && !ctx.slot('system').includes(note)) ctx.add('system', note);
+    if (note && !ctx.section('system').includes(note)) ctx.add('system', note);
   }
 
   /** First tool call in a session: record the workspace, announce it, read project instructions. */
@@ -165,7 +162,7 @@ export function defineWorkspacePlugin(spec) {
     try {
       // Environment facts once per session (OS, architecture, installed
       // tools): the model should not spend turns probing for them.
-      if (!ctx.slot('environment').some((e) => e?.root === ws.root)) {
+      if (!ctx.section('environment').some((e) => e?.root === ws.root)) {
         try {
           const env = await tk.environment();
           ctx.add('environment', { root: ws.root, ...env, network: spec.network?.(ctx.config ?? {}) ?? null });
@@ -177,12 +174,12 @@ export function defineWorkspacePlugin(spec) {
       await ctx.publish('workspace-info', { ...info, mode: ws.mode, base: ws.base }, { ui: { v: 1, kind: 'progress', label: `Workspace ${info.root}${ws.mode !== 'primary' ? ` (${ws.mode})` : ''}${info.git?.branch ? ` · git ${info.git.branch}@${(info.git.head || '').slice(0, 8)}${info.git.dirty ? ` (${info.git.dirty} changed)` : ''}` : ''}` } });
       const skills = await tk.skills((ctx.config?.skill_dirs || []).map((d) => (typeof d === 'string' ? { dir: d, authority: 'user' } : d)));
       if (skills.length) {
-        ctx.clearSlot('skills-index');
+        ctx.clearSection('skills-index');
         ctx.add('skills-index', { root: ws.root, skills });
       }
       const wsPolicy = await tk.workspacePolicy();
       if (wsPolicy) ctx.add('workspace-policy', { root: ws.root, ...wsPolicy });
-      const have = new Set(ctx.slot('instructions').map((i) => `${i?.root}|${i?.path}|${i?.sha256}`));
+      const have = new Set(ctx.section('instructions').map((i) => `${i?.root}|${i?.path}|${i?.sha256}`));
       for (const ins of await tk.instructions()) {
         const item = { root: ws.root, path: ins.path, sha256: ins.sha256, text: ins.text, authority: 'workspace' };
         if (!have.has(`${item.root}|${item.path}|${item.sha256}`)) ctx.add('instructions', item);
@@ -204,7 +201,7 @@ export function defineWorkspacePlugin(spec) {
 
   async function loadSkill(ctx, ws, tk, args) {
     const context = await ctx.host.query('context', { session_id: ctx.sessionId });
-    const index = context.filter((c) => c.slot === 'skills-index').pop()?.value?.skills || [];
+    const index = context.filter((c) => c.section === 'skills-index').pop()?.value?.skills || [];
     const sk = index.find((x) => x.name === String(args?.name || ''));
     if (!sk) return { output: `No skill named ${JSON.stringify(args?.name)}. Available: ${index.map((x) => x.name).join(', ') || 'none'}`, error: true, summary: 'error' };
     const { text, sha256 } = await tk.readSkill(sk.path);
@@ -228,7 +225,7 @@ export function defineWorkspacePlugin(spec) {
   async function adoptChanges(ctx, ws, tk, args, emit) {
     const other = String(args.session || '').trim();
     if (!/^s\d+$/.test(other)) return { output: '`session` must be a session id like s0007', error: true, summary: 'error' };
-    const theirs = (await ctx.host.query('context', { session_id: other })).filter((c) => c.slot === 'workspace').pop()?.value;
+    const theirs = (await ctx.host.query('context', { session_id: other })).filter((c) => c.section === 'workspace').pop()?.value;
     if (!theirs || theirs.mode !== 'isolated' || !theirs.base?.tree) return { output: `${other} did not work in an isolated workspace (nothing to adopt; its changes, if any, are already in the shared workspace)`, error: true, summary: 'error' };
     if (normalizePath(theirs.git_dir || '') !== normalizePath(tk.shadowGitDir)) {
       return { output: `${other}'s workspace was not branched from this workspace (${theirs.git_dir} vs ${tk.shadowGitDir}); adopt from its parent instead`, error: true, summary: 'error' };
@@ -243,7 +240,8 @@ export function defineWorkspacePlugin(spec) {
     return { output: lines.join('\n'), error: res.adopted.length === 0 && res.conflicts.length > 0, summary: `${res.adopted.length} adopted`, data: { adopted: res.adopted, conflicts: res.conflicts, checkpoint: res.checkpoint, from: other, from_tree: snap.tree } };
   }
 
-  // The tools this plugin handles, from config alone (compile-time handlers).
+  // The tools this plugin provides, from config alone: one member subscription
+  // each, so the compiler knows them when it resolves the loop's family.
   const declared = (cfg) => [
     ...toolSpecs({ root: normalizePath(spec.root(cfg || {})), lifecycle: !!spec.lifecycle, importRepos: (cfg || {}).import_repos !== false }),
     ADOPT_SPEC,
@@ -255,10 +253,10 @@ export function defineWorkspacePlugin(spec) {
     manifest: (cfg) => ({
       ...spec.manifest,
       subscribe: [
-        { event: 'session-started', mode: 'blocking', actions: ['contribute-context'], receives: withContext() },
-        { event: 'config-applied', mode: 'blocking', actions: ['contribute-context'], receives: withContext() },
+        { event: 'session-started', mode: 'blocking', actions: ['contribute-context'], ...withContext() },
+        { event: 'config-applied', mode: 'blocking', actions: ['contribute-context'], ...withContext() },
         // Tool calls record the session's workspace and environment in context.
-        ...toolCalls(declared(cfg).map((t) => t.name), { actions: ['contribute-context'], receives: withContext({ ...TOOL_CALL_KEYS }) }),
+        ...toolCalls(declared(cfg), { actions: ['contribute-context'], ...withContext({ ...TOOL_CALL_KEYS }) }),
         { event: 'ui-action', mode: 'async', receives: { reply_to: key('string'), action: key('string') } },
       ],
       emit: [

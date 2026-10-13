@@ -12,7 +12,7 @@
 // Native runtime only. Config: { chrome: "/path/to/chrome" (default: found on
 // PATH or CHROME_PATH), cdp_url: "ws://…" (attach to a running Chrome instead),
 // args: [] }
-import { definePlugin, offerSubscriptions, offerTools, optional, toolCalls, toolResult, toolSpec } from '../sdk/agentmod.js';
+import { definePlugin, optional, toolCalls, toolResult, toolSpec } from '../sdk/agentmod.js';
 import { Cdp, findChrome, launchChrome, SNAPSHOT_JS } from '../sdk/cdp.js';
 
 const target = (desc) => ({ ref: { type: 'string', description: `element ref from browser_snapshot (e.g. "e3")${desc ? `; ${desc}` : ''}` }, selector: { type: 'string', description: 'CSS selector (alternative to ref)' } });
@@ -126,14 +126,12 @@ definePlugin({
     name: 'browser-control',
     version: '0.1.0',
     description: 'Headless Chrome automation (CDP) to validate web apps: navigate, snapshot, click, type, screenshot, console, eval.',
-    subscribe: [...offerSubscriptions(), ...toolCalls(NAMES)],
+    subscribe: toolCalls(TOOLS),
     emit: [toolResult({ trust: optional('string'), duration_ms: optional('number'), attachments: optional('array<object>') })],
     config_schema: { chrome: 'path (default: PATH / CHROME_PATH)', cdp_url: null, args: [] },
   },
   shutdown: () => browser?.close(),
   handlers: {
-    'session-started': (ctx) => offerTools(ctx, TOOLS),
-    'config-applied': (ctx) => offerTools(ctx, TOOLS),
     'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (!NAMES.has(name)) return;

@@ -165,7 +165,7 @@ async fn serve(args: &Args, compile_only: bool) -> Result<(), String> {
 /// Print one compiled definition: its graph (as routes), and the report sections.
 fn print_revision(name: &str, rev: &agentmod_core::compiler::Revision) {
     let g = &rev.graph;
-    let members = rev.plugins.values().filter(|m| m.member).count();
+    let members = rev.plugins.len();
     println!(
         "definition `{name}` — revision {} — runtime {} — {members} plugin(s){}",
         rev.revision,
@@ -187,17 +187,17 @@ fn print_revision(name: &str, rev: &agentmod_core::compiler::Revision) {
             })
             .collect();
         let asyncs: Vec<&str> = r.asyncs.iter().map(|i| g.edge(*i).to.as_str()).collect();
-        let mut line = format!("    {} --{}-->", r.from, r.class);
+        let via = if r.emit == r.event {
+            String::new()
+        } else {
+            format!(" (from {})", r.emit)
+        };
+        let mut line = format!("    {} --{}{via}-->", r.from, r.event);
         if !chain.is_empty() {
             line.push_str(&format!(" blocking [{}]", chain.join(" → ")));
         }
         if !asyncs.is_empty() {
             line.push_str(&format!(" async [{}]", asyncs.join(", ")));
-        }
-        match (r.handler, r.exactly_one_handler) {
-            (Some(i), _) => line.push_str(&format!(" handler {}", g.edge(i).to)),
-            (None, true) => line.push_str(" handler (none: dispatch-failed)"),
-            _ => {}
         }
         println!("{line}");
     }
@@ -210,16 +210,33 @@ fn print_revision(name: &str, rev: &agentmod_core::compiler::Revision) {
             }
         }
     };
-    section("cycles", rp.cycles.iter().map(|c| c.join(" → ")).collect());
+    section(
+        "internal cycles",
+        rp.cycles.internal.iter().map(|c| c.join(" → ")).collect(),
+    );
+    section(
+        "cycles through external input",
+        rp.cycles
+            .external_input
+            .iter()
+            .map(|c| c.join(" → "))
+            .collect(),
+    );
     section(
         "families",
         rp.families
             .iter()
-            .flat_map(|(f, h)| {
-                h.members
-                    .iter()
-                    .chain(&h.subfamilies)
-                    .map(move |(m, p)| format!("{f} {m} → {p}"))
+            .flat_map(|(f, by)| {
+                by.iter().map(move |(emitter, members)| {
+                    format!(
+                        "{emitter}: {f} → {}",
+                        if members.is_empty() {
+                            "(nothing)".to_owned()
+                        } else {
+                            members.join(", ")
+                        }
+                    )
+                })
             })
             .collect(),
     );

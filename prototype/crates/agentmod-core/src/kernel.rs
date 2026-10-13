@@ -16,12 +16,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::compiler::{
-    Compilation, Diagnostic, Edge, FamilyHandlers, Revision, compile_definition,
-};
+use crate::compiler::{Compilation, Diagnostic, Edge, ResolvedEmit, Revision, compile_definition};
 use crate::context::ContextState;
 use crate::core_manifest::{
-    BOUNDARY, CONFIG_APPLIED, DISPATCH_FAILED, SESSION_START_FAILED, SESSION_STARTED,
+    BOUNDARY, CONFIG_APPLIED, INVOCATION_FAILED, SESSION_START_FAILED, SESSION_STARTED,
 };
 use crate::manifest::{
     ACTION_CONTRIBUTE, ACTION_VETO, CONTEXT_SLOT, Capability, Definition, Manifest, PluginConfig,
@@ -61,6 +59,10 @@ pub enum Effect {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InvokeRequest {
     pub invocation_id: String,
+    /// The revision the invocation runs under; it selects the plugin's
+    /// resolved emit set (sent to the plugin before its first invocation
+    /// under any revision).
+    pub revision: String,
     pub mode: Mode,
     pub position: usize,
     pub attempt: u32,
@@ -102,7 +104,9 @@ pub struct PublishRequest {
     pub payload: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<Value>,
-    /// Defaults to the emit declaration's lane; a different lane is a breach.
+    /// The lane this publish uses: one of the lanes the emit declares
+    /// (anything else is a breach). It may be omitted only when the emit
+    /// declares exactly one lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lane: Option<Lane>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -130,18 +134,12 @@ impl PublishRequest {
     }
 }
 
-/// Initial event carried by `start-session`.
+/// `start-session`: a runtime call, the sole rootless act (compiler.md §9).
+/// The runtime compiles the definition; on success it creates the session
+/// and emits `session-started` into it carrying `input`, in the fixed shape
+/// the core manifest declares. Nothing but the core emits `session-started`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InitialEvent {
-    pub event_name: String,
-    #[serde(default = "empty_object")]
-    pub payload: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ui: Option<Value>,
-}
-
-/// The sole rootless act.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StartRequest {
     #[serde(default)]
     pub plugin: String,
@@ -152,10 +150,17 @@ pub struct StartRequest {
     /// config's plugins).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spec: Option<Definition>,
+    /// The calling invocation, when the start comes from one (the new
+    /// session's cause, and where `session-start-failed` is delivered).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_id: Option<String>,
+    /// The initial input (`text`, `attachments`, `data`), carried by
+    /// `session-started` as its `input` key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial: Option<InitialEvent>,
+    pub input: Option<Value>,
+    /// A UI hint for `session-started` (a frontend shows the first message).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_from: Option<LogRef>,
 }
@@ -260,8 +265,6 @@ struct InvInfo {
     /// executor identity even if the session's revision changed since.
     stamp: Stamp,
     revision: String,
-    /// Family member of a handler dispatch.
-    route: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -318,9 +321,7 @@ const CORE_PLUGIN: &str = "core";
 /// The emitter of an event in the compiled graph.
 fn emitter_of(origin: &Origin) -> String {
     match origin {
-        Origin::Pipeline { plugin, .. }
-        | Origin::Deferred { plugin, .. }
-        | Origin::Start { plugin } => plugin.clone(),
+        Origin::Pipeline { plugin, .. } | Origin::Deferred { plugin, .. } => plugin.clone(),
         Origin::Core | Origin::CrossSession { .. } => BOUNDARY.to_owned(),
     }
 }
@@ -335,7 +336,7 @@ fn project(payload: &Value, sub: &Subscription) -> Value {
         return payload.clone();
     }
     let mut out = Map::new();
-    for k in sub.receives.keys.keys() {
+    for k in sub.receives.keys() {
         if let Some(v) = obj.get(k) {
             out.insert(k.clone(), v.clone());
         }
@@ -450,7 +451,7 @@ impl Kernel {
         let mut out = BTreeMap::new();
         for h in self.revisions_in_use() {
             if let Some(r) = self.revision(&h) {
-                for (n, m) in r.plugins.iter().filter(|(_, m)| m.member) {
+                for (n, m) in &r.plugins {
                     out.insert((n.clone(), m.stamp.clone()), m.config.clone());
                 }
             }
@@ -536,10 +537,10 @@ impl Kernel {
         })
     }
 
-    /// The compiled `exactly_one_handler` families of a session's revision.
+    /// A plugin's resolved emit set under an installed revision.
     #[must_use]
-    pub fn families(&self, session_id: &str) -> Option<BTreeMap<String, FamilyHandlers>> {
-        Some(self.session_revision(session_id)?.report.families.clone())
+    pub fn emit_set(&self, revision: &str, plugin: &str) -> Option<Vec<ResolvedEmit>> {
+        Some(self.revision(revision)?.emit_set(plugin).to_vec())
     }
 
     // ------------------------------------------------------------------
@@ -645,7 +646,6 @@ impl Kernel {
                 stamp,
                 revision,
                 payload,
-                route,
                 subscription,
                 ..
             } => {
@@ -665,7 +665,7 @@ impl Kernel {
                             .iter()
                             .find(|x| x.event == *subscription && x.mode == *mode)
                     })
-                    .map(|x| x.receives.slots.keys().cloned().collect())
+                    .map(|x| x.slots.keys().cloned().collect())
                     .unwrap_or_default();
                 let subscription = subscription.clone();
                 s.invocations.insert(
@@ -685,7 +685,6 @@ impl Kernel {
                         attempt_outputs: 0,
                         stamp: stamp.clone(),
                         revision: revision.clone(),
-                        route: route.clone(),
                     },
                 );
                 match mode {
@@ -770,31 +769,14 @@ impl Kernel {
         self.revisions.get(&s.revision).cloned()
     }
 
-    /// The edges an event takes, in order: (blocking, asyncs, handler, decl info).
+    /// The edges an event takes, in order: its blocking chain, then its asyncs.
+    /// The graph holds only concrete events, so this is one exact lookup.
     fn route_edges(rev: &Revision, ev: &EventRecord) -> Option<RouteEdges> {
-        let emitter = emitter_of(&ev.origin);
-        let (decl, route) = rev.route(&emitter, &ev.event_name)?;
-        let Some(route) = route else {
-            return Some(RouteEdges {
-                family: decl.event.clone(),
-                exactly_one_handler: decl.exactly_one_handler,
-                ..Default::default()
-            });
-        };
+        let route = rev.graph.route(&emitter_of(&ev.origin), &ev.event_name)?;
+        let edges = |ix: &[usize]| ix.iter().map(|i| rev.graph.edge(*i).clone()).collect();
         Some(RouteEdges {
-            blocking: route
-                .blocking
-                .iter()
-                .map(|i| rev.graph.edge(*i).clone())
-                .collect(),
-            asyncs: route
-                .asyncs
-                .iter()
-                .map(|i| rev.graph.edge(*i).clone())
-                .collect(),
-            handler: route.handler.map(|i| rev.graph.edge(i).clone()),
-            exactly_one_handler: route.exactly_one_handler,
-            family: decl.event.clone(),
+            blocking: edges(&route.blocking),
+            asyncs: edges(&route.asyncs),
         })
     }
 
@@ -864,14 +846,12 @@ impl Kernel {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn start_invocation(
         &mut self,
         sid: &str,
         edge: &Edge,
         event_id: &str,
         payload: &Value,
-        route: Option<String>,
         now: u64,
         fx: &mut Vec<Effect>,
     ) {
@@ -902,7 +882,6 @@ impl Kernel {
                 stamp: stamp.clone(),
                 revision: rev.revision.clone(),
                 payload: delivered.clone(),
-                route,
             },
             fx,
         );
@@ -910,7 +889,7 @@ impl Kernel {
         if let Some(sub) = &sub
             && let Err(e) = check_keys(
                 payload.as_object().unwrap_or(&Map::new()),
-                &sub.receives.keys,
+                &sub.receives,
                 "",
             )
         {
@@ -925,14 +904,15 @@ impl Kernel {
                     event_id: Some(event_id.to_owned()),
                     invocation_id: Some(invocation_id.clone()),
                     plugin: edge.to.clone(),
-                    declaration: json!({ "kind": "receives", "plugin": edge.to, "subscription": edge.subscription, "event": edge.event, "key": e.path, "keys": sub.receives.keys }),
+                    declaration: json!({ "kind": "receives", "plugin": edge.to, "subscription": edge.subscription, "event": edge.event, "key": e.path, "keys": sub.receives }),
                     observed: payload.clone(),
                     reason: reason.clone(),
                     reaction: "invocation-failed",
                 },
                 fx,
             );
-            // Recorded as a failed invocation; the dispatch loop moves on.
+            // Recorded as a failed invocation, reported as `invocation-failed`;
+            // the dispatch loop moves on.
             self.emit(
                 sid,
                 now,
@@ -947,6 +927,7 @@ impl Kernel {
                 },
                 fx,
             );
+            self.report_failure(sid, &invocation_id, &reason, now, fx);
             if edge.mode == Mode::Blocking {
                 self.emit(
                     sid,
@@ -970,6 +951,7 @@ impl Kernel {
             attempt: 1,
             request: InvokeRequest {
                 invocation_id,
+                revision: rev.revision.clone(),
                 mode: edge.mode,
                 position,
                 attempt: 1,
@@ -1027,14 +1009,14 @@ impl Kernel {
                 if run.open.is_some() {
                     return;
                 }
-                let ev = s.events[&run.event_id].record.clone();
+                let ev = &s.events[&run.event_id].record;
                 let route = self
                     .rev_of(s)
-                    .and_then(|rev| Self::route_edges(&rev, &ev))
+                    .and_then(|rev| Self::route_edges(&rev, ev))
                     .unwrap_or_default();
                 if let Some(edge) = route.blocking.get(run.next_blocking) {
                     let edge = edge.clone();
-                    self.start_invocation(sid, &edge, &run.event_id, &run.payload, None, now, fx);
+                    self.start_invocation(sid, &edge, &run.event_id, &run.payload, now, fx);
                     if self
                         .sessions
                         .get(sid)
@@ -1056,49 +1038,7 @@ impl Kernel {
                     fx,
                 );
                 for edge in &route.asyncs {
-                    self.start_invocation(sid, edge, &run.event_id, &run.payload, None, now, fx);
-                }
-                // Family handler: exactly the one compiled handler, never a scan.
-                if let Some(edge) = &route.handler {
-                    self.start_invocation(
-                        sid,
-                        edge,
-                        &run.event_id,
-                        &run.payload,
-                        Some(member_of(&ev.event_name, &route.family)),
-                        now,
-                        fx,
-                    );
-                } else if route.exactly_one_handler {
-                    let handled: Vec<String> = self
-                        .rev_of(&self.sessions[sid])
-                        .and_then(|r| r.report.families.get(&route.family).cloned())
-                        .map(|f| {
-                            f.members
-                                .keys()
-                                .chain(f.subfamilies.keys())
-                                .map(|m| member_of(m, &route.family))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    self.append_event(
-                        sid,
-                        now,
-                        DISPATCH_FAILED,
-                        json!({
-                            "reason": "no-handler", "event_id": run.event_id, "event_name": ev.event_name,
-                            "family": route.family, "member": member_of(&ev.event_name, &route.family),
-                            "payload": run.payload, "handled": handled,
-                        }),
-                        None,
-                        Lane::Normal,
-                        Cause::Core {
-                            reason: DISPATCH_FAILED.into(),
-                        },
-                        Origin::Core,
-                        None,
-                        fx,
-                    );
+                    self.start_invocation(sid, edge, &run.event_id, &run.payload, now, fx);
                 }
                 continue;
             }
@@ -1114,6 +1054,53 @@ impl Kernel {
             };
             self.emit(sid, now, Body::PipelineStarted { event_id: next }, fx);
         }
+    }
+
+    /// A plugin invocation failed: the core emits `invocation-failed` with the
+    /// failed event, the plugin, and the error (compiler.md §3.4 step 7, §7).
+    /// A failure while handling `invocation-failed` itself is recorded but not
+    /// reported again, so one broken subscriber cannot loop.
+    fn report_failure(
+        &mut self,
+        sid: &str,
+        invocation_id: &str,
+        error: &str,
+        now: u64,
+        fx: &mut Vec<Effect>,
+    ) {
+        let s = &self.sessions[sid];
+        let Some(info) = s.invocations.get(invocation_id) else {
+            return;
+        };
+        let Some(ev) = s.events.get(&info.event_id) else {
+            return;
+        };
+        if ev.record.event_name == INVOCATION_FAILED {
+            return;
+        }
+        let payload = json!({
+            "event_id": info.event_id,
+            "event_name": ev.record.event_name,
+            "payload": ev.record.payload,
+            "plugin": info.plugin,
+            "invocation_id": invocation_id,
+            "mode": info.mode,
+            "error": error,
+        });
+        self.append_event(
+            sid,
+            now,
+            INVOCATION_FAILED,
+            payload,
+            None,
+            Lane::Normal,
+            Cause::Invocation {
+                invocation_id: invocation_id.to_owned(),
+            },
+            Origin::Core,
+            None,
+            fx,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1160,8 +1147,7 @@ impl Kernel {
         let Some(config) = self.configs.get(&self.active).cloned() else {
             return fail("no active config".into());
         };
-        let is_core = req.plugin == CORE_PLUGIN;
-        if !is_core {
+        if req.plugin != CORE_PLUGIN {
             let Some(m) = config.manifest(&req.plugin) else {
                 return fail(format!("unknown plugin `{}`", req.plugin));
             };
@@ -1247,26 +1233,31 @@ impl Kernel {
             }
             return out;
         }
-        if let Some(init) = &req.initial
-            && !is_core
+        // `session-started` carries the input in the core manifest's fixed shape.
+        let mut started = json!({ "definition": rev.name, "revision": rev.revision });
+        if let Some(f) = &req.fork_from {
+            started["fork_of"] = json!(f);
+        }
+        if let Some(inv) = &req.invocation_id {
+            started["parent_session"] = json!(session_of(inv));
+        }
+        if let Some(input) = &req.input {
+            started["input"] = input.clone();
+        }
+        let declared = rev
+            .core()
+            .emit_for(SESSION_STARTED)
+            .map(|e| e.keys.clone())
+            .unwrap_or_default();
+        if let Err(e) = check_keys(started.as_object().unwrap_or(&Map::new()), &declared, "") {
+            return fail(format!(
+                "the start-session input contradicts `{SESSION_STARTED}`'s declared shape: {e}"
+            ));
+        }
+        if let Some(ui) = &req.ui
+            && !ui.get("kind").is_some_and(Value::is_string)
         {
-            let Some(decl) = rev.emit_decl(&req.plugin, &init.event_name) else {
-                return fail(format!(
-                    "`{}` does not declare `{}` in its emits",
-                    req.plugin, init.event_name
-                ));
-            };
-            if let Err(e) = init
-                .payload
-                .as_object()
-                .ok_or_else(|| "payload must be a JSON object".to_owned())
-                .and_then(|o| check_keys(o, &decl.keys, "").map_err(|e| e.to_string()))
-            {
-                return fail(format!(
-                    "initial `{}` contradicts `{}`'s emit declaration: {e}",
-                    init.event_name, req.plugin
-                ));
-            }
+            return fail("ui hint must be an object with a string `kind`".into());
         }
         let seeded = match &req.fork_from {
             Some(r) => match self.sessions.get(&r.session_id) {
@@ -1307,41 +1298,18 @@ impl Kernel {
                 fx,
             );
         }
-        let mut started = json!({ "definition": rev.name, "revision": rev.revision });
-        if let Some(f) = &req.fork_from {
-            started["fork_of"] = json!(f);
-        }
-        if let Some(inv) = &req.invocation_id {
-            started["parent_session"] = json!(session_of(inv));
-        }
         self.append_event(
             &sid,
             now,
             SESSION_STARTED,
             started,
-            None,
+            req.ui.clone(),
             Lane::Normal,
-            cause.clone(),
+            cause,
             Origin::Core,
             None,
             fx,
         );
-        if let Some(init) = &req.initial {
-            self.append_event(
-                &sid,
-                now,
-                &init.event_name,
-                init.payload.clone(),
-                init.ui.clone(),
-                Lane::Normal,
-                cause,
-                Origin::Start {
-                    plugin: req.plugin.clone(),
-                },
-                None,
-                fx,
-            );
-        }
         self.advance(&sid, now, fx);
         out.session_id = Some(sid);
         out.revision = Some(rev.revision.clone());
@@ -1512,28 +1480,48 @@ impl Kernel {
                 now,
             );
         }
-        // An event of this session: the emit declaration decides everything.
-        let Some(decl) = manifest.emit_for(&req.event_name).cloned() else {
-            let declared: Vec<&str> = manifest.emit.iter().map(|e| e.event.as_str()).collect();
-            return self.breach_block(&source, req, json!({ "kind": "emit", "plugin": req.plugin, "event": req.event_name, "declared": declared }), format!("undeclared emit `{}` (declared: {})", req.event_name, declared.join(", ")), now);
+        // An event of this session: the plugin's resolved emit set decides
+        // everything. A family member the definition does not resolve is an
+        // undeclared emit like any other (compiler.md §3.4 step 5).
+        let Some(resolved) = rev.resolved_emit(&req.plugin, &req.event_name) else {
+            let declared: Vec<&str> = rev
+                .emit_set(&req.plugin)
+                .iter()
+                .map(|e| e.event.as_str())
+                .collect();
+            return self.breach_block(&source, req, json!({ "kind": "emit", "plugin": req.plugin, "event": req.event_name, "declared": manifest.emit.iter().map(|e| &e.event).collect::<Vec<_>>(), "resolved": declared }), format!("undeclared emit `{}` (resolved emit set: {})", req.event_name, if declared.is_empty() { "nothing".to_owned() } else { declared.join(", ") }), now);
         };
-        let decl_json = json!({ "kind": "emit", "plugin": req.plugin, "event": decl.event, "lane": decl.lane, "deferred": decl.deferred, "keys": decl.keys });
+        let decl = resolved.decl();
+        let decl_json = json!({ "kind": "emit", "plugin": req.plugin, "event": decl.event, "family": resolved.family, "lanes": decl.lanes, "deferred": decl.deferred, "keys": decl.keys });
         if deferred && !(decl.deferred && manifest.has(Capability::DeferredPublish)) {
             return self.breach_block(&source, req, decl_json, format!("`{}` may not be published deferred (invocation closed or absent; the emit is not declared `deferred`)", req.event_name), now);
         }
-        let lane = req.lane.unwrap_or(decl.lane);
-        if lane != decl.lane {
-            return self.breach_block(
-                &source,
-                req,
-                decl_json,
-                format!(
-                    "`{}` is declared on the {:?} lane but was published on the {lane:?} lane",
-                    decl.event, decl.lane
-                ),
-                now,
-            );
-        }
+        // The publisher chooses the lane, from the lanes the emit declares.
+        let lane = match (req.lane, decl.lanes.as_slice()) {
+            (Some(l), lanes) if lanes.contains(&l) => l,
+            (None, [only]) => *only,
+            (chosen, lanes) => {
+                let names: Vec<String> = lanes
+                    .iter()
+                    .map(|l| format!("{l:?}").to_lowercase())
+                    .collect();
+                let why = match chosen {
+                    Some(l) => format!(
+                        "`{}` was published on the {} lane, which its emit does not declare (lanes: {})",
+                        decl.event,
+                        format!("{l:?}").to_lowercase(),
+                        names.join(", ")
+                    ),
+                    None => format!(
+                        "`{}` may be published on {} lanes ({}); a publish must choose its lane",
+                        decl.event,
+                        lanes.len(),
+                        names.join(", ")
+                    ),
+                };
+                return self.breach_block(&source, req, decl_json, why, now);
+            }
+        };
         if let Err(e) = check_keys(
             req.payload.as_object().unwrap_or(&Map::new()),
             &decl.keys,
@@ -1871,7 +1859,7 @@ impl Kernel {
                     }
                 }
                 None => {
-                    let unlisted = !supplied.contains_key(k) && !sub.receives.keys.contains_key(k);
+                    let unlisted = !supplied.contains_key(k) && !sub.receives.contains_key(k);
                     match current.get(k) {
                         Some(old) if sub.unlisted_keys && unlisted => {
                             if kind_of(old) != kind_of(v) {
@@ -2006,31 +1994,8 @@ impl Kernel {
             },
             &mut fx,
         );
-        if let (Some(member), Outcome::Failed { error }) = (&info.route, &outcome) {
-            let ev = self.sessions[sid].events[&info.event_id].record.clone();
-            let family = self
-                .rev_of(&self.sessions[sid])
-                .and_then(|r| r.emit_decl(&emitter_of(&ev.origin), &ev.event_name))
-                .map(|d| d.event)
-                .unwrap_or_default();
-            self.append_event(
-                sid,
-                now,
-                DISPATCH_FAILED,
-                json!({
-                    "reason": "handler-failed", "event_id": info.event_id, "event_name": ev.event_name,
-                    "family": family, "member": member, "payload": ev.payload,
-                    "plugin": info.plugin, "error": error,
-                }),
-                None,
-                Lane::Normal,
-                Cause::Core {
-                    reason: DISPATCH_FAILED.into(),
-                },
-                Origin::Core,
-                None,
-                &mut fx,
-            );
+        if let Outcome::Failed { error } = &outcome {
+            self.report_failure(sid, invocation_id, error, now, &mut fx);
         }
         if info.mode == Mode::Blocking {
             let settlement = match outcome {
@@ -2106,6 +2071,7 @@ impl Kernel {
             attempt,
             request: InvokeRequest {
                 invocation_id: invocation_id.to_owned(),
+                revision: info.revision.clone(),
                 mode: info.mode,
                 position: info.position,
                 attempt,
@@ -2401,9 +2367,6 @@ impl Kernel {
 struct RouteEdges {
     blocking: Vec<Edge>,
     asyncs: Vec<Edge>,
-    handler: Option<Edge>,
-    exactly_one_handler: bool,
-    family: String,
 }
 
 struct BreachInfo {
@@ -2414,32 +2377,4 @@ struct BreachInfo {
     observed: Value,
     reason: String,
     reaction: &'static str,
-}
-
-/// The member part of a family event name (`tool-call/read_file` → `read_file`).
-fn member_of(name: &str, family: &str) -> String {
-    let base = family.trim_end_matches('*');
-    let base = base.rsplit_once('/').map_or(base, |(b, _)| b);
-    name.strip_prefix(base)
-        .and_then(|r| r.strip_prefix('/'))
-        .unwrap_or(name)
-        .to_owned()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::member_of;
-
-    #[test]
-    fn members() {
-        assert_eq!(member_of("tool-call/read_file", "tool-call/*"), "read_file");
-        assert_eq!(
-            member_of("tool-call/mcp__gh__x", "tool-call/*"),
-            "mcp__gh__x"
-        );
-        assert_eq!(
-            member_of("tool-call/mcp__gh__*", "tool-call/*"),
-            "mcp__gh__*"
-        );
-    }
 }

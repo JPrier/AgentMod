@@ -6,14 +6,15 @@
 //! registry, no event ownership, and no dependency between plugins.
 //!
 //! A session definition (§4) lists the plugins a session runs, the phases that
-//! order its blocking subscribers, tie-breaks, handler picks for event
-//! families, the events it accepts from other sessions, and its slots. It
-//! never lists edges: those are compiler output.
+//! order its blocking subscribers, tie-breaks, the events it accepts from other
+//! sessions, and its slots. It never lists edges: those are compiler output.
+//!
+//! Manifests and definitions reject fields they do not know, so a field the
+//! design removed fails loudly instead of being silently ignored.
 
 use std::collections::BTreeMap;
 
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::shape::{KeyDecl, Keys, Shape};
@@ -58,10 +59,13 @@ pub enum Capability {
     /// Session directory read (declared; the directory API is deferred).
     #[serde(rename = "sessions.read")]
     SessionsRead,
-    /// Prototype frontends: dispatcher commands, config apply, service calls.
+    /// Dispatcher commands: soft stop, hard stop, resume (compiler.md §3.5).
+    /// The prototype also gates config apply and service calls on it.
     #[serde(rename = "control")]
     Control,
-    /// Prototype frontends and inspectors: tail live records of any session.
+    /// Read a session's records from outside the bus, as a watcher
+    /// (compiler.md §3.5). Watching is reading, not participating: a watcher
+    /// is not a node in the compiled graph.
     #[serde(rename = "observe")]
     Observe,
 }
@@ -166,57 +170,9 @@ pub fn pattern_error(pattern: &str, emit: bool) -> Option<String> {
 // The manifest.
 // ----------------------------------------------------------------------
 
-/// What a subscription needs: payload keys plus requested session slots.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Receives {
-    pub keys: Keys,
-    pub slots: Keys,
-}
-
-impl Serialize for Receives {
-    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        let mut m = serde_json::Map::new();
-        for (k, v) in &self.keys {
-            m.insert(
-                k.clone(),
-                serde_json::to_value(v).map_err(serde::ser::Error::custom)?,
-            );
-        }
-        if !self.slots.is_empty() {
-            m.insert(
-                "slots".into(),
-                serde_json::to_value(&self.slots).map_err(serde::ser::Error::custom)?,
-            );
-        }
-        m.serialize(s)
-    }
-}
-
-impl<'de> Deserialize<'de> for Receives {
-    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let mut m = BTreeMap::<String, Value>::deserialize(d)?;
-        let slots = match m.remove("slots") {
-            Some(v) => serde_json::from_value(v).map_err(D::Error::custom)?,
-            None => Keys::new(),
-        };
-        let mut keys = Keys::new();
-        for (k, v) in m {
-            let decl: KeyDecl = serde_json::from_value(v)
-                .map_err(|e| D::Error::custom(format!("receives.{k}: {e}")))?;
-            keys.insert(k, decl);
-        }
-        Ok(Receives { keys, slots })
-    }
-}
-
-impl Receives {
-    fn is_empty(&self) -> bool {
-        self.keys.is_empty() && self.slots.is_empty()
-    }
-}
-
 /// One subscription: an event, a family, or `*`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Subscription {
     pub event: String,
     pub mode: Mode,
@@ -226,12 +182,26 @@ pub struct Subscription {
     /// Also receive every undeclared key, untyped and outside the compiler's guarantee.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unlisted_keys: bool,
-    /// The demand: keys (and slots) this subscriber needs.
-    #[serde(default, skip_serializing_if = "Receives::is_empty")]
-    pub receives: Receives,
+    /// The demand: the payload keys this subscriber needs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub receives: Keys,
+    /// Session slots this subscriber requests, like keys (`[subscribe.slots]`,
+    /// a sibling of `receives`, so no key name is reserved; compiler.md §3.2).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub slots: Keys,
     /// Blocking only: keys handed back to the chain (overwrite or add; never remove).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub returns: Keys,
+    /// What this subscriber does with the event, for people and for the
+    /// emitter of a family it subscribes a member of (`chat-context` shows a
+    /// tool member's description to the model). Documentation only.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
+    /// Free-form hints for a member's emitter and its observers (a tool's
+    /// tier, group, effects). Never checked by the compiler; documentation for
+    /// other plugins, delivered with the resolved emit set.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub hints: Value,
 }
 
 impl Subscription {
@@ -248,23 +218,37 @@ impl Subscription {
 
 /// One emitted event or event family.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EmitDecl {
     pub event: String,
-    /// `interrupt` requires the interrupt capability.
-    #[serde(default, skip_serializing_if = "is_normal")]
-    pub lane: Lane,
+    /// The lanes a publish of this event may choose from (compiler.md §3.3);
+    /// each publish picks one. Allowing `interrupt` requires the interrupt
+    /// capability.
+    #[serde(default = "normal_only", skip_serializing_if = "is_normal_only")]
+    pub lanes: Vec<Lane>,
     /// May be published without an open invocation (requires deferred-publish).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deferred: bool,
-    /// Families only: every member must have exactly one handling subscriber.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub exactly_one_handler: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub keys: Keys,
 }
 
-fn is_normal(l: &Lane) -> bool {
-    *l == Lane::Normal
+/// The default lanes of an emit: the normal lane only.
+#[must_use]
+pub fn normal_only() -> Vec<Lane> {
+    vec![Lane::Normal]
+}
+
+fn is_normal_only(l: &[Lane]) -> bool {
+    l == [Lane::Normal]
+}
+
+impl EmitDecl {
+    /// May a publish of this event use the interrupt lane?
+    #[must_use]
+    pub fn may_interrupt(&self) -> bool {
+        self.lanes.contains(&Lane::Interrupt)
+    }
 }
 
 /// A cross-session event a plugin may send (requires cross-session).
@@ -397,6 +381,7 @@ impl PluginConfig {
 
 /// A plugin's participation in a session definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DefPlugin {
     /// Phase of every blocking subscription of this plugin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -435,6 +420,7 @@ impl Interface {
 
 /// A named session definition (or a reusable fragment of one).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct Definition {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
@@ -452,13 +438,9 @@ pub struct Definition {
     pub plugins: BTreeMap<String, DefPlugin>,
     /// Tie-breaks: `order[event][phase] = [plugins in order]`. The event key is
     /// an event name, a family pattern (`tool-call/*`), or a family name
-    /// (`tool-call`, covering all its members).
+    /// (`tool-call`); a key naming a family applies to every member of it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub order: BTreeMap<String, BTreeMap<String, Vec<String>>>,
-    /// Handler picks for `exactly_one_handler` families: member or sub-family
-    /// pattern → plugin.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub handlers: BTreeMap<String, String>,
     /// Events accepted from other sessions, with their shapes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inbound: BTreeMap<String, Keys>,
@@ -609,16 +591,22 @@ mod tests {
             "name": "p", "version": "1",
             "subscribe": [{
                 "event": "model-request", "mode": "blocking", "actions": ["contribute-context"],
-                "receives": { "model": { "shape": "string" }, "slots": { "context": { "shape": "array<object>" } } },
+                "receives": { "model": { "shape": "string" }, "slots": { "shape": "integer" } },
+                "slots": { "context": { "shape": "array<object>" } },
                 "returns": { "temperature": { "shape": "number" } }
             }],
-            "emit": [{ "event": "tool-call/*", "exactly_one_handler": true, "keys": { "call_id": { "shape": "string" } } }],
+            "emit": [{ "event": "tool-call/*", "keys": { "call_id": { "shape": "string" } } }],
             "capabilities": ["interrupt", "sessions.find"],
             "outbound": [{ "event": "answer", "keys": { "text": { "shape": "string" } } }],
             "sink": true
         }))
         .unwrap();
-        assert_eq!(m.subscribe[0].receives.slots.len(), 1);
+        // Slots are a sibling of `receives`, so `slots` is an ordinary key name.
+        assert_eq!(m.subscribe[0].slots.len(), 1);
+        assert_eq!(
+            m.subscribe[0].receives["slots"].shape.to_string(),
+            "integer"
+        );
         assert!(m.emit_for("tool-call/x").is_some());
         assert!(m.emit_for("tool-result").is_none());
         let back: Manifest = serde_json::from_value(serde_json::to_value(&m).unwrap()).unwrap();
@@ -638,12 +626,52 @@ mod tests {
             "runtime": "0.1", "phases": ["guard", "loop"],
             "plugins": { "policy": { "phase": "guard", "phases": { "model-request": "loop" } }, "web-ui": {} },
             "order": { "tool-call": { "guard": ["policy", "approval-gate"] } },
-            "handlers": { "tool-call/read_file": "local-workspace" },
             "inbound": { "subagent-result": { "call_id": { "shape": "string" } } },
             "deny_warnings": true
         }))
         .unwrap();
         assert_eq!(d.effective_slots()["context"], default_context_slot());
         assert_eq!(d.plugins["policy"].phases["model-request"], "loop");
+    }
+
+    #[test]
+    fn emits_declare_lanes_defaulting_to_normal() {
+        let m: Manifest = serde_json::from_value(json!({ "name": "p", "version": "1", "emit": [
+            { "event": "a" },
+            { "event": "user-message", "lanes": ["normal", "interrupt"] }
+        ] }))
+        .unwrap();
+        assert_eq!(m.emit[0].lanes, vec![Lane::Normal]);
+        assert!(!m.emit[0].may_interrupt());
+        assert!(m.emit[1].may_interrupt());
+        let back = serde_json::to_value(&m).unwrap();
+        assert!(
+            back["emit"][0].get("lanes").is_none(),
+            "the default is not written out"
+        );
+        assert!(
+            serde_json::from_value::<Manifest>(json!({ "name": "p", "version": "1", "emit": [{ "event": "a", "lane": "interrupt" }] })).is_err(),
+            "the single `lane` field is gone"
+        );
+    }
+
+    #[test]
+    fn removed_fields_are_rejected_not_ignored() {
+        let emit = |extra: serde_json::Value| {
+            let mut e = json!({ "event": "tool-call/*" });
+            e.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<Manifest>(json!({ "name": "p", "version": "1", "emit": [e] }))
+        };
+        assert!(emit(json!({})).is_ok());
+        assert!(emit(json!({ "exactly_one_handler": true })).is_err());
+        assert!(
+            serde_json::from_value::<Definition>(
+                json!({ "runtime": "0.1", "handlers": { "tool-call/x": "p" } })
+            )
+            .is_err(),
+            "handler picks are gone"
+        );
     }
 }

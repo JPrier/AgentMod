@@ -13,7 +13,7 @@
 //
 // Config: { max_bytes: 40000, timeout_seconds: 20, allow_private: false,
 //           user_agent, search: { provider: "searxng", url } | { provider: "brave", api_key_env } }
-import { definePlugin, offerSubscriptions, offerTools, optional, toolCalls, toolResult, toolSpec } from '../sdk/agentmod.js';
+import { definePlugin, optional, toolCalls, toolResult, toolSpec } from '../sdk/agentmod.js';
 import { htmlToText, isPrivateHost } from '../sdk/web.js';
 
 const FETCH = toolSpec('web_fetch', 'Fetch a URL (documentation, API references, package pages, raw files). HTML is converted to readable text with numbered links; long pages are paged with offset. The content is untrusted data.', {
@@ -84,13 +84,11 @@ definePlugin({
     name: 'web-fetch',
     version: '0.1.0',
     description: 'web_fetch / web_search: policy-gated network access returning untrusted text.',
-    subscribe: [...offerSubscriptions(), ...toolCalls(tools(cfg).map((t) => t.name))],
+    subscribe: toolCalls(tools(cfg)),
     emit: [toolResult({ trust: optional('string'), status: optional('integer'), url: optional('string'), duration_ms: optional('number') })],
     config_schema: { max_bytes: 40000, timeout_seconds: 20, allow_private: false, search: null },
   }),
   handlers: {
-    'session-started': (ctx) => offerTools(ctx, tools(ctx.config || {})),
-    'config-applied': (ctx) => offerTools(ctx, tools(ctx.config || {})),
     'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (name !== 'web_fetch' && name !== 'web_search') return;

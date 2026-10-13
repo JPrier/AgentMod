@@ -114,10 +114,6 @@ pub enum Body {
         revision: String,
         /// Input state: exactly what was delivered (the projected payload).
         payload: Value,
-        /// Family handler dispatch: the member that selected this plugin as
-        /// its one handler (e.g. the tool name). Absent for other edges.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        route: Option<String>,
     },
     /// An orphaned or crashed invocation was restarted.
     InvocationRetried {

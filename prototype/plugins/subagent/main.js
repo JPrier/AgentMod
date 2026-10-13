@@ -12,7 +12,7 @@
 // The child's full transcript stays in its own log; the parent gets a concise
 // conclusion plus evidence. `subagents` lists children and cancels one; a hard
 // stop of the parent cascades to its running children.
-import { definePlugin, key, offerSubscriptions, offerTools, optional, toolCalls, toolResult } from '../sdk/agentmod.js';
+import { definePlugin, key, optional, toolCalls, toolResult } from '../sdk/agentmod.js';
 import { DELEGATE, SUBAGENTS, CHILD_DEFAULT_TOOLS, READ_ONLY_TOOLS, childReport } from '../sdk/delegation.js';
 
 const TOOLS = [DELEGATE, SUBAGENTS];
@@ -29,14 +29,11 @@ definePlugin({
     version: '0.2.0',
     description: 'delegate / subagents: isolated child agents with scoped tools, workspaces, and budgets.',
     subscribe: [
-      ...offerSubscriptions(),
-      ...toolCalls(TOOLS.map((t) => t.name)),
+      ...toolCalls(TOOLS),
       // From child sessions: the parent definition declares it `inbound`.
       { event: 'subagent-result', mode: 'async', receives: { call_id: key('string'), text: key('string'), worker: key('string'), evidence: key('object') } },
     ],
     emit: [
-      // The initial event of each child session (start-session).
-      { event: 'user-message', keys: { text: key('string'), parent: key('object'), delegation: key('object') } },
       { event: 'subagent-started', keys: { call_id: key('string'), child: key('string'), definition: optional('string'), workspace: optional('string'), tools: optional('array<string>') } },
       toolResult({ child: optional('string'), evidence: optional('object'), trust: optional('string'), cancelled: optional('bool') }),
     ],
@@ -59,8 +56,6 @@ definePlugin({
     }
   },
   handlers: {
-    'session-started': (ctx) => offerTools(ctx, TOOLS),
-    'config-applied': (ctx) => offerTools(ctx, TOOLS),
     'tool-call/*': async (ctx) => {
       const { call_id, name, args } = ctx.payload;
       if (name === 'subagents') {
@@ -112,14 +107,14 @@ definePlugin({
         budget: { max_model_requests: Math.min(Number(args?.max_steps) || cfg.max_steps || 30, cfg.max_steps || 30) },
       };
       const text = args?.context ? `${task}\n\nContext from the delegating agent:\n${String(args.context)}` : task;
+      // start-session: the child's definition and its input. The core emits
+      // `session-started` into the child carrying the task, the parent link,
+      // and the delegation the child's own plugins enforce.
       const { session_id } = await ctx.host.startSession({
         definition: cfg.definition || 'worker',
         invocationId: ctx.invocationId,
-        initial: {
-          event_name: 'user-message',
-          payload: { text, parent: { session_id: ctx.sessionId, call_id }, delegation },
-          ui: { v: 1, kind: 'text', role: 'user', text },
-        },
+        input: { text, data: { parent: { session_id: ctx.sessionId, call_id }, delegation } },
+        ui: { v: 1, kind: 'text', role: 'user', text },
       });
       await ctx.publish('subagent-started', { call_id, child: session_id, definition: cfg.definition || 'worker', workspace, tools }, { ui: { v: 1, kind: 'progress', label: `Delegated to ${session_id}: ${task.slice(0, 80)}`, session: session_id } });
     },

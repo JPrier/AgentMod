@@ -9,6 +9,7 @@
 // A plugin is uncategorized: event in -> contributed context + published events.
 
 import { createStreamWriter } from './stream.js';
+import { argsKey } from './toolschema.js';
 
 export const PROTOCOL = 'agentmod/0.1';
 
@@ -87,9 +88,17 @@ export function sleep(ms, signal) {
   });
 }
 
-/** Read context items of one section (values only). */
-export function slot(context, name) {
-  return (context || []).filter((c) => c.slot === name).map((c) => c.value);
+/** The input a session was started with (`session-started`'s `input`), from a session view. */
+export function startInputOf(view) {
+  return (view?.events || []).find((e) => e.event_name === 'session-started')?.payload?.input || null;
+}
+
+/** The `receives` key for a `session-started` subscriber that reads the start input. */
+export const START_INPUT = { input: { shape: 'object', optional: true, keys: { text: { shape: 'string', optional: true }, attachments: { shape: 'array<object>', optional: true }, data: { shape: 'object', optional: true } } } };
+
+/** Read the context items of one section (values only). */
+export function section(context, name) {
+  return (context || []).filter((c) => c.section === name).map((c) => c.value);
 }
 
 // ---------------------------------------------------------------------------
@@ -101,11 +110,15 @@ export const key = (shape, extra = {}) => ({ shape, ...extra });
 /** An optional key. */
 export const optional = (shape, extra = {}) => ({ shape, optional: true, ...extra });
 
-/** The default `context` slot, requested like a key (`receives.slots`). */
+/** The default `context` slot, requested like a key (`[subscribe.slots]`). */
 export const CONTEXT = { context: key('array<object>') };
 
-/** Receives for a subscription that reads the context slot, plus `keys`. */
-export const withContext = (keys = {}) => ({ ...keys, slots: CONTEXT });
+/**
+ * A subscription that receives `keys` and reads the context slot: spread it
+ * into the subscription (`{ event, mode, ...withContext({ text: key('string') }) }`).
+ * Slots are a sibling of `receives` (compiler.md §3.2).
+ */
+export const withContext = (keys = {}) => ({ receives: keys, slots: CONTEXT });
 
 /** Keys every tool call carries (`tool-call/<name>`, emitted by the loop plugin). */
 export const TOOL_CALL_KEYS = {
@@ -137,26 +150,31 @@ export const MODEL_RESPONSE_KEYS = {
 /** The `tool-result` emit declaration (extra keys may be declared in `more`). */
 export const toolResult = (more = {}) => ({ event: 'tool-result', keys: { ...TOOL_RESULT_KEYS, ...more } });
 
-/**
- * Subscriptions that make this plugin the handler of these tools: one
- * `tool-call/<name>` member (or `tool-call/<prefix>*` sub-family) each, async.
- * The compiler checks there is exactly one handler per member.
- */
-export function toolCalls(names, extra = {}) {
-  return [...names].map((n) => ({ event: `tool-call/${n}`, mode: 'async', receives: { ...TOOL_CALL_KEYS }, ...extra }));
-}
+/** Hints a tool spec carries for the loop, discovery, and policy plugins. */
+const HINTS = ['tier', 'group', 'effects', 'trust', 'intents'];
 
 /**
- * The subscriptions a tool plugin uses to offer its tool specs: at session
- * start and after a config apply it reads the context slot and contributes to
- * its `tools` section. Blocking, so the tools are in context before the next
- * event runs; a definition gives them a phase and an order.
+ * The subscriptions that make these tools exist (compiler.md §3.4): one
+ * concrete `tool-call/<name>` member per tool spec, async. The member's
+ * `receives.args` is the tool's argument schema (as a shape, from the spec's
+ * parameters), its `description` the tool's description, and its `hints` the
+ * spec's tier, group, effects, trust, and intents. The compiler resolves the
+ * loop plugin's `tool-call/*` family into exactly these members, and the model
+ * is offered exactly them. Several plugins may subscribe to one member: all run.
  */
-export function offerSubscriptions() {
-  return [
-    { event: 'session-started', mode: 'blocking', actions: ['contribute-context'], receives: withContext() },
-    { event: 'config-applied', mode: 'blocking', actions: ['contribute-context'], receives: withContext() },
-  ];
+export function toolCalls(specs, extra = {}) {
+  const { receives = {}, ...rest } = extra;
+  return [...specs].map((spec) => {
+    const hints = Object.fromEntries(HINTS.filter((k) => spec[k] !== undefined).map((k) => [k, spec[k]]));
+    return {
+      event: `tool-call/${spec.name}`,
+      mode: 'async',
+      ...(spec.description ? { description: spec.description } : {}),
+      ...(Object.keys(hints).length ? { hints } : {}),
+      receives: { ...TOOL_CALL_KEYS, ...receives, args: argsKey(spec) },
+      ...rest,
+    };
+  });
 }
 
 /** Does a pattern (`tool-call/*`, `tool-call/mcp__x__*`, exact) match a name? */
@@ -170,12 +188,14 @@ export function patternMatches(pattern, name) {
  * Define and start a plugin.
  *
  * @param {object} spec
- * @param {object} spec.manifest  name, version, subscribe, emit, capabilities, outbound, sink
+ * @param {object|Function} spec.manifest  name, version, subscribe, emit, capabilities, outbound, sink;
+ *   or (config) => manifest (may be async: an MCP bridge connects before it can declare its tools)
  * @param {Record<string, Function>} spec.handlers  event name, family pattern (`tool-call/*`), or '*' -> async (ctx) => result
  * @param {Function} [spec.validate] async (config, {env}) => void; throw to refuse the handshake
  * @param {Function} [spec.init]   async (plugin) => void, after the handshake
  * @param {Function} [spec.onRecord] (record) => void, for plugins that `watch`
  * @param {Function} [spec.onStream] (messages) => void, live stream messages for watchers
+ * @param {Function} [spec.onEmitSet] (revision, emits) => void, when the runtime sends a resolved emit set
  */
 export function definePlugin(spec) {
   const plugin = new Plugin(spec);
@@ -192,12 +212,21 @@ class Plugin {
     this.config = {};
     this.manifest = typeof spec.manifest === 'function' ? null : spec.manifest;
     this.name = spec.name || this.manifest?.name || 'plugin';
+    // Revision → this plugin's resolved emit set under it (compiler.md §3.4):
+    // the concrete events it may emit, sent by the runtime after the handshake
+    // and before its first invocation under any new revision.
+    this.emitSets = new Map();
+    this.latestRevision = null;
   }
 
   /** The manifest for a config (a manifest may depend on it, e.g. declared tools). */
-  manifestFor(config) {
-    const m = typeof this.spec.manifest === 'function' ? this.spec.manifest(config || {}) : this.spec.manifest;
-    return m;
+  async manifestFor(config) {
+    return typeof this.spec.manifest === 'function' ? await this.spec.manifest(config || {}) : this.spec.manifest;
+  }
+
+  /** The resolved emit set under a revision (the latest one received if omitted). */
+  emitsFor(revision) {
+    return this.emitSets.get(revision ?? this.latestRevision) || [];
   }
 
   async start() {
@@ -224,10 +253,16 @@ class Plugin {
   get host() {
     return {
       query: (what, args = {}) => this.request('query', { what, ...args }),
-      /** Start a session from a definition (by name, or a `spec` written now). A
-       *  definition that fails to compile rejects with `error.data.diagnostics`. */
-      startSession: ({ definition, spec, initial, invocationId, forkFrom }) =>
-        this.request('start_session', { definition, spec, initial, invocation_id: invocationId, fork_from: forkFrom }),
+      /**
+       * `start-session`, a runtime call (compiler.md §9): a definition (by
+       * name, or a `spec` written now) and an initial `input` (`{ text,
+       * attachments, data }`). The runtime compiles the definition, creates
+       * the session, and emits `session-started` carrying the input; `ui` is
+       * an optional hint for that event. A definition that fails to compile
+       * creates no session and rejects with `error.data.diagnostics`.
+       */
+      startSession: ({ definition, spec, input, ui, invocationId, forkFrom }) =>
+        this.request('start_session', { definition, spec, input, ui, invocation_id: invocationId, fork_from: forkFrom }),
       publishDeferred: (event_name, payload = {}, opts = {}) =>
         this.request('publish', { event_name, payload, cite: opts.cite, ui: opts.ui, lane: opts.lane, target_session: opts.targetSession }),
       command: (session_id, command) => this.request('command', { session_id, command }),
@@ -258,7 +293,7 @@ class Plugin {
         case 'initialize': {
           this.config = params.config || {};
           this.instance = params.plugin;
-          this.manifest = this.manifestFor(this.config);
+          this.manifest = await this.manifestFor(this.config);
           this.name = this.manifest?.name || this.name;
           if (this.spec.validate) {
             // A plugin may refuse to start (e.g. a required secret is missing);
@@ -302,6 +337,12 @@ class Plugin {
         }
         case 'cancel': {
           this.aborts.get(params.invocation_id)?.abort();
+          return;
+        }
+        case 'emit_set': {
+          this.emitSets.set(params.revision, params.emits || []);
+          this.latestRevision = params.revision;
+          this.spec.onEmitSet?.(params.revision, params.emits || [], this);
           return;
         }
         case 'record': {
@@ -349,7 +390,7 @@ class Plugin {
     const plugin = this;
     const slots = ev.slots;
     const noContext = () => {
-      throw new Error(`\`${this.name}\` read the context on \`${ev.event_name}\`, but its subscription (${req.subscription || ev.event_name}) does not request the \`context\` slot (receives.slots.context)`);
+      throw new Error(`\`${this.name}\` read the context on \`${ev.event_name}\`, but its subscription (${req.subscription || ev.event_name}) does not request the \`context\` slot (slots.context)`);
     };
     const ctx = {
       plugin,
@@ -361,6 +402,12 @@ class Plugin {
       subscription: req.subscription,
       sessionId: ev.session_id,
       invocationId: req.invocation_id,
+      /** The revision this invocation runs under. */
+      revision: req.revision,
+      /** This plugin's resolved emit set under that revision: the concrete events it may emit. */
+      get emits() { return plugin.emitsFor(req.revision); },
+      /** May this plugin emit `name` under this invocation's revision? */
+      mayEmit: (name) => plugin.emitsFor(req.revision).some((e) => e.event === name),
       attempt: req.attempt,
       mode: req.mode,
       signal: abort.signal,
@@ -369,7 +416,8 @@ class Plugin {
       host: this.host,
       log: (...a) => this.log(...a),
       sleep: (ms) => sleep(ms, abort.signal),
-      slot: (name) => slot(ctx.context, name),
+      /** The values of one context section (`messages`, `tools`, …). */
+      section: (name) => section(ctx.context, name),
       /** Publish as output of this invocation. */
       publish: (event_name, payload = {}, opts = {}) =>
         this.request('publish', {
@@ -380,10 +428,10 @@ class Plugin {
           lane: opts.lane,
           target_session: opts.targetSession,
         }),
-      add: (slotName, value) => result.contributions.push({ op: 'add', slot: slotName, value }),
+      add: (name, value) => result.contributions.push({ op: 'add', section: name, value }),
       replace: (id, value) => result.contributions.push({ op: 'replace', id, value }),
       remove: (id) => result.contributions.push({ op: 'remove', id }),
-      clearSlot: (slotName) => result.contributions.push({ op: 'clear-slot', slot: slotName }),
+      clearSection: (name) => result.contributions.push({ op: 'clear-section', section: name }),
       restore: (to_sequence) => result.contributions.push({ op: 'restore', to_sequence }),
       contribute: (op) => result.contributions.push(op),
       veto: (reason) => { result.veto = reason; },
@@ -411,12 +459,15 @@ class Plugin {
 }
 
 /**
- * Standard tool description contributed to the `tools` context slot.
+ * A tool, as its plugin writes it: name, description, JSON-Schema-style
+ * parameters (`required` lists required ones). `toolCalls` turns specs into
+ * the member subscriptions that make the tools exist; the loop plugin offers
+ * the model the tools its `tool-call/*` family resolves to (sdk/toolschema.js).
  *
  * `opts.tier` is `core` (sent to the model every turn) or `deferred` (found
  * through tool_search; see sdk/projection.js). `group` names a capability
- * family for discovery and policy, `effects` is read | write | varies, and
- * `required` lists required parameters.
+ * family for discovery and policy, and `effects` is read | write | varies.
+ * These travel as the subscription's `hints`.
  */
 export function toolSpec(name, description, parameters = {}, opts = {}) {
   const spec = { name, description, parameters };
@@ -428,24 +479,4 @@ export function toolSpec(name, description, parameters = {}, opts = {}) {
   // Phrases in a user message that make a deferred tool load by itself.
   if (opts.intents?.length) spec.intents = opts.intents;
   return spec;
-}
-
-/**
- * Contribute this plugin's tool descriptions unless already present
- * (used on session-started and config-applied). A tool the plugin does not
- * subscribe to as a `tool-call/<name>` member is not offered: every offered
- * tool has a compiled handler.
- */
-export function offerTools(ctx, tools) {
-  const present = new Set(ctx.slot('tools').map((t) => t?.name));
-  const subs = (ctx.plugin?.manifest?.subscribe || []).map((s) => s.event).filter((e) => e.startsWith('tool-call/'));
-  const handles = (name) => !ctx.plugin?.manifest || subs.some((p) => patternMatches(p, `tool-call/${name}`) && p !== 'tool-call/*');
-  for (const t of tools) {
-    if (present.has(t.name)) continue;
-    if (!handles(t.name)) {
-      ctx.log(`not offering \`${t.name}\`: this plugin does not subscribe to \`tool-call/${t.name}\``);
-      continue;
-    }
-    ctx.add('tools', t);
-  }
 }

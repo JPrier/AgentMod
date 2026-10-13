@@ -85,3 +85,12 @@ _Avoid_: global keys
 **Embedded workflow**:
 A session definition used as a single plugin inside another definition.
 _Avoid_: sub-agent (as a runtime concept)
+
+## Plugin processes
+
+**Attempt**:
+One dispatch of an invocation to a plugin process. An invocation interrupted by something other than its own failure is dispatched again as a new attempt, and every attempt after the first tells the plugin which attempt it is and which attempts came before.
+_Avoid_: retry (as a noun for the record)
+
+**Collateral invocation**:
+An invocation stopped only because the process running it was killed for another invocation's sake.

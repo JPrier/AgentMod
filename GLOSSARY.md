@@ -2,6 +2,12 @@
 
 AgentMod is an agent runtime. Plugins declare what they consume and emit, and session definitions select those plugins. A compiler turns these into one validated graph that the runtime executes deterministically.
 
+## Sessions
+
+**Session**:
+An independent append-only log with its own serial dispatcher, running one compiled definition. Chats, trigger journals, ephemeral workflows and the deployment session are all sessions.
+_Avoid_: conversation, thread, run, workflow instance
+
 ## Definitions and compilation
 
 **Session definition**:

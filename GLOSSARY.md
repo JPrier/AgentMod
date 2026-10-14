@@ -102,3 +102,13 @@ _Avoid_: instance, worker
 **Process start config**:
 The config keys a plugin's author lists as sent once, when a process starts. Sessions that differ in any of them never share a process; every other key travels with each invocation.
 _Avoid_: instance config, static config
+
+**Plugin store**:
+The runtime-owned set of installed plugin binaries, identified by binary hash. Name and version are labels from each binary's manifest; two binaries may share a label, and a reference to that label resolves to the most recently installed.
+_Avoid_: registry, marketplace
+
+**Deployment session**:
+The session, started by the runtime at first boot, whose log records every change to the plugin store. It runs a deployment workflow.
+
+**Deployment workflow**:
+The replaceable session definition the deployment session runs: what happens when a plugin is requested, installed, or removed.

@@ -94,3 +94,11 @@ _Avoid_: retry (as a noun for the record)
 
 **Collateral invocation**:
 An invocation stopped only because the process running it was killed for another invocation's sake.
+
+**Process pool**:
+The plugin processes that serve every session whose plugin has the same binary and the same process start config. Different versions of a plugin are different pools, running side by side.
+_Avoid_: instance, worker
+
+**Process start config**:
+The config keys a plugin's author lists as sent once, when a process starts. Sessions that differ in any of them never share a process; every other key travels with each invocation.
+_Avoid_: instance config, static config
